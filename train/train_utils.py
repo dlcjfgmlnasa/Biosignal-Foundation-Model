@@ -36,7 +36,7 @@ class TrainConfig:
 
     # 데이터
     processed_dir: str = "datasets/processed"
-    signal_types: list[int] = field(default_factory=lambda: [2, 4, 5])
+    signal_types: list[int] = field(default_factory=lambda: [0, 1, 2, 3, 4, 5, 6])
     max_subjects: int | None = None
     window_seconds: float = 30.0
     max_length: int = 50000

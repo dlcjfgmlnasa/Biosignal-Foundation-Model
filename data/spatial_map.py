@@ -38,15 +38,20 @@ SPATIAL_MAP: dict[int, dict[str, int]] = {
         "Unknown": 0,
         "Finger": 1, "Ear": 2, "Forehead": 3, "Wrist": 4,
     },
-    # EMG (signal_type=4)
+    # CVP (signal_type=4)
     4: {
         "Unknown": 0,
-        "Submental": 1, "Tibialis": 2, "Intercostal": 3,
+        "Internal_Jugular": 1, "Subclavian": 2,
     },
-    # Resp (signal_type=5)
+    # CO2/Capnography (signal_type=5)
     5: {
         "Unknown": 0,
-        "Oronasal": 1, "Nasal": 2, "Thorax": 3, "Abdomen": 4,
+        "Mainstream": 1, "Sidestream": 2,
+    },
+    # AWP/Airway Pressure (signal_type=6)
+    6: {
+        "Unknown": 0,
+        "Proximal": 1, "Distal": 2,
     },
 }
 
@@ -67,7 +72,7 @@ def get_global_spatial_id(signal_type: int, local_id: int) -> int:
     Parameters
     ----------
     signal_type:
-        신호 대분류 코드 (0~5).
+        신호 대분류 코드 (0~6).
     local_id:
         signal_type 내 로컬 spatial ID. 0 = Unknown.
 
@@ -103,12 +108,13 @@ CHANNEL_NAME_TO_SPATIAL: dict[str, tuple[int, int]] = {
     "EEG Fpz": (2, 21),
     # EEG — bipolar (Sleep-EDF)
     "EEG Fpz-Cz": (2, 22), "EEG Pz-Oz": (2, 23),
-    # EMG
-    "EMG submental": (4, 1), "EMG Submental": (4, 1),
-    "EMG tibialis": (4, 2), "EMG Tibialis": (4, 2),
-    # Resp
-    "Resp oro-nasal": (5, 1), "Resp Oronasal": (5, 1),
-    "Resp nasal": (5, 2), "Resp Nasal": (5, 2),
-    "Resp thorax": (5, 3), "Resp Thorax": (5, 3),
-    "Resp abdomen": (5, 4), "Resp Abdomen": (5, 4),
+    # CVP
+    "CVP": (4, 0),
+    "CVP Internal Jugular": (4, 1), "CVP Subclavian": (4, 2),
+    # CO2
+    "CO2": (5, 0),
+    "CO2 Mainstream": (5, 1), "CO2 Sidestream": (5, 2),
+    # AWP
+    "AWP": (6, 0),
+    "AWP Proximal": (6, 1), "AWP Distal": (6, 2),
 }

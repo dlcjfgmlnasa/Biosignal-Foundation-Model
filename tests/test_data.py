@@ -493,7 +493,7 @@ def test_cross_modal_any_variate():
     divider("Cross-modal: session_id 기반 any_variate 그루핑")
 
     # ECG: 2ch, 100ts, fs=500, signal_type=0, session_id="S001"
-    # EMG: 1ch, 100ts, fs=100, signal_type=4, session_id="S001"
+    # CVP: 1ch, 100ts, fs=100, signal_type=4, session_id="S001"
     # → 같은 session + 같은 physical_time(0초) → 하나의 그룹
     samples = [
         BiosignalSample(torch.ones(100) * 1, 100, 0, 0, 500.0, 2, win_start=0, signal_type=0, session_id="S001"),
@@ -506,11 +506,11 @@ def test_cross_modal_any_variate():
 
     # 3개 variate가 하나의 그룹으로 묶임 (physical_time 모두 0ms)
     var_ids = batch.variate_id[0]
-    # 정렬: signal_type 순 → ECG(0) ch0, ECG(0) ch1, EMG(4) ch0
+    # 정렬: signal_type 순 → ECG(0) ch0, ECG(0) ch1, CVP(4) ch0
     assert (var_ids[:100] == 1).all(), "ECG ch0 should be variate 1"
     assert (var_ids[100:200] == 2).all(), "ECG ch1 should be variate 2"
-    assert (var_ids[200:300] == 3).all(), "EMG ch0 should be variate 3"
-    print(f"  3 variates (ECG×2 + EMG×1) → 1 그룹, variate_id 검증  OK")
+    assert (var_ids[200:300] == 3).all(), "CVP ch0 should be variate 3"
+    print(f"  3 variates (ECG×2 + CVP×1) → 1 그룹, variate_id 검증  OK")
 
     # per-variate 메타데이터 검증
     assert batch.signal_types.tolist() == [0, 0, 4], \
@@ -539,7 +539,7 @@ def test_cross_modal_physical_time_alignment():
     var_ids = batch.variate_id[0]
     assert (var_ids[:50] == 1).all()
     assert (var_ids[50:100] == 2).all()
-    print(f"  같은 session, ECG(ws=500,fs=500) + EMG(ws=100,fs=100) → 1000ms → 1그룹  OK")
+    print(f"  같은 session, ECG(ws=500,fs=500) + CVP(ws=100,fs=100) → 1000ms → 1그룹  OK")
 
     # 다른 session_id + 같은 physical_time → 별도 그룹
     samples_diff = [
@@ -556,7 +556,7 @@ def test_cross_modal_different_physical_time():
     divider("Cross-modal: 다른 물리적 시간 → 별도 그룹")
 
     # ECG: fs=500, win_start=0 → 0ms
-    # EMG: fs=100, win_start=100 → 1000ms
+    # CVP: fs=100, win_start=100 → 1000ms
     # → 다른 physical_time → 별도 그룹
     samples = [
         BiosignalSample(torch.ones(50), 50, 0, 0, 500.0, 1, win_start=0, signal_type=0, session_id="S003"),

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -80,3 +81,31 @@ def save_recording(tensor: torch.Tensor, out_path: str) -> None:
         저장 경로 (.pt).
     """
     torch.save(tensor.to(torch.float32), out_path)
+
+
+def save_recording_zarr(
+    data: np.ndarray,
+    out_path: str | Path,
+    compressor=None,
+) -> None:
+    """(C, T) float32 배열을 zarr 압축 포맷으로 저장한다.
+
+    Parameters
+    ----------
+    data:
+        (n_channels, n_timesteps) float32 배열.
+    out_path:
+        저장 경로 (.zarr 디렉토리).
+    compressor:
+        zarr compressor. None이면 blosc(zstd, clevel=3)을 사용한다.
+    """
+    import zarr
+    from numcodecs import Blosc
+
+    if compressor is None:
+        compressor = Blosc(cname="zstd", clevel=3, shuffle=Blosc.BITSHUFFLE)
+
+    store = zarr.DirectoryStore(str(out_path))
+    z = zarr.open(store, mode="w", shape=data.shape, dtype="float32",
+                  compressor=compressor, chunks=(data.shape[0], min(data.shape[1], 100_000)))
+    z[:] = data.astype(np.float32)

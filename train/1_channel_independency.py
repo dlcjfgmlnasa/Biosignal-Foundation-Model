@@ -54,8 +54,8 @@ def parse_args() -> argparse.Namespace:
     # Data
     g = p.add_argument_group("Data")
     g.add_argument("--processed_dir", type=str, default="datasets/processed")
-    g.add_argument("--signal_types", type=int, nargs="+", default=[2, 4, 5],
-                   help="Signal type IDs (0=ECG, 1=ABP, 2=EEG, 3=PPG, 4=EMG, 5=Resp)")
+    g.add_argument("--signal_types", type=int, nargs="+", default=[0, 1, 2, 3, 4, 5, 6],
+                   help="Signal type IDs (0=ECG, 1=ABP, 2=EEG, 3=PPG, 4=CVP, 5=CO2, 6=AWP)")
     g.add_argument("--max_subjects", type=int, default=None)
     g.add_argument("--window_seconds", type=float, default=30.0)
     g.add_argument("--max_length", type=int, default=50000)

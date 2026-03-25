@@ -118,7 +118,12 @@ class BiosignalDataset(Dataset[BiosignalSample]):
     def _load_recording_impl(
         self, rec_idx: int
     ) -> torch.Tensor:  # (channels, time)
-        return torch.load(self._manifest[rec_idx].path, weights_only=True, mmap=self._use_mmap)
+        path = self._manifest[rec_idx].path
+        if path.endswith(".zarr"):
+            import zarr
+            arr = zarr.open(path, mode="r")
+            return torch.from_numpy(arr[:])
+        return torch.load(path, weights_only=True, mmap=self._use_mmap)
 
     def __getstate__(self) -> dict:
         """Pickle 직렬화: lru_cache wrapper는 pickle 불가이므로 제외."""

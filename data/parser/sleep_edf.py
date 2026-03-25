@@ -6,8 +6,6 @@
 
 신호 타입 매핑 (signal_type):
   EEG Fpz-Cz, EEG Pz-Oz  → eeg (2)  → {session}_eeg.pt
-  EMG submental           → emg (4)  → {session}_emg.pt
-  Resp oro-nasal          → resp (5) → {session}_resp.pt
 
 사용법:
   python -m data.parser.sleep_edf \\
@@ -37,8 +35,9 @@ SIGNAL_TYPES: dict[str, int] = {
     "abp": 1,
     "eeg": 2,
     "ppg": 3,
-    "emg": 4,
-    "resp": 5,
+    "cvp": 4,
+    "co2": 5,
+    "awp": 6,
 }
 
 # Sleep-EDF EDF 채널명 → signal_type 키 매핑
@@ -46,15 +45,11 @@ SIGNAL_TYPES: dict[str, int] = {
 CHANNEL_MAP: dict[str, str] = {
     "EEG Fpz-Cz": "eeg",
     "EEG Pz-Oz": "eeg",
-    "EMG submental": "emg",
-    "Resp oro-nasal": "resp",
 }
 # Sleep-EDF 채널명 → 로컬 spatial_id 매핑
 CHANNEL_SPATIAL: dict[str, int] = {
     "EEG Fpz-Cz": 22,   # EEG Fpz-Cz bipolar montage
     "EEG Pz-Oz": 23,    # EEG Pz-Oz bipolar montage
-    "EMG submental": 1,  # EMG Submental
-    "Resp oro-nasal": 1, # Resp Oronasal
 }
 
 

@@ -26,7 +26,7 @@ model_config:
 
 # ── 데이터 ──
 processed_dir: datasets/processed
-signal_types: [2, 4, 5]    # EEG, EMG, Resp
+signal_types: [0, 1, 2, 3, 4, 5, 6]  # ECG, ABP, EEG, PPG, CVP, CO2, AWP
 max_subjects: null
 window_seconds: 30.0
 max_length: 50000

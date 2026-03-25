@@ -1,7 +1,7 @@
 # -*- coding:utf-8 -*-
 """통합 테스트: data 파이프라인 → TransformerEncoder end-to-end.
 
-가짜 생체신호(ECG, EEG, EMG 등)를 생성하고, BiosignalDataset → PackCollate →
+가짜 생체신호(ECG, EEG, CVP 등)를 생성하고, BiosignalDataset → PackCollate →
 간단한 Linear projection → TransformerEncoder로 forward pass를 수행한다.
 """
 import tempfile
@@ -64,12 +64,12 @@ def make_fake_eeg(
     return torch.stack(channels)
 
 
-def make_fake_emg(
+def make_fake_cvp(
     n_channels: int = 2,
     n_timesteps: int = 1000,
     sampling_rate: float = 1000.0,
 ) -> torch.Tensor:
-    """가짜 EMG: 고주파 burst + noise."""
+    """가짜 CVP: 고주파 burst + noise."""
     t = torch.linspace(0, n_timesteps / sampling_rate, n_timesteps)
     channels = []
     for ch in range(n_channels):
@@ -178,7 +178,7 @@ class TestSingleModalEEGPipeline:
 
 
 class TestMultiModalPipeline:
-    """ECG + EEG + EMG 동시 세션: cross-modal any-variate 패킹 → Encoder."""
+    """ECG + EEG + CVP 동시 세션: cross-modal any-variate 패킹 → Encoder."""
 
     def test_cross_modal_session(self):
         d_model = 64
@@ -196,14 +196,14 @@ class TestMultiModalPipeline:
             # 같은 세션, 짧은 신호 (모두 1초 분량)
             ecg = make_fake_ecg(n_channels=1, n_timesteps=100, sampling_rate=100.0)
             eeg = make_fake_eeg(n_channels=2, n_timesteps=100, sampling_rate=100.0)
-            emg = make_fake_emg(n_channels=1, n_timesteps=100, sampling_rate=100.0)
+            cvp = make_fake_cvp(n_channels=1, n_timesteps=100, sampling_rate=100.0)
 
             manifest_ecg = save_recordings([ecg], tmpdir, 100.0, 0, session_id="S001")
             manifest_eeg = save_recordings([eeg], tmpdir, 100.0, 1, session_id="S001")
-            manifest_emg = save_recordings([emg], tmpdir, 100.0, 4, session_id="S001")
+            manifest_cvp = save_recordings([cvp], tmpdir, 100.0, 4, session_id="S001")
 
             ds = BiosignalDataset(
-                manifest_ecg + manifest_eeg + manifest_emg,
+                manifest_ecg + manifest_eeg + manifest_cvp,
                 window_seconds=1.0, stride_seconds=1.0,
             )
             assert len(ds) > 0

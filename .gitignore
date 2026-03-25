@@ -28,3 +28,7 @@ Thumbs.db
 *.log
 wandb/
 runs/
+
+# Claude Code
+.claude/
+.plans/

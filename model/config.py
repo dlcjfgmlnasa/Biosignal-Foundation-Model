@@ -40,7 +40,7 @@ class ModelConfig:
     dropout_p:
         드롭아웃 확률.
     num_signal_types:
-        신호 타입 수 (ECG, ABP, EEG, PPG, EMG, Resp).
+        신호 타입 수 (ECG, ABP, EEG, PPG, CVP, CO2, AWP).
     num_spatial_ids:
         글로벌 spatial ID 수.
     max_horizon:
@@ -72,7 +72,7 @@ class ModelConfig:
     dropout_p: float = 0.0
 
     # Signal types
-    num_signal_types: int = 6
+    num_signal_types: int = 7
     num_spatial_ids: int = 55
 
     # Task
