@@ -1,5 +1,6 @@
 # -*- coding:utf-8 -*-
 import bisect
+import random
 import tempfile
 from dataclasses import dataclass
 from functools import lru_cache
@@ -81,11 +82,13 @@ class BiosignalDataset(Dataset[BiosignalSample]):
         stride_seconds: float | None = None,
         cache_size: int = 8,
         use_mmap: bool = False,
+        crop_ratio_range: tuple[float, float] | None = None,
     ) -> None:
         super().__init__()
         self.max_length = max_length
         self.window_seconds = window_seconds
         self.stride_seconds = stride_seconds
+        self.crop_ratio_range = crop_ratio_range  # e.g. (0.5, 1.0)
         self._manifest = list(manifest)
         self._use_mmap = use_mmap
         self._cache_size = cache_size
@@ -160,6 +163,16 @@ class BiosignalDataset(Dataset[BiosignalSample]):
             values = channel
             if self.max_length is not None:
                 values = values[: self.max_length]
+
+        # Random crop: 윈도우 내에서 랜덤 비율로 잘라냄
+        if self.crop_ratio_range is not None and len(values) > 0:
+            lo, hi = self.crop_ratio_range
+            ratio = random.uniform(lo, hi)
+            crop_len = max(1, int(len(values) * ratio))
+            if crop_len < len(values):
+                start = random.randint(0, len(values) - crop_len)
+                values = values[start : start + crop_len]
+                win_start = win_start + start
 
         spatial_id = 0
         if entry.spatial_ids is not None:
