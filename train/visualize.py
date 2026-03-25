@@ -51,40 +51,46 @@ def _batch_to_device(batch: PackedBatch, device: torch.device) -> None:
     batch.variate_id = batch.variate_id.to(device)
 
 
-def _build_variate_signal_map(
+def _build_signal_map(
     batch: PackedBatch,
-    p_vid: torch.Tensor,  # (B, N)
+    p_sid: torch.Tensor,  # (B, N) patch_sample_id
+    p_vid: torch.Tensor,  # (B, N) patch_variate_id
     patch_mask: torch.Tensor,  # (B, N)
     B: int,
-) -> dict[tuple[int, int], int]:
-    """(row, variate_id) → signal_type 매핑을 반환한다.
+) -> dict[tuple[int, int, int], int]:
+    """(row, sample_id, variate_id) → signal_type 매핑을 반환한다.
 
     ``batch.signal_types``는 ``(total_variates,)``로, 배치 전체의 variate를
-    순서대로 나열한 것이다. 각 row의 variate_id를 global index로 변환하여
-    올바른 signal type을 찾는다.
+    row 순서 → unit(sample) 순서 → variate 순서로 나열한 것이다.
+    CI 모드에서는 각 unit이 1개 variate를 가지므로 sample_id로 구분해야 한다.
     """
     has_signal_types = hasattr(batch, "signal_types") and batch.signal_types is not None
-    mapping: dict[tuple[int, int], int] = {}
+    mapping: dict[tuple[int, int, int], int] = {}
     if not has_signal_types:
         return mapping
 
-    # row별 max variate_id → global offset 계산
-    per_row_max_var = patch_mask.long() * p_vid  # padding 제외
-    per_row_n_var = per_row_max_var.max(dim=-1).values  # (B,)
-    var_offsets = torch.zeros(B, dtype=torch.long, device=p_vid.device)
-    if B > 1:
-        var_offsets[1:] = per_row_n_var[:-1].cumsum(dim=0)
-
+    # row별 고유 (sample_id, variate_id) 쌍을 순서대로 추출하여 global index에 대응
+    gvi = 0
     for b in range(B):
         valid = patch_mask[b]
         if not valid.any():
             continue
-        # row 내 고유 variate_id 추출
-        unique_vids = p_vid[b, valid].unique().tolist()
-        for vid in unique_vids:
-            gvi = int(var_offsets[b].item()) + int(vid) - 1
-            if 0 <= gvi < len(batch.signal_types):
-                mapping[(b, int(vid))] = batch.signal_types[gvi].item()
+
+        # row 내 고유 (sid, vid) 쌍을 등장 순서대로 추출
+        sid_valid = p_sid[b, valid]
+        vid_valid = p_vid[b, valid]
+        seen: set[tuple[int, int]] = set()
+        ordered_pairs: list[tuple[int, int]] = []
+        for i in range(len(sid_valid)):
+            pair = (int(sid_valid[i].item()), int(vid_valid[i].item()))
+            if pair not in seen:
+                seen.add(pair)
+                ordered_pairs.append(pair)
+
+        for sid, vid in ordered_pairs:
+            if gvi < len(batch.signal_types):
+                mapping[(b, sid, vid)] = batch.signal_types[gvi].item()
+            gvi += 1
 
     return mapping
 
@@ -123,10 +129,10 @@ def _process_batch_masked(
     mask_ratio: float,
     device: torch.device | None,
 ) -> list[_RowCandidate]:
-    """Masked reconstruction 후보를 variate 단위로 추출한다.
+    """Masked reconstruction 후보를 (sample_id, variate_id) 단위로 추출한다.
 
-    한 row에 여러 signal type의 variate가 packed될 수 있으므로,
-    variate_id별로 분리하여 각각 별도의 후보로 만든다.
+    CI 모드에서는 한 row에 여러 sample이 packed되며 모두 variate_id=1이므로,
+    sample_id까지 함께 사용하여 분리해야 한다.
     """
     if device is not None:
         _batch_to_device(batch, device)
@@ -134,6 +140,7 @@ def _process_batch_masked(
     out = model(batch, task="masked")
     reconstructed = out["reconstructed"]  # (B, N, P)
     patch_mask = out["patch_mask"]        # (B, N)
+    p_sid = out["patch_sample_id"]        # (B, N)
     p_vid = out["patch_variate_id"]       # (B, N)
 
     pred_mask = create_patch_mask(patch_mask, mask_ratio=mask_ratio)
@@ -144,7 +151,7 @@ def _process_batch_masked(
     N = L // P
     original_patches = normalized[:, :N * P].reshape(B, N, P)
 
-    sig_map = _build_variate_signal_map(batch, p_vid, patch_mask, B)
+    sig_map = _build_signal_map(batch, p_sid, p_vid, patch_mask, B)
 
     candidates: list[_RowCandidate] = []
     for b in range(B):
@@ -154,32 +161,34 @@ def _process_batch_masked(
 
         masked = pred_mask[b] & valid
 
-        # row 내 고유 variate_id별로 분리
-        unique_vids = p_vid[b, valid].unique().tolist()
-        for vid in unique_vids:
-            vid = int(vid)
-            var_mask = valid & (p_vid[b] == vid)  # 이 variate에 속하는 valid 패치
-            n_var = var_mask.sum().item()
-            if n_var == 0:
+        # row 내 고유 (sample_id, variate_id) 쌍별로 분리
+        combo = p_sid[b] * 10000 + p_vid[b]  # 고유 키 생성
+        unique_combos = combo[valid].unique().tolist()
+        for c in unique_combos:
+            sid = int(c) // 10000
+            vid = int(c) % 10000
+            seg_mask = valid & (combo == c)
+            n_seg = seg_mask.sum().item()
+            if n_seg == 0:
                 continue
 
-            var_indices = var_mask.nonzero(as_tuple=True)[0]
-            var_orig = original_patches[b, var_indices].cpu().numpy()  # (n_var, P)
-            var_masked = masked[var_indices].cpu().numpy()
-            var_recon = reconstructed[b, var_indices].cpu().numpy()
+            seg_indices = seg_mask.nonzero(as_tuple=True)[0]
+            seg_orig = original_patches[b, seg_indices].cpu().numpy()
+            seg_masked = masked[seg_indices].cpu().numpy()
+            seg_recon = reconstructed[b, seg_indices].cpu().numpy()
 
-            pred = np.full_like(var_orig, np.nan)
-            pred[var_masked] = var_recon[var_masked]
+            pred = np.full_like(seg_orig, np.nan)
+            pred[seg_masked] = seg_recon[seg_masked]
 
-            sig_type = sig_map.get((b, vid), -1)
+            sig_type = sig_map.get((b, sid, vid), -1)
             sig_name = SIGNAL_TYPE_NAMES.get(sig_type, "?")
 
             candidates.append(_RowCandidate(
-                orig_patches=var_orig,
+                orig_patches=seg_orig,
                 pred_patches=pred,
                 signal_type=sig_type,
                 signal_name=sig_name,
-                n_valid=n_var,
+                n_valid=n_seg,
                 patch_size=P,
             ))
 
@@ -195,10 +204,10 @@ def _process_batch_next_pred(
     horizon: int,
     device: torch.device | None,
 ) -> list[_RowCandidate]:
-    """Next-patch prediction 후보를 variate 단위로 추출한다.
+    """Next-patch prediction 후보를 (sample_id, variate_id) 단위로 추출한다.
 
     next_pred[i]가 original[i+H]를 예측하므로,
-    같은 variate 내에서 H만큼 shift하여 대응시킨다.
+    같은 (sample_id, variate_id) 내에서 H만큼 shift하여 대응시킨다.
     """
     if device is not None:
         _batch_to_device(batch, device)
@@ -206,6 +215,7 @@ def _process_batch_next_pred(
     out = model(batch, task="next_pred", horizon=horizon)
     next_pred = out["next_pred"]      # (B, N, P)
     patch_mask = out["patch_mask"]    # (B, N)
+    p_sid = out["patch_sample_id"]    # (B, N)
     p_vid = out["patch_variate_id"]   # (B, N)
 
     P = model.patch_size
@@ -214,7 +224,7 @@ def _process_batch_next_pred(
     N = L // P
     original_patches = normalized[:, :N * P].reshape(B, N, P)
 
-    sig_map = _build_variate_signal_map(batch, p_vid, patch_mask, B)
+    sig_map = _build_signal_map(batch, p_sid, p_vid, patch_mask, B)
 
     candidates: list[_RowCandidate] = []
     for b in range(B):
@@ -222,30 +232,31 @@ def _process_batch_next_pred(
         if not valid.any():
             continue
 
-        unique_vids = p_vid[b, valid].unique().tolist()
-        for vid in unique_vids:
-            vid = int(vid)
-            var_mask = valid & (p_vid[b] == vid)
-            var_indices = var_mask.nonzero(as_tuple=True)[0]
-            n_var = len(var_indices)
-            if n_var <= horizon:
+        combo = p_sid[b] * 10000 + p_vid[b]
+        unique_combos = combo[valid].unique().tolist()
+        for c in unique_combos:
+            sid = int(c) // 10000
+            vid = int(c) % 10000
+            seg_mask = valid & (combo == c)
+            seg_indices = seg_mask.nonzero(as_tuple=True)[0]
+            n_seg = len(seg_indices)
+            if n_seg <= horizon:
                 continue
 
-            var_orig = original_patches[b, var_indices].cpu().numpy()  # (n_var, P)
-            # next_pred[i] → original[i+H]: variate 내 인덱스 기준으로 shift
-            var_next = next_pred[b, var_indices].cpu().numpy()
-            pred = np.full((n_var, P), np.nan)
-            pred[horizon:n_var] = var_next[:n_var - horizon]
+            seg_orig = original_patches[b, seg_indices].cpu().numpy()
+            seg_next = next_pred[b, seg_indices].cpu().numpy()
+            pred = np.full((n_seg, P), np.nan)
+            pred[horizon:n_seg] = seg_next[:n_seg - horizon]
 
-            sig_type = sig_map.get((b, vid), -1)
+            sig_type = sig_map.get((b, sid, vid), -1)
             sig_name = SIGNAL_TYPE_NAMES.get(sig_type, "?")
 
             candidates.append(_RowCandidate(
-                orig_patches=var_orig,
+                orig_patches=seg_orig,
                 pred_patches=pred,
                 signal_type=sig_type,
                 signal_name=sig_name,
-                n_valid=n_var,
+                n_valid=n_seg,
                 patch_size=P,
             ))
 
