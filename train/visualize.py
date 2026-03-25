@@ -162,13 +162,12 @@ def _process_batch_next_pred(
     batch: PackedBatch,
     horizon: int,
     device: torch.device | None,
-    n_samples: int = 8,
 ) -> list[_RowCandidate]:
     """Next-patch prediction 후보를 추출한다.
 
     next_pred[i]가 original[i+H]를 예측하므로,
-    비교를 위해 pred_patches를 H만큼 shift하여 저장한다.
-    가독성을 위해 ``n_samples``개 위치만 균등 간격으로 선택한다.
+    비교를 위해 pred_patches를 H만큼 shift하여 전체 저장한다.
+    실제 표시 개수 제한은 ``_plot_figure``에서 crop 후 수행한다.
     """
     if device is not None:
         _batch_to_device(batch, device)
@@ -199,18 +198,9 @@ def _process_batch_next_pred(
         sig_type = row_signal_types.get(b, -1)
         sig_name = SIGNAL_TYPE_NAMES.get(sig_type, "?")
 
-        # next_pred[i] → original[i+H] 대응
-        # 전체 중 n_samples개만 균등 간격으로 선택
-        n_predictable = n_valid - horizon
-        show_count = min(n_samples, n_predictable)
-        if show_count <= 0:
-            continue
-        show_indices = np.linspace(0, n_predictable - 1, show_count, dtype=int)
-
+        # next_pred[i] → original[i+H] 대응 (전체 저장)
         pred = np.full((n_valid, P), np.nan)
-        next_pred_np = next_pred[b, :n_predictable].cpu().numpy()
-        for idx in show_indices:
-            pred[idx + horizon] = next_pred_np[idx]
+        pred[horizon:n_valid] = next_pred[b, :n_valid - horizon].cpu().numpy()
 
         candidates.append(_RowCandidate(
             orig_patches=original_patches[b, :n_valid].cpu().numpy(),
@@ -235,8 +225,15 @@ def _plot_figure(
     sampling_rate: float,
     mode: str,  # "masked" or "next_pred"
     horizon: int = 1,
+    next_pred_ratio: float = 0.3,
 ) -> Path:
-    """선택된 후보들로 figure를 그려 저장한다."""
+    """선택된 후보들로 figure를 그려 저장한다.
+
+    Parameters
+    ----------
+    next_pred_ratio:
+        next_pred 모드에서 crop된 패치 중 표시할 비율 (기본 30%).
+    """
     P = selected[0].patch_size
     max_patches = max(1, int(max_duration_s * sampling_rate / P))
     n_rows = len(selected)
@@ -259,14 +256,34 @@ def _plot_figure(
 
         n_show = min(cand.n_valid, max_patches)
         orig_wave = cand.orig_patches[:n_show].reshape(-1)
-        pred_wave = cand.pred_patches[:n_show].reshape(-1)
+        pred_patches_cropped = cand.pred_patches[:n_show]  # (n_show, P)
 
+        # next_pred: crop 후 범위에서 균등 샘플링
+        if mode == "next_pred":
+            # crop 범위 내 예측 가능한 위치 (NaN이 아닌 위치)
+            valid_pred_indices = [
+                p_idx for p_idx in range(n_show)
+                if not np.isnan(pred_patches_cropped[p_idx, 0])
+            ]
+            n_to_show = max(1, int(len(valid_pred_indices) * next_pred_ratio))
+            if len(valid_pred_indices) > n_to_show:
+                sampled = np.linspace(0, len(valid_pred_indices) - 1, n_to_show, dtype=int)
+                keep = set(valid_pred_indices[s] for s in sampled)
+            else:
+                keep = set(valid_pred_indices)
+            # 선택되지 않은 위치는 NaN으로
+            for p_idx in valid_pred_indices:
+                if p_idx not in keep:
+                    pred_patches_cropped[p_idx] = np.nan
+
+        pred_wave = pred_patches_cropped.reshape(-1)
         t = np.arange(len(orig_wave)) / sampling_rate
 
         ax.plot(t, orig_wave, color="steelblue", linewidth=0.8,
                 label="Original", alpha=0.9)
 
         # 예측이 있는 패치만 하이라이트 + 오버레이
+        n_pred = 0
         for patch_idx in range(n_show):
             start = patch_idx * P
             end = start + P
@@ -276,14 +293,10 @@ def _plot_figure(
                            alpha=0.12, color=highlight_color)
                 ax.plot(t[start:end], patch_pred,
                         color=pred_color, linewidth=1.2)
+                n_pred += 1
 
         ax.set_ylabel(cand.signal_name, fontsize=10)
 
-        # 예측 패치 수 계산
-        n_pred = sum(
-            1 for p_idx in range(n_show)
-            if not np.isnan(cand.pred_patches[p_idx, 0])
-        )
         duration_shown = n_show * P / sampling_rate
         ax.set_title(
             f"Predicted: {n_pred}/{n_show} patches  |  "
