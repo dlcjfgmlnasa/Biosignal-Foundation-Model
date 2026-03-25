@@ -284,6 +284,11 @@ def main():
             window_seconds=config.window_seconds,
             cache_size=config.cache_size,
         )
+        val_sampler = None
+        if use_ddp:
+            val_sampler = DistributedSampler(
+                val_dataset, num_replicas=world_size, rank=local_rank, shuffle=False,
+            )
         val_dataloader = create_dataloader(
             val_dataset,
             max_length=config.max_length,
@@ -293,6 +298,7 @@ def main():
             collate_mode=config.collate_mode,
             patch_size=config.model_config.patch_size,
             pin_memory=True,
+            sampler=val_sampler,
         )
         if rank0:
             print(f"Val dataset: {len(val_dataset)} windows, {len(val_dataloader)} batches")
