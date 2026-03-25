@@ -100,12 +100,9 @@ def save_recording_zarr(
         zarr compressor. None이면 blosc(zstd, clevel=3)을 사용한다.
     """
     import zarr
-    from numcodecs import Blosc
 
-    if compressor is None:
-        compressor = Blosc(cname="zstd", clevel=3, shuffle=Blosc.BITSHUFFLE)
-
-    store = zarr.DirectoryStore(str(out_path))
-    z = zarr.open(store, mode="w", shape=data.shape, dtype="float32",
-                  compressor=compressor, chunks=(data.shape[0], min(data.shape[1], 100_000)))
+    z = zarr.open(
+        str(out_path), mode="w", shape=data.shape, dtype="float32",
+        chunks=(data.shape[0], min(data.shape[1], 100_000)),
+    )
     z[:] = data.astype(np.float32)
