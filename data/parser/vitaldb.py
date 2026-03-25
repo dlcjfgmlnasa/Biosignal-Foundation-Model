@@ -370,7 +370,17 @@ def main() -> None:
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    subject_sessions: dict[str, list[dict]] = {}
+    # manifest.jsonl 기존 항목 로드
+    jsonl_path = out_dir / "manifest.jsonl"
+    existing_subjects: set[str] = set()
+    if jsonl_path.exists():
+        with open(jsonl_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    existing_subjects.add(json.loads(line)["subject_id"])
+
+    n_processed = 0
 
     for vf_path in vital_files:
         print(f"[{vf_path.name}]")
@@ -386,43 +396,40 @@ def main() -> None:
             print(f"    [SKIP] 유효 레코딩 없음")
             continue
 
-        subject_sessions.setdefault(subject_id, []).append(
-            {"session_id": session_id, "recordings": recordings}
-        )
+        # ── 즉시 manifest.json 저장 (중단 시에도 유실 방지) ──
+        subj_dir = out_dir / subject_id
+        manifest_path = subj_dir / "manifest.json"
 
-    # subject별 manifest.json 저장
-    global_index: list[dict] = []
-    for subject_id, sessions in sorted(subject_sessions.items()):
-        manifest = {
-            "subject_id": subject_id,
-            "source": "vitaldb",
-            "sessions": sessions,
-        }
-        manifest_path = out_dir / subject_id / "manifest.json"
+        # 기존 manifest가 있으면 세션 병합
+        if manifest_path.exists():
+            with open(manifest_path, encoding="utf-8") as f:
+                existing_manifest = json.load(f)
+            existing_manifest["sessions"].append(
+                {"session_id": session_id, "recordings": recordings}
+            )
+        else:
+            existing_manifest = {
+                "subject_id": subject_id,
+                "source": "vitaldb",
+                "sessions": [{"session_id": session_id, "recordings": recordings}],
+            }
+
         with open(manifest_path, "w", encoding="utf-8") as f:
-            json.dump(manifest, f, indent=2, ensure_ascii=False)
-        global_index.append(
-            {"subject_id": subject_id, "manifest": f"{subject_id}/manifest.json"}
-        )
+            json.dump(existing_manifest, f, indent=2, ensure_ascii=False)
 
-    # manifest.jsonl에 추가 (기존 항목 유지)
-    jsonl_path = out_dir / "manifest.jsonl"
-    existing: set[str] = set()
-    if jsonl_path.exists():
-        with open(jsonl_path, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    entry = json.loads(line)
-                    existing.add(entry["subject_id"])
+        # manifest.jsonl에 즉시 추가
+        if subject_id not in existing_subjects:
+            with open(jsonl_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(
+                    {"subject_id": subject_id, "manifest": f"{subject_id}/manifest.json"},
+                    ensure_ascii=False,
+                ) + "\n")
+            existing_subjects.add(subject_id)
 
-    with open(jsonl_path, "a", encoding="utf-8") as f:
-        for entry in global_index:
-            if entry["subject_id"] not in existing:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        n_processed += 1
 
     print(
-        f"\n완료: {len(subject_sessions)}명 처리 → {out_dir}"
+        f"\n완료: {n_processed}명 처리 → {out_dir}"
         f"\n인덱스: {jsonl_path}"
     )
 
