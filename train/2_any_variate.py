@@ -14,6 +14,7 @@ Usage
 """
 import argparse
 import gc
+import time
 from pathlib import Path
 
 import torch
@@ -22,6 +23,7 @@ from loss.criterion import CombinedLoss
 from model import BiosignalFoundationModel, ModelConfig
 from model.checkpoint import load_checkpoint
 from .train_utils import (
+    CSVLogger,
     EarlyStopping,
     TrainConfig,
     create_scaler,
@@ -345,6 +347,7 @@ def main():
     # ── 학습 루프 ──
     best_loss = float("inf")
     early_stopper = EarlyStopping(patience=config.patience) if config.patience > 0 else None
+    csv_logger = CSVLogger(output_dir / "training_log.csv")
     print(f"\nStarting training: {config.n_epochs} epochs")
     print(f"  alpha={config.alpha}, beta={config.beta}, gamma={config.gamma}, delta={config.delta}")
     print(f"  max_horizon={config.model_config.max_horizon}, mask_ratio={config.mask_ratio}")
@@ -356,6 +359,7 @@ def main():
     print(f"{'='*60}")
 
     for epoch in range(config.n_epochs):
+        epoch_start = time.time()
         losses = train_one_epoch(
             model, dataloader, optimizer, criterion,
             config=config,
@@ -373,6 +377,7 @@ def main():
                 model, val_dataloader, criterion,
                 config=config, device=device, phase_name="Phase2_AV",
             )
+        epoch_sec = time.time() - epoch_start
 
         current_lr = optimizer.param_groups[0]["lr"]
         line = (
@@ -385,8 +390,11 @@ def main():
         )
         if val_losses is not None:
             line += f" | val: {val_losses['total']:.6f}"
-        line += f" | LR: {current_lr:.2e}"
+        line += f" | LR: {current_lr:.2e} | {epoch_sec:.0f}s"
         print(line)
+
+        # CSV 로깅
+        csv_logger.log(epoch, "Phase2_AV", losses, val_losses, current_lr, epoch_sec)
 
         # Reconstruction & Next-Pred 시각화
         if viz_batches is not None and (epoch % viz_every == 0 or epoch == config.n_epochs - 1):

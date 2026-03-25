@@ -22,6 +22,7 @@ Usage
 """
 import argparse
 import gc
+import time
 from pathlib import Path
 
 import torch
@@ -31,6 +32,7 @@ from loss.criterion import CombinedLoss
 from model import BiosignalFoundationModel
 from model.checkpoint import load_checkpoint
 from train.train_utils import (
+    CSVLogger,
     EarlyStopping,
     TrainConfig,
     create_scaler,
@@ -238,6 +240,7 @@ def main():
     # ── 학습 루프 ──
     best_loss = float("inf")
     early_stopper = EarlyStopping(patience=config.patience) if config.patience > 0 and not config.dry_run else None
+    csv_logger = CSVLogger(output_dir / "training_log.csv") if not config.dry_run else None
     print(f"\nStarting training: {config.n_epochs} epochs")
     print(f"  alpha={config.alpha}, beta={config.beta}, gamma={config.gamma}, delta={config.delta}")
     print(f"  mask_ratio={config.mask_ratio}, variate_mask_prob={config.variate_mask_prob}")
@@ -248,6 +251,7 @@ def main():
     print(f"{'='*60}")
 
     for epoch in range(config.n_epochs):
+        epoch_start = time.time()
         losses = train_one_epoch(
             model, dataloader, optimizer, criterion,
             config=config, device=device, epoch=epoch,
@@ -262,6 +266,7 @@ def main():
                 model, val_dataloader, criterion,
                 config=config, device=device, phase_name=phase_name,
             )
+        epoch_sec = time.time() - epoch_start
 
         current_lr = optimizer.param_groups[0]["lr"]
         line = (
@@ -274,8 +279,12 @@ def main():
         )
         if val_losses is not None:
             line += f" | val: {val_losses['total']:.6f}"
-        line += f" | LR: {current_lr:.2e}"
+        line += f" | LR: {current_lr:.2e} | {epoch_sec:.0f}s"
         print(line)
+
+        # CSV 로깅
+        if csv_logger is not None:
+            csv_logger.log(epoch, phase_name, losses, val_losses, current_lr, epoch_sec)
 
         if config.dry_run:
             print(f"\n{'='*60}")

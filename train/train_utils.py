@@ -4,10 +4,12 @@
 ``train/1_channel_independency.py``와 ``train/2_any_variate.py``에서 공통으로 사용하는
 데이터 로딩, 학습 루프, 체크포인트 함수를 정의한다.
 """
+import csv
 import json
 import math
 import os
 import random
+import time
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
@@ -514,6 +516,61 @@ class EarlyStopping:
             return False
         self.counter += 1
         return self.counter >= self.patience
+
+
+# ── CSV 로깅 ─────────────────────────────────────────────────
+
+
+class CSVLogger:
+    """에폭별 학습 메트릭을 CSV 파일에 기록한다.
+
+    Parameters
+    ----------
+    path:
+        CSV 파일 경로. 디렉토리가 없으면 자동 생성.
+    """
+
+    COLUMNS = [
+        "epoch", "phase",
+        "train_total", "train_masked", "train_next", "train_cross", "train_contrastive",
+        "val_total", "val_masked", "val_next", "val_cross", "val_contrastive",
+        "lr", "epoch_sec",
+    ]
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if not self.path.exists():
+            with open(self.path, "w", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow(self.COLUMNS)
+
+    def log(
+        self,
+        epoch: int,
+        phase: str,
+        train_losses: dict[str, float],
+        val_losses: dict[str, float] | None,
+        lr: float,
+        epoch_sec: float,
+    ) -> None:
+        """1에폭 결과를 CSV에 추가한다."""
+        row = [
+            epoch, phase,
+            train_losses["total"],
+            train_losses["masked_loss"],
+            train_losses["next_loss"],
+            train_losses["cross_modal_loss"],
+            train_losses["contrastive_loss"],
+            val_losses["total"] if val_losses else "",
+            val_losses["masked_loss"] if val_losses else "",
+            val_losses["next_loss"] if val_losses else "",
+            val_losses["cross_modal_loss"] if val_losses else "",
+            val_losses["contrastive_loss"] if val_losses else "",
+            lr,
+            f"{epoch_sec:.1f}",
+        ]
+        with open(self.path, "a", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(row)
 
 
 # ── 유틸리티 ────────────────────────────────────────────────────

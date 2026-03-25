@@ -16,6 +16,7 @@ Usage (멀티 GPU — DDP)
 import argparse
 import gc
 import os
+import time
 from pathlib import Path
 
 import torch
@@ -27,6 +28,7 @@ from data import BiosignalDataset, create_dataloader
 from loss.criterion import CombinedLoss
 from model import BiosignalFoundationModel, ModelConfig
 from .train_utils import (
+    CSVLogger,
     EarlyStopping,
     TrainConfig,
     cleanup_ddp,
@@ -338,6 +340,7 @@ def main():
     # ── 학습 루프 ──
     best_loss = float("inf")
     early_stopper = EarlyStopping(patience=config.patience) if config.patience > 0 else None
+    csv_logger = CSVLogger(output_dir / "training_log.csv") if rank0 else None
     if rank0:
         print(f"\nStarting training: {config.n_epochs} epochs")
         print(f"  alpha={config.alpha}, beta={config.beta}, gamma={config.gamma}")
@@ -352,6 +355,7 @@ def main():
         if sampler is not None:
             sampler.set_epoch(epoch)
 
+        epoch_start = time.time()
         losses = train_one_epoch(
             model, dataloader, optimizer, criterion,
             config=config,
@@ -369,6 +373,7 @@ def main():
                 model, val_dataloader, criterion,
                 config=config, device=device, phase_name="Phase1_CI",
             )
+        epoch_sec = time.time() - epoch_start
 
         if rank0:
             current_lr = optimizer.param_groups[0]["lr"]
@@ -380,8 +385,12 @@ def main():
             )
             if val_losses is not None:
                 line += f" | val: {val_losses['total']:.6f}"
-            line += f" | LR: {current_lr:.2e}"
+            line += f" | LR: {current_lr:.2e} | {epoch_sec:.0f}s"
             print(line)
+
+            # CSV 로깅
+            if csv_logger is not None:
+                csv_logger.log(epoch, "Phase1_CI", losses, val_losses, current_lr, epoch_sec)
 
             # Reconstruction & Next-Pred 시각화
             if viz_batches is not None and (epoch % viz_every == 0 or epoch == config.n_epochs - 1):
