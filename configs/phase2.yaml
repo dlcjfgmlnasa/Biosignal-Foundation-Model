@@ -31,6 +31,8 @@ max_subjects: null
 window_seconds: 30.0
 max_length: 50000
 cache_size: 16
+crop_ratio_min: 0.0
+crop_ratio_max: 0.0
 
 # ── 학습 ──
 batch_size: 4

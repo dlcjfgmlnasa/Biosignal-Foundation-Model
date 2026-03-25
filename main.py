@@ -74,6 +74,10 @@ def parse_args() -> argparse.Namespace:
     g.add_argument("--max_subjects", type=int, default=None)
     g.add_argument("--output_dir", type=str, default=None)
     g.add_argument("--seed", type=int, default=None)
+    g.add_argument("--crop_ratio_min", type=float, default=None,
+                    help="Random crop 최소 비율 (0=비활성)")
+    g.add_argument("--crop_ratio_max", type=float, default=None,
+                    help="Random crop 최대 비율 (0=비활성)")
     g.add_argument("--use_amp", action="store_true",
                     help="AMP (Automatic Mixed Precision) 활성")
     g.add_argument("--val_ratio", type=float, default=None,
@@ -111,6 +115,8 @@ def main():
         "max_subjects": args.max_subjects,
         "output_dir": args.output_dir,
         "seed": args.seed,
+        "crop_ratio_min": args.crop_ratio_min,
+        "crop_ratio_max": args.crop_ratio_max,
         "val_ratio": args.val_ratio,
         "patience": args.patience,
         "exp_name": args.exp_name,
@@ -181,10 +187,16 @@ def main():
     else:
         train_manifest = manifest
 
+    crop_range = None
+    if config.crop_ratio_min > 0 and config.crop_ratio_max > 0:
+        crop_range = (config.crop_ratio_min, config.crop_ratio_max)
+        print(f"Random crop: {crop_range}")
+
     dataset = BiosignalDataset(
         train_manifest,
         window_seconds=config.window_seconds,
         cache_size=config.cache_size,
+        crop_ratio_range=crop_range,
     )
     print(f"Train dataset: {len(dataset)} windows")
 

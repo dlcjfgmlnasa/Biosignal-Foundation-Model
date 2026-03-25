@@ -93,6 +93,10 @@ def parse_args() -> argparse.Namespace:
     g.add_argument("--window_seconds", type=float, default=30.0)
     g.add_argument("--max_length", type=int, default=50000)
     g.add_argument("--cache_size", type=int, default=16)
+    g.add_argument("--crop_ratio_min", type=float, default=0.0,
+                   help="Random crop 최소 비율 (0=비활성)")
+    g.add_argument("--crop_ratio_max", type=float, default=0.0,
+                   help="Random crop 최대 비율 (0=비활성)")
 
     # Training
     g = p.add_argument_group("Training")
@@ -167,6 +171,8 @@ def main():
         window_seconds=args.window_seconds,
         max_length=args.max_length,
         cache_size=args.cache_size,
+        crop_ratio_min=args.crop_ratio_min,
+        crop_ratio_max=args.crop_ratio_max,
 
         # 학습
         batch_size=args.batch_size,
@@ -268,10 +274,16 @@ def main():
     else:
         train_manifest = manifest
 
+    crop_range = None
+    if config.crop_ratio_min > 0 and config.crop_ratio_max > 0:
+        crop_range = (config.crop_ratio_min, config.crop_ratio_max)
+        print(f"Random crop: {crop_range}")
+
     dataset = BiosignalDataset(
         train_manifest,
         window_seconds=config.window_seconds,
         cache_size=config.cache_size,
+        crop_ratio_range=crop_range,
     )
     print(f"Train dataset: {len(dataset)} windows")
 

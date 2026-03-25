@@ -46,6 +46,8 @@ class TrainConfig:
     window_seconds: float = 30.0
     max_length: int = 50000
     cache_size: int = 16
+    crop_ratio_min: float = 0.0  # >0이면 random crop 활성 (min ratio)
+    crop_ratio_max: float = 0.0  # >0이면 random crop 활성 (max ratio)
 
     # 학습
     batch_size: int = 16
