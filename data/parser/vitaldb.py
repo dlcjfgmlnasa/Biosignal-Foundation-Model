@@ -95,15 +95,15 @@ SIGNAL_TYPES: dict[str, int] = {
 # ── 전처리 함수 ────────────────────────────────────────────────
 
 
-def _apply_range_check(data: np.ndarray, valid_range: tuple[float, float]) -> np.ndarray:
+def _apply_range_check(data: np.ndarray, valid_range: tuple[float, float]) -> tuple[np.ndarray, int]:
     """범위 밖 값을 NaN으로 마킹한다. (1D inplace-safe copy)"""
     lo, hi = valid_range
     out = data.copy()
     mask = (out < lo) | (out > hi)
-    n_bad = mask.sum()
+    n_bad = int(mask.sum())
     if n_bad > 0:
         out[mask] = np.nan
-    return out, int(n_bad)
+    return out, n_bad
 
 
 def _apply_bandpass(data: np.ndarray, lo: float, hi: float, sr: float) -> np.ndarray:
@@ -121,7 +121,7 @@ def _apply_bandpass(data: np.ndarray, lo: float, hi: float, sr: float) -> np.nda
 
 
 def _detect_electrocautery(data: np.ndarray, sr: float, threshold_std: float = 10.0,
-                           blank_ms: float = 100.0) -> np.ndarray:
+                           blank_ms: float = 100.0) -> tuple[np.ndarray, int]:
     """전기소작기 아티팩트 구간을 NaN으로 마킹한다. (ECG/EEG용)
 
     급격한 진폭 변화(미분의 절대값)가 threshold_std배 이상인 구간을
@@ -132,11 +132,11 @@ def _detect_electrocautery(data: np.ndarray, sr: float, threshold_std: float = 1
     med = np.median(diff)
     mad = np.median(np.abs(diff - med)) * 1.4826  # MAD → std 추정
     if mad < 1e-10:
-        return out
+        return out, 0
 
     spike_mask = diff > (med + threshold_std * mad)
     if not spike_mask.any():
-        return out
+        return out, 0
 
     # blank_ms만큼 전후 확장
     blank_samples = int(blank_ms / 1000.0 * sr)
