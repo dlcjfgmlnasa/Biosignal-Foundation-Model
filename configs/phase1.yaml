@@ -1,0 +1,61 @@
+# Phase 1: Channel-Independent Pre-training
+# Usage:
+#   python main.py --config configs/phase1.yaml
+#   python main.py --config configs/phase1.yaml --dry-run
+
+# ── 모델 ──
+model_config:
+  d_model: 64
+  num_layers: 2
+  patch_size: 128
+  stride: null
+  num_heads: null
+  num_groups: null
+  use_glu: true
+  use_moe: false
+  use_rope: true
+  use_var_attn_bias: true
+  use_spatial_embed: true
+  dropout_p: 0.0
+  max_horizon: 5
+  use_cnn_stem: false
+  stem_hidden_channels: 64
+  stem_num_layers: 3
+  stem_kernel_size: 3
+  contrastive_proj_dim: 0
+
+# ── 데이터 ──
+processed_dir: datasets/processed
+signal_types: [2, 4, 5]    # EEG, EMG, Resp
+max_subjects: null
+window_seconds: 30.0
+max_length: 50000
+cache_size: 16
+
+# ── 학습 ──
+batch_size: 16
+lr: 1.0e-3
+n_epochs: 70
+warmup_epochs: 5
+min_lr_ratio: 0.1
+mask_ratio: 0.15
+gradient_clip: 1.0
+seed: 42
+collate_mode: ci
+
+# ── Loss 가중치 (Phase 1: MPM + Next-Pred) ──
+alpha: 1.0          # masked reconstruction
+beta: 1.0           # next-patch prediction
+gamma: 0.0          # cross-modal (비활성)
+delta: 0.0          # contrastive (비활성)
+contrastive_temperature: 0.07
+learnable_temperature: true
+
+# ── Masking ──
+variate_mask_prob: 0.0  # Phase 1은 비활성
+
+# ── 시스템 ──
+device: auto
+num_workers: 0
+output_dir: outputs/phase1_ci
+checkpoint_every: 10

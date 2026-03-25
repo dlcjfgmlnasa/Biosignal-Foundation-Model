@@ -1,0 +1,124 @@
+# -*- coding:utf-8 -*-
+"""α * MPM + β * NextPred (same-variate + γ * cross-modal) + δ * Contrastive 복합 손실 함수."""
+import torch
+from torch import nn
+
+from loss.contrastive_loss import CrossModalContrastiveLoss
+from loss.masked_mse_loss import MaskedPatchLoss
+from loss.next_prediction_loss import NextPredictionLoss
+
+
+class MaskedMSELoss(nn.Module):
+    """마스킹된 위치만 MSE를 계산하는 손실 함수 (하위 호환).
+
+    mask=1인 위치의 (pred - target)^2 평균을 반환한다.
+    마스킹된 위치가 없으면 0을 반환한다.
+    """
+
+    def forward(
+        self,
+        pred: torch.Tensor,  # (batch, seq_len)
+        target: torch.Tensor,  # (batch, seq_len)
+        mask: torch.Tensor,  # (batch, seq_len) — 1=마스킹된 부분, 0=정상
+    ) -> torch.Tensor:  # scalar
+        mask = mask.float()
+        n_masked = mask.sum()
+        if n_masked == 0:
+            return pred.new_tensor(0.0)
+        loss = ((pred - target) ** 2 * mask).sum() / n_masked
+        return loss
+
+
+class CombinedLoss(nn.Module):
+    """α * MPM + β * NextPred (same-variate + γ * cross-modal) + δ * Contrastive 하이브리드 손실 함수.
+
+    Parameters
+    ----------
+    alpha:
+        Masked reconstruction loss 가중치.
+    beta:
+        Next-patch prediction loss 가중치. 0이면 next-patch 계산 스킵.
+    gamma:
+        Cross-modal prediction loss 가중치 (beta 내부 가중). 0이면 비활성.
+    delta:
+        Cross-modal contrastive loss 가중치. 0이면 비활성.
+    contrastive_temperature:
+        InfoNCE 초기 temperature.
+    learnable_temperature:
+        Temperature를 학습 가능한 파라미터로 설정.
+    """
+
+    def __init__(
+        self,
+        alpha: float = 1.0,
+        beta: float = 0.0,
+        gamma: float = 0.0,
+        delta: float = 0.0,
+        contrastive_temperature: float = 0.07,
+        learnable_temperature: bool = True,
+    ) -> None:
+        super().__init__()
+        self.alpha = alpha
+        self.beta = beta
+        self.gamma = gamma
+        self.delta = delta
+        self.masked_loss_fn = MaskedPatchLoss()
+        self.next_loss_fn = NextPredictionLoss(cross_modal_weight=gamma)
+        if delta > 0:
+            self.contrastive_loss_fn = CrossModalContrastiveLoss(
+                temperature=contrastive_temperature,
+                learnable_temperature=learnable_temperature,
+            )
+
+    def forward(
+        self,
+        reconstructed: torch.Tensor,     # (B, N, patch_size)
+        next_pred: torch.Tensor | None,  # (B, N, patch_size) or None
+        original_patches: torch.Tensor,  # (B, N, patch_size)
+        pred_mask: torch.Tensor,         # (B, N) bool — 마스킹된 패치
+        patch_mask: torch.Tensor,        # (B, N) bool — 유효 패치
+        patch_sample_id: torch.Tensor,   # (B, N) long — 패치별 sample_id
+        patch_variate_id: torch.Tensor,  # (B, N) long — 패치별 variate_id
+        horizon: int = 1,
+        cross_pred: torch.Tensor | None = None,  # (B, N, patch_size) — cross-modal 예측
+        time_id: torch.Tensor | None = None,     # (B, N) long — cross-modal 페어링용
+        contrastive_z: torch.Tensor | None = None,  # (B, N, proj_dim) — contrastive 임베딩
+    ) -> dict[str, torch.Tensor]:
+        # ── Masked Reconstruction Loss ──
+        masked_loss = self.masked_loss_fn(reconstructed, original_patches, pred_mask)
+
+        # ── Next-Patch Prediction Loss ──
+        if self.beta > 0 and next_pred is not None:
+            next_dict = self.next_loss_fn(
+                next_pred, cross_pred, original_patches,
+                patch_mask, patch_sample_id, patch_variate_id,
+                time_id=time_id, horizon=horizon,
+            )
+            next_loss = next_dict["next_loss"]
+            cross_modal_loss = next_dict["cross_modal_loss"]
+        else:
+            next_loss = reconstructed.new_tensor(0.0)
+            cross_modal_loss = reconstructed.new_tensor(0.0)
+
+        # ── Cross-Modal Contrastive Loss ──
+        if self.delta > 0 and contrastive_z is not None and time_id is not None:
+            contrastive_loss = self.contrastive_loss_fn(
+                contrastive_z, patch_mask,
+                patch_sample_id, patch_variate_id, time_id,
+            )
+        else:
+            contrastive_loss = reconstructed.new_tensor(0.0)
+
+        total = (
+            self.alpha * masked_loss
+            + self.beta * (next_loss + cross_modal_loss)
+            + self.delta * contrastive_loss
+        )
+
+        return {
+            "total": total,
+            "masked_loss": masked_loss,
+            "next_loss": next_loss,
+            "cross_modal_loss": cross_modal_loss,
+            "contrastive_loss": contrastive_loss,
+        }

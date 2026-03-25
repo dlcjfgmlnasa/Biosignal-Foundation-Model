@@ -1,0 +1,61 @@
+# Phase 2: Any-Variate Training (Cross-Modal)
+# Usage:
+#   python main.py --config configs/phase2.yaml
+#   python main.py --config configs/phase2.yaml --resume outputs/phase1_ci/checkpoint_phase1_ci_epoch069_best.pt
+
+# ── 모델 ──
+model_config:
+  d_model: 64
+  num_layers: 2
+  patch_size: 128
+  stride: null
+  num_heads: null
+  num_groups: null
+  use_glu: true
+  use_moe: false
+  use_rope: true
+  use_var_attn_bias: true
+  use_spatial_embed: true
+  dropout_p: 0.0
+  max_horizon: 5
+  use_cnn_stem: false
+  stem_hidden_channels: 64
+  stem_num_layers: 3
+  stem_kernel_size: 3
+  contrastive_proj_dim: 128
+
+# ── 데이터 ──
+processed_dir: datasets/processed
+signal_types: [2, 4, 5]    # EEG, EMG, Resp
+max_subjects: null
+window_seconds: 30.0
+max_length: 50000
+cache_size: 16
+
+# ── 학습 ──
+batch_size: 4
+lr: 1.0e-4
+n_epochs: 30
+warmup_epochs: 3
+min_lr_ratio: 0.1
+mask_ratio: 0.15
+gradient_clip: 1.0
+seed: 42
+collate_mode: any_variate
+
+# ── Loss 가중치 (Phase 2: 전체 활성) ──
+alpha: 0.7          # masked reconstruction
+beta: 0.3           # next-patch prediction
+gamma: 1.0          # cross-modal
+delta: 0.1          # contrastive
+contrastive_temperature: 0.07
+learnable_temperature: true
+
+# ── Masking ──
+variate_mask_prob: 0.3  # variate-level 마스킹
+
+# ── 시스템 ──
+device: auto
+num_workers: 0
+output_dir: outputs/phase2_any_variate
+checkpoint_every: 5

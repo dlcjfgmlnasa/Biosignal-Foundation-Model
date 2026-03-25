@@ -1,0 +1,393 @@
+# -*- coding:utf-8 -*-
+import heapq
+from collections import defaultdict
+from dataclasses import dataclass
+from typing import Optional
+
+import torch
+
+from data.dataset import BiosignalSample
+from data.spatial_map import get_global_spatial_id
+
+
+@dataclass
+class PackedBatch:
+    """PackCollate의 출력.
+
+    Attributes
+    ----------
+    values:
+        패킹된 신호 값. ``(batch, max_length)``.
+        남는 위치는 0으로 채워진다.
+    sample_id:
+        각 time-step이 어떤 원본 샘플에 속하는지 나타내는 ID.
+        행(row) 내에서 1부터 시작하며, 0은 패딩을 의미한다.
+        ``(batch, max_length)``.
+    variate_id:
+        각 time-step이 속한 variate ID (1-based, 0=padding).
+        ``(batch, max_length)``.
+    lengths:
+        per-variate 원래 길이. ``(total_variates,)``.
+    sampling_rates:
+        per-variate 샘플링 레이트 (Hz). ``(total_variates,)``.
+    signal_types:
+        per-variate 신호 타입. ``(total_variates,)``.
+    padded_lengths:
+        per-variate patch 정렬된 길이. ``(total_variates,)``.
+        패치가 설정된 경우에만 존재하며, 각 variate의 길이가
+        ``patch_size``의 배수로 올림 패딩된 값이다. ``None``이면 미사용.
+    variate_patch_sizes:
+        per-variate 해상도별 패치 크기. ``(total_variates,)``.
+        ``patch_sizes`` (multi-resolution) 설정 시에만 존재한다.
+        ``None``이면 고정 patch_size 또는 미사용.
+    """
+
+    values: torch.Tensor  # (batch, max_length)
+    sample_id: torch.Tensor  # (batch, max_length) long
+    variate_id: torch.Tensor  # (batch, max_length) long
+    lengths: torch.Tensor  # (total_variates,) long
+    sampling_rates: torch.Tensor  # (total_variates,) float
+    signal_types: torch.Tensor  # (total_variates,) long
+    spatial_ids: torch.Tensor  # (total_variates,) long — 전역 spatial_id
+    padded_lengths: Optional[torch.Tensor] = None  # (total_variates,) long
+    variate_patch_sizes: Optional[torch.Tensor] = None  # (total_variates,) long
+
+
+# ── 내부 데이터 구조 ────────────────────────────────────────────
+
+@dataclass
+class _PackUnit:
+    """FFD 패킹의 단위. 같은 그룹의 variate들을 이어 붙인 시퀀스."""
+
+    values: torch.Tensor  # (time,)
+    total_length: int
+    channel_spans: list[tuple[int, int, int]]  # [(ch_idx, start, end), ...]
+    variate_rates: list[float]
+    variate_types: list[int]
+    variate_spatial_ids: list[int]  # per-variate 전역 spatial_id
+    variate_lengths: list[int]
+    padded_variate_lengths: list[int]
+    resolved_patch_sizes: list[int]  # per-variate resolved patch_size (빈 리스트 = 미사용)
+
+
+class PackCollate:
+    """Bin-packing collate: 가변 길이 시계열을 빈틈없이 채워 넣는다.
+
+    같은 ``(recording_idx, win_start)`` 또는 ``(session_id, physical_time)``의
+    채널들을 하나의 그룹으로 묶고, FFD 알고리즘으로 행에 패킹한다.
+
+    Parameters
+    ----------
+    max_length:
+        출력 텐서의 고정 행 너비. 이보다 긴 샘플은 잘린다.
+    collate_mode:
+        그루핑 모드. ``"any_variate"`` (기본) 또는 ``"ci"`` (채널 독립).
+    patch_size:
+        고정 패치 크기. ``patch_sizes``와 동시 사용 불가.
+    stride:
+        패치 간 보폭 (overlapping 지원). ``patch_size``와 함께 사용.
+    patch_sizes:
+        다중 해상도 패치 크기 목록 (e.g., ``[8, 16, 32, 64]``).
+        ``target_patch_duration_ms``와 함께 사용.
+    target_patch_duration_ms:
+        목표 패치 물리적 지속 시간 (ms). sampling_rate와 함께
+        가장 가까운 patch_size를 선택한다.
+
+    Packing strategy: First-Fit Decreasing (FFD)
+    """
+
+    def __init__(
+        self,
+        max_length: int,
+        collate_mode: str = "any_variate",
+        patch_size: Optional[int] = None,
+        stride: Optional[int] = None,
+        patch_sizes: Optional[list[int]] = None,
+        target_patch_duration_ms: Optional[float] = None,
+    ) -> None:
+        assert not (patch_size is not None and patch_sizes is not None), (
+            "patch_size와 patch_sizes는 동시에 사용할 수 없습니다."
+        )
+        if patch_sizes is not None:
+            assert target_patch_duration_ms is not None, (
+                "patch_sizes 사용 시 target_patch_duration_ms가 필요합니다."
+            )
+
+        self.patch_size = patch_size
+        self.patch_sizes = sorted(patch_sizes) if patch_sizes is not None else None
+        self.target_patch_duration_ms = target_patch_duration_ms
+        self._multi_resolution = patch_sizes is not None
+
+        if patch_size is not None:
+            self.stride = stride if stride is not None else patch_size
+            assert patch_size % self.stride == 0, (
+                f"patch_size({patch_size})는 stride({self.stride})의 배수여야 합니다."
+            )
+            max_length = max(
+                patch_size, -(-max_length // self.stride) * self.stride
+            )
+        else:
+            self.stride = None
+
+        self.max_length = max_length
+        self.collate_mode = collate_mode
+
+    def _resolve_variate_patch_size(self, sampling_rate: float) -> int:
+        """sampling_rate에서 가장 적합한 patch_size를 결정한다."""
+        ideal = sampling_rate * self.target_patch_duration_ms / 1000.0
+        return min(self.patch_sizes, key=lambda ps: abs(ps - ideal))
+
+    def __call__(self, samples: list[BiosignalSample]) -> PackedBatch:
+        # 1. 그루핑: collate_mode에 따라 키 결정
+        groups: dict[tuple, list[BiosignalSample]] = defaultdict(list)
+        for i, s in enumerate(samples):
+            if self.collate_mode == "ci":
+                key = (i,)  # 고유 키 → 채널 간 그루핑 없음
+            elif s.session_id:
+                physical_time_ms = round(s.win_start / s.sampling_rate * 1000)
+                key = (s.session_id, physical_time_ms)
+            else:
+                key = (s.recording_idx, s.win_start)
+            groups[key].append(s)
+
+        # 2. 각 그룹을 정렬 후 이어 붙여 하나의 PackUnit으로
+        units: list[_PackUnit] = []
+        for _key, group_samples in groups.items():
+            group_samples.sort(key=lambda s: (s.signal_type, s.channel_idx))
+
+            channel_values: list[torch.Tensor] = []  # each (time,)
+            channel_spans: list[tuple[int, int, int]] = []
+            variate_rates: list[float] = []
+            variate_types: list[int] = []
+            variate_spatial_ids: list[int] = []
+            variate_lengths: list[int] = []
+            padded_variate_lengths: list[int] = []
+            resolved_ps_list: list[int] = []
+            offset = 0
+
+            # [최적화] Concat 전에 미리 길이 확인하여 초과분 제거
+            for s in group_samples:
+                remaining = self.max_length - offset
+                if remaining <= 0:
+                    break  # 이미 max_length 도달
+
+                seg_len = min(s.values.shape[0], remaining)
+
+                # per-variate patch 파라미터 결정
+                var_P: Optional[int] = None
+                var_S: Optional[int] = None
+                if self._multi_resolution:
+                    var_P = self._resolve_variate_patch_size(s.sampling_rate)
+                    var_S = var_P  # multi-resolution은 non-overlapping
+                elif self.patch_size is not None:
+                    var_P = self.patch_size
+                    var_S = self.stride
+
+                if var_P is not None:
+                    # 통합 패딩: P + ceil(max(0, seg_len - P) / S) * S
+                    excess = max(0, seg_len - var_P)
+                    padded_seg_len = var_P + -(-excess // var_S) * var_S
+                    if padded_seg_len > remaining:
+                        if remaining < var_P:
+                            break
+                        padded_seg_len = var_P + ((remaining - var_P) // var_S) * var_S
+                        seg_len = min(seg_len, padded_seg_len)
+                    v = torch.zeros(padded_seg_len)
+                    v[:seg_len] = s.values[:seg_len]
+                    effective_len = padded_seg_len
+                else:
+                    v = s.values[:seg_len]
+                    effective_len = seg_len
+                    padded_seg_len = seg_len
+
+                channel_spans.append((s.channel_idx, offset, offset + effective_len))
+                channel_values.append(v)
+                variate_rates.append(s.sampling_rate)
+                variate_types.append(s.signal_type)
+                variate_spatial_ids.append(
+                    get_global_spatial_id(s.signal_type, s.spatial_id)
+                )
+                variate_lengths.append(seg_len)
+                padded_variate_lengths.append(padded_seg_len)
+                if var_P is not None:
+                    resolved_ps_list.append(var_P)
+                offset += effective_len
+
+            # Concat은 이미 max_length 이하이므로 재정리 불필요
+            if channel_values:  # Empty check
+                concat = torch.cat(channel_values)
+
+                units.append(
+                    _PackUnit(
+                        values=concat,
+                        total_length=concat.shape[0],
+                        channel_spans=channel_spans,
+                        variate_rates=variate_rates,
+                        variate_types=variate_types,
+                        variate_spatial_ids=variate_spatial_ids,
+                        variate_lengths=variate_lengths,
+                        padded_variate_lengths=padded_variate_lengths,
+                        resolved_patch_sizes=resolved_ps_list,
+                    )
+                )
+
+        # 3. FFD 패킹
+        bins = self._ffd_pack(units)
+
+        # 4. 텐서 생성 (최적화: 실제 필요한 크기만 할당)
+        n_rows = len(bins)
+
+        # [최적화] 각 행의 실제 필요 길이 계산
+        row_lengths: list[int] = []
+        for contents in bins:
+            row_len = sum(u.total_length for u in contents)
+            row_lengths.append(min(row_len, self.max_length))
+
+        # 행마다 다른 길이로 할당 (padding 최소화)
+        packed_values: list[torch.Tensor] = []
+        packed_ids: list[torch.Tensor] = []
+        packed_var_ids: list[torch.Tensor] = []
+        all_lengths: list[int] = []
+        all_padded_lengths: list[int] = []
+        all_rates: list[float] = []
+        all_types: list[int] = []
+        all_spatial_ids: list[int] = []
+        all_resolved_ps: list[int] = []
+
+        for row_idx, (contents, row_len) in enumerate(zip(bins, row_lengths)):
+            row_values = torch.zeros(row_len)
+            row_ids = torch.zeros(row_len, dtype=torch.long)
+            row_var_ids = torch.zeros(row_len, dtype=torch.long)
+
+            row_offset = 0
+            for local_id, unit in enumerate(contents, start=1):
+                seg_len = unit.total_length
+                end_offset = min(row_offset + seg_len, row_len)
+                actual_seg_len = end_offset - row_offset
+
+                if actual_seg_len > 0:
+                    row_values[row_offset:end_offset] = unit.values[:actual_seg_len]
+                    row_ids[row_offset:end_offset] = local_id
+
+                    # variate_id 할당
+                    for var_id, (_ch_idx, start, end) in enumerate(
+                        unit.channel_spans, start=1
+                    ):
+                        var_start = max(row_offset, row_offset + start)
+                        var_end = min(end_offset, row_offset + end)
+                        if var_end > var_start:
+                            row_var_ids[var_start:var_end] = var_id
+
+                # metadata 수집
+                if actual_seg_len == seg_len:  # 전체 unit이 포함됨
+                    all_lengths.extend(unit.variate_lengths)
+                    all_padded_lengths.extend(unit.padded_variate_lengths)
+                    all_rates.extend(unit.variate_rates)
+                    all_types.extend(unit.variate_types)
+                    all_spatial_ids.extend(unit.variate_spatial_ids)
+                    all_resolved_ps.extend(unit.resolved_patch_sizes)
+                else:
+                    # Trimmed unit: 포함된 variates만
+                    for var_id, (_ch_idx, start, end) in enumerate(unit.channel_spans):
+                        var_start = max(0, row_offset + start)
+                        var_end = min(actual_seg_len, row_offset + end)
+                        if var_end > var_start:
+                            included = var_end - var_start
+                            all_lengths.append(
+                                min(included, unit.variate_lengths[var_id])
+                            )
+                            all_padded_lengths.append(included)
+                            all_rates.append(unit.variate_rates[var_id])
+                            all_types.append(unit.variate_types[var_id])
+                            all_spatial_ids.append(
+                                unit.variate_spatial_ids[var_id]
+                            )
+                            if var_id < len(unit.resolved_patch_sizes):
+                                all_resolved_ps.append(
+                                    unit.resolved_patch_sizes[var_id]
+                                )
+
+                row_offset += actual_seg_len
+                if row_offset >= row_len:
+                    break
+
+            packed_values.append(row_values)
+            packed_ids.append(row_ids)
+            packed_var_ids.append(row_var_ids)
+
+        # 모든 행을 max_length로 pad
+        padded_values = torch.zeros(n_rows, self.max_length)
+        padded_ids = torch.zeros(n_rows, self.max_length, dtype=torch.long)
+        padded_var_ids = torch.zeros(n_rows, self.max_length, dtype=torch.long)
+
+        for i, (v, ids, var_ids) in enumerate(zip(packed_values, packed_ids, packed_var_ids)):
+            padded_values[i, : v.shape[0]] = v
+            padded_ids[i, : ids.shape[0]] = ids
+            padded_var_ids[i, : var_ids.shape[0]] = var_ids
+
+        uses_patching = self.patch_size is not None or self._multi_resolution
+        padded_lengths_tensor = (
+            torch.tensor(all_padded_lengths, dtype=torch.long)
+            if uses_patching
+            else None
+        )
+        variate_ps_tensor = (
+            torch.tensor(all_resolved_ps, dtype=torch.long)
+            if self._multi_resolution
+            else None
+        )
+
+        return PackedBatch(
+            values=padded_values,
+            sample_id=padded_ids,
+            variate_id=padded_var_ids,
+            lengths=torch.tensor(all_lengths, dtype=torch.long),
+            sampling_rates=torch.tensor(all_rates, dtype=torch.float32),
+            signal_types=torch.tensor(all_types, dtype=torch.long),
+            spatial_ids=torch.tensor(all_spatial_ids, dtype=torch.long),
+            padded_lengths=padded_lengths_tensor,
+            variate_patch_sizes=variate_ps_tensor,
+        )
+
+    # ── FFD 패킹 ─────────────────────────────────────────────────
+
+    def _ffd_pack(self, units: list[_PackUnit]) -> list[list[_PackUnit]]:
+        """First-Fit Decreasing bin-packing (optimized). 긴 것부터 배치."""
+        sorted_units = sorted(units, key=lambda u: u.total_length, reverse=True)
+
+        # [최적화] 버전 번호를 사용하여 stale entries 제거
+        heap: list[tuple[int, int, int]] = []   # (-remaining, bin_idx, version)
+        bin_remaining: list[int] = []
+        bin_version: list[int] = []  # 각 bin의 현재 버전
+        bin_contents: list[list[_PackUnit]] = []
+
+        for unit in sorted_units:
+            placed = False
+
+            # [최적화] Stale entries를 한 번에 정리
+            while heap and heap[0][2] != bin_version[heap[0][1]]:
+                heapq.heappop(heap)
+
+            if heap:
+                neg_rem, bin_idx, ver = heap[0]
+                remaining = -neg_rem
+                if remaining >= unit.total_length:
+                    heapq.heappop(heap)
+                    bin_contents[bin_idx].append(unit)
+                    new_remaining = remaining - unit.total_length
+                    bin_remaining[bin_idx] = new_remaining
+                    bin_version[bin_idx] += 1
+                    if new_remaining > 0:
+                        heapq.heappush(heap, (-new_remaining, bin_idx, bin_version[bin_idx]))
+                    placed = True
+
+            if not placed:
+                bi = len(bin_contents)
+                rem = self.max_length - unit.total_length
+                bin_contents.append([unit])
+                bin_remaining.append(rem)
+                bin_version.append(1)
+                if rem > 0:
+                    heapq.heappush(heap, (-rem, bi, 1))
+
+        return bin_contents

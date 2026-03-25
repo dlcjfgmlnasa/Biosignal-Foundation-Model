@@ -1,0 +1,52 @@
+# Dry-run: 로컬 CPU에서 shape/에러 검증용
+# Usage: python main.py --config configs/dry_run.yaml
+
+model_config:
+  d_model: 32
+  num_layers: 1
+  patch_size: 128
+  stride: null
+  num_heads: null
+  num_groups: null
+  use_glu: true
+  use_moe: false
+  use_rope: true
+  use_var_attn_bias: true
+  use_spatial_embed: true
+  dropout_p: 0.0
+  max_horizon: 2
+  use_cnn_stem: false
+  stem_hidden_channels: 32
+  stem_num_layers: 2
+  stem_kernel_size: 3
+  contrastive_proj_dim: 0
+
+processed_dir: datasets/processed
+signal_types: [2, 4, 5]
+max_subjects: 2
+window_seconds: 10.0
+max_length: 5000
+cache_size: 4
+
+batch_size: 2
+lr: 1.0e-3
+n_epochs: 1
+warmup_epochs: 0
+min_lr_ratio: 0.1
+mask_ratio: 0.15
+gradient_clip: 1.0
+seed: 42
+collate_mode: ci
+
+alpha: 1.0
+beta: 1.0
+gamma: 0.0
+delta: 0.0
+
+variate_mask_prob: 0.0
+
+device: cpu
+num_workers: 0
+output_dir: outputs/dry_run
+checkpoint_every: 1
+dry_run: true
