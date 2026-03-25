@@ -41,7 +41,7 @@ from .train_utils import (
     setup_ddp,
     train_one_epoch,
 )
-from .visualize import save_reconstruction_figure
+from .visualize import save_reconstruction_figure, save_next_pred_figure
 
 
 def parse_args() -> argparse.Namespace:
@@ -314,7 +314,7 @@ def main():
                 f"LR: {current_lr:.2e}"
             )
 
-            # Reconstruction 시각화
+            # Reconstruction & Next-Pred 시각화
             if viz_batches is not None and (epoch % viz_every == 0 or epoch == config.n_epochs - 1):
                 viz_model = model.module if use_ddp else model
                 fig_path = save_reconstruction_figure(
@@ -323,6 +323,12 @@ def main():
                     device=device,
                 )
                 print(f"  → Reconstruction figure saved: {fig_path}")
+                np_path = save_next_pred_figure(
+                    viz_model, viz_batches, epoch=epoch,
+                    output_dir=viz_dir, horizon=1,
+                    device=device,
+                )
+                print(f"  → Next-pred figure saved: {np_path}")
 
             # Best model 저장
             if losses["total"] < best_loss:
