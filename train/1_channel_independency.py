@@ -5,27 +5,38 @@
 - Masked Patch Modeling (MPM): 마스킹된 패치 복원
 - Next-Patch Prediction: 랜덤 horizon으로 미래 패치 예측
 
-Usage
+Usage (단일 GPU)
 -----
-    python -m train.1_channel_independency
-    python -m train.1_channel_independency --d_model 128 --num_layers 4 --batch_size 32
+    python -m train.1_channel_independency --device cuda:0
+
+Usage (멀티 GPU — DDP)
+-----
+    torchrun --nproc_per_node=2 -m train.1_channel_independency
 """
 import argparse
 import gc
+import os
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+
 from data import BiosignalDataset, create_dataloader
 from loss.criterion import CombinedLoss
 from model import BiosignalFoundationModel, ModelConfig
 from .train_utils import (
     TrainConfig,
+    cleanup_ddp,
     create_scheduler,
     get_model_config,
+    is_main_process,
     load_manifest_from_processed,
     resolve_device,
     save_training_checkpoint,
     set_seed,
+    setup_ddp,
     train_one_epoch,
 )
 from .visualize import save_reconstruction_figure
@@ -93,6 +104,19 @@ def parse_args() -> argparse.Namespace:
 def main():
     args = parse_args()
 
+    # ── DDP 감지 (torchrun이 설정한 환경 변수) ──
+    local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    use_ddp = local_rank >= 0
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+
+    if use_ddp:
+        setup_ddp(local_rank, world_size)
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = resolve_device(args.device)
+
+    rank0 = is_main_process()
+
     # ── Phase 1 설정 ──
     model_config = ModelConfig(
         d_model=args.d_model,
@@ -151,15 +175,16 @@ def main():
         max_batches=args.max_batches,
     )
 
-    set_seed(config.seed)
-    device = resolve_device(config.device)
+    set_seed(config.seed + (local_rank if use_ddp else 0))
     output_dir = Path(config.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if rank0:
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"{'='*60}")
-    print(f"Phase 1: Channel-Independent Pre-training")
-    print(f"Device: {device}")
-    print(f"{'='*60}")
+    if rank0:
+        print(f"{'='*60}")
+        print(f"Phase 1: Channel-Independent Pre-training")
+        print(f"Device: {device}" + (f" (DDP: {world_size} GPUs)" if use_ddp else ""))
+        print(f"{'='*60}")
 
     # ── 데이터 로딩 ──
     manifest = load_manifest_from_processed(
@@ -167,48 +192,66 @@ def main():
         signal_types=config.signal_types,
         max_subjects=config.max_subjects,
     )
-    print(f"Loaded {len(manifest)} recordings")
+    if rank0:
+        print(f"Loaded {len(manifest)} recordings")
 
     dataset = BiosignalDataset(
         manifest,
         window_seconds=config.window_seconds,
         cache_size=config.cache_size,
     )
-    print(f"Dataset size: {len(dataset)} windows")
+    if rank0:
+        print(f"Dataset size: {len(dataset)} windows")
+
+    # DDP: DistributedSampler 사용
+    sampler = None
+    shuffle = True
+    if use_ddp:
+        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=local_rank, shuffle=True)
+        shuffle = False  # sampler가 셔플 담당
 
     dataloader = create_dataloader(
         dataset,
         max_length=config.max_length,
         batch_size=config.batch_size,
-        shuffle=True,
+        shuffle=shuffle,
         num_workers=config.num_workers,
         collate_mode=config.collate_mode,
         patch_size=config.model_config.patch_size,
+        pin_memory=True,
+        sampler=sampler,
     )
-    print(f"Batches per epoch: {len(dataloader)}")
+    if rank0:
+        print(f"Batches per epoch: {len(dataloader)}")
 
     # ── 모델 ──
     model = BiosignalFoundationModel.from_config(config.model_config)
     model.to(device)
 
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"Model params: {total_params:,}")
+    if use_ddp:
+        model = DDP(model, device_ids=[local_rank])
+
+    if rank0:
+        raw_model = model.module if use_ddp else model
+        total_params = sum(p.numel() for p in raw_model.parameters())
+        print(f"Model params: {total_params:,}")
 
     # ── Optimizer & Scheduler ──
     criterion = CombinedLoss(
         alpha=config.alpha, beta=config.beta, gamma=config.gamma,
         delta=config.delta, contrastive_temperature=config.contrastive_temperature,
         learnable_temperature=config.learnable_temperature,
-    )
+    ).to(device)
     optimizer = torch.optim.Adam(
         list(model.parameters()) + list(criterion.parameters()), lr=config.lr,
     )
     scheduler = create_scheduler(optimizer, config)
 
-    # ── 시각화용 배치 캐시 ──
+    # ── 시각화용 배치 캐시 (rank 0만) ──
     viz_every = args.viz_every
     viz_batch = None
-    if viz_every > 0:
+    viz_dir = None
+    if rank0 and viz_every > 0:
         viz_iter = iter(dataloader)
         viz_batch = next(viz_iter)
         del viz_iter
@@ -218,13 +261,18 @@ def main():
 
     # ── 학습 루프 ──
     best_loss = float("inf")
-    print(f"\nStarting training: {config.n_epochs} epochs")
-    print(f"  alpha={config.alpha}, beta={config.beta}, gamma={config.gamma}")
-    print(f"  max_horizon={config.model_config.max_horizon}, mask_ratio={config.mask_ratio}")
-    print(f"  warmup_epochs={config.warmup_epochs}")
-    print(f"{'='*60}")
+    if rank0:
+        print(f"\nStarting training: {config.n_epochs} epochs")
+        print(f"  alpha={config.alpha}, beta={config.beta}, gamma={config.gamma}")
+        print(f"  max_horizon={config.model_config.max_horizon}, mask_ratio={config.mask_ratio}")
+        print(f"  warmup_epochs={config.warmup_epochs}")
+        print(f"{'='*60}")
 
     for epoch in range(config.n_epochs):
+        # DDP: sampler 에폭 설정 (셔플링 동기화)
+        if sampler is not None:
+            sampler.set_epoch(epoch)
+
         losses = train_one_epoch(
             model, dataloader, optimizer, criterion,
             config=config,
@@ -234,59 +282,67 @@ def main():
         )
         scheduler.step()
 
-        current_lr = optimizer.param_groups[0]["lr"]
-        print(
-            f"Epoch {epoch:3d} | "
-            f"total: {losses['total']:.6f} | "
-            f"masked: {losses['masked_loss']:.6f} | "
-            f"next: {losses['next_loss']:.6f} | "
-            f"LR: {current_lr:.2e}"
-        )
-
-        # Reconstruction 시각화
-        if viz_batch is not None and (epoch % viz_every == 0 or epoch == config.n_epochs - 1):
-            fig_path = save_reconstruction_figure(
-                model, viz_batch, epoch=epoch,
-                output_dir=viz_dir, mask_ratio=config.mask_ratio,
-                device=device,
+        if rank0:
+            current_lr = optimizer.param_groups[0]["lr"]
+            print(
+                f"Epoch {epoch:3d} | "
+                f"total: {losses['total']:.6f} | "
+                f"masked: {losses['masked_loss']:.6f} | "
+                f"next: {losses['next_loss']:.6f} | "
+                f"LR: {current_lr:.2e}"
             )
-            print(f"  → Reconstruction figure saved: {fig_path}")
 
-        # Best model 저장
-        if losses["total"] < best_loss:
-            best_loss = losses["total"]
-            path = save_training_checkpoint(
-                model, optimizer, epoch, config,
-                phase_name="phase1_ci", loss=best_loss,
-                output_dir=output_dir, tag="best",
-            )
-            print(f"  → Best model saved: {path}")
+            # Reconstruction 시각화
+            if viz_batch is not None and (epoch % viz_every == 0 or epoch == config.n_epochs - 1):
+                viz_model = model.module if use_ddp else model
+                fig_path = save_reconstruction_figure(
+                    viz_model, viz_batch, epoch=epoch,
+                    output_dir=viz_dir, mask_ratio=config.mask_ratio,
+                    device=device,
+                )
+                print(f"  → Reconstruction figure saved: {fig_path}")
 
-        # 주기적 체크포인트
-        if (epoch + 1) % config.checkpoint_every == 0:
-            save_training_checkpoint(
-                model, optimizer, epoch, config,
-                phase_name="phase1_ci", loss=losses["total"],
-                output_dir=output_dir,
-            )
+            # Best model 저장
+            if losses["total"] < best_loss:
+                best_loss = losses["total"]
+                save_model = model.module if use_ddp else model
+                path = save_training_checkpoint(
+                    save_model, optimizer, epoch, config,
+                    phase_name="phase1_ci", loss=best_loss,
+                    output_dir=output_dir, tag="best",
+                )
+                print(f"  → Best model saved: {path}")
+
+            # 주기적 체크포인트
+            if (epoch + 1) % config.checkpoint_every == 0:
+                save_model = model.module if use_ddp else model
+                save_training_checkpoint(
+                    save_model, optimizer, epoch, config,
+                    phase_name="phase1_ci", loss=losses["total"],
+                    output_dir=output_dir,
+                )
 
     # ── 최종 체크포인트 ──
-    final_path = save_training_checkpoint(
-        model, optimizer, config.n_epochs - 1, config,
-        phase_name="phase1_ci", loss=losses["total"],
-        output_dir=output_dir, tag="final",
-    )
-    print(f"\n{'='*60}")
-    print(f"Phase 1 complete. Final loss: {losses['total']:.6f}")
-    print(f"Best loss: {best_loss:.6f}")
-    print(f"Final checkpoint: {final_path}")
-    print(f"{'='*60}")
+    if rank0:
+        save_model = model.module if use_ddp else model
+        final_path = save_training_checkpoint(
+            save_model, optimizer, config.n_epochs - 1, config,
+            phase_name="phase1_ci", loss=losses["total"],
+            output_dir=output_dir, tag="final",
+        )
+        print(f"\n{'='*60}")
+        print(f"Phase 1 complete. Final loss: {losses['total']:.6f}")
+        print(f"Best loss: {best_loss:.6f}")
+        print(f"Final checkpoint: {final_path}")
+        print(f"{'='*60}")
 
-    # 메모리 정리
+    # 정리
     del dataloader
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+    if use_ddp:
+        cleanup_ddp()
 
 
 if __name__ == "__main__":

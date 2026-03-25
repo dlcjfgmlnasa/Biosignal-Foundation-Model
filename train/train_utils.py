@@ -6,14 +6,17 @@
 """
 import json
 import math
+import os
 import random
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
 import torch
+import torch.distributed as dist
 import yaml
 from torch import nn
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.lr_scheduler import LambdaLR
 
 from data import RecordingManifest
@@ -204,7 +207,8 @@ def train_one_epoch(
         )
 
         # 원본 패치 추출 (정규화된 값)
-        P = model.patch_size
+        raw_model = model.module if isinstance(model, DDP) else model
+        P = raw_model.patch_size
         normalized = ((batch.values.unsqueeze(-1) - out["loc"]) / out["scale"]).squeeze(-1)
         B, L = normalized.shape
         N = L // P
@@ -242,19 +246,21 @@ def train_one_epoch(
 
         # NaN/Inf 감지
         if not torch.isfinite(loss):
-            print(
-                f"  [{phase_name}] WARNING: NaN/Inf loss detected at batch {n_batches + 1}, "
-                f"skipping batch (masked={losses['masked_loss'].item():.4f}, "
-                f"next={losses['next_loss'].item():.4f}, "
-                f"cross={losses['cross_modal_loss'].item():.4f}, "
-                f"contrastive={losses['contrastive_loss'].item():.4f})"
-            )
+            if is_main_process():
+                print(
+                    f"  [{phase_name}] WARNING: NaN/Inf loss detected at batch {n_batches + 1}, "
+                    f"skipping batch (masked={losses['masked_loss'].item():.4f}, "
+                    f"next={losses['next_loss'].item():.4f}, "
+                    f"cross={losses['cross_modal_loss'].item():.4f}, "
+                    f"contrastive={losses['contrastive_loss'].item():.4f})"
+                )
             nan_count += 1
             if nan_count >= max_nan_batches:
-                print(
-                    f"  [{phase_name}] ERROR: {nan_count} consecutive NaN/Inf batches. "
-                    f"Stopping epoch early."
-                )
+                if is_main_process():
+                    print(
+                        f"  [{phase_name}] ERROR: {nan_count} consecutive NaN/Inf batches. "
+                        f"Stopping epoch early."
+                    )
                 break
             optimizer.zero_grad()
             continue
@@ -268,10 +274,11 @@ def train_one_epoch(
             model.parameters(), max_norm=config.gradient_clip,
         )
         if not torch.isfinite(grad_norm):
-            print(
-                f"  [{phase_name}] WARNING: NaN/Inf gradient at batch {n_batches + 1}, "
-                f"skipping update."
-            )
+            if is_main_process():
+                print(
+                    f"  [{phase_name}] WARNING: NaN/Inf gradient at batch {n_batches + 1}, "
+                    f"skipping update."
+                )
             optimizer.zero_grad()
             n_batches += 1
             continue
@@ -286,7 +293,7 @@ def train_one_epoch(
         epoch_contrastive += losses["contrastive_loss"].item()
         n_batches += 1
 
-        if n_batches % 50 == 0 or config.dry_run:
+        if is_main_process() and (n_batches % 50 == 0 or config.dry_run):
             print(
                 f"  [{phase_name}] batch {n_batches} | "
                 f"total: {losses['total'].item():.6f} | "
@@ -299,12 +306,14 @@ def train_one_epoch(
 
         # Dry-run: 1 batch만 실행
         if config.dry_run:
-            print(f"  [{phase_name}] dry-run: 1 batch 완료, 종료.")
+            if is_main_process():
+                print(f"  [{phase_name}] dry-run: 1 batch 완료, 종료.")
             break
 
         # max_batches 제한
         if config.max_batches > 0 and n_batches >= config.max_batches:
-            print(f"  [{phase_name}] max_batches={config.max_batches} 도달, 에폭 종료.")
+            if is_main_process():
+                print(f"  [{phase_name}] max_batches={config.max_batches} 도달, 에폭 종료.")
             break
 
     denom = max(n_batches, 1)
@@ -333,6 +342,27 @@ def resolve_device(device_str: str) -> torch.device:
     if device_str == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return torch.device(device_str)
+
+
+def setup_ddp(rank: int, world_size: int) -> None:
+    """DDP 프로세스 그룹을 초기화한다."""
+    os.environ.setdefault("MASTER_ADDR", "localhost")
+    os.environ.setdefault("MASTER_PORT", "29500")
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    torch.cuda.set_device(rank)
+
+
+def cleanup_ddp() -> None:
+    """DDP 프로세스 그룹을 종료한다."""
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def is_main_process() -> bool:
+    """현재 프로세스가 rank 0인지 (또는 단일 GPU인지) 반환한다."""
+    if not dist.is_initialized():
+        return True
+    return dist.get_rank() == 0
 
 
 def create_scheduler(

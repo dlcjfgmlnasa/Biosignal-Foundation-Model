@@ -1,5 +1,5 @@
 # -*- coding:utf-8 -*-
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
 
 from data.collate import PackCollate, PackedBatch
 from data.dataset import BiosignalDataset
@@ -19,6 +19,7 @@ def create_dataloader(
     collate_mode: str = "any_variate",
     patch_size: int | None = None,
     stride: int | None = None,
+    sampler: Sampler | None = None,
 ) -> DataLoader:
     """PackCollate가 적용된 DataLoader를 생성한다.
 
@@ -77,11 +78,12 @@ def create_dataloader(
             prefetch_factor=(prefetch_factor if num_workers > 0 else None),
         )
     else:
-        # CI 모드: 기존 동작 (개별 샘플 랜덤 샘플링)
+        # CI 모드: 개별 샘플 랜덤 샘플링 (DDP 시 sampler 사용)
         return DataLoader(
             dataset,
             batch_size=batch_size,
-            shuffle=shuffle,
+            shuffle=(shuffle and sampler is None),
+            sampler=sampler,
             num_workers=num_workers,
             drop_last=drop_last,
             collate_fn=collate_fn,
