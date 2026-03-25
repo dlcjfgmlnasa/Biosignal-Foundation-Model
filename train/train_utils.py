@@ -77,6 +77,9 @@ class TrainConfig:
     val_ratio: float = 0.2  # subject 단위 validation 비율
     patience: int = 10  # early stopping patience (0=비활성)
 
+    # Mixed Precision
+    use_amp: bool = False  # True면 AMP (autocast + GradScaler) 활성
+
     # 실험 관리
     exp_name: str = ""  # 실험 이름 (비어있으면 output_dir 그대로 사용)
 
@@ -215,6 +218,7 @@ def train_one_epoch(
     device: torch.device,
     epoch: int,
     phase_name: str,
+    scaler: torch.amp.GradScaler | None = None,
 ) -> dict[str, float]:
     """1에폭 학습을 수행하고 평균 loss를 반환한다."""
     model.train()
@@ -228,6 +232,8 @@ def train_one_epoch(
     max_nan_batches = 10
 
     enable_next = config.beta > 0
+    use_amp = scaler is not None
+    amp_dtype = torch.float16 if device.type == "cuda" else torch.bfloat16
 
     for batch in dataloader:
         # GPU로 이동
@@ -241,48 +247,50 @@ def train_one_epoch(
             H = random.randint(1, config.model_config.max_horizon)
 
         task = "both" if enable_next else "masked"
-        out = model(batch, task=task, horizon=H)
 
-        reconstructed = out["reconstructed"]  # (B, N, patch_size)
-        cross_pred = out["cross_pred"]        # (B, N, patch_size)
-        patch_mask = out["patch_mask"]        # (B, N) bool
-        time_id = out["time_id"]              # (B, N)
-        next_pred = out.get("next_pred")      # (B, N, patch_size) or None
+        with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
+            out = model(batch, task=task, horizon=H)
 
-        # 패치 단위 마스킹 (variate-level 마스킹 지원)
-        pred_mask = create_patch_mask(
-            patch_mask,
-            mask_ratio=config.mask_ratio,
-            patch_variate_id=out["patch_variate_id"] if config.variate_mask_prob > 0 else None,
-            variate_mask_prob=config.variate_mask_prob,
-        )
+            reconstructed = out["reconstructed"]  # (B, N, patch_size)
+            cross_pred = out["cross_pred"]        # (B, N, patch_size)
+            patch_mask = out["patch_mask"]        # (B, N) bool
+            time_id = out["time_id"]              # (B, N)
+            next_pred = out.get("next_pred")      # (B, N, patch_size) or None
 
-        # 원본 패치 추출 (정규화된 값)
-        raw_model = model.module if isinstance(model, DDP) else model
-        P = raw_model.patch_size
-        normalized = ((batch.values.unsqueeze(-1) - out["loc"]) / out["scale"]).squeeze(-1)
-        B, L = normalized.shape
-        N = L // P
-        original_patches = normalized.reshape(B, N, P)  # (B, N, P)
+            # 패치 단위 마스킹 (variate-level 마스킹 지원)
+            pred_mask = create_patch_mask(
+                patch_mask,
+                mask_ratio=config.mask_ratio,
+                patch_variate_id=out["patch_variate_id"] if config.variate_mask_prob > 0 else None,
+                variate_mask_prob=config.variate_mask_prob,
+            )
 
-        # ── Contrastive embeddings ──
-        contrastive_z = out.get("contrastive_z")  # (B, N, proj_dim) or None
+            # 원본 패치 추출 (정규화된 값)
+            raw_model = model.module if isinstance(model, DDP) else model
+            P = raw_model.patch_size
+            normalized = ((batch.values.unsqueeze(-1) - out["loc"]) / out["scale"]).squeeze(-1)
+            B, L = normalized.shape
+            N = L // P
+            original_patches = normalized.reshape(B, N, P)  # (B, N, P)
 
-        # ── CombinedLoss ──
-        needs_time_id = config.gamma > 0 or config.delta > 0
-        losses = criterion(
-            reconstructed=reconstructed,
-            next_pred=next_pred,
-            original_patches=original_patches,
-            pred_mask=pred_mask,
-            patch_mask=patch_mask,
-            patch_sample_id=out["patch_sample_id"],
-            patch_variate_id=out["patch_variate_id"],
-            horizon=H,
-            cross_pred=cross_pred if config.gamma > 0 else None,
-            time_id=time_id if needs_time_id else None,
-            contrastive_z=contrastive_z if config.delta > 0 else None,
-        )
+            # ── Contrastive embeddings ──
+            contrastive_z = out.get("contrastive_z")  # (B, N, proj_dim) or None
+
+            # ── CombinedLoss ──
+            needs_time_id = config.gamma > 0 or config.delta > 0
+            losses = criterion(
+                reconstructed=reconstructed,
+                next_pred=next_pred,
+                original_patches=original_patches,
+                pred_mask=pred_mask,
+                patch_mask=patch_mask,
+                patch_sample_id=out["patch_sample_id"],
+                patch_variate_id=out["patch_variate_id"],
+                horizon=H,
+                cross_pred=cross_pred if config.gamma > 0 else None,
+                time_id=time_id if needs_time_id else None,
+                contrastive_z=contrastive_z if config.delta > 0 else None,
+            )
 
         # ── Backward ──
         loss = losses["total"]
@@ -310,7 +318,12 @@ def train_one_epoch(
 
         nan_count = 0  # 정상 batch면 카운터 리셋
         optimizer.zero_grad()
-        loss.backward()
+
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+        else:
+            loss.backward()
 
         # Gradient NaN/Inf 감지
         grad_norm = nn.utils.clip_grad_norm_(
@@ -324,9 +337,15 @@ def train_one_epoch(
                 )
             optimizer.zero_grad()
             n_batches += 1
+            if scaler is not None:
+                scaler.update()
             continue
 
-        optimizer.step()
+        if scaler is not None:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
 
         # ── 로깅 ──
         epoch_total += losses["total"].item()
@@ -388,6 +407,8 @@ def validate(
     n_batches = 0
 
     enable_next = config.beta > 0
+    use_amp = config.use_amp and device.type == "cuda"
+    amp_dtype = torch.float16 if device.type == "cuda" else torch.bfloat16
 
     for batch in dataloader:
         batch.values = batch.values.to(device)
@@ -399,44 +420,46 @@ def validate(
             H = random.randint(1, config.model_config.max_horizon)
 
         task = "both" if enable_next else "masked"
-        out = model(batch, task=task, horizon=H)
 
-        reconstructed = out["reconstructed"]
-        cross_pred = out["cross_pred"]
-        patch_mask = out["patch_mask"]
-        time_id = out["time_id"]
-        next_pred = out.get("next_pred")
+        with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
+            out = model(batch, task=task, horizon=H)
 
-        pred_mask = create_patch_mask(
-            patch_mask,
-            mask_ratio=config.mask_ratio,
-            patch_variate_id=out["patch_variate_id"] if config.variate_mask_prob > 0 else None,
-            variate_mask_prob=config.variate_mask_prob,
-        )
+            reconstructed = out["reconstructed"]
+            cross_pred = out["cross_pred"]
+            patch_mask = out["patch_mask"]
+            time_id = out["time_id"]
+            next_pred = out.get("next_pred")
 
-        raw_model = model.module if isinstance(model, DDP) else model
-        P = raw_model.patch_size
-        normalized = ((batch.values.unsqueeze(-1) - out["loc"]) / out["scale"]).squeeze(-1)
-        B, L = normalized.shape
-        N = L // P
-        original_patches = normalized.reshape(B, N, P)
+            pred_mask = create_patch_mask(
+                patch_mask,
+                mask_ratio=config.mask_ratio,
+                patch_variate_id=out["patch_variate_id"] if config.variate_mask_prob > 0 else None,
+                variate_mask_prob=config.variate_mask_prob,
+            )
 
-        contrastive_z = out.get("contrastive_z")
+            raw_model = model.module if isinstance(model, DDP) else model
+            P = raw_model.patch_size
+            normalized = ((batch.values.unsqueeze(-1) - out["loc"]) / out["scale"]).squeeze(-1)
+            B, L = normalized.shape
+            N = L // P
+            original_patches = normalized.reshape(B, N, P)
 
-        needs_time_id = config.gamma > 0 or config.delta > 0
-        losses = criterion(
-            reconstructed=reconstructed,
-            next_pred=next_pred,
-            original_patches=original_patches,
-            pred_mask=pred_mask,
-            patch_mask=patch_mask,
-            patch_sample_id=out["patch_sample_id"],
-            patch_variate_id=out["patch_variate_id"],
-            horizon=H,
-            cross_pred=cross_pred if config.gamma > 0 else None,
-            time_id=time_id if needs_time_id else None,
-            contrastive_z=contrastive_z if config.delta > 0 else None,
-        )
+            contrastive_z = out.get("contrastive_z")
+
+            needs_time_id = config.gamma > 0 or config.delta > 0
+            losses = criterion(
+                reconstructed=reconstructed,
+                next_pred=next_pred,
+                original_patches=original_patches,
+                pred_mask=pred_mask,
+                patch_mask=patch_mask,
+                patch_sample_id=out["patch_sample_id"],
+                patch_variate_id=out["patch_variate_id"],
+                horizon=H,
+                cross_pred=cross_pred if config.gamma > 0 else None,
+                time_id=time_id if needs_time_id else None,
+                contrastive_z=contrastive_z if config.delta > 0 else None,
+            )
 
         loss = losses["total"]
         if not torch.isfinite(loss):
@@ -494,6 +517,13 @@ class EarlyStopping:
 
 
 # ── 유틸리티 ────────────────────────────────────────────────────
+
+
+def create_scaler(config: TrainConfig, device: torch.device) -> torch.amp.GradScaler | None:
+    """AMP가 활성이고 CUDA 디바이스일 때 GradScaler를 생성한다."""
+    if config.use_amp and device.type == "cuda":
+        return torch.amp.GradScaler("cuda")
+    return None
 
 
 def set_seed(seed: int) -> None:

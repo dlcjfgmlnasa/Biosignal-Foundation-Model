@@ -54,6 +54,9 @@ learnable_temperature: true
 # ── Masking ──
 variate_mask_prob: 0.3  # variate-level 마스킹
 
+# ── Mixed Precision ──
+use_amp: false  # AMP 활성 (CUDA만 지원)
+
 # ── Validation & Early Stopping ──
 val_ratio: 0.2      # subject 단위 validation 비율 (0=비활성)
 patience: 10        # early stopping patience (0=비활성)

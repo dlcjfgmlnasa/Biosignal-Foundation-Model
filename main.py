@@ -33,6 +33,7 @@ from model.checkpoint import load_checkpoint
 from train.train_utils import (
     EarlyStopping,
     TrainConfig,
+    create_scaler,
     create_scheduler,
     load_manifest_from_processed,
     resolve_device,
@@ -71,6 +72,8 @@ def parse_args() -> argparse.Namespace:
     g.add_argument("--max_subjects", type=int, default=None)
     g.add_argument("--output_dir", type=str, default=None)
     g.add_argument("--seed", type=int, default=None)
+    g.add_argument("--use_amp", action="store_true",
+                    help="AMP (Automatic Mixed Precision) 활성")
     g.add_argument("--val_ratio", type=float, default=None,
                     help="Validation 비율 (subject 단위, 0=비활성)")
     g.add_argument("--patience", type=int, default=None,
@@ -112,6 +115,8 @@ def main():
     }
     config = TrainConfig.from_yaml_with_overrides(args.config, overrides)
 
+    if args.use_amp:
+        config.use_amp = True
     if args.dry_run:
         config.dry_run = True
         config.n_epochs = 1
@@ -219,6 +224,9 @@ def main():
         list(model.parameters()) + list(criterion.parameters()), lr=config.lr,
     )
     scheduler = create_scheduler(optimizer, config)
+    scaler = create_scaler(config, device)
+    if scaler is not None:
+        print(f"AMP enabled (GradScaler)")
 
     # ── 실험 정보 & 설정 저장 (재현용) ──
     if not config.dry_run:
@@ -243,7 +251,7 @@ def main():
         losses = train_one_epoch(
             model, dataloader, optimizer, criterion,
             config=config, device=device, epoch=epoch,
-            phase_name=phase_name,
+            phase_name=phase_name, scaler=scaler,
         )
         scheduler.step()
 

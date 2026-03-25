@@ -30,6 +30,7 @@ from .train_utils import (
     EarlyStopping,
     TrainConfig,
     cleanup_ddp,
+    create_scaler,
     create_scheduler,
     get_model_config,
     is_main_process,
@@ -98,6 +99,8 @@ def parse_args() -> argparse.Namespace:
 
     # System
     g = p.add_argument_group("System")
+    g.add_argument("--use_amp", action="store_true",
+                   help="AMP (Automatic Mixed Precision) 활성")
     g.add_argument("--device", type=str, default="auto")
     g.add_argument("--num_workers", type=int, default=0)
     g.add_argument("--output_dir", type=str, default="outputs/phase1_ci")
@@ -181,6 +184,9 @@ def main():
         # Validation & Early Stopping
         val_ratio=args.val_ratio,
         patience=args.patience,
+
+        # Mixed Precision
+        use_amp=args.use_amp,
 
         # 실험 관리
         exp_name=args.exp_name,
@@ -298,6 +304,9 @@ def main():
         list(model.parameters()) + list(criterion.parameters()), lr=config.lr,
     )
     scheduler = create_scheduler(optimizer, config)
+    scaler = create_scaler(config, device)
+    if rank0 and scaler is not None:
+        print(f"AMP enabled (GradScaler)")
 
     # ── 시각화용 배치 캐시 (rank 0만) ──
     # 여러 배치를 수집하여 신호 타입 다양성을 확보한다.
@@ -349,6 +358,7 @@ def main():
             device=device,
             epoch=epoch,
             phase_name="Phase1_CI",
+            scaler=scaler,
         )
         scheduler.step()
 

@@ -24,6 +24,7 @@ from model.checkpoint import load_checkpoint
 from .train_utils import (
     EarlyStopping,
     TrainConfig,
+    create_scaler,
     create_scheduler,
     load_manifest_from_processed,
     resolve_device,
@@ -117,6 +118,8 @@ def parse_args() -> argparse.Namespace:
 
     # System
     g = p.add_argument_group("System")
+    g.add_argument("--use_amp", action="store_true",
+                   help="AMP (Automatic Mixed Precision) 활성")
     g.add_argument("--device", type=str, default="auto")
     g.add_argument("--num_workers", type=int, default=0)
     g.add_argument("--output_dir", type=str, default="outputs/phase2_any_variate")
@@ -187,6 +190,9 @@ def main():
         # Validation & Early Stopping
         val_ratio=args.val_ratio,
         patience=args.patience,
+
+        # Mixed Precision
+        use_amp=args.use_amp,
 
         # 실험 관리
         exp_name=args.exp_name,
@@ -306,6 +312,9 @@ def main():
         list(model.parameters()) + list(criterion.parameters()), lr=config.lr,
     )
     scheduler = create_scheduler(optimizer, config)
+    scaler = create_scaler(config, device)
+    if scaler is not None:
+        print(f"AMP enabled (GradScaler)")
 
     # ── 시각화용 배치 캐시 ──
     viz_every = args.viz_every
@@ -353,6 +362,7 @@ def main():
             device=device,
             epoch=epoch,
             phase_name="Phase2_AV",
+            scaler=scaler,
         )
         scheduler.step()
 
