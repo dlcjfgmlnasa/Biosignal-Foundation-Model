@@ -70,8 +70,21 @@ def save_reconstruction_figure(
     N = L // P
     original_patches = normalized[:, :N * P].reshape(B, N, P)
 
-    # signal type 정보
+    # signal type 정보 — 모델 forward와 동일한 global_var_idx 로직
     has_signal_types = hasattr(batch, "signal_types") and batch.signal_types is not None
+    row_signal_names: dict[int, str] = {}
+    if has_signal_types:
+        per_row_max_var = p_vid.max(dim=-1).values  # (B,)
+        var_offsets = torch.zeros(B, dtype=torch.long, device=p_vid.device)
+        if B > 1:
+            var_offsets[1:] = per_row_max_var[:-1].cumsum(dim=0)
+        for b in range(B):
+            gvi = (var_offsets[b] + (p_vid[b, 0] - 1)).clamp(min=0).item()
+            if gvi < len(batch.signal_types):
+                sig_type = batch.signal_types[gvi].item()
+                row_signal_names[b] = SIGNAL_TYPE_NAMES.get(sig_type, f"type{sig_type}")
+            else:
+                row_signal_names[b] = "?"
 
     # 시각화할 row 선택: 유효한 variate (p_vid > 0)인 row만
     valid_rows = []
@@ -117,13 +130,8 @@ def save_reconstruction_figure(
                 )
 
         # 라벨
-        vid = p_vid[b, 0].item()
         if has_signal_types:
-            # global_var_idx → signal_type
-            per_row_max_var = p_vid[b].max().item()
-            sig_type_idx = min(vid - 1, len(batch.signal_types) - 1) if vid > 0 else 0
-            sig_type_idx = max(sig_type_idx, 0)
-            sig_name = SIGNAL_TYPE_NAMES.get(batch.signal_types[sig_type_idx].item(), "?")
+            sig_name = row_signal_names.get(b, "?")
             ax.set_ylabel(f"Row {b}\n{sig_name}", fontsize=10)
         else:
             ax.set_ylabel(f"Row {b}", fontsize=10)
