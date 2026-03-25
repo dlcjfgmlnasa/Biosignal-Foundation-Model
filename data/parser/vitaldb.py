@@ -2,7 +2,8 @@
 """VitalDB (.vital) → datasets/processed/ 변환 스크립트.
 
 VitalDB(https://vitaldb.net)의 수술 중 모니터링 데이터를 파싱하여
-zarr 압축 포맷으로 저장한다.
+zarr 압축 포맷으로 저장한다. 신호별 physiological range check와
+bandpass filtering을 적용하고, 모든 유효 세그먼트를 개별 zarr로 저장한다.
 
 신호 타입 매핑:
   ECG(0), ABP(1), EEG(2), PPG(3), CVP(4), CO2(5), AWP(6)
@@ -23,6 +24,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -31,6 +33,31 @@ from data.parser._common import resample_to_target, save_recording_zarr
 
 # 목표 sampling rate (Hz)
 TARGET_SR: float = 100.0
+
+
+# ── 신호별 전처리 설정 ──────────────────────────────────────────
+
+
+@dataclass
+class SignalConfig:
+    """신호 타입별 전처리 파라미터."""
+    valid_range: tuple[float, float] | None  # (min, max) — None이면 range check 안 함
+    bandpass: tuple[float, float] | None     # (lo, hi) Hz — None이면 필터 안 함
+
+
+SIGNAL_CONFIGS: dict[str, SignalConfig] = {
+    "ecg": SignalConfig(valid_range=(-5.0, 5.0),       bandpass=(0.5, 40.0)),
+    "abp": SignalConfig(valid_range=(0.0, 300.0),      bandpass=(0.5, 40.0)),
+    "eeg": SignalConfig(valid_range=(-500.0, 500.0),   bandpass=(0.5, 45.0)),
+    "ppg": SignalConfig(valid_range=None,               bandpass=(0.5, 8.0)),
+    "cvp": SignalConfig(valid_range=(-5.0, 40.0),      bandpass=(0.5, 20.0)),
+    "co2": SignalConfig(valid_range=(0.0, 100.0),      bandpass=None),
+    "awp": SignalConfig(valid_range=(-10.0, 80.0),     bandpass=None),
+}
+
+
+# ── VitalDB 트랙 매핑 ──────────────────────────────────────────
+
 
 # VitalDB 트랙명 → (signal_type_key, local_spatial_id)
 TRACK_MAP: dict[str, tuple[str, int]] = {
@@ -65,51 +92,72 @@ SIGNAL_TYPES: dict[str, int] = {
 }
 
 
-def discover_tracks(vital_path: Path) -> list[str]:
-    """파일 내 트랙명을 출력한다 (로컬 탐색용)."""
-    import vitaldb
-
-    vf = vitaldb.VitalFile(str(vital_path))
-    tracks = vf.get_track_names()
-    return tracks
+# ── 전처리 함수 ────────────────────────────────────────────────
 
 
-def _parse_subject_id(vital_path: Path) -> tuple[str, str]:
-    """파일명에서 (subject_id, session_id)를 추출한다.
+def _apply_range_check(data: np.ndarray, valid_range: tuple[float, float]) -> np.ndarray:
+    """범위 밖 값을 NaN으로 마킹한다. (1D inplace-safe copy)"""
+    lo, hi = valid_range
+    out = data.copy()
+    mask = (out < lo) | (out > hi)
+    n_bad = mask.sum()
+    if n_bad > 0:
+        out[mask] = np.nan
+    return out, int(n_bad)
 
-    예: 00042.vital → ("VDB_0042", "VDB_0042_S0")
+
+def _apply_bandpass(data: np.ndarray, lo: float, hi: float, sr: float) -> np.ndarray:
+    """Butterworth bandpass filter. (1D)"""
+    from scipy.signal import butter, sosfiltfilt
+
+    nyq = sr / 2.0
+    if hi >= nyq:
+        hi = nyq - 1.0
+    if hi <= lo:
+        return data
+
+    sos = butter(4, [lo / nyq, hi / nyq], btype="band", output="sos")
+    return sosfiltfilt(sos, data).astype(data.dtype)
+
+
+def _detect_electrocautery(data: np.ndarray, sr: float, threshold_std: float = 10.0,
+                           blank_ms: float = 100.0) -> np.ndarray:
+    """전기소작기 아티팩트 구간을 NaN으로 마킹한다. (ECG/EEG용)
+
+    급격한 진폭 변화(미분의 절대값)가 threshold_std배 이상인 구간을
+    전후 blank_ms만큼 확장하여 NaN 처리한다.
     """
-    stem = vital_path.stem
-    # 숫자만 추출하여 zero-pad
-    digits = "".join(c for c in stem if c.isdigit())
-    if not digits:
-        digits = stem
-    subject_id = f"VDB_{int(digits):04d}"
-    session_id = f"{subject_id}_S0"
-    return subject_id, session_id
+    out = data.copy()
+    diff = np.abs(np.diff(out, prepend=out[0]))
+    med = np.median(diff)
+    mad = np.median(np.abs(diff - med)) * 1.4826  # MAD → std 추정
+    if mad < 1e-10:
+        return out
+
+    spike_mask = diff > (med + threshold_std * mad)
+    if not spike_mask.any():
+        return out
+
+    # blank_ms만큼 전후 확장
+    blank_samples = int(blank_ms / 1000.0 * sr)
+    spike_idx = np.where(spike_mask)[0]
+    for idx in spike_idx:
+        start = max(0, idx - blank_samples)
+        end = min(len(out), idx + blank_samples + 1)
+        out[start:end] = np.nan
+
+    n_blanked = np.isnan(out).sum() - np.isnan(data).sum()
+    return out, int(n_blanked)
 
 
 def _extract_nan_free_segments(
     data: np.ndarray,  # (T,) float
     min_samples: int,
 ) -> list[np.ndarray]:
-    """NaN 구간을 제거하고 연속 valid 세그먼트를 반환한다.
-
-    Parameters
-    ----------
-    data:
-        1D 신호 배열. NaN이 포함될 수 있음.
-    min_samples:
-        최소 세그먼트 길이 (샘플 수).
-
-    Returns
-    -------
-    min_samples 이상인 연속 valid 세그먼트 리스트.
-    """
+    """NaN 구간을 제거하고 연속 valid 세그먼트를 반환한다."""
     valid = ~np.isnan(data)
     segments: list[np.ndarray] = []
 
-    # valid 구간의 시작/끝 찾기
     diff = np.diff(valid.astype(np.int8), prepend=0, append=0)
     starts = np.where(diff == 1)[0]
     ends = np.where(diff == -1)[0]
@@ -121,6 +169,28 @@ def _extract_nan_free_segments(
     return segments
 
 
+# ── 탐색 / 파싱 ────────────────────────────────────────────────
+
+
+def discover_tracks(vital_path: Path) -> list[str]:
+    """파일 내 트랙명을 출력한다 (로컬 탐색용)."""
+    import vitaldb
+
+    vf = vitaldb.VitalFile(str(vital_path))
+    tracks = vf.get_track_names()
+    return tracks
+
+
+def _parse_subject_id(vital_path: Path) -> tuple[str, str]:
+    """파일명에서 (subject_id, session_id)를 추출한다."""
+    stem = vital_path.stem
+    digits = "".join(c for c in stem if c.isdigit())
+    if not digits:
+        digits = stem
+    subject_id = f"VDB_{int(digits):04d}"
+    session_id = f"{subject_id}_S0"
+    return subject_id, session_id
+
 
 def process_vital(
     vital_path: Path,
@@ -129,19 +199,11 @@ def process_vital(
 ) -> tuple[str, str, list[dict]]:
     """단일 .vital 파일을 처리하여 zarr 파일들을 저장한다.
 
-    Parameters
-    ----------
-    vital_path:
-        .vital 파일 경로.
-    out_dir:
-        datasets/processed/ 루트 경로.
-    min_duration_s:
-        최소 유효 신호 길이 (초).
+    모든 유효 세그먼트를 개별 zarr로 저장한다.
 
     Returns
     -------
     (subject_id, session_id, recordings)
-    recordings는 manifest.json sessions[].recordings 항목 리스트.
     """
     import vitaldb
 
@@ -161,6 +223,7 @@ def process_vital(
 
         stype_key, spatial_id = TRACK_MAP[track_name]
         signal_type = SIGNAL_TYPES[stype_key]
+        cfg = SIGNAL_CONFIGS[stype_key]
 
         # 동일 (signal_type, spatial_id) 중복 시 첫 번째만 처리
         key = (signal_type, spatial_id)
@@ -172,14 +235,10 @@ def process_vital(
             trk = vf.find_track(track_name)
             native_sr = trk.srate if trk is not None and trk.srate > 0 else 0
             if native_sr <= 0:
-                # fallback: 일반적인 SR 추정
                 native_sr = 500.0
             data = vf.to_numpy(track_name, interval=1.0 / native_sr)
         except Exception as exc:
-            print(
-                f"    [WARN] {track_name} 로드 실패: {exc}",
-                file=sys.stderr,
-            )
+            print(f"    [WARN] {track_name} 로드 실패: {exc}", file=sys.stderr)
             continue
 
         if data is None or len(data) == 0:
@@ -187,55 +246,66 @@ def process_vital(
 
         data = data.flatten()
 
-        # NaN-free 세그먼트 추출
+        # ── Step 1: Physiological range check ──
+        if cfg.valid_range is not None:
+            data, n_bad = _apply_range_check(data, cfg.valid_range)
+            if n_bad > 0:
+                pct = n_bad / len(data) * 100
+                print(f"    [RANGE] {track_name}: {n_bad} samples ({pct:.1f}%) out of range", file=sys.stderr)
+
+        # ── Step 2: 전기소작기 아티팩트 제거 (ECG/EEG만) ──
+        if stype_key in ("ecg", "eeg"):
+            data, n_blanked = _detect_electrocautery(data, native_sr)
+            if n_blanked > 0:
+                pct = n_blanked / len(data) * 100
+                print(f"    [CAUTERY] {track_name}: {n_blanked} samples ({pct:.1f}%) blanked", file=sys.stderr)
+
+        # ── Step 3: NaN-free 세그먼트 추출 ──
         min_samples = int(min_duration_s * native_sr)
         segments = _extract_nan_free_segments(data, min_samples)
         if not segments:
-            print(
-                f"    [SKIP] {track_name}: 유효 세그먼트 없음 (min={min_duration_s}s)",
-                file=sys.stderr,
-            )
+            print(f"    [SKIP] {track_name}: 유효 세그먼트 없음 (min={min_duration_s}s)", file=sys.stderr)
             continue
 
-        # 가장 긴 세그먼트 선택
-        segment = max(segments, key=len)
+        # ── Step 4: 각 세그먼트별 처리 & 저장 ──
+        seg_count = 0
+        for seg_idx, segment in enumerate(segments):
+            # Flatline 검사
+            if segment.std() < 1e-6:
+                print(f"    [SKIP] {track_name} seg{seg_idx}: 플랫라인", file=sys.stderr)
+                continue
 
-        # Flatline 검사
-        if segment.std() < 1e-6:
-            print(
-                f"    [SKIP] {track_name}: 플랫라인",
-                file=sys.stderr,
-            )
-            continue
+            # Bandpass filtering (range check/cautery 이후 clean 세그먼트에 적용)
+            if cfg.bandpass is not None:
+                segment = _apply_bandpass(segment, cfg.bandpass[0], cfg.bandpass[1], native_sr)
 
-        # Resampling → TARGET_SR (100Hz)
-        if native_sr != TARGET_SR:
-            segment = resample_to_target(segment, orig_sr=native_sr, target_sr=TARGET_SR)
-            print(
-                f"    [RESAMPLE] {track_name}: {native_sr:.0f}Hz → {TARGET_SR:.0f}Hz "
-                f"({len(segment)} samples)",
-                file=sys.stderr,
-            )
+            # Resampling → TARGET_SR (100Hz)
+            if native_sr != TARGET_SR:
+                segment = resample_to_target(segment, orig_sr=native_sr, target_sr=TARGET_SR)
 
-        # (1, T) 형태로 저장 (정규화는 모델의 PackedScaler가 수행)
-        channel_data = segment.reshape(1, -1).astype(np.float32)
+            # (1, T) 형태로 저장
+            channel_data = segment.reshape(1, -1).astype(np.float32)
 
-        # zarr로 저장
-        fname = f"{session_id}_{stype_key}_{spatial_id}.zarr"
-        save_recording_zarr(channel_data, subj_out / fname)
+            # 파일명: seg 인덱스 포함
+            fname = f"{session_id}_{stype_key}_{spatial_id}_seg{seg_idx}.zarr"
+            save_recording_zarr(channel_data, subj_out / fname)
 
-        recordings.append(
-            {
+            recordings.append({
                 "signal_type": signal_type,
                 "file": fname,
                 "n_channels": 1,
                 "sampling_rate": TARGET_SR,
                 "n_timesteps": channel_data.shape[1],
                 "spatial_ids": [spatial_id],
-            }
-        )
-        processed_keys.add(key)
-        print(f"    saved {fname}  shape={tuple(channel_data.shape)}  fs={TARGET_SR:.0f}Hz")
+            })
+            seg_count += 1
+            duration_s = channel_data.shape[1] / TARGET_SR
+            print(f"    saved {fname}  shape={tuple(channel_data.shape)}  {duration_s:.0f}s")
+
+        if seg_count > 0:
+            processed_keys.add(key)
+            if seg_count > 1:
+                print(f"    [{track_name}] {seg_count}개 세그먼트 저장")
 
     return subject_id, session_id, recordings
 
