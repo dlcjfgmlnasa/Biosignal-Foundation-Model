@@ -73,6 +73,9 @@ class TrainConfig:
     output_dir: str = "outputs"
     checkpoint_every: int = 10  # 에폭 간격 체크포인트 저장
 
+    # 실험 관리
+    exp_name: str = ""  # 실험 이름 (비어있으면 output_dir 그대로 사용)
+
     # 실행 제한
     max_batches: int = 0  # >0이면 에폭당 최대 배치 수 제한
     dry_run: bool = False  # True면 1 batch만 실행 후 종료
@@ -389,6 +392,72 @@ def create_scheduler(
 def get_model_config(config: TrainConfig) -> dict[str, Any]:
     """checkpoint 저장용 모델 config dict."""
     return config.model_config.to_dict()
+
+
+def resolve_output_dir(config: TrainConfig) -> Path:
+    """exp_name이 설정되어 있으면 output_dir/exp_name/ 경로를 반환한다."""
+    base = Path(config.output_dir)
+    if config.exp_name:
+        return base / config.exp_name
+    return base
+
+
+def save_experiment_info(config: TrainConfig, output_dir: Path, phase_name: str, extra_info: dict[str, Any] | None = None) -> None:
+    """실험 정보를 experiment_info.txt 와 config.yaml로 저장한다."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # config.yaml 저장
+    config.to_yaml(output_dir / "config.yaml")
+
+    # experiment_info.txt 저장
+    mc = config.model_config
+    lines = [
+        f"# Experiment: {config.exp_name or phase_name}",
+        f"# Phase: {phase_name}",
+        f"",
+        f"[Model]",
+        f"d_model        = {mc.d_model}",
+        f"num_layers     = {mc.num_layers}",
+        f"patch_size     = {mc.patch_size}",
+        f"num_heads      = {mc.num_heads}",
+        f"num_groups     = {mc.num_groups}",
+        f"use_glu        = {mc.use_glu}",
+        f"use_moe        = {mc.use_moe}",
+        f"use_rope       = {mc.use_rope}",
+        f"use_cnn_stem   = {mc.use_cnn_stem}",
+        f"max_horizon    = {mc.max_horizon}",
+        f"",
+        f"[Training]",
+        f"batch_size     = {config.batch_size}",
+        f"lr             = {config.lr}",
+        f"n_epochs       = {config.n_epochs}",
+        f"warmup_epochs  = {config.warmup_epochs}",
+        f"mask_ratio     = {config.mask_ratio}",
+        f"collate_mode   = {config.collate_mode}",
+        f"seed           = {config.seed}",
+        f"",
+        f"[Loss]",
+        f"alpha (masked)      = {config.alpha}",
+        f"beta  (next-pred)   = {config.beta}",
+        f"gamma (cross-modal) = {config.gamma}",
+        f"delta (contrastive) = {config.delta}",
+        f"variate_mask_prob   = {config.variate_mask_prob}",
+        f"",
+        f"[Data]",
+        f"processed_dir  = {config.processed_dir}",
+        f"signal_types   = {config.signal_types}",
+        f"max_subjects   = {config.max_subjects}",
+        f"window_seconds = {config.window_seconds}",
+    ]
+
+    if extra_info:
+        lines.append("")
+        lines.append("[Extra]")
+        for k, v in extra_info.items():
+            lines.append(f"{k:15s}= {v}")
+
+    info_path = output_dir / "experiment_info.txt"
+    info_path.write_text("\n".join(lines), encoding="utf-8")
 
 
 def save_training_checkpoint(

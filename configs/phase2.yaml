@@ -54,6 +54,9 @@ learnable_temperature: true
 # ── Masking ──
 variate_mask_prob: 0.3  # variate-level 마스킹
 
+# ── 실험 관리 ──
+exp_name: ""  # 실험 이름 (output_dir/exp_name/ 하위에 저장, 비어있으면 output_dir 그대로)
+
 # ── 시스템 ──
 device: auto
 num_workers: 0

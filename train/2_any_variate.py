@@ -26,10 +26,13 @@ from .train_utils import (
     create_scheduler,
     load_manifest_from_processed,
     resolve_device,
+    resolve_output_dir,
+    save_experiment_info,
     save_training_checkpoint,
     set_seed,
     train_one_epoch,
 )
+from .visualize import save_reconstruction_figure
 
 
 def find_phase1_checkpoint(output_dir: str = "outputs/phase1_ci") -> Path | None:
@@ -111,6 +114,10 @@ def parse_args() -> argparse.Namespace:
     g.add_argument("--num_workers", type=int, default=0)
     g.add_argument("--output_dir", type=str, default="outputs/phase2_any_variate")
     g.add_argument("--checkpoint_every", type=int, default=5)
+    g.add_argument("--viz_every", type=int, default=5,
+                   help="N 에폭마다 reconstruction 시각화 저장 (0=비활성)")
+    g.add_argument("--exp_name", type=str, default="",
+                   help="실험 이름 (output_dir 하위 서브디렉토리)")
 
     return p.parse_args()
 
@@ -170,6 +177,9 @@ def main():
         # Phase 2: variate-level 마스킹
         variate_mask_prob=args.variate_mask_prob,
 
+        # 실험 관리
+        exp_name=args.exp_name,
+
         # 시스템
         device=args.device,
         num_workers=args.num_workers,
@@ -179,11 +189,13 @@ def main():
 
     set_seed(config.seed)
     device = resolve_device(config.device)
-    output_dir = Path(config.output_dir)
+    output_dir = resolve_output_dir(config)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"{'='*60}")
     print(f"Phase 2: Any-Variate Training (Cross-Modal)")
+    if config.exp_name:
+        print(f"Experiment: {config.exp_name}")
     print(f"Device: {device}")
     print(f"{'='*60}")
 
@@ -210,6 +222,14 @@ def main():
 
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Model params: {total_params:,}")
+
+    # 실험 정보 저장
+    save_experiment_info(config, output_dir, phase_name="Phase2_AV", extra_info={
+        "phase1_ckpt": ckpt_path,
+        "phase1_epoch": str(phase1_epoch),
+        "phase1_loss": str(phase1_loss),
+        "total_params": f"{total_params:,}",
+    })
 
     # ── 데이터 로딩 ──
     manifest = load_manifest_from_processed(
@@ -248,6 +268,29 @@ def main():
     )
     scheduler = create_scheduler(optimizer, config)
 
+    # ── 시각화용 배치 캐시 ──
+    viz_every = args.viz_every
+    viz_batches: list | None = None
+    viz_dir = None
+    if viz_every > 0:
+        viz_iter = iter(dataloader)
+        viz_batches = []
+        for _ in range(min(10, len(dataloader))):
+            try:
+                viz_batches.append(next(viz_iter))
+            except StopIteration:
+                break
+        del viz_iter
+        viz_dir = output_dir / "figures"
+        viz_dir.mkdir(parents=True, exist_ok=True)
+        n_types = len({
+            int(b.signal_types[j])
+            for b in viz_batches
+            for j in range(len(b.signal_types))
+        })
+        print(f"Visualization every {viz_every} epochs → {viz_dir}"
+              f"  ({len(viz_batches)} batches, {n_types} signal types)")
+
     # ── 학습 루프 ──
     best_loss = float("inf")
     print(f"\nStarting training: {config.n_epochs} epochs")
@@ -278,6 +321,15 @@ def main():
             f"contrastive: {losses['contrastive_loss']:.6f} | "
             f"LR: {current_lr:.2e}"
         )
+
+        # Reconstruction 시각화
+        if viz_batches is not None and (epoch % viz_every == 0 or epoch == config.n_epochs - 1):
+            fig_path = save_reconstruction_figure(
+                model, viz_batches, epoch=epoch,
+                output_dir=viz_dir, mask_ratio=config.mask_ratio,
+                device=device,
+            )
+            print(f"  → Reconstruction figure saved: {fig_path}")
 
         # Best model 저장
         if losses["total"] < best_loss:

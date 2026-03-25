@@ -35,6 +35,8 @@ from train.train_utils import (
     create_scheduler,
     load_manifest_from_processed,
     resolve_device,
+    resolve_output_dir,
+    save_experiment_info,
     save_training_checkpoint,
     set_seed,
     train_one_epoch,
@@ -66,6 +68,8 @@ def parse_args() -> argparse.Namespace:
     g.add_argument("--max_subjects", type=int, default=None)
     g.add_argument("--output_dir", type=str, default=None)
     g.add_argument("--seed", type=int, default=None)
+    g.add_argument("--exp_name", type=str, default=None,
+                    help="실험 이름 (output_dir 하위 서브디렉토리)")
 
     return p.parse_args()
 
@@ -95,6 +99,7 @@ def main():
         "max_subjects": args.max_subjects,
         "output_dir": args.output_dir,
         "seed": args.seed,
+        "exp_name": args.exp_name,
     }
     config = TrainConfig.from_yaml_with_overrides(args.config, overrides)
 
@@ -108,12 +113,14 @@ def main():
 
     set_seed(config.seed)
     device = resolve_device(config.device)
-    output_dir = Path(config.output_dir)
+    output_dir = resolve_output_dir(config)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # ── 설정 출력 ──
     print(f"{'='*60}")
     print(f"{phase_name} {'(dry-run)' if config.dry_run else ''}")
+    if config.exp_name:
+        print(f"Experiment: {config.exp_name}")
     print(f"Config: {args.config}")
     print(f"Device: {device}")
     print(f"{'='*60}")
@@ -177,9 +184,12 @@ def main():
     )
     scheduler = create_scheduler(optimizer, config)
 
-    # ── 설정 저장 (재현용) ──
+    # ── 실험 정보 & 설정 저장 (재현용) ──
     if not config.dry_run:
-        config.to_yaml(output_dir / "config.yaml")
+        extra = {}
+        if is_phase2 and ckpt_path:
+            extra["phase1_ckpt"] = ckpt_path
+        save_experiment_info(config, output_dir, phase_name=phase_name, extra_info=extra or None)
 
     # ── 학습 루프 ──
     best_loss = float("inf")

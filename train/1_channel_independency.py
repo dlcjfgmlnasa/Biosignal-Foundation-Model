@@ -34,6 +34,8 @@ from .train_utils import (
     is_main_process,
     load_manifest_from_processed,
     resolve_device,
+    resolve_output_dir,
+    save_experiment_info,
     save_training_checkpoint,
     set_seed,
     setup_ddp,
@@ -167,6 +169,9 @@ def main():
         # Phase 1은 variate-level 마스킹 비활성
         variate_mask_prob=0.0,
 
+        # 실험 관리
+        exp_name=args.exp_name,
+
         # 시스템
         device=args.device,
         num_workers=args.num_workers,
@@ -176,13 +181,16 @@ def main():
     )
 
     set_seed(config.seed + (local_rank if use_ddp else 0))
-    output_dir = Path(config.output_dir)
+    output_dir = resolve_output_dir(config)
     if rank0:
         output_dir.mkdir(parents=True, exist_ok=True)
+        save_experiment_info(config, output_dir, phase_name="Phase1_CI")
 
     if rank0:
         print(f"{'='*60}")
         print(f"Phase 1: Channel-Independent Pre-training")
+        if config.exp_name:
+            print(f"Experiment: {config.exp_name}")
         print(f"Device: {device}" + (f" (DDP: {world_size} GPUs)" if use_ddp else ""))
         print(f"{'='*60}")
 
@@ -248,16 +256,28 @@ def main():
     scheduler = create_scheduler(optimizer, config)
 
     # ── 시각화용 배치 캐시 (rank 0만) ──
+    # 여러 배치를 수집하여 신호 타입 다양성을 확보한다.
     viz_every = args.viz_every
-    viz_batch = None
+    viz_batches: list | None = None
     viz_dir = None
     if rank0 and viz_every > 0:
         viz_iter = iter(dataloader)
-        viz_batch = next(viz_iter)
+        viz_batches = []
+        for _ in range(min(10, len(dataloader))):
+            try:
+                viz_batches.append(next(viz_iter))
+            except StopIteration:
+                break
         del viz_iter
         viz_dir = output_dir / "figures"
         viz_dir.mkdir(parents=True, exist_ok=True)
-        print(f"Visualization every {viz_every} epochs → {viz_dir}")
+        n_types = len({
+            int(b.signal_types[j])
+            for b in viz_batches
+            for j in range(len(b.signal_types))
+        })
+        print(f"Visualization every {viz_every} epochs → {viz_dir}"
+              f"  ({len(viz_batches)} batches, {n_types} signal types)")
 
     # ── 학습 루프 ──
     best_loss = float("inf")
@@ -293,10 +313,10 @@ def main():
             )
 
             # Reconstruction 시각화
-            if viz_batch is not None and (epoch % viz_every == 0 or epoch == config.n_epochs - 1):
+            if viz_batches is not None and (epoch % viz_every == 0 or epoch == config.n_epochs - 1):
                 viz_model = model.module if use_ddp else model
                 fig_path = save_reconstruction_figure(
-                    viz_model, viz_batch, epoch=epoch,
+                    viz_model, viz_batches, epoch=epoch,
                     output_dir=viz_dir, mask_ratio=config.mask_ratio,
                     device=device,
                 )
