@@ -146,15 +146,20 @@ class ModalityCNNStem(nn.Module):
 
         flat_patches = patches.reshape(B * N, P)          # (B*N, P)
         flat_types = signal_types.reshape(B * N)           # (B*N,)
-        flat_output = torch.zeros(
-            B * N, self.d_model, device=device, dtype=dtype,
-        )
+        flat_output: torch.Tensor | None = None
 
         for t, stem in enumerate(self.stems):
             mask = flat_types == t                         # (B*N,)
             if mask.any():
                 selected = flat_patches[mask]              # (M_t, P)
                 embedded = stem(selected)                  # (M_t, d_model)
+                if flat_output is None:
+                    flat_output = torch.zeros(
+                        B * N, self.d_model, device=device, dtype=embedded.dtype,
+                    )
                 flat_output[mask] = embedded
+
+        if flat_output is None:
+            flat_output = torch.zeros(B * N, self.d_model, device=device, dtype=dtype)
 
         return flat_output.reshape(B, N, self.d_model)    # (B, N, d_model)
