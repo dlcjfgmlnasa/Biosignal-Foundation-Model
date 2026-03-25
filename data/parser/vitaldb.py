@@ -121,13 +121,6 @@ def _extract_nan_free_segments(
     return segments
 
 
-def _normalize(data: np.ndarray) -> np.ndarray:
-    """채널별 z-score 정규화. (C, T) → (C, T) float32."""
-    mean = data.mean(axis=-1, keepdims=True)
-    std = data.std(axis=-1, keepdims=True)
-    std = np.where(std < 1e-8, 1.0, std)
-    return ((data - mean) / std).astype(np.float32)
-
 
 def process_vital(
     vital_path: Path,
@@ -223,9 +216,8 @@ def process_vital(
                 file=sys.stderr,
             )
 
-        # (1, T) 형태로 정규화
-        channel_data = segment.reshape(1, -1)
-        channel_data = _normalize(channel_data)
+        # (1, T) 형태로 저장 (정규화는 모델의 PackedScaler가 수행)
+        channel_data = segment.reshape(1, -1).astype(np.float32)
 
         # zarr로 저장
         fname = f"{session_id}_{stype_key}_{spatial_id}.zarr"
