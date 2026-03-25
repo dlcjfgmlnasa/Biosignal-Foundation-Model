@@ -3,7 +3,7 @@
 
 신호 타입(ECG, EEG, EMG 등)별 전용 1D-CNN으로 raw patch에서
 저수준 특징을 추출한다. ``padding="same"`` + ``AdaptiveAvgPool1d(1)``
-구조로 임의의 patch_size를 처리할 수 있어 MultiResolution에도 호환된다.
+구조로 임의의 patch_size를 처리할 수 있다.
 """
 import torch
 from torch import nn

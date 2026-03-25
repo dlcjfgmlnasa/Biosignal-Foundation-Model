@@ -9,7 +9,7 @@ from .packed_scaler import (
     PackedAbsMeanScaler,
 )
 from .cnn_stem import Conv1dStem, ModalityCNNStem
-from .patch import PatchEmbedding, MultiResolutionPatchEmbedding
+from .patch import PatchEmbedding
 from .transformer import TransformerEncoderLayer, TransformerEncoder
 from .position import (
     AttentionBias,

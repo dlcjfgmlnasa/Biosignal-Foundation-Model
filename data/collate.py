@@ -36,10 +36,6 @@ class PackedBatch:
         per-variate patch 정렬된 길이. ``(total_variates,)``.
         패치가 설정된 경우에만 존재하며, 각 variate의 길이가
         ``patch_size``의 배수로 올림 패딩된 값이다. ``None``이면 미사용.
-    variate_patch_sizes:
-        per-variate 해상도별 패치 크기. ``(total_variates,)``.
-        ``patch_sizes`` (multi-resolution) 설정 시에만 존재한다.
-        ``None``이면 고정 patch_size 또는 미사용.
     """
 
     values: torch.Tensor  # (batch, max_length)
@@ -50,7 +46,6 @@ class PackedBatch:
     signal_types: torch.Tensor  # (total_variates,) long
     spatial_ids: torch.Tensor  # (total_variates,) long — 전역 spatial_id
     padded_lengths: Optional[torch.Tensor] = None  # (total_variates,) long
-    variate_patch_sizes: Optional[torch.Tensor] = None  # (total_variates,) long
 
 
 # ── 내부 데이터 구조 ────────────────────────────────────────────
@@ -67,7 +62,6 @@ class _PackUnit:
     variate_spatial_ids: list[int]  # per-variate 전역 spatial_id
     variate_lengths: list[int]
     padded_variate_lengths: list[int]
-    resolved_patch_sizes: list[int]  # per-variate resolved patch_size (빈 리스트 = 미사용)
 
 
 class PackCollate:
@@ -83,15 +77,9 @@ class PackCollate:
     collate_mode:
         그루핑 모드. ``"any_variate"`` (기본) 또는 ``"ci"`` (채널 독립).
     patch_size:
-        고정 패치 크기. ``patch_sizes``와 동시 사용 불가.
+        고정 패치 크기.
     stride:
         패치 간 보폭 (overlapping 지원). ``patch_size``와 함께 사용.
-    patch_sizes:
-        다중 해상도 패치 크기 목록 (e.g., ``[8, 16, 32, 64]``).
-        ``target_patch_duration_ms``와 함께 사용.
-    target_patch_duration_ms:
-        목표 패치 물리적 지속 시간 (ms). sampling_rate와 함께
-        가장 가까운 patch_size를 선택한다.
 
     Packing strategy: First-Fit Decreasing (FFD)
     """
@@ -102,21 +90,8 @@ class PackCollate:
         collate_mode: str = "any_variate",
         patch_size: Optional[int] = None,
         stride: Optional[int] = None,
-        patch_sizes: Optional[list[int]] = None,
-        target_patch_duration_ms: Optional[float] = None,
     ) -> None:
-        assert not (patch_size is not None and patch_sizes is not None), (
-            "patch_size와 patch_sizes는 동시에 사용할 수 없습니다."
-        )
-        if patch_sizes is not None:
-            assert target_patch_duration_ms is not None, (
-                "patch_sizes 사용 시 target_patch_duration_ms가 필요합니다."
-            )
-
         self.patch_size = patch_size
-        self.patch_sizes = sorted(patch_sizes) if patch_sizes is not None else None
-        self.target_patch_duration_ms = target_patch_duration_ms
-        self._multi_resolution = patch_sizes is not None
 
         if patch_size is not None:
             self.stride = stride if stride is not None else patch_size
@@ -131,11 +106,6 @@ class PackCollate:
 
         self.max_length = max_length
         self.collate_mode = collate_mode
-
-    def _resolve_variate_patch_size(self, sampling_rate: float) -> int:
-        """sampling_rate에서 가장 적합한 patch_size를 결정한다."""
-        ideal = sampling_rate * self.target_patch_duration_ms / 1000.0
-        return min(self.patch_sizes, key=lambda ps: abs(ps - ideal))
 
     def __call__(self, samples: list[BiosignalSample]) -> PackedBatch:
         # 1. 그루핑: collate_mode에 따라 키 결정
@@ -162,7 +132,6 @@ class PackCollate:
             variate_spatial_ids: list[int] = []
             variate_lengths: list[int] = []
             padded_variate_lengths: list[int] = []
-            resolved_ps_list: list[int] = []
             offset = 0
 
             # [최적화] Concat 전에 미리 길이 확인하여 초과분 제거
@@ -176,10 +145,7 @@ class PackCollate:
                 # per-variate patch 파라미터 결정
                 var_P: Optional[int] = None
                 var_S: Optional[int] = None
-                if self._multi_resolution:
-                    var_P = self._resolve_variate_patch_size(s.sampling_rate)
-                    var_S = var_P  # multi-resolution은 non-overlapping
-                elif self.patch_size is not None:
+                if self.patch_size is not None:
                     var_P = self.patch_size
                     var_S = self.stride
 
@@ -209,8 +175,6 @@ class PackCollate:
                 )
                 variate_lengths.append(seg_len)
                 padded_variate_lengths.append(padded_seg_len)
-                if var_P is not None:
-                    resolved_ps_list.append(var_P)
                 offset += effective_len
 
             # Concat은 이미 max_length 이하이므로 재정리 불필요
@@ -227,7 +191,6 @@ class PackCollate:
                         variate_spatial_ids=variate_spatial_ids,
                         variate_lengths=variate_lengths,
                         padded_variate_lengths=padded_variate_lengths,
-                        resolved_patch_sizes=resolved_ps_list,
                     )
                 )
 
@@ -252,7 +215,6 @@ class PackCollate:
         all_rates: list[float] = []
         all_types: list[int] = []
         all_spatial_ids: list[int] = []
-        all_resolved_ps: list[int] = []
 
         for row_idx, (contents, row_len) in enumerate(zip(bins, row_lengths)):
             row_values = torch.zeros(row_len)
@@ -285,7 +247,6 @@ class PackCollate:
                     all_rates.extend(unit.variate_rates)
                     all_types.extend(unit.variate_types)
                     all_spatial_ids.extend(unit.variate_spatial_ids)
-                    all_resolved_ps.extend(unit.resolved_patch_sizes)
                 else:
                     # Trimmed unit: 포함된 variates만
                     for var_id, (_ch_idx, start, end) in enumerate(unit.channel_spans):
@@ -302,10 +263,6 @@ class PackCollate:
                             all_spatial_ids.append(
                                 unit.variate_spatial_ids[var_id]
                             )
-                            if var_id < len(unit.resolved_patch_sizes):
-                                all_resolved_ps.append(
-                                    unit.resolved_patch_sizes[var_id]
-                                )
 
                 row_offset += actual_seg_len
                 if row_offset >= row_len:
@@ -325,15 +282,9 @@ class PackCollate:
             padded_ids[i, : ids.shape[0]] = ids
             padded_var_ids[i, : var_ids.shape[0]] = var_ids
 
-        uses_patching = self.patch_size is not None or self._multi_resolution
         padded_lengths_tensor = (
             torch.tensor(all_padded_lengths, dtype=torch.long)
-            if uses_patching
-            else None
-        )
-        variate_ps_tensor = (
-            torch.tensor(all_resolved_ps, dtype=torch.long)
-            if self._multi_resolution
+            if self.patch_size is not None
             else None
         )
 
@@ -346,7 +297,6 @@ class PackCollate:
             signal_types=torch.tensor(all_types, dtype=torch.long),
             spatial_ids=torch.tensor(all_spatial_ids, dtype=torch.long),
             padded_lengths=padded_lengths_tensor,
-            variate_patch_sizes=variate_ps_tensor,
         )
 
     # ── FFD 패킹 ─────────────────────────────────────────────────

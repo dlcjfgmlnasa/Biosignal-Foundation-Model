@@ -19,8 +19,6 @@ def create_dataloader(
     collate_mode: str = "any_variate",
     patch_size: int | None = None,
     stride: int | None = None,
-    patch_sizes: list[int] | None = None,
-    target_patch_duration_ms: float | None = None,
 ) -> DataLoader:
     """PackCollate가 적용된 DataLoader를 생성한다.
 
@@ -53,19 +51,12 @@ def create_dataloader(
         패치 크기. 설정 시 PackCollate가 variate 길이를 patch_size 배수로 정렬.
     stride:
         패치 보폭 (overlapping 시). ``None``이면 ``patch_size``와 동일.
-    patch_sizes:
-        다중 해상도 패치 크기 후보 목록. ``patch_size``와 동시 사용 불가.
-    target_patch_duration_ms:
-        목표 패치 시간(ms). ``patch_sizes``와 함께 사용하여
-        sampling rate별 최적 patch_size를 자동 선택.
     """
     collate_fn = PackCollate(
         max_length=max_length,
         collate_mode=collate_mode,
         patch_size=patch_size,
         stride=stride,
-        patch_sizes=patch_sizes,
-        target_patch_duration_ms=target_patch_duration_ms,
     )
 
     # any_variate 모드: GroupedBatchSampler로 같은 (session, time) 채널들을 같은 배치에 넣기

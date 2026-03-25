@@ -482,7 +482,6 @@ def _append_patch_to_batch(
             signal_types=batch.signal_types,
             spatial_ids=batch.spatial_ids,
             padded_lengths=batch.padded_lengths,
-            variate_patch_sizes=batch.variate_patch_sizes,
         )
 
     # 새 패치를 각 row에 append
