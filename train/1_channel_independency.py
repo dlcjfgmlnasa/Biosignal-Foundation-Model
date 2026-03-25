@@ -272,7 +272,10 @@ def main():
                 break
         del viz_iter
         viz_dir = output_dir / "figures"
-        viz_dir.mkdir(parents=True, exist_ok=True)
+        viz_recon_dir = viz_dir / "recon"
+        viz_np_dir = viz_dir / "next_pred"
+        viz_recon_dir.mkdir(parents=True, exist_ok=True)
+        viz_np_dir.mkdir(parents=True, exist_ok=True)
         n_types = len({
             int(b.signal_types[j])
             for b in viz_batches
@@ -319,13 +322,13 @@ def main():
                 viz_model = model.module if use_ddp else model
                 fig_path = save_reconstruction_figure(
                     viz_model, viz_batches, epoch=epoch,
-                    output_dir=viz_dir, mask_ratio=config.mask_ratio,
+                    output_dir=viz_recon_dir, mask_ratio=config.mask_ratio,
                     device=device,
                 )
                 print(f"  → Reconstruction figure saved: {fig_path}")
                 np_path = save_next_pred_figure(
                     viz_model, viz_batches, epoch=epoch,
-                    output_dir=viz_dir, horizon=1,
+                    output_dir=viz_np_dir, horizon=1,
                     device=device,
                 )
                 print(f"  → Next-pred figure saved: {np_path}")
