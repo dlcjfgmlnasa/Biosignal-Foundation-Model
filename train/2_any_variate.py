@@ -44,18 +44,20 @@ from .visualize import save_reconstruction_figure, save_next_pred_figure
 def find_phase1_checkpoint(output_dir: str = "outputs/phase1_ci") -> Path | None:
     """Phase 1 best 또는 final checkpoint를 자동 탐색한다."""
     base = Path(output_dir)
-    # best 우선
-    best_candidates = sorted(base.glob("*_best.pt"))
-    if best_candidates:
-        return best_candidates[-1]
-    # final 차선
-    final_candidates = sorted(base.glob("*_final.pt"))
-    if final_candidates:
-        return final_candidates[-1]
-    # 아무거나
-    all_ckpts = sorted(base.glob("*.pt"))
-    if all_ckpts:
-        return all_ckpts[-1]
+    # checkpoints/ 하위 디렉토리 우선, 없으면 base에서 탐색 (하위 호환)
+    search_dirs = [base / "checkpoints", base]
+    for d in search_dirs:
+        if not d.exists():
+            continue
+        best_candidates = sorted(d.glob("*_best.pt"))
+        if best_candidates:
+            return best_candidates[-1]
+        final_candidates = sorted(d.glob("*_final.pt"))
+        if final_candidates:
+            return final_candidates[-1]
+        all_ckpts = sorted(d.glob("*.pt"))
+        if all_ckpts:
+            return all_ckpts[-1]
     return None
 
 

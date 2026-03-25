@@ -725,10 +725,11 @@ def save_training_checkpoint(
     tag: str = "",
 ) -> Path:
     """학습 checkpoint를 저장하고 경로를 반환한다."""
-    output_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_dir = output_dir / "checkpoints"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
     suffix = f"_{tag}" if tag else ""
     filename = f"checkpoint_{phase_name}_epoch{epoch:03d}{suffix}.pt"
-    path = output_dir / filename
+    path = ckpt_dir / filename
     save_checkpoint(
         path, model, optimizer=optimizer, epoch=epoch,
         config=get_model_config(config),
