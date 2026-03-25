@@ -109,9 +109,12 @@ class NextPredictionLoss(nn.Module):
         같은 (sample_id, time_id)에서 서로 다른 variate_id를 가진 패치 쌍을 매칭하고,
         cross_pred[b, i]가 original_patches[b, j]를 예측하도록 MSE를 계산한다.
         """
-        # group_key: (sample_id, time_id)가 같은 패치를 그룹핑
+        # group_key: (batch, sample_id, time_id)가 같은 패치를 그룹핑
+        B, N = time_id.shape
         K = time_id.max().item() + 1
-        group_key = patch_sample_id * K + time_id  # (B, N)
+        S = patch_sample_id.max().item() + 1
+        batch_idx = torch.arange(B, device=time_id.device).unsqueeze(-1)  # (B, 1)
+        group_key = batch_idx * (S * K) + patch_sample_id * K + time_id  # (B, N)
 
         # (B, N, N) pairwise 비교
         same_group = group_key.unsqueeze(-1) == group_key.unsqueeze(-2)

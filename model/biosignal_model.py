@@ -205,7 +205,7 @@ class BiosignalFoundationModel(nn.Module):
             sample_id=batch.sample_id,
             variate_id=batch.variate_id,
         )
-        normalized = ((values - loc) / scale).squeeze(-1)  # (B, L)
+        normalized = ((values - loc) / scale.clamp(min=1e-8)).squeeze(-1)  # (B, L)
 
         # 2. Patchify (projection 전 raw patches 추출)
         patches, p_sid, p_vid, time_id, patch_mask = self.patch_embed.patchify(
