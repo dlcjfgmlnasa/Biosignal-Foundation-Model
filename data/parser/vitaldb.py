@@ -192,6 +192,49 @@ def _parse_subject_id(vital_path: Path) -> tuple[str, str]:
     return subject_id, session_id
 
 
+def _save_subject_manifest(
+    subj_dir: Path,
+    subject_id: str,
+    session_id: str,
+    recordings: list[dict],
+) -> None:
+    """subject의 manifest.json을 즉시 갱신한다.
+
+    기존 manifest가 있으면 세션/레코딩을 병합하고,
+    없으면 새로 생성한다. zarr 저장 직후 호출하여
+    중단 시에도 manifest 유실을 방지한다.
+    """
+    manifest_path = subj_dir / "manifest.json"
+
+    if manifest_path.exists():
+        with open(manifest_path, encoding="utf-8") as f:
+            manifest = json.load(f)
+        # 같은 session_id가 있으면 recordings 병합, 없으면 세션 추가
+        existing_session = None
+        for s in manifest["sessions"]:
+            if s["session_id"] == session_id:
+                existing_session = s
+                break
+        if existing_session is not None:
+            existing_files = {r["file"] for r in existing_session["recordings"]}
+            for rec in recordings:
+                if rec["file"] not in existing_files:
+                    existing_session["recordings"].append(rec)
+        else:
+            manifest["sessions"].append(
+                {"session_id": session_id, "recordings": recordings}
+            )
+    else:
+        manifest = {
+            "subject_id": subject_id,
+            "source": "vitaldb",
+            "sessions": [{"session_id": session_id, "recordings": recordings}],
+        }
+
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2, ensure_ascii=False)
+
+
 def process_vital(
     vital_path: Path,
     out_dir: Path,
@@ -199,7 +242,8 @@ def process_vital(
 ) -> tuple[str, str, list[dict]]:
     """단일 .vital 파일을 처리하여 zarr 파일들을 저장한다.
 
-    모든 유효 세그먼트를 개별 zarr로 저장한다.
+    각 트랙의 zarr 저장 직후 manifest.json을 갱신하여,
+    중간 중단 시에도 이미 저장된 데이터의 manifest가 유지된다.
 
     Returns
     -------
@@ -269,6 +313,7 @@ def process_vital(
 
         # ── Step 4: 각 세그먼트별 처리 & 저장 ──
         seg_count = 0
+        track_recordings: list[dict] = []
         for seg_idx, segment in enumerate(segments):
             # Flatline 검사
             if segment.std() < 1e-6:
@@ -290,20 +335,24 @@ def process_vital(
             fname = f"{session_id}_{stype_key}_{spatial_id}_seg{seg_idx}.zarr"
             save_recording_zarr(channel_data, subj_out / fname)
 
-            recordings.append({
+            rec = {
                 "signal_type": signal_type,
                 "file": fname,
                 "n_channels": 1,
                 "sampling_rate": TARGET_SR,
                 "n_timesteps": channel_data.shape[1],
                 "spatial_ids": [spatial_id],
-            })
+            }
+            track_recordings.append(rec)
+            recordings.append(rec)
             seg_count += 1
             duration_s = channel_data.shape[1] / TARGET_SR
             print(f"    saved {fname}  shape={tuple(channel_data.shape)}  {duration_s:.0f}s")
 
         if seg_count > 0:
             processed_keys.add(key)
+            # 트랙 처리 완료 즉시 manifest 갱신
+            _save_subject_manifest(subj_out, subject_id, session_id, track_recordings)
             if seg_count > 1:
                 print(f"    [{track_name}] {seg_count}개 세그먼트 저장")
 
@@ -396,28 +445,8 @@ def main() -> None:
             print(f"    [SKIP] 유효 레코딩 없음")
             continue
 
-        # ── 즉시 manifest.json 저장 (중단 시에도 유실 방지) ──
-        subj_dir = out_dir / subject_id
-        manifest_path = subj_dir / "manifest.json"
-
-        # 기존 manifest가 있으면 세션 병합
-        if manifest_path.exists():
-            with open(manifest_path, encoding="utf-8") as f:
-                existing_manifest = json.load(f)
-            existing_manifest["sessions"].append(
-                {"session_id": session_id, "recordings": recordings}
-            )
-        else:
-            existing_manifest = {
-                "subject_id": subject_id,
-                "source": "vitaldb",
-                "sessions": [{"session_id": session_id, "recordings": recordings}],
-            }
-
-        with open(manifest_path, "w", encoding="utf-8") as f:
-            json.dump(existing_manifest, f, indent=2, ensure_ascii=False)
-
-        # manifest.jsonl에 즉시 추가
+        # manifest.json은 process_vital() 내부에서 트랙마다 즉시 저장됨
+        # 여기서는 manifest.jsonl 인덱스만 관리
         if subject_id not in existing_subjects:
             with open(jsonl_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(
