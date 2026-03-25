@@ -162,11 +162,13 @@ def _process_batch_next_pred(
     batch: PackedBatch,
     horizon: int,
     device: torch.device | None,
+    n_samples: int = 8,
 ) -> list[_RowCandidate]:
     """Next-patch prediction 후보를 추출한다.
 
     next_pred[i]가 original[i+H]를 예측하므로,
     비교를 위해 pred_patches를 H만큼 shift하여 저장한다.
+    가독성을 위해 ``n_samples``개 위치만 균등 간격으로 선택한다.
     """
     if device is not None:
         _batch_to_device(batch, device)
@@ -198,9 +200,17 @@ def _process_batch_next_pred(
         sig_name = SIGNAL_TYPE_NAMES.get(sig_type, "?")
 
         # next_pred[i] → original[i+H] 대응
-        # shift: pred_patches[i+H] = next_pred[i]  (0 <= i < n_valid - H)
+        # 전체 중 n_samples개만 균등 간격으로 선택
+        n_predictable = n_valid - horizon
+        show_count = min(n_samples, n_predictable)
+        if show_count <= 0:
+            continue
+        show_indices = np.linspace(0, n_predictable - 1, show_count, dtype=int)
+
         pred = np.full((n_valid, P), np.nan)
-        pred[horizon:n_valid] = next_pred[b, :n_valid - horizon].cpu().numpy()
+        next_pred_np = next_pred[b, :n_predictable].cpu().numpy()
+        for idx in show_indices:
+            pred[idx + horizon] = next_pred_np[idx]
 
         candidates.append(_RowCandidate(
             orig_patches=original_patches[b, :n_valid].cpu().numpy(),
