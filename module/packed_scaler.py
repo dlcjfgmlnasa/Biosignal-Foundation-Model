@@ -1,13 +1,12 @@
 # -*- coding:utf-8 -*-
 """Packed scalers for normalizing packed time series batches.
 
-Ported from Salesforce uni2ts (Apache 2.0).
-Adapted: uses local safe_div helper instead of uni2ts.common.torch_util.
+Originally ported from Salesforce uni2ts (Apache 2.0).
+Rewritten to use scatter-based O(L) grouping instead of O(L^2) pairwise masks.
 """
 from typing import Optional
 
 import torch
-from einops import reduce
 from torch import nn
 
 from ._util import safe_div
@@ -53,6 +52,15 @@ class PackedScaler(nn.Module):
         raise NotImplementedError
 
 
+def _make_group_key(
+    sample_id: torch.Tensor,  # (B, L)
+    variate_id: torch.Tensor,  # (B, L)
+) -> torch.Tensor:  # (B, L)
+    """(sample_id, variate_id) 쌍을 단일 정수 group key로 변환한다."""
+    max_vid = variate_id.max().item() + 1
+    return sample_id * max_vid + variate_id
+
+
 class PackedNOPScaler(PackedScaler):
     """No-op scaler: loc=0, scale=1."""
 
@@ -72,7 +80,10 @@ class PackedNOPScaler(PackedScaler):
 
 
 class PackedStdScaler(PackedScaler):
-    """Z-score normalization with Bessel's correction, grouped by sample_id/variate_id."""
+    """Z-score normalization with Bessel's correction, grouped by sample_id/variate_id.
+
+    scatter_add 기반 O(L) 구현. 기존 O(L^2) pairwise id_mask 대비 메모리 효율적.
+    """
 
     def __init__(self, correction: int = 1, minimum_scale: float = 1e-5):
         super().__init__()
@@ -81,48 +92,56 @@ class PackedStdScaler(PackedScaler):
 
     def _get_loc_scale(
         self,
-        target: torch.Tensor,  # (*batch, seq_len, #dim)
-        observed_mask: torch.Tensor,  # (*batch, seq_len, #dim) bool
-        sample_id: torch.Tensor,  # (*batch, seq_len) long
-        variate_id: torch.Tensor,  # (*batch, seq_len) long
+        target: torch.Tensor,  # (B, L, D)
+        observed_mask: torch.Tensor,  # (B, L, D) bool
+        sample_id: torch.Tensor,  # (B, L) long
+        variate_id: torch.Tensor,  # (B, L) long
     ) -> tuple[
-        torch.Tensor,  # (*batch, seq_len, #dim) — loc
-        torch.Tensor,  # (*batch, seq_len, #dim) — scale
+        torch.Tensor,  # (B, L, D) — loc
+        torch.Tensor,  # (B, L, D) — scale
     ]:
-        id_mask = torch.logical_and(
-            torch.eq(sample_id.unsqueeze(-1), sample_id.unsqueeze(-2)),
-            torch.eq(variate_id.unsqueeze(-1), variate_id.unsqueeze(-2)),
-        )
-        tobs = reduce(
-            id_mask * reduce(observed_mask, "... seq dim -> ... 1 seq", "sum"),
-            "... seq1 seq2 -> ... seq1 1",
-            "sum",
-        )
-        loc = reduce(
-            id_mask * reduce(target * observed_mask, "... seq dim -> ... 1 seq", "sum"),
-            "... seq1 seq2 -> ... seq1 1",
-            "sum",
-        )
-        loc = safe_div(loc, tobs)
-        var = reduce(
-            id_mask
-            * reduce(
-                ((target - loc) ** 2) * observed_mask,
-                "... seq dim -> ... 1 seq",
-                "sum",
-            ),
-            "... seq1 seq2 -> ... seq1 1",
-            "sum",
-        )
-        var = safe_div(var, (tobs - self.correction))
-        scale = torch.sqrt(var + self.minimum_scale)
-        loc[sample_id == 0] = 0
-        scale[sample_id == 0] = 1
+        B, L, D = target.shape
+        group_key = _make_group_key(sample_id, variate_id)  # (B, L)
+        n_groups = group_key.max().item() + 1
+
+        # group_key를 D 차원으로 확장
+        gk = group_key.unsqueeze(-1).expand(B, L, D)  # (B, L, D)
+        obs_float = observed_mask.to(target.dtype)  # (B, L, D)
+
+        # 그룹별 관측 수
+        group_count = torch.zeros(B, n_groups, D, dtype=target.dtype, device=target.device)
+        group_count.scatter_add_(1, gk, obs_float)  # (B, n_groups, D)
+
+        # 그룹별 합
+        group_sum = torch.zeros(B, n_groups, D, dtype=target.dtype, device=target.device)
+        group_sum.scatter_add_(1, gk, target * obs_float)  # (B, n_groups, D)
+
+        # 그룹별 평균 → per-timestep loc
+        group_loc = safe_div(group_sum, group_count)  # (B, n_groups, D)
+        loc = group_loc.gather(1, gk)  # (B, L, D)
+
+        # 그룹별 분산
+        diff_sq = ((target - loc) ** 2) * obs_float  # (B, L, D)
+        group_var_sum = torch.zeros(B, n_groups, D, dtype=target.dtype, device=target.device)
+        group_var_sum.scatter_add_(1, gk, diff_sq)  # (B, n_groups, D)
+
+        group_var = safe_div(group_var_sum, (group_count - self.correction).clamp(min=0))
+        group_scale = torch.sqrt(group_var + self.minimum_scale)  # (B, n_groups, D)
+        scale = group_scale.gather(1, gk)  # (B, L, D)
+
+        # 패딩 위치(sample_id==0) 초기화
+        padding = (sample_id == 0).unsqueeze(-1)  # (B, L, 1)
+        loc = loc.masked_fill(padding, 0.0)
+        scale = scale.masked_fill(padding, 1.0)
+
         return loc, scale
 
 
 class PackedAbsMeanScaler(PackedScaler):
-    """Absolute mean scaling, grouped by sample_id/variate_id."""
+    """Absolute mean scaling, grouped by sample_id/variate_id.
+
+    scatter_add 기반 O(L) 구현.
+    """
 
     def __init__(self, minimum_scale: float = 1e-5):
         super().__init__()
@@ -130,33 +149,39 @@ class PackedAbsMeanScaler(PackedScaler):
 
     def _get_loc_scale(
         self,
-        target: torch.Tensor,  # (*batch, seq_len, #dim)
-        observed_mask: torch.Tensor,  # (*batch, seq_len, #dim) bool
-        sample_id: torch.Tensor,  # (*batch, seq_len) long
-        variate_id: torch.Tensor,  # (*batch, seq_len) long
+        target: torch.Tensor,  # (B, L, D)
+        observed_mask: torch.Tensor,  # (B, L, D) bool
+        sample_id: torch.Tensor,  # (B, L) long
+        variate_id: torch.Tensor,  # (B, L) long
     ) -> tuple[
-        torch.Tensor,  # (*batch, seq_len, #dim) — loc
-        torch.Tensor,  # (*batch, seq_len, #dim) — scale
+        torch.Tensor,  # (B, L, D) — loc
+        torch.Tensor,  # (B, L, D) — scale
     ]:
-        id_mask = torch.logical_and(
-            torch.eq(sample_id.unsqueeze(-1), sample_id.unsqueeze(-2)),
-            torch.eq(variate_id.unsqueeze(-1), variate_id.unsqueeze(-2)),
-        )
-        tobs = reduce(
-            id_mask * reduce(observed_mask, "... seq dim -> ... 1 seq", "sum"),
-            "... seq1 seq2 -> ... seq1 1",
-            "sum",
-        )
-        scale = reduce(
-            id_mask
-            * reduce(target.abs() * observed_mask, "... seq dim -> ... 1 seq", "sum"),
-            "... seq1 seq2 -> ... seq1 1",
-            "sum",
-        )
-        scale = safe_div(scale, tobs)
-        scale = torch.clamp(scale, min=self.minimum_scale)
+        B, L, D = target.shape
+        group_key = _make_group_key(sample_id, variate_id)  # (B, L)
+        n_groups = group_key.max().item() + 1
+
+        gk = group_key.unsqueeze(-1).expand(B, L, D)  # (B, L, D)
+        obs_float = observed_mask.to(target.dtype)  # (B, L, D)
+
+        # 그룹별 관측 수
+        group_count = torch.zeros(B, n_groups, D, dtype=target.dtype, device=target.device)
+        group_count.scatter_add_(1, gk, obs_float)
+
+        # 그룹별 절대값 합
+        group_abs_sum = torch.zeros(B, n_groups, D, dtype=target.dtype, device=target.device)
+        group_abs_sum.scatter_add_(1, gk, target.abs() * obs_float)
+
+        # 그룹별 절대 평균 → scale
+        group_scale = safe_div(group_abs_sum, group_count)
+        group_scale = torch.clamp(group_scale, min=self.minimum_scale)
+        scale = group_scale.gather(1, gk)  # (B, L, D)
+
         loc = torch.zeros_like(scale)
 
-        loc[sample_id == 0] = 0
-        scale[sample_id == 0] = 1
+        # 패딩 위치 초기화
+        padding = (sample_id == 0).unsqueeze(-1)
+        loc = loc.masked_fill(padding, 0.0)
+        scale = scale.masked_fill(padding, 1.0)
+
         return loc, scale
