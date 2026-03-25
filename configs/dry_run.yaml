@@ -4,7 +4,7 @@
 model_config:
   d_model: 64
   num_layers: 1
-  patch_size: 128
+  patch_size: 100
   stride: null
   num_heads: null
   num_groups: null

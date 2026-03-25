@@ -58,7 +58,7 @@ class ModelConfig:
     # Architecture
     d_model: int = 64
     num_layers: int = 2
-    patch_size: int = 128
+    patch_size: int = 100
     stride: int | None = None
     num_heads: int | None = None
     num_groups: int | None = None

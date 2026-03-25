@@ -49,7 +49,7 @@ def parse_args() -> argparse.Namespace:
     g = p.add_argument_group("Model")
     g.add_argument("--d_model", type=int, default=64)
     g.add_argument("--num_layers", type=int, default=2)
-    g.add_argument("--patch_size", type=int, default=128)
+    g.add_argument("--patch_size", type=int, default=100)
     g.add_argument("--num_heads", type=int, default=None)
     g.add_argument("--num_groups", type=int, default=None)
     g.add_argument("--use_glu", action=argparse.BooleanOptionalAction, default=True)
