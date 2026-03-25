@@ -2,7 +2,7 @@
 # Usage: python main.py --config configs/dry_run.yaml
 
 model_config:
-  d_model: 32
+  d_model: 64
   num_layers: 1
   patch_size: 128
   stride: null

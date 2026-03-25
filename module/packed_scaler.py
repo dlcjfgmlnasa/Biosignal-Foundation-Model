@@ -124,6 +124,10 @@ class PackedStdScaler(PackedScaler):
 class PackedAbsMeanScaler(PackedScaler):
     """Absolute mean scaling, grouped by sample_id/variate_id."""
 
+    def __init__(self, minimum_scale: float = 1e-5):
+        super().__init__()
+        self.minimum_scale = minimum_scale
+
     def _get_loc_scale(
         self,
         target: torch.Tensor,  # (*batch, seq_len, #dim)
@@ -150,6 +154,7 @@ class PackedAbsMeanScaler(PackedScaler):
             "sum",
         )
         scale = safe_div(scale, tobs)
+        scale = torch.clamp(scale, min=self.minimum_scale)
         loc = torch.zeros_like(scale)
 
         loc[sample_id == 0] = 0
