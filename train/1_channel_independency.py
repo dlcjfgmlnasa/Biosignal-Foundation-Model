@@ -27,6 +27,7 @@ from data import BiosignalDataset, create_dataloader
 from loss.criterion import CombinedLoss
 from model import BiosignalFoundationModel, ModelConfig
 from .train_utils import (
+    EarlyStopping,
     TrainConfig,
     cleanup_ddp,
     create_scheduler,
@@ -39,7 +40,9 @@ from .train_utils import (
     save_training_checkpoint,
     set_seed,
     setup_ddp,
+    split_manifest_by_subject,
     train_one_epoch,
+    validate,
 )
 from .visualize import save_reconstruction_figure, save_next_pred_figure
 
@@ -88,6 +91,10 @@ def parse_args() -> argparse.Namespace:
     g.add_argument("--alpha", type=float, default=1.0, help="Masked reconstruction weight")
     g.add_argument("--beta", type=float, default=1.0, help="Next-patch prediction weight")
     g.add_argument("--delta", type=float, default=0.0, help="Contrastive loss weight (0=disabled)")
+    g.add_argument("--val_ratio", type=float, default=0.2,
+                   help="Validation 비율 (subject 단위, 0=비활성)")
+    g.add_argument("--patience", type=int, default=10,
+                   help="Early stopping patience (0=비활성)")
 
     # System
     g = p.add_argument_group("System")
@@ -171,6 +178,10 @@ def main():
         # Phase 1은 variate-level 마스킹 비활성
         variate_mask_prob=0.0,
 
+        # Validation & Early Stopping
+        val_ratio=args.val_ratio,
+        patience=args.patience,
+
         # 실험 관리
         exp_name=args.exp_name,
 
@@ -205,13 +216,24 @@ def main():
     if rank0:
         print(f"Loaded {len(manifest)} recordings")
 
+    # Train/Val split (subject 단위)
+    val_dataloader = None
+    if config.val_ratio > 0:
+        train_manifest, val_manifest = split_manifest_by_subject(
+            manifest, val_ratio=config.val_ratio, seed=config.seed,
+        )
+        if rank0:
+            print(f"Train/Val split: {len(train_manifest)} train, {len(val_manifest)} val recordings")
+    else:
+        train_manifest = manifest
+
     dataset = BiosignalDataset(
-        manifest,
+        train_manifest,
         window_seconds=config.window_seconds,
         cache_size=config.cache_size,
     )
     if rank0:
-        print(f"Dataset size: {len(dataset)} windows")
+        print(f"Train dataset: {len(dataset)} windows")
 
     # DDP: DistributedSampler 사용
     sampler = None
@@ -232,7 +254,27 @@ def main():
         sampler=sampler,
     )
     if rank0:
-        print(f"Batches per epoch: {len(dataloader)}")
+        print(f"Train batches per epoch: {len(dataloader)}")
+
+    # Validation dataloader
+    if config.val_ratio > 0:
+        val_dataset = BiosignalDataset(
+            val_manifest,
+            window_seconds=config.window_seconds,
+            cache_size=config.cache_size,
+        )
+        val_dataloader = create_dataloader(
+            val_dataset,
+            max_length=config.max_length,
+            batch_size=config.batch_size,
+            shuffle=False,
+            num_workers=config.num_workers,
+            collate_mode=config.collate_mode,
+            patch_size=config.model_config.patch_size,
+            pin_memory=True,
+        )
+        if rank0:
+            print(f"Val dataset: {len(val_dataset)} windows, {len(val_dataloader)} batches")
 
     # ── 모델 ──
     model = BiosignalFoundationModel.from_config(config.model_config)
@@ -286,11 +328,14 @@ def main():
 
     # ── 학습 루프 ──
     best_loss = float("inf")
+    early_stopper = EarlyStopping(patience=config.patience) if config.patience > 0 else None
     if rank0:
         print(f"\nStarting training: {config.n_epochs} epochs")
         print(f"  alpha={config.alpha}, beta={config.beta}, gamma={config.gamma}")
         print(f"  max_horizon={config.model_config.max_horizon}, mask_ratio={config.mask_ratio}")
         print(f"  warmup_epochs={config.warmup_epochs}")
+        if val_dataloader is not None:
+            print(f"  val_ratio={config.val_ratio}, patience={config.patience}")
         print(f"{'='*60}")
 
     for epoch in range(config.n_epochs):
@@ -307,15 +352,26 @@ def main():
         )
         scheduler.step()
 
+        # ── Validation ──
+        val_losses = None
+        if val_dataloader is not None:
+            val_losses = validate(
+                model, val_dataloader, criterion,
+                config=config, device=device, phase_name="Phase1_CI",
+            )
+
         if rank0:
             current_lr = optimizer.param_groups[0]["lr"]
-            print(
+            line = (
                 f"Epoch {epoch:3d} | "
-                f"total: {losses['total']:.6f} | "
+                f"train: {losses['total']:.6f} | "
                 f"masked: {losses['masked_loss']:.6f} | "
-                f"next: {losses['next_loss']:.6f} | "
-                f"LR: {current_lr:.2e}"
+                f"next: {losses['next_loss']:.6f}"
             )
+            if val_losses is not None:
+                line += f" | val: {val_losses['total']:.6f}"
+            line += f" | LR: {current_lr:.2e}"
+            print(line)
 
             # Reconstruction & Next-Pred 시각화
             if viz_batches is not None and (epoch % viz_every == 0 or epoch == config.n_epochs - 1):
@@ -333,9 +389,10 @@ def main():
                 )
                 print(f"  → Next-pred figure saved: {np_path}")
 
-            # Best model 저장
-            if losses["total"] < best_loss:
-                best_loss = losses["total"]
+            # Best model 저장 (val_loss 기준, 없으면 train_loss)
+            track_loss = val_losses["total"] if val_losses is not None else losses["total"]
+            if track_loss < best_loss:
+                best_loss = track_loss
                 save_model = model.module if use_ddp else model
                 path = save_training_checkpoint(
                     save_model, optimizer, epoch, config,
@@ -353,17 +410,29 @@ def main():
                     output_dir=output_dir,
                 )
 
+        # ── Early Stopping ──
+        if early_stopper is not None and val_losses is not None:
+            if early_stopper.step(val_losses["total"]):
+                if rank0:
+                    print(
+                        f"\n  Early stopping at epoch {epoch} "
+                        f"(patience={config.patience}, best_val={early_stopper.best_loss:.6f})"
+                    )
+                break
+
     # ── 최종 체크포인트 ──
     if rank0:
         save_model = model.module if use_ddp else model
         final_path = save_training_checkpoint(
-            save_model, optimizer, config.n_epochs - 1, config,
+            save_model, optimizer, epoch, config,
             phase_name="phase1_ci", loss=losses["total"],
             output_dir=output_dir, tag="final",
         )
         print(f"\n{'='*60}")
-        print(f"Phase 1 complete. Final loss: {losses['total']:.6f}")
-        print(f"Best loss: {best_loss:.6f}")
+        print(f"Phase 1 complete. Final train loss: {losses['total']:.6f}")
+        if val_losses is not None:
+            print(f"Final val loss: {val_losses['total']:.6f}")
+        print(f"Best {'val' if val_dataloader else 'train'} loss: {best_loss:.6f}")
         print(f"Final checkpoint: {final_path}")
         print(f"{'='*60}")
 

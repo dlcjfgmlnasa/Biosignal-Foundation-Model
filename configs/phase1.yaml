@@ -54,6 +54,10 @@ learnable_temperature: true
 # ── Masking ──
 variate_mask_prob: 0.0  # Phase 1은 비활성
 
+# ── Validation & Early Stopping ──
+val_ratio: 0.2      # subject 단위 validation 비율 (0=비활성)
+patience: 10        # early stopping patience (0=비활성)
+
 # ── 실험 관리 ──
 exp_name: ""  # 실험 이름 (output_dir/exp_name/ 하위에 저장, 비어있으면 output_dir 그대로)
 

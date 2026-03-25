@@ -73,6 +73,10 @@ class TrainConfig:
     output_dir: str = "outputs"
     checkpoint_every: int = 10  # 에폭 간격 체크포인트 저장
 
+    # Validation & Early Stopping
+    val_ratio: float = 0.2  # subject 단위 validation 비율
+    patience: int = 10  # early stopping patience (0=비활성)
+
     # 실험 관리
     exp_name: str = ""  # 실험 이름 (비어있으면 output_dir 그대로 사용)
 
@@ -160,6 +164,43 @@ def load_manifest_from_processed(
                     )
                 )
     return entries
+
+
+def split_manifest_by_subject(
+    manifest: list[RecordingManifest],
+    val_ratio: float = 0.2,
+    seed: int = 42,
+) -> tuple[list[RecordingManifest], list[RecordingManifest]]:
+    """Subject(디렉토리) 단위로 train/val을 분할한다.
+
+    같은 subject의 모든 recording이 동일한 split에 들어간다.
+
+    Returns
+    -------
+    (train_manifest, val_manifest)
+    """
+    # subject = path의 부모 디렉토리 이름
+    subject_to_entries: dict[str, list[RecordingManifest]] = {}
+    for entry in manifest:
+        subject = str(Path(entry.path).parent)
+        subject_to_entries.setdefault(subject, []).append(entry)
+
+    subjects = sorted(subject_to_entries.keys())
+    rng = random.Random(seed)
+    rng.shuffle(subjects)
+
+    n_val = max(1, int(len(subjects) * val_ratio))
+    val_subjects = set(subjects[:n_val])
+
+    train_entries: list[RecordingManifest] = []
+    val_entries: list[RecordingManifest] = []
+    for subj in subjects:
+        if subj in val_subjects:
+            val_entries.extend(subject_to_entries[subj])
+        else:
+            train_entries.extend(subject_to_entries[subj])
+
+    return train_entries, val_entries
 
 
 # ── 학습 루프 ───────────────────────────────────────────────────
@@ -326,6 +367,130 @@ def train_one_epoch(
         "cross_modal_loss": epoch_cross / denom,
         "contrastive_loss": epoch_contrastive / denom,
     }
+
+
+@torch.no_grad()
+def validate(
+    model: BiosignalFoundationModel,
+    dataloader,
+    criterion: CombinedLoss,
+    config: TrainConfig,
+    device: torch.device,
+    phase_name: str,
+) -> dict[str, float]:
+    """Validation 루프. train_one_epoch()과 동일한 loss 계산, backward 없이."""
+    model.eval()
+    epoch_total = 0.0
+    epoch_masked = 0.0
+    epoch_next = 0.0
+    epoch_cross = 0.0
+    epoch_contrastive = 0.0
+    n_batches = 0
+
+    enable_next = config.beta > 0
+
+    for batch in dataloader:
+        batch.values = batch.values.to(device)
+        batch.sample_id = batch.sample_id.to(device)
+        batch.variate_id = batch.variate_id.to(device)
+
+        H = 1
+        if enable_next:
+            H = random.randint(1, config.model_config.max_horizon)
+
+        task = "both" if enable_next else "masked"
+        out = model(batch, task=task, horizon=H)
+
+        reconstructed = out["reconstructed"]
+        cross_pred = out["cross_pred"]
+        patch_mask = out["patch_mask"]
+        time_id = out["time_id"]
+        next_pred = out.get("next_pred")
+
+        pred_mask = create_patch_mask(
+            patch_mask,
+            mask_ratio=config.mask_ratio,
+            patch_variate_id=out["patch_variate_id"] if config.variate_mask_prob > 0 else None,
+            variate_mask_prob=config.variate_mask_prob,
+        )
+
+        raw_model = model.module if isinstance(model, DDP) else model
+        P = raw_model.patch_size
+        normalized = ((batch.values.unsqueeze(-1) - out["loc"]) / out["scale"]).squeeze(-1)
+        B, L = normalized.shape
+        N = L // P
+        original_patches = normalized.reshape(B, N, P)
+
+        contrastive_z = out.get("contrastive_z")
+
+        needs_time_id = config.gamma > 0 or config.delta > 0
+        losses = criterion(
+            reconstructed=reconstructed,
+            next_pred=next_pred,
+            original_patches=original_patches,
+            pred_mask=pred_mask,
+            patch_mask=patch_mask,
+            patch_sample_id=out["patch_sample_id"],
+            patch_variate_id=out["patch_variate_id"],
+            horizon=H,
+            cross_pred=cross_pred if config.gamma > 0 else None,
+            time_id=time_id if needs_time_id else None,
+            contrastive_z=contrastive_z if config.delta > 0 else None,
+        )
+
+        loss = losses["total"]
+        if not torch.isfinite(loss):
+            continue
+
+        epoch_total += losses["total"].item()
+        epoch_masked += losses["masked_loss"].item()
+        epoch_next += losses["next_loss"].item()
+        epoch_cross += losses["cross_modal_loss"].item()
+        epoch_contrastive += losses["contrastive_loss"].item()
+        n_batches += 1
+
+        if config.max_batches > 0 and n_batches >= config.max_batches:
+            break
+
+    model.train()
+    denom = max(n_batches, 1)
+    return {
+        "total": epoch_total / denom,
+        "masked_loss": epoch_masked / denom,
+        "next_loss": epoch_next / denom,
+        "cross_modal_loss": epoch_cross / denom,
+        "contrastive_loss": epoch_contrastive / denom,
+    }
+
+
+# ── Early Stopping ────────────────────────────────────────────
+
+
+class EarlyStopping:
+    """Validation loss 기반 조기 종료.
+
+    Parameters
+    ----------
+    patience:
+        개선 없이 허용하는 에폭 수.
+    min_delta:
+        개선으로 인정하는 최소 감소량.
+    """
+
+    def __init__(self, patience: int = 10, min_delta: float = 1e-4) -> None:
+        self.patience = patience
+        self.min_delta = min_delta
+        self.best_loss: float = float("inf")
+        self.counter: int = 0
+
+    def step(self, val_loss: float) -> bool:
+        """val_loss를 기록하고 학습을 중단해야 하면 True를 반환한다."""
+        if val_loss < self.best_loss - self.min_delta:
+            self.best_loss = val_loss
+            self.counter = 0
+            return False
+        self.counter += 1
+        return self.counter >= self.patience
 
 
 # ── 유틸리티 ────────────────────────────────────────────────────
