@@ -169,7 +169,8 @@ def process_vital(
 
         # Native sampling rate로 데이터 추출
         try:
-            native_sr = vf.get_track_info(track_name).get("srate", 0)
+            trk = vf.find_track(track_name)
+            native_sr = trk.srate if trk is not None and trk.srate > 0 else 0
             if native_sr <= 0:
                 # fallback: 일반적인 SR 추정
                 native_sr = 500.0
