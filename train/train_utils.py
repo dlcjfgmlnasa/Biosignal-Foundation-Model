@@ -401,8 +401,15 @@ def validate(
     device: torch.device,
     phase_name: str,
 ) -> dict[str, float]:
-    """Validation 루프. train_one_epoch()과 동일한 loss 계산, backward 없이."""
+    """Validation 루프. train_one_epoch()과 동일한 loss 계산, backward 없이.
+
+    DDP 환경에서는 unwrapped 모델로 forward하여 rank별 배치 수
+    불일치로 인한 데드락을 방지한다.
+    """
     model.eval()
+    # DDP wrapper를 벗겨서 forward — validation에서는 gradient sync 불필요
+    raw_model = model.module if isinstance(model, DDP) else model
+
     epoch_total = 0.0
     epoch_masked = 0.0
     epoch_next = 0.0
@@ -426,7 +433,7 @@ def validate(
         task = "both" if enable_next else "masked"
 
         with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
-            out = model(batch, task=task, horizon=H)
+            out = raw_model(batch, task=task, horizon=H)
 
             reconstructed = out["reconstructed"]
             cross_pred = out["cross_pred"]
@@ -441,7 +448,6 @@ def validate(
                 variate_mask_prob=config.variate_mask_prob,
             )
 
-            raw_model = model.module if isinstance(model, DDP) else model
             P = raw_model.patch_size
             normalized = ((batch.values.unsqueeze(-1) - out["loc"]) / out["scale"]).squeeze(-1)
             B, L = normalized.shape
