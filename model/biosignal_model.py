@@ -17,7 +17,7 @@ from torch import nn
 from data.collate import PackedBatch
 from model.config import ModelConfig
 from module.cnn_stem import ModalityCNNStem
-from module.packed_scaler import PackedAbsMeanScaler, PackedScaler
+from module.packed_scaler import PackedStdScaler, PackedScaler
 from module.patch import PatchEmbedding
 from module.position import BinaryAttentionBias, QueryKeyProjection, RotaryProjection
 from module.transformer import TransformerEncoder
@@ -49,7 +49,7 @@ class BiosignalFoundationModel(nn.Module):
     use_var_attn_bias:
         BinaryAttentionBias (variate 간 bias) 사용 여부.
     scaler:
-        입력 정규화 스케일러. ``None``이면 ``PackedAbsMeanScaler``.
+        입력 정규화 스케일러. ``None``이면 ``PackedStdScaler``.
     dropout_p:
         드롭아웃 확률.
     """
@@ -83,7 +83,7 @@ class BiosignalFoundationModel(nn.Module):
         self.patch_size = patch_size
 
         # 1. Scaler (point-level)
-        self.scaler = scaler or PackedAbsMeanScaler()
+        self.scaler = scaler or PackedStdScaler()
 
         # 2. Patch Embedding
         self.use_cnn_stem = use_cnn_stem
