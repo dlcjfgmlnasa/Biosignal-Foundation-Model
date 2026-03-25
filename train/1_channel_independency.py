@@ -99,6 +99,8 @@ def parse_args() -> argparse.Namespace:
                    help="에폭당 최대 배치 수 (0=무제한)")
     g.add_argument("--viz_every", type=int, default=5,
                    help="N 에폭마다 reconstruction 시각화 저장 (0=비활성)")
+    g.add_argument("--exp_name", type=str, default="",
+                   help="실험 이름 (output_dir 하위 서브디렉토리)")
 
     return p.parse_args()
 
