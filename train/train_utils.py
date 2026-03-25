@@ -191,12 +191,19 @@ def train_one_epoch(
         batch.sample_id = batch.sample_id.to(device)
         batch.variate_id = batch.variate_id.to(device)
 
-        # ── Masked Reconstruction forward ──
-        out = model(batch, task="masked")
+        # ── Forward (single pass: masked + next_pred 동시) ──
+        H = 1
+        if enable_next:
+            H = random.randint(1, config.model_config.max_horizon)
+
+        task = "both" if enable_next else "masked"
+        out = model(batch, task=task, horizon=H)
+
         reconstructed = out["reconstructed"]  # (B, N, patch_size)
         cross_pred = out["cross_pred"]        # (B, N, patch_size)
         patch_mask = out["patch_mask"]        # (B, N) bool
         time_id = out["time_id"]              # (B, N)
+        next_pred = out.get("next_pred")      # (B, N, patch_size) or None
 
         # 패치 단위 마스킹 (variate-level 마스킹 지원)
         pred_mask = create_patch_mask(
@@ -214,15 +221,7 @@ def train_one_epoch(
         N = L // P
         original_patches = normalized.reshape(B, N, P)  # (B, N, P)
 
-        # ── Next-Patch Prediction forward (별도 causal forward) ──
-        H = 1
-        next_pred = None
-        if enable_next:
-            H = random.randint(1, config.model_config.max_horizon)
-            out_next = model(batch, task="next_pred", horizon=H)
-            next_pred = out_next["next_pred"]  # (B, N, patch_size)
-
-        # ── Contrastive embeddings (masked forward에서 추출) ──
+        # ── Contrastive embeddings ──
         contrastive_z = out.get("contrastive_z")  # (B, N, proj_dim) or None
 
         # ── CombinedLoss ──

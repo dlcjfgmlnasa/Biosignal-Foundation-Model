@@ -272,6 +272,7 @@ class BiosignalFoundationModel(nn.Module):
             )
             final_attn_mask = base_attn_mask & causal_tri.unsqueeze(0)  # (B, N, N)
         else:
+            # "masked" 또는 "both": bidirectional attention
             final_attn_mask = base_attn_mask
 
         # 6. Transformer Encoder (task에 맞는 mask 적용)
@@ -294,12 +295,13 @@ class BiosignalFoundationModel(nn.Module):
             "time_id": time_id,
         }
 
-        if task == "masked":
+        if task in ("masked", "both"):
             out_dict["reconstructed"] = self.head(encoded)  # (B, N, patch_size)
             out_dict["cross_pred"] = self.cross_head(encoded)  # (B, N, patch_size)
             if self.contrastive_proj_dim > 0:
                 out_dict["contrastive_z"] = self.contrastive_proj(encoded)  # (B, N, proj_dim)
-        elif task == "next_pred":
+
+        if task in ("next_pred", "both"):
             # Horizon conditioning: encoded에 horizon embedding 더함
             h_emb = self.horizon_embed(
                 torch.tensor(horizon - 1, device=encoded.device)
