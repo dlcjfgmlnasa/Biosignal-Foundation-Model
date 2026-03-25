@@ -113,25 +113,25 @@ def _process_batch(
 def _select_diverse(candidates: list[_RowCandidate], max_rows: int) -> list[_RowCandidate]:
     """신호 타입이 고루 분포하도록 후보를 선택한다.
 
-    각 신호 타입에서 라운드-로빈으로 1개씩 선택한다.
+    각 신호 타입에서 1개씩 선택한다. 타입 수가 max_rows보다 적으면
+    타입 수만큼만 선택하여 중복을 방지한다.
     """
     by_type: dict[int, list[_RowCandidate]] = {}
     for c in candidates:
         by_type.setdefault(c.signal_type, []).append(c)
 
+    # 타입 수보다 max_rows가 크면 타입 수로 제한 (중복 방지)
+    n_types = len(by_type)
+    effective_rows = min(max_rows, n_types)
+
     selected: list[_RowCandidate] = []
     types = sorted(by_type.keys())
 
-    while len(selected) < max_rows:
-        added = False
-        for t in types:
-            if len(selected) >= max_rows:
-                break
-            if by_type[t]:
-                selected.append(by_type[t].pop(0))
-                added = True
-        if not added:
+    for t in types:
+        if len(selected) >= effective_rows:
             break
+        if by_type[t]:
+            selected.append(by_type[t].pop(0))
 
     return selected
 
