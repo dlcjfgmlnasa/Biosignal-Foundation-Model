@@ -70,7 +70,8 @@ class TrainConfig:
     output_dir: str = "outputs"
     checkpoint_every: int = 10  # 에폭 간격 체크포인트 저장
 
-    # Dry-run
+    # 실행 제한
+    max_batches: int = 0  # >0이면 에폭당 최대 배치 수 제한
     dry_run: bool = False  # True면 1 batch만 실행 후 종료
 
     # ── YAML 직렬화 ──────────────────────────────────────────
@@ -299,6 +300,11 @@ def train_one_epoch(
         # Dry-run: 1 batch만 실행
         if config.dry_run:
             print(f"  [{phase_name}] dry-run: 1 batch 완료, 종료.")
+            break
+
+        # max_batches 제한
+        if config.max_batches > 0 and n_batches >= config.max_batches:
+            print(f"  [{phase_name}] max_batches={config.max_batches} 도달, 에폭 종료.")
             break
 
     denom = max(n_batches, 1)

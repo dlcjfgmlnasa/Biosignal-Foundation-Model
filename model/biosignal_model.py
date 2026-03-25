@@ -133,7 +133,11 @@ class BiosignalFoundationModel(nn.Module):
             self.signal_type_embed = nn.Embedding(num_signal_types, d_model)
             self.spatial_id_embed = nn.Embedding(num_spatial_ids, d_model)
 
-        # 5. Reconstruction Head
+        # 5. Loc/Scale Injection (환자별 절대 레벨 정보 보존)
+        self.loc_proj = nn.Linear(1, d_model)
+        self.scale_proj = nn.Linear(1, d_model)
+
+        # 6. Reconstruction Head
         self.head = nn.Linear(d_model, patch_size)
 
         # 6. Next-Patch Prediction Head
@@ -240,7 +244,20 @@ class BiosignalFoundationModel(nn.Module):
             valid_mask = (p_vid > 0).unsqueeze(-1)  # (B, N, 1)
             embedded = embedded + (sig_emb + spa_emb) * valid_mask
 
-        # 4. Base Attention Mask: 같은 sample 내에서만 attend + 유효 패치만
+        # 6. Loc/Scale Dual Injection — 절대 레벨 정보 보존
+        N = embedded.shape[1]
+        stride = self.patch_embed.stride
+        # loc/scale는 variate 내 동일 → 각 패치 시작점에서 샘플링
+        patch_starts = torch.arange(N, device=device) * stride  # (N,)
+        patch_starts = patch_starts.clamp(max=loc.shape[1] - 1)
+        patch_loc = loc[:, patch_starts, :]      # (B, N, 1)
+        patch_scale = scale[:, patch_starts, :]  # (B, N, 1)
+        loc_emb = self.loc_proj(patch_loc)      # (B, N, d_model)
+        scale_emb = self.scale_proj(patch_scale)  # (B, N, d_model)
+        valid_mask_ls = (p_vid > 0).unsqueeze(-1)  # (B, N, 1)
+        embedded = embedded + (loc_emb + scale_emb) * valid_mask_ls
+
+        # 7. Base Attention Mask: 같은 sample 내에서만 attend + 유효 패치만
         base_attn_mask = (
             (p_sid.unsqueeze(-1) == p_sid.unsqueeze(-2))
             & patch_mask.unsqueeze(-2)

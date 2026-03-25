@@ -28,6 +28,7 @@ from .train_utils import (
     set_seed,
     train_one_epoch,
 )
+from .visualize import save_reconstruction_figure
 
 
 def parse_args() -> argparse.Namespace:
@@ -46,7 +47,7 @@ def parse_args() -> argparse.Namespace:
     g.add_argument("--use_var_attn_bias", action=argparse.BooleanOptionalAction, default=True)
     g.add_argument("--dropout_p", type=float, default=0.0)
     g.add_argument("--max_horizon", type=int, default=5)
-    g.add_argument("--use_cnn_stem", action=argparse.BooleanOptionalAction, default=False)
+    g.add_argument("--use_cnn_stem", action=argparse.BooleanOptionalAction, default=True)
     g.add_argument("--stem_hidden_channels", type=int, default=64)
     g.add_argument("--stem_num_layers", type=int, default=3)
     g.add_argument("--stem_kernel_size", type=int, default=3)
@@ -81,6 +82,10 @@ def parse_args() -> argparse.Namespace:
     g.add_argument("--num_workers", type=int, default=0)
     g.add_argument("--output_dir", type=str, default="outputs/phase1_ci")
     g.add_argument("--checkpoint_every", type=int, default=10)
+    g.add_argument("--max_batches", type=int, default=0,
+                   help="에폭당 최대 배치 수 (0=무제한)")
+    g.add_argument("--viz_every", type=int, default=5,
+                   help="N 에폭마다 reconstruction 시각화 저장 (0=비활성)")
 
     return p.parse_args()
 
@@ -143,6 +148,7 @@ def main():
         num_workers=args.num_workers,
         output_dir=args.output_dir,
         checkpoint_every=args.checkpoint_every,
+        max_batches=args.max_batches,
     )
 
     set_seed(config.seed)
@@ -199,6 +205,17 @@ def main():
     )
     scheduler = create_scheduler(optimizer, config)
 
+    # ── 시각화용 배치 캐시 ──
+    viz_every = args.viz_every
+    viz_batch = None
+    if viz_every > 0:
+        viz_iter = iter(dataloader)
+        viz_batch = next(viz_iter)
+        del viz_iter
+        viz_dir = output_dir / "figures"
+        viz_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Visualization every {viz_every} epochs → {viz_dir}")
+
     # ── 학습 루프 ──
     best_loss = float("inf")
     print(f"\nStarting training: {config.n_epochs} epochs")
@@ -225,6 +242,15 @@ def main():
             f"next: {losses['next_loss']:.6f} | "
             f"LR: {current_lr:.2e}"
         )
+
+        # Reconstruction 시각화
+        if viz_batch is not None and (epoch % viz_every == 0 or epoch == config.n_epochs - 1):
+            fig_path = save_reconstruction_figure(
+                model, viz_batch, epoch=epoch,
+                output_dir=viz_dir, mask_ratio=config.mask_ratio,
+                device=device,
+            )
+            print(f"  → Reconstruction figure saved: {fig_path}")
 
         # Best model 저장
         if losses["total"] < best_loss:
