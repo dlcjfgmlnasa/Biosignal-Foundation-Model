@@ -241,6 +241,7 @@ def process_vital(
     vital_path: Path,
     out_dir: Path,
     min_duration_s: float = 60.0,
+    signal_types: set[int] | None = None,
 ) -> tuple[str, str, list[dict]]:
     """단일 .vital 파일을 처리하여 zarr 파일들을 저장한다.
 
@@ -270,6 +271,10 @@ def process_vital(
         stype_key, spatial_id = TRACK_MAP[track_name]
         signal_type = SIGNAL_TYPES[stype_key]
         cfg = SIGNAL_CONFIGS[stype_key]
+
+        # signal_types 필터: 지정된 타입만 파싱
+        if signal_types is not None and signal_type not in signal_types:
+            continue
 
         # 동일 (signal_type, spatial_id) 중복 시 첫 번째만 처리
         key = (signal_type, spatial_id)
@@ -385,6 +390,10 @@ def main() -> None:
         "--max-files", type=int, default=None,
         help="처리할 최대 파일 수 (테스트용)",
     )
+    parser.add_argument(
+        "--signal-types", type=int, nargs="+", default=None,
+        help="파싱할 signal type IDs (0=ECG,1=ABP,2=EEG,3=PPG,4=CVP,5=CO2,6=AWP). 미지정 시 전부.",
+    )
     args = parser.parse_args()
 
     raw_dir = Path(args.raw)
@@ -436,8 +445,10 @@ def main() -> None:
     for vf_path in vital_files:
         print(f"[{vf_path.name}]")
         try:
+            sig_filter = set(args.signal_types) if args.signal_types else None
             subject_id, session_id, recordings = process_vital(
                 vf_path, out_dir, min_duration_s=args.min_duration,
+                signal_types=sig_filter,
             )
         except Exception as exc:
             print(f"    [ERROR] {exc}", file=sys.stderr)
