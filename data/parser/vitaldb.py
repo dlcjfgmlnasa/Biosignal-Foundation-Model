@@ -29,7 +29,12 @@ from pathlib import Path
 
 import numpy as np
 
-from data.parser._common import resample_to_target, save_recording_zarr, segment_quality_score
+from data.parser._common import (
+    domain_quality_check,
+    resample_to_target,
+    save_recording_zarr,
+    segment_quality_score,
+)
 
 # 목표 sampling rate (Hz)
 TARGET_SR: float = 100.0
@@ -373,6 +378,17 @@ def process_vital(
             # 리샘플링 → TARGET_SR (100Hz)
             if native_sr != TARGET_SR:
                 segment = resample_to_target(segment, orig_sr=native_sr, target_sr=TARGET_SR)
+
+            # ── Domain-specific 품질 검사 (bandpass + resample 후, 100Hz 기준) ──
+            domain_result = domain_quality_check(stype_key, segment, sr=TARGET_SR)
+            if not domain_result["pass"]:
+                detail_parts = [f"{k}={v}" for k, v in domain_result.items() if k != "pass"]
+                print(
+                    f"    [SKIP] {track_name} seg{seg_idx}: "
+                    f"domain check failed ({', '.join(detail_parts)})",
+                    file=sys.stderr,
+                )
+                continue
 
             # (1, T) 형태로 저장
             channel_data = segment.reshape(1, -1).astype(np.float32)

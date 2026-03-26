@@ -152,6 +152,386 @@ def segment_quality_score(
     }
 
 
+# ── Domain-specific quality checks ────────────────────────────
+
+
+def _bandpass_for_peaks(
+    data: np.ndarray,
+    lo: float,
+    hi: float,
+    sr: float,
+) -> np.ndarray:
+    """Peak detection용 임시 bandpass filter. 원본을 변경하지 않는다."""
+    from scipy.signal import butter, sosfiltfilt
+
+    nyq = sr / 2.0
+    if hi >= nyq:
+        hi = nyq - 1.0
+    if hi <= lo:
+        return data
+    sos = butter(3, [lo / nyq, hi / nyq], btype="band", output="sos")
+    return sosfiltfilt(sos, data).astype(data.dtype)
+
+
+def ecg_quality_check(
+    segment: np.ndarray,
+    sr: float = 100.0,
+    min_hr: float = 30.0,
+    max_hr: float = 200.0,
+    regularity_threshold: float = 0.5,
+) -> dict:
+    """ECG 세그먼트의 QRS peak 기반 심박수 품질 검사.
+
+    Parameters
+    ----------
+    segment:
+        (n_timesteps,) 1D ECG 배열 (bandpass + resample 후 100Hz 기준).
+    sr:
+        sampling rate (Hz).
+    min_hr, max_hr:
+        정상 심박수 범위 (bpm).
+    regularity_threshold:
+        R-R interval의 변이계수(std/mean) 상한. 초과하면 불규칙.
+
+    Returns
+    -------
+    {"hr": float, "hr_valid": bool, "n_peaks": int, "regularity": float, "pass": bool}
+    """
+    from scipy.signal import find_peaks
+
+    if len(segment) < int(sr * 2):
+        return {"hr": 0.0, "hr_valid": False, "n_peaks": 0, "regularity": 1.0, "pass": False}
+
+    # R-peak 검출: prominence 기반 (amplitude 대비 상대적 높이)
+    amp = np.max(segment) - np.min(segment)
+    if amp < 1e-6:
+        return {"hr": 0.0, "hr_valid": False, "n_peaks": 0, "regularity": 1.0, "pass": False}
+
+    # R-R interval 최소 거리: max_hr=200bpm → 0.3s → sr*0.3 samples
+    min_distance = int(sr * 60.0 / max_hr * 0.8)  # 약간 여유
+    min_distance = max(min_distance, 1)
+
+    peaks, properties = find_peaks(
+        segment,
+        prominence=amp * 0.2,  # peak-to-peak의 20% 이상 prominence
+        distance=min_distance,
+    )
+
+    n_peaks = len(peaks)
+    if n_peaks < 2:
+        return {"hr": 0.0, "hr_valid": False, "n_peaks": n_peaks, "regularity": 1.0, "pass": False}
+
+    # R-R intervals → 심박수
+    rr_intervals = np.diff(peaks) / sr  # seconds
+    rr_mean = float(np.mean(rr_intervals))
+    if rr_mean < 1e-6:
+        return {"hr": 0.0, "hr_valid": False, "n_peaks": n_peaks, "regularity": 1.0, "pass": False}
+
+    hr = 60.0 / rr_mean
+    hr_valid = min_hr <= hr <= max_hr
+
+    # Regularity: 변이계수 (CV = std/mean)
+    rr_std = float(np.std(rr_intervals))
+    regularity = rr_std / rr_mean
+
+    passed = hr_valid and regularity < regularity_threshold
+
+    return {
+        "hr": round(hr, 1),
+        "hr_valid": hr_valid,
+        "n_peaks": n_peaks,
+        "regularity": round(regularity, 4),
+        "pass": passed,
+    }
+
+
+def abp_quality_check(
+    segment: np.ndarray,
+    sr: float = 100.0,
+    min_hr: float = 30.0,
+    max_hr: float = 200.0,
+    regularity_threshold: float = 0.5,
+) -> dict:
+    """ABP 세그먼트의 pulse peak regularity 기반 품질 검사.
+
+    데이터가 z-score 정규화되어 있으므로 절대 mmHg 범위 대신
+    pulse 존재 여부와 regularity를 검사한다.
+
+    Parameters
+    ----------
+    segment:
+        (n_timesteps,) 1D ABP 배열 (bandpass + resample 후 100Hz 기준).
+    sr:
+        sampling rate (Hz).
+    min_hr, max_hr:
+        정상 맥박수 범위 (bpm).
+    regularity_threshold:
+        peak-to-peak interval 변이계수 상한.
+
+    Returns
+    -------
+    {"hr": float, "n_peaks": int, "regularity": float, "pass": bool}
+    """
+    from scipy.signal import find_peaks
+
+    if len(segment) < int(sr * 2):
+        return {"hr": 0.0, "n_peaks": 0, "regularity": 1.0, "pass": False}
+
+    amp = np.max(segment) - np.min(segment)
+    if amp < 1e-6:
+        return {"hr": 0.0, "n_peaks": 0, "regularity": 1.0, "pass": False}
+
+    # Systolic peaks: 최소 0.4s 간격 (max ~150bpm)
+    min_distance = int(sr * 0.4)
+    peaks, _ = find_peaks(
+        segment,
+        prominence=amp * 0.15,
+        distance=min_distance,
+    )
+
+    if len(peaks) < 2:
+        return {"hr": 0.0, "n_peaks": len(peaks), "regularity": 1.0, "pass": False}
+
+    pp_intervals = np.diff(peaks) / sr
+    pp_mean = float(np.mean(pp_intervals))
+    if pp_mean < 1e-6:
+        return {"hr": 0.0, "n_peaks": len(peaks), "regularity": 1.0, "pass": False}
+
+    hr = 60.0 / pp_mean
+    hr_valid = min_hr <= hr <= max_hr
+
+    pp_std = float(np.std(pp_intervals))
+    regularity = pp_std / pp_mean
+
+    passed = hr_valid and regularity < regularity_threshold
+
+    return {
+        "hr": round(hr, 1),
+        "n_peaks": len(peaks),
+        "regularity": round(regularity, 4),
+        "pass": passed,
+    }
+
+
+def ppg_quality_check(
+    segment: np.ndarray,
+    sr: float = 100.0,
+    min_hr: float = 30.0,
+    max_hr: float = 200.0,
+    regularity_threshold: float = 0.5,
+) -> dict:
+    """PPG 세그먼트의 pulse peak regularity 기반 품질 검사.
+
+    Parameters
+    ----------
+    segment:
+        (n_timesteps,) 1D PPG 배열 (bandpass + resample 후 100Hz 기준).
+    sr:
+        sampling rate (Hz).
+    min_hr, max_hr:
+        정상 심박수 범위 (bpm).
+    regularity_threshold:
+        peak-to-peak interval 변이계수 상한.
+
+    Returns
+    -------
+    {"hr": float, "regularity": float, "pass": bool}
+    """
+    from scipy.signal import find_peaks
+
+    if len(segment) < int(sr * 2):
+        return {"hr": 0.0, "regularity": 1.0, "pass": False}
+
+    amp = np.max(segment) - np.min(segment)
+    if amp < 1e-6:
+        return {"hr": 0.0, "regularity": 1.0, "pass": False}
+
+    min_distance = int(sr * 60.0 / max_hr * 0.8)
+    min_distance = max(min_distance, 1)
+
+    peaks, _ = find_peaks(
+        segment,
+        prominence=amp * 0.15,
+        distance=min_distance,
+    )
+
+    if len(peaks) < 2:
+        return {"hr": 0.0, "regularity": 1.0, "pass": False}
+
+    pp_intervals = np.diff(peaks) / sr
+    pp_mean = float(np.mean(pp_intervals))
+    if pp_mean < 1e-6:
+        return {"hr": 0.0, "regularity": 1.0, "pass": False}
+
+    hr = 60.0 / pp_mean
+    hr_valid = min_hr <= hr <= max_hr
+
+    pp_std = float(np.std(pp_intervals))
+    regularity = pp_std / pp_mean
+
+    passed = hr_valid and regularity < regularity_threshold
+
+    return {
+        "hr": round(hr, 1),
+        "regularity": round(regularity, 4),
+        "pass": passed,
+    }
+
+
+def co2_quality_check(
+    segment: np.ndarray,
+    sr: float = 100.0,
+    min_rr: float = 4.0,
+    max_rr: float = 40.0,
+) -> dict:
+    """CO2 (capnogram) 세그먼트의 호흡 사이클 품질 검사.
+
+    Parameters
+    ----------
+    segment:
+        (n_timesteps,) 1D CO2 배열 (resample 후 100Hz 기준).
+    sr:
+        sampling rate (Hz).
+    min_rr, max_rr:
+        정상 호흡수 범위 (breaths/min).
+
+    Returns
+    -------
+    {"resp_rate": float, "pass": bool}
+    """
+    from scipy.signal import find_peaks
+
+    duration_s = len(segment) / sr
+    if duration_s < 5.0:
+        return {"resp_rate": 0.0, "pass": False}
+
+    amp = np.max(segment) - np.min(segment)
+    if amp < 1.0:  # CO2 최소 진폭 ~1 mmHg 이상이어야 호흡 존재
+        return {"resp_rate": 0.0, "pass": False}
+
+    # End-tidal CO2 peaks: 호흡 주기 최소 60/max_rr 초
+    min_distance = int(sr * 60.0 / max_rr * 0.8)
+    min_distance = max(min_distance, 1)
+
+    peaks, _ = find_peaks(
+        segment,
+        prominence=amp * 0.2,
+        distance=min_distance,
+    )
+
+    if len(peaks) < 2:
+        return {"resp_rate": 0.0, "pass": False}
+
+    # 호흡수 계산: peak 간격 기반
+    peak_intervals = np.diff(peaks) / sr
+    mean_interval = float(np.mean(peak_intervals))
+    if mean_interval < 1e-6:
+        return {"resp_rate": 0.0, "pass": False}
+
+    resp_rate = 60.0 / mean_interval
+    rr_valid = min_rr <= resp_rate <= max_rr
+
+    return {
+        "resp_rate": round(resp_rate, 1),
+        "pass": rr_valid,
+    }
+
+
+def awp_quality_check(
+    segment: np.ndarray,
+    sr: float = 100.0,
+    min_rr: float = 4.0,
+    max_rr: float = 40.0,
+) -> dict:
+    """AWP (기도압) 세그먼트의 환기 사이클 품질 검사.
+
+    Parameters
+    ----------
+    segment:
+        (n_timesteps,) 1D AWP 배열 (resample 후 100Hz 기준).
+    sr:
+        sampling rate (Hz).
+    min_rr, max_rr:
+        정상 호흡수 범위 (breaths/min).
+
+    Returns
+    -------
+    {"resp_rate": float, "pass": bool}
+    """
+    from scipy.signal import find_peaks
+
+    duration_s = len(segment) / sr
+    if duration_s < 5.0:
+        return {"resp_rate": 0.0, "pass": False}
+
+    amp = np.max(segment) - np.min(segment)
+    if amp < 1.0:  # AWP 최소 진폭 ~1 cmH2O
+        return {"resp_rate": 0.0, "pass": False}
+
+    min_distance = int(sr * 60.0 / max_rr * 0.8)
+    min_distance = max(min_distance, 1)
+
+    peaks, _ = find_peaks(
+        segment,
+        prominence=amp * 0.2,
+        distance=min_distance,
+    )
+
+    if len(peaks) < 2:
+        return {"resp_rate": 0.0, "pass": False}
+
+    peak_intervals = np.diff(peaks) / sr
+    mean_interval = float(np.mean(peak_intervals))
+    if mean_interval < 1e-6:
+        return {"resp_rate": 0.0, "pass": False}
+
+    resp_rate = 60.0 / mean_interval
+    rr_valid = min_rr <= resp_rate <= max_rr
+
+    return {
+        "resp_rate": round(resp_rate, 1),
+        "pass": rr_valid,
+    }
+
+
+# ── Dispatcher: signal type → domain check function ──────────
+
+DOMAIN_QUALITY_CHECKS: dict[str, callable] = {
+    "ecg": ecg_quality_check,
+    "abp": abp_quality_check,
+    "ppg": ppg_quality_check,
+    "co2": co2_quality_check,
+    "awp": awp_quality_check,
+}
+
+
+def domain_quality_check(stype_key: str, segment: np.ndarray, sr: float = 100.0) -> dict:
+    """Signal type에 해당하는 domain-specific 품질 검사를 실행한다.
+
+    Parameters
+    ----------
+    stype_key:
+        신호 타입 키 ("ecg", "abp", "ppg", "co2", "awp").
+        "eeg", "cvp" 등 미지원 타입은 항상 {"pass": True}를 반환한다.
+    segment:
+        (n_timesteps,) 1D 배열.
+    sr:
+        sampling rate (Hz).
+
+    Returns
+    -------
+    dict with at least "pass" key.
+    """
+    check_fn = DOMAIN_QUALITY_CHECKS.get(stype_key)
+    if check_fn is None:
+        return {"pass": True}
+    try:
+        return check_fn(segment, sr)
+    except Exception:
+        # 검출기 자체 에러 시 보수적으로 통과 처리 (데이터 유실 방지)
+        return {"pass": True}
+
+
 def save_recording(tensor: torch.Tensor, out_path: str) -> None:
     """float32로 강제 변환 후 .pt 파일로 저장한다.
 
