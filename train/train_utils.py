@@ -12,6 +12,7 @@ import math
 import os
 import random
 import time
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
@@ -257,8 +258,12 @@ def train_one_epoch(
 
         with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
             # Pass 1: masked (bidirectional attention)
+            # DDP: 두 번 forward 시 no_sync()로 첫 pass의 gradient sync 지연
             raw_model = model.module if isinstance(model, DDP) else model
-            out = model(batch, task="masked")
+            use_ddp = isinstance(model, DDP)
+            no_sync = model.no_sync() if (use_ddp and enable_next) else nullcontext()
+            with no_sync:
+                out = model(batch, task="masked")
 
             reconstructed = out["reconstructed"]  # (B, N, patch_size)
             cross_pred = out["cross_pred"]        # (B, N, patch_size)
@@ -271,7 +276,7 @@ def train_one_epoch(
                 if hasattr(layer.ffn, "aux_loss") and layer.ffn.aux_loss is not None:
                     aux_loss = aux_loss + layer.ffn.aux_loss
 
-            # Pass 2: next_pred (causal attention) — 별도 forward
+            # Pass 2: next_pred (causal attention) — DDP sync는 이 pass에서 수행
             next_pred = None
             if enable_next:
                 out_next = model(batch, task="next_pred", horizon=H)
@@ -588,8 +593,12 @@ def train_one_epoch_v2(
 
         with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
             # Pass 1: masked (bidirectional attention)
+            # DDP: 두 번 forward 시 no_sync()로 첫 pass의 gradient sync 지연
             raw_model = model.module if isinstance(model, DDP) else model
-            out = model(batch, task="masked")
+            use_ddp = isinstance(model, DDP)
+            no_sync = model.no_sync() if (use_ddp and enable_next) else nullcontext()
+            with no_sync:
+                out = model(batch, task="masked")
 
             reconstructed = out["reconstructed"]  # (B, N, patch_size)
             cross_pred = out["cross_pred"]        # (B, N, patch_size)
@@ -607,7 +616,7 @@ def train_one_epoch_v2(
                 if hasattr(layer.ffn, "aux_loss") and layer.ffn.aux_loss is not None:
                     aux_loss = aux_loss + layer.ffn.aux_loss
 
-            # Pass 2: next_pred (causal attention) — 별도 forward
+            # Pass 2: next_pred (causal attention) — DDP sync는 이 pass에서 수행
             next_pred = None
             if enable_next:
                 out_next = model(batch, task="next_pred", horizon=H)
