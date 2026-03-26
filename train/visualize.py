@@ -1,4 +1,6 @@
 # -*- coding:utf-8 -*-
+from __future__ import annotations
+
 """학습 중 시각화 — 하위 호환 re-export.
 
 실제 구현은 분리된 모듈에 있다:

@@ -1,4 +1,6 @@
 # -*- coding:utf-8 -*-
+from __future__ import annotations
+
 """α * MPM + β * NextPred (same-variate + γ * cross-modal) + δ * Contrastive 복합 손실 함수."""
 import torch
 from torch import nn

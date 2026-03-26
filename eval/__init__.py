@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """다운스트림 태스크 평가 패키지."""
 
 from eval._metrics import pearson_r, regression_metrics

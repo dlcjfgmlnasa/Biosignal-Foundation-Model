@@ -1,9 +1,11 @@
 # -*- coding:utf-8 -*-
-"""Patch-based tokenization for packed biosignal sequences.
+"""Packed 생체신호 시퀀스의 패치 기반 토큰화.
 
 연속 신호를 고정 크기 패치 단위로 나누어 트랜스포머 입력 토큰으로 변환한다.
 PackCollate의 patch_size/stride 정렬과 함께 사용한다.
 """
+from __future__ import annotations
+
 import torch
 from torch import nn
 
@@ -25,6 +27,8 @@ class PatchEmbedding(nn.Module):
         ``stride < patch_size``이면 overlapping. ``patch_size % stride == 0`` 필수.
     bias:
         선형 투영의 bias 사용 여부.
+    stem:
+        CNN stem 모듈. ``None``이면 선형 투영 사용.
     """
 
     def __init__(
@@ -76,7 +80,7 @@ class PatchEmbedding(nn.Module):
         patches: torch.Tensor,  # (batch, num_patches, patch_size)
         patch_signal_types: torch.Tensor | None = None,  # (batch, num_patches) long
     ) -> torch.Tensor:  # (batch, num_patches, d_model)
-        """Raw patches → d_model embedding (linear 또는 CNN stem)."""
+        """Raw patches를 d_model 임베딩으로 투영한다 (linear 또는 CNN stem)."""
         if self.stem is not None and patch_signal_types is not None:
             return self.stem(patches, patch_signal_types)
         return self.proj(patches)
@@ -118,7 +122,7 @@ class PatchEmbedding(nn.Module):
 
         patches = values.reshape(B, N, P)  # (B, N, P)
 
-        # Downsample metadata
+        # 메타데이터 다운샘플
         patch_sample_id = sample_id[:, ::P]  # (B, N)
         patch_variate_id = variate_id[:, ::P]  # (B, N)
         patch_mask = patch_sample_id != 0  # (B, N)
@@ -149,15 +153,15 @@ class PatchEmbedding(nn.Module):
 
         patches = values.unfold(-1, P, S)  # (B, N, P)
 
-        # Unfold metadata to check patch validity
+        # unfold로 패치 유효성 검사
         sid_unfold = sample_id.unfold(-1, P, S)  # (B, N, P)
         vid_unfold = variate_id.unfold(-1, P, S)  # (B, N, P)
 
-        # Metadata from first position of each patch
+        # 각 패치 첫 위치의 메타데이터
         patch_sample_id = sid_unfold[:, :, 0]  # (B, N)
         patch_variate_id = vid_unfold[:, :, 0]  # (B, N)
 
-        # Patch is valid iff all P positions have same (sid, vid) and sid != 0
+        # 패치 유효 조건: P개 위치 모두 동일 (sid, vid) & sid != 0
         sid_ok = (sid_unfold == sid_unfold[:, :, :1]).all(dim=-1)  # (B, N)
         vid_ok = (vid_unfold == vid_unfold[:, :, :1]).all(dim=-1)  # (B, N)
         patch_mask = sid_ok & vid_ok & (patch_sample_id != 0)  # (B, N)

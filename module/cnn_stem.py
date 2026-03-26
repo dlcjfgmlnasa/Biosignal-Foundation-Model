@@ -1,10 +1,12 @@
 # -*- coding:utf-8 -*-
-"""Modality-specific 1D-CNN stem for biosignal patch embedding.
+"""Modality-specific 1D-CNN stem (생체신호 패치 임베딩용).
 
 신호 타입(ECG, EEG, EMG 등)별 전용 1D-CNN으로 raw patch에서
 저수준 특징을 추출한다. ``padding="same"`` + ``AdaptiveAvgPool1d(1)``
 구조로 임의의 patch_size를 처리할 수 있다.
 """
+from __future__ import annotations
+
 import torch
 from torch import nn
 
@@ -41,13 +43,13 @@ class Conv1dStem(nn.Module):
 
         layers: list[nn.Module] = []
 
-        # First layer: 1 → hidden_channels
+        # 첫 번째 레이어: 1 → hidden_channels
         layers.append(
             nn.Conv1d(1, hidden_channels, kernel_size, padding="same", bias=bias)
         )
         layers.append(nn.GELU())
 
-        # Middle layers: hidden_channels → hidden_channels
+        # 중간 레이어: hidden_channels → hidden_channels
         for _ in range(num_layers - 2):
             layers.append(
                 nn.Conv1d(
@@ -57,14 +59,14 @@ class Conv1dStem(nn.Module):
             )
             layers.append(nn.GELU())
 
-        # Last layer: hidden_channels → d_model (pointwise, no activation)
+        # 마지막 레이어: hidden_channels → d_model (pointwise, 활성화 없음)
         layers.append(nn.Conv1d(hidden_channels, d_model, 1, bias=bias))
 
         self.convs = nn.Sequential(*layers)
         self.pool = nn.AdaptiveAvgPool1d(1)
 
     def forward(self, patches: torch.Tensor) -> torch.Tensor:  # (M, P) → (M, d_model)
-        """Forward.
+        """순전파.
 
         Parameters
         ----------
@@ -83,7 +85,7 @@ class Conv1dStem(nn.Module):
 
 
 class ModalityCNNStem(nn.Module):
-    """Modality-specific 1D-CNN stem dispatcher.
+    """Modality-specific 1D-CNN stem 디스패처.
 
     신호 타입별 전용 ``Conv1dStem``을 보유하고, per-patch signal_type에
     따라 vectorized gather/scatter로 라우팅한다.
@@ -126,7 +128,7 @@ class ModalityCNNStem(nn.Module):
         patches: torch.Tensor,        # (B, N, P)
         signal_types: torch.Tensor,    # (B, N) long
     ) -> torch.Tensor:                 # (B, N, d_model)
-        """Forward — per-type vectorized dispatch.
+        """순전파 — 신호 타입별 vectorized dispatch.
 
         Parameters
         ----------

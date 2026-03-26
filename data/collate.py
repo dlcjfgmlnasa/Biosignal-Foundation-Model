@@ -1,8 +1,9 @@
 # -*- coding:utf-8 -*-
+from __future__ import annotations
+
 import heapq
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Optional
 
 import torch
 
@@ -45,7 +46,7 @@ class PackedBatch:
     sampling_rates: torch.Tensor  # (total_variates,) float
     signal_types: torch.Tensor  # (total_variates,) long
     spatial_ids: torch.Tensor  # (total_variates,) long — 전역 spatial_id
-    padded_lengths: Optional[torch.Tensor] = None  # (total_variates,) long
+    padded_lengths: torch.Tensor | None = None  # (total_variates,) long
 
 
 # ── 내부 데이터 구조 ────────────────────────────────────────────
@@ -81,15 +82,15 @@ class PackCollate:
     stride:
         패치 간 보폭 (overlapping 지원). ``patch_size``와 함께 사용.
 
-    Packing strategy: First-Fit Decreasing (FFD)
+    패킹 전략: First-Fit Decreasing (FFD)
     """
 
     def __init__(
         self,
         max_length: int,
         collate_mode: str = "any_variate",
-        patch_size: Optional[int] = None,
-        stride: Optional[int] = None,
+        patch_size: int | None = None,
+        stride: int | None = None,
     ) -> None:
         self.patch_size = patch_size
 
@@ -143,8 +144,8 @@ class PackCollate:
                 seg_len = min(s.values.shape[0], remaining)
 
                 # per-variate patch 파라미터 결정
-                var_P: Optional[int] = None
-                var_S: Optional[int] = None
+                var_P: int | None = None
+                var_S: int | None = None
                 if self.patch_size is not None:
                     var_P = self.patch_size
                     var_S = self.stride
@@ -178,7 +179,7 @@ class PackCollate:
                 offset += effective_len
 
             # Concat은 이미 max_length 이하이므로 재정리 불필요
-            if channel_values:  # Empty check
+            if channel_values:  # 빈 그룹 체크
                 concat = torch.cat(channel_values)
 
                 units.append(
@@ -241,7 +242,7 @@ class PackCollate:
                     all_types.extend(unit.variate_types)
                     all_spatial_ids.extend(unit.variate_spatial_ids)
                 else:
-                    # Trimmed unit: 포함된 variates만
+                    # 잘린 unit: 포함된 variate만 수집
                     for var_id, (_ch_idx, start, end) in enumerate(unit.channel_spans):
                         var_start = max(0, row_offset + start)
                         var_end = min(actual_seg_len, row_offset + end)
@@ -281,10 +282,10 @@ class PackCollate:
     # ── FFD 패킹 ─────────────────────────────────────────────────
 
     def _ffd_pack(self, units: list[_PackUnit]) -> list[list[_PackUnit]]:
-        """First-Fit Decreasing bin-packing (optimized). 긴 것부터 배치."""
+        """First-Fit Decreasing bin-packing (최적화). 긴 unit부터 배치한다."""
         sorted_units = sorted(units, key=lambda u: u.total_length, reverse=True)
 
-        # [최적화] 버전 번호를 사용하여 stale entries 제거
+        # [최적화] 버전 번호를 사용하여 오래된 항목 제거
         heap: list[tuple[int, int, int]] = []   # (-remaining, bin_idx, version)
         bin_remaining: list[int] = []
         bin_version: list[int] = []  # 각 bin의 현재 버전
@@ -293,7 +294,7 @@ class PackCollate:
         for unit in sorted_units:
             placed = False
 
-            # [최적화] Stale entries를 한 번에 정리
+            # [최적화] 오래된 항목을 한 번에 정리
             while heap and heap[0][2] != bin_version[heap[0][1]]:
                 heapq.heappop(heap)
 

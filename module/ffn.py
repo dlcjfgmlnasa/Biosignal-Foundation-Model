@@ -1,10 +1,11 @@
 # -*- coding:utf-8 -*-
-"""Feed-Forward Network modules: standard FFN, GLU FFN, and Mixture of Experts.
+"""Feed-Forward Network 모듈: 표준 FFN, GLU FFN, Mixture of Experts.
 
-Ported from Salesforce uni2ts (Apache 2.0).
+Salesforce uni2ts (Apache 2.0)에서 포팅.
 """
+from __future__ import annotations
+
 from collections.abc import Callable
-from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -12,11 +13,29 @@ from torch import nn
 
 
 class FeedForward(nn.Module):
+    """표준 Feed-Forward Network (fc1 → activation → fc2).
+
+    Parameters
+    ----------
+    in_dim:
+        입력 차원.
+    hidden_dim:
+        은닉 차원. ``None``이면 ``4 * in_dim``.
+    out_dim:
+        출력 차원. ``None``이면 ``in_dim``.
+    activation:
+        활성화 함수.
+    bias:
+        Linear bias 사용 여부.
+    ffn_dropout_p:
+        드롭아웃 확률.
+    """
+
     def __init__(
         self,
         in_dim: int,
-        hidden_dim: Optional[int] = None,
-        out_dim: Optional[int] = None,
+        hidden_dim: int | None = None,
+        out_dim: int | None = None,
         activation: Callable[[torch.Tensor], torch.Tensor] = F.gelu,
         bias: bool = True,
         ffn_dropout_p: float = 0.0,
@@ -40,7 +59,7 @@ class FeedForward(nn.Module):
     def forward(
         self,
         x: torch.Tensor,  # (..., in_dim)
-        centroid: Optional[torch.Tensor] = None,  # (expert, in_dim)
+        centroid: torch.Tensor | None = None,  # (expert, in_dim)
     ) -> torch.Tensor:  # (..., out_dim)
         x = self._in_proj(x)
         return self.dropout2(self.fc2(self.dropout1(x)))
@@ -52,13 +71,29 @@ class FeedForward(nn.Module):
 
 
 class GatedLinearUnitFeedForward(FeedForward):
-    """SiLU-gated FFN with adjusted hidden dim (2/3 * 4d, rounded to multiple of 8)."""
+    """SiLU-gated FFN (hidden_dim = 2/3 * 4d, 8의 배수로 반올림).
+
+    Parameters
+    ----------
+    in_dim:
+        입력 차원.
+    hidden_dim:
+        은닉 차원. ``None``이면 ``adjust_hidden_dim(4 * in_dim)``.
+    out_dim:
+        출력 차원. ``None``이면 ``in_dim``.
+    activation:
+        게이트 활성화 함수.
+    bias:
+        Linear bias 사용 여부.
+    ffn_dropout_p:
+        드롭아웃 확률.
+    """
 
     def __init__(
         self,
         in_dim: int,
-        hidden_dim: Optional[int] = None,
-        out_dim: Optional[int] = None,
+        hidden_dim: int | None = None,
+        out_dim: int | None = None,
         activation: Callable[[torch.Tensor], torch.Tensor] = F.silu,
         bias: bool = True,
         ffn_dropout_p: float = 0.0,
@@ -84,15 +119,35 @@ class GatedLinearUnitFeedForward(FeedForward):
 
 
 class MoEFeedForward(nn.Module):
-    """Mixture of Experts FFN with centroid-based routing and top-k expert selection."""
+    """Mixture of Experts FFN (centroid 기반 라우팅, top-k expert 선택).
+
+    Parameters
+    ----------
+    num_experts:
+        전문가 수.
+    num_experts_per_token:
+        토큰당 활성화되는 전문가 수.
+    in_dim:
+        입력 차원.
+    hidden_dim:
+        각 expert의 은닉 차원.
+    out_dim:
+        출력 차원.
+    activation:
+        활성화 함수.
+    bias:
+        Linear bias 사용 여부.
+    ffn_dropout_p:
+        드롭아웃 확률.
+    """
 
     def __init__(
         self,
         num_experts: int,
         num_experts_per_token: int,
         in_dim: int,
-        hidden_dim: Optional[int] = None,
-        out_dim: Optional[int] = None,
+        hidden_dim: int | None = None,
+        out_dim: int | None = None,
         activation: Callable[[torch.Tensor], torch.Tensor] = F.silu,
         bias: bool = True,
         ffn_dropout_p: float = 0.0,
@@ -118,7 +173,7 @@ class MoEFeedForward(nn.Module):
     def forward(
         self,
         x: torch.Tensor,  # (..., in_dim)
-        centroid: Optional[torch.Tensor] = None,  # (expert, in_dim)
+        centroid: torch.Tensor | None = None,  # (expert, in_dim)
     ) -> torch.Tensor:  # (..., dim)
         x_squashed = x.view(-1, x.shape[-1])
 

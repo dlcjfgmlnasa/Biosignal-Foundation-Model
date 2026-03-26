@@ -1,11 +1,13 @@
 # -*- coding:utf-8 -*-
+from __future__ import annotations
+
 import bisect
 import random
 import tempfile
+from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Sequence
 
 import torch
 from torch.utils.data import Dataset
@@ -202,7 +204,7 @@ class BiosignalDataset(Dataset[BiosignalSample]):
         signal_type: int = 0,
         cache_dir: str | None = None,
         cache_size: int = 8,
-    ) -> "BiosignalDataset":
+    ) -> BiosignalDataset:
         """인메모리 텐서로부터 데이터셋 생성 (테스트/프로토타이핑용).
 
         각 텐서를 임시 ``.pt`` 파일로 저장한 뒤 manifest를 구성한다.

@@ -1,10 +1,10 @@
 # -*- coding:utf-8 -*-
-"""Packed scalers for normalizing packed time series batches.
+"""Packed 시계열 배치 정규화 스케일러.
 
-Originally ported from Salesforce uni2ts (Apache 2.0).
-Rewritten to use scatter-based O(L) grouping instead of O(L^2) pairwise masks.
+Salesforce uni2ts (Apache 2.0)에서 포팅.
+scatter_add 기반 O(L) 구현 (기존 O(L^2) pairwise mask 대체).
 """
-from typing import Optional
+from __future__ import annotations
 
 import torch
 from torch import nn
@@ -13,12 +13,14 @@ from ._util import safe_div
 
 
 class PackedScaler(nn.Module):
+    """Packed batch 정규화 스케일러 기본 클래스."""
+
     def forward(
         self,
         target: torch.Tensor,  # (*batch, seq_len, #dim)
-        observed_mask: Optional[torch.Tensor] = None,  # (*batch, seq_len, #dim) bool
-        sample_id: Optional[torch.Tensor] = None,  # (*batch, seq_len) long
-        variate_id: Optional[torch.Tensor] = None,  # (*batch, seq_len) long
+        observed_mask: torch.Tensor | None = None,  # (*batch, seq_len, #dim) bool
+        sample_id: torch.Tensor | None = None,  # (*batch, seq_len) long
+        variate_id: torch.Tensor | None = None,  # (*batch, seq_len) long
     ) -> tuple[
         torch.Tensor,  # (*batch, seq_len, #dim) — loc
         torch.Tensor,  # (*batch, seq_len, #dim) — scale
@@ -73,7 +75,7 @@ def _make_group_key(
 
 
 class PackedNOPScaler(PackedScaler):
-    """No-op scaler: loc=0, scale=1."""
+    """No-op 스케일러: loc=0, scale=1."""
 
     def _get_loc_scale(
         self,
@@ -91,9 +93,16 @@ class PackedNOPScaler(PackedScaler):
 
 
 class PackedStdScaler(PackedScaler):
-    """Z-score normalization with Bessel's correction, grouped by sample_id/variate_id.
+    """Z-score 정규화 (Bessel 보정, sample_id/variate_id 그룹별).
 
-    scatter_add 기반 O(L) 구현. 기존 O(L^2) pairwise id_mask 대비 메모리 효율적.
+    scatter_add 기반 O(L) 구현.
+
+    Parameters
+    ----------
+    correction:
+        분산 계산 시 Bessel 보정값.
+    minimum_scale:
+        최소 스케일 (수치 안정성).
     """
 
     def __init__(self, correction: int = 1, minimum_scale: float = 1e-5):
@@ -148,9 +157,14 @@ class PackedStdScaler(PackedScaler):
 
 
 class PackedAbsMeanScaler(PackedScaler):
-    """Absolute mean scaling, grouped by sample_id/variate_id.
+    """절대 평균 스케일링 (sample_id/variate_id 그룹별).
 
     scatter_add 기반 O(L) 구현.
+
+    Parameters
+    ----------
+    minimum_scale:
+        최소 스케일 (수치 안정성).
     """
 
     def __init__(self, minimum_scale: float = 1e-5):

@@ -1,4 +1,6 @@
 # -*- coding:utf-8 -*-
+from __future__ import annotations
+
 """Next-Patch Prediction Loss.
 
 Phase 1 (CI): 같은 variate 내 시간 예측 (dynamics).

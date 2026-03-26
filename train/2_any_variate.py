@@ -1,4 +1,6 @@
 # -*- coding:utf-8 -*-
+from __future__ import annotations
+
 """Phase 2: Any-Variate 학습 (Cross-Modal).
 
 Phase 1 checkpoint를 로드하여, 다변량 세션에서 cross-modal 학습을 수행한다.

@@ -1,13 +1,14 @@
 # -*- coding:utf-8 -*-
-"""Grouped Query Attention with variable/temporal bias and projection support.
+"""Grouped Query Attention (variate/temporal bias 및 projection 지원).
 
-Ported from Salesforce uni2ts (Apache 2.0).
-Adapted: RMSNorm as default norm_layer.
+Salesforce uni2ts (Apache 2.0)에서 포팅.
+RMSNorm을 기본 norm_layer로 사용하도록 수정.
 """
+from __future__ import annotations
+
 import math
 from collections.abc import Callable
 from functools import partial
-from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -22,11 +23,11 @@ def native_scaled_dot_product_attention(
     query: torch.Tensor,  # (*batch, group, hpg, q_len, dim)
     key: torch.Tensor,  # (*batch, group, hpg, kv_len, dim)
     value: torch.Tensor,  # (*batch, group, hpg, kv_len, dim)
-    attn_mask: Optional[torch.Tensor] = None,  # (*batch, #group, #hpg, q_len, kv_len) bool|float
+    attn_mask: torch.Tensor | None = None,  # (*batch, #group, #hpg, q_len, kv_len) bool|float
     dropout_p: float = 0.0,
-    scale: Optional[float] = None,
+    scale: float | None = None,
 ) -> torch.Tensor:  # (*batch, group, hpg, q_len, dim)
-    """Fallback scaled dot-product attention (native PyTorch, no FlashAttention)."""
+    """Fallback scaled dot-product attention (FlashAttention 미사용 시 대체)."""
     scale_factor = 1 / math.sqrt(query.size(-1)) if scale is None else scale
     attn_weight = query @ key.transpose(-2, -1) * scale_factor
     if attn_mask is not None:
@@ -42,19 +43,51 @@ def native_scaled_dot_product_attention(
 
 
 class GroupedQueryAttention(nn.Module):
+    """Grouped Query Attention.
+
+    Q는 전체 헤드 수만큼, K/V는 그룹 수만큼 projection하여
+    그룹 내 헤드가 K/V를 공유한다. Q/K norm, variate/time bias,
+    RoPE 등 position encoding을 지원한다.
+
+    Parameters
+    ----------
+    dim:
+        입력/출력 차원.
+    num_heads:
+        어텐션 헤드 수.
+    num_groups:
+        K/V 그룹 수 (``num_heads``이면 MHA, ``1``이면 MQA).
+    bias:
+        Linear projection의 bias 사용 여부.
+    norm_layer:
+        Q/K norm에 사용할 레이어. ``None``이면 비활성.
+    softmax_scale:
+        softmax 스케일 팩터. ``None``이면 ``1/sqrt(head_dim)``.
+    attn_dropout_p:
+        어텐션 드롭아웃 확률.
+    var_attn_bias:
+        Variate 어텐션 바이어스 팩토리.
+    time_attn_bias:
+        시간 어텐션 바이어스 팩토리.
+    var_qk_proj:
+        Variate Q/K projection 팩토리.
+    time_qk_proj:
+        시간 Q/K projection 팩토리 (예: RoPE).
+    """
+
     def __init__(
         self,
         dim: int,
         num_heads: int,
         num_groups: int,
         bias: bool = True,
-        norm_layer: Optional[type[nn.Module] | partial[nn.Module]] = RMSNorm,
-        softmax_scale: Optional[float] = None,
+        norm_layer: type[nn.Module] | partial[nn.Module] | None = RMSNorm,
+        softmax_scale: float | None = None,
         attn_dropout_p: float = 0.0,
-        var_attn_bias: Optional[Callable[[], AttentionBias]] = None,
-        time_attn_bias: Optional[Callable[[], AttentionBias]] = None,
-        var_qk_proj: Optional[Callable[[], QueryKeyProjection]] = None,
-        time_qk_proj: Optional[Callable[[], QueryKeyProjection]] = None,
+        var_attn_bias: Callable[[], AttentionBias] | None = None,
+        time_attn_bias: Callable[[], AttentionBias] | None = None,
+        var_qk_proj: Callable[[], QueryKeyProjection] | None = None,
+        time_qk_proj: Callable[[], QueryKeyProjection] | None = None,
     ):
         super().__init__()
         assert num_heads > 0 and dim % num_heads == 0
@@ -87,11 +120,11 @@ class GroupedQueryAttention(nn.Module):
         self,
         query: torch.Tensor,  # (*batch, group, hpg, q_len, dim)
         key: torch.Tensor,  # (*batch, group, hpg, kv_len, dim)
-        query_var_id: Optional[torch.Tensor],  # (*batch, q_len) long
-        kv_var_id: Optional[torch.Tensor],  # (*batch, kv_len) long
+        query_var_id: torch.Tensor | None,  # (*batch, q_len) long
+        kv_var_id: torch.Tensor | None,  # (*batch, kv_len) long
     ) -> tuple[
-        Optional[torch.Tensor],  # (*batch, #group, #hpg, q_len) long
-        Optional[torch.Tensor],  # (*batch, #group, #hpg, kv_len) long
+        torch.Tensor | None,  # (*batch, #group, #hpg, q_len) long
+        torch.Tensor | None,  # (*batch, #group, #hpg, kv_len) long
     ]:
         if self.var_attn_bias is not None or self.var_qk_proj is not None:
             if query_var_id is None:
@@ -116,11 +149,11 @@ class GroupedQueryAttention(nn.Module):
         self,
         query: torch.Tensor,  # (*batch, group, hpg, q_len, dim)
         key: torch.Tensor,  # (*batch, group, hpg, kv_len, dim)
-        query_time_id: Optional[torch.Tensor],  # (*batch, q_len) long
-        kv_time_id: Optional[torch.Tensor],  # (*batch, kv_len) long
+        query_time_id: torch.Tensor | None,  # (*batch, q_len) long
+        kv_time_id: torch.Tensor | None,  # (*batch, kv_len) long
     ) -> tuple[
-        Optional[torch.Tensor],  # (*batch, 1, 1, q_len) long
-        Optional[torch.Tensor],  # (*batch, 1, 1, kv_len) long
+        torch.Tensor | None,  # (*batch, 1, 1, q_len) long
+        torch.Tensor | None,  # (*batch, 1, 1, kv_len) long
     ]:
         if self.time_attn_bias is not None or self.time_qk_proj is not None:
             if query_time_id is None:
@@ -145,14 +178,14 @@ class GroupedQueryAttention(nn.Module):
 
     def _update_attn_mask(
         self,
-        attn_mask: Optional[torch.Tensor],  # (*batch, q_len, kv_len) bool
+        attn_mask: torch.Tensor | None,  # (*batch, q_len, kv_len) bool
         query: torch.Tensor,  # (*batch, group, hpg, q_len, dim)
         key: torch.Tensor,  # (*batch, group, hpg, kv_len, dim)
-        query_var_id: Optional[torch.Tensor] = None,  # (*batch, 1, 1, q_len) long
-        kv_var_id: Optional[torch.Tensor] = None,  # (*batch, 1, 1, kv_len) long
-        query_time_id: Optional[torch.Tensor] = None,  # (*batch, 1, 1, q_len) long
-        kv_time_id: Optional[torch.Tensor] = None,  # (*batch, 1, 1, kv_len) long
-    ) -> Optional[torch.Tensor]:  # (*batch, #group, #hpg, q_len, kv_len) bool|float
+        query_var_id: torch.Tensor | None = None,  # (*batch, 1, 1, q_len) long
+        kv_var_id: torch.Tensor | None = None,  # (*batch, 1, 1, kv_len) long
+        query_time_id: torch.Tensor | None = None,  # (*batch, 1, 1, q_len) long
+        kv_time_id: torch.Tensor | None = None,  # (*batch, 1, 1, kv_len) long
+    ) -> torch.Tensor | None:  # (*batch, #group, #hpg, q_len, kv_len) bool|float
         if attn_mask is not None:
             attn_mask = rearrange(
                 attn_mask,
@@ -191,10 +224,10 @@ class GroupedQueryAttention(nn.Module):
         self,
         query: torch.Tensor,  # (*batch, group, hpg, q_len, dim)
         key: torch.Tensor,  # (*batch, group, hpg, kv_len, dim)
-        query_var_id: Optional[torch.Tensor],  # (*batch, #group, #hpg, q_len) long
-        kv_var_id: Optional[torch.Tensor],  # (*batch, #group, #hpg, kv_len) long
-        query_time_id: Optional[torch.Tensor],  # (*batch, #group, #hpg, q_len) long
-        kv_time_id: Optional[torch.Tensor],  # (*batch, #group, #hpg, kv_len) long
+        query_var_id: torch.Tensor | None,  # (*batch, #group, #hpg, q_len) long
+        kv_var_id: torch.Tensor | None,  # (*batch, #group, #hpg, kv_len) long
+        query_time_id: torch.Tensor | None,  # (*batch, #group, #hpg, q_len) long
+        kv_time_id: torch.Tensor | None,  # (*batch, #group, #hpg, kv_len) long
     ) -> tuple[
         torch.Tensor,  # (*batch, group, hpg, q_len, dim)
         torch.Tensor,  # (*batch, group, hpg, kv_len, dim)
@@ -216,11 +249,11 @@ class GroupedQueryAttention(nn.Module):
         query: torch.Tensor,  # (*batch, q_len, dim)
         key: torch.Tensor,  # (*batch, kv_len, dim)
         value: torch.Tensor,  # (*batch, kv_len, dim)
-        attn_mask: Optional[torch.Tensor] = None,  # (*batch, q_len, kv_len) bool
-        query_var_id: Optional[torch.Tensor] = None,  # (*batch, q_len) long
-        kv_var_id: Optional[torch.Tensor] = None,  # (*batch, kv_len) long
-        query_time_id: Optional[torch.Tensor] = None,  # (*batch, q_len) long
-        kv_time_id: Optional[torch.Tensor] = None,  # (*batch, kv_len) long
+        attn_mask: torch.Tensor | None = None,  # (*batch, q_len, kv_len) bool
+        query_var_id: torch.Tensor | None = None,  # (*batch, q_len) long
+        kv_var_id: torch.Tensor | None = None,  # (*batch, kv_len) long
+        query_time_id: torch.Tensor | None = None,  # (*batch, q_len) long
+        kv_time_id: torch.Tensor | None = None,  # (*batch, kv_len) long
     ) -> torch.Tensor:  # (*batch, q_len, dim)
         query = self.q_proj(query)
         key = self.k_proj(key)
@@ -234,8 +267,8 @@ class GroupedQueryAttention(nn.Module):
                 hpg=self.heads_per_group,
             )
         )
-        # Reshape K to (*batch, group, 1, kv_len, dim), apply norm, then expand
-        # the hpg=1 dim to hpg without physical copy (zero-copy broadcast).
+        # K를 (*batch, group, 1, kv_len, dim)으로 reshape 후 norm 적용,
+        # hpg=1 차원을 expand로 물리 복사 없이 broadcast.
         key = self.k_norm(
             rearrange(
                 key,
@@ -247,7 +280,7 @@ class GroupedQueryAttention(nn.Module):
             *key.shape[:-4], self.num_groups, self.heads_per_group,
             key.shape[-2], key.shape[-1],
         )  # (*batch, group, hpg, kv_len, dim)
-        # Reshape V to (*batch, group, 1, kv_len, dim), then expand — no copy.
+        # V를 (*batch, group, 1, kv_len, dim)으로 reshape 후 expand — 복사 없음.
         value = rearrange(
             value,
             "... kv_len (group dim) -> ... group 1 kv_len dim",
@@ -298,20 +331,20 @@ class GroupedQueryAttention(nn.Module):
 
 
 class MultiQueryAttention(GroupedQueryAttention):
-    """Multi-Query Attention: all heads share a single key/value group."""
+    """Multi-Query Attention: 모든 헤드가 단일 K/V 그룹을 공유한다."""
 
     def __init__(
         self,
         dim: int,
         num_heads: int,
         bias: bool = True,
-        norm_layer: Optional[type[nn.Module] | partial[nn.Module]] = RMSNorm,
-        softmax_scale: Optional[float] = None,
+        norm_layer: type[nn.Module] | partial[nn.Module] | None = RMSNorm,
+        softmax_scale: float | None = None,
         attn_dropout_p: float = 0.0,
-        var_attn_bias: Optional[Callable[[], AttentionBias]] = None,
-        time_attn_bias: Optional[Callable[[], AttentionBias]] = None,
-        var_qk_proj: Optional[Callable[[], QueryKeyProjection]] = None,
-        time_qk_proj: Optional[Callable[[], QueryKeyProjection]] = None,
+        var_attn_bias: Callable[[], AttentionBias] | None = None,
+        time_attn_bias: Callable[[], AttentionBias] | None = None,
+        var_qk_proj: Callable[[], QueryKeyProjection] | None = None,
+        time_qk_proj: Callable[[], QueryKeyProjection] | None = None,
     ):
         super().__init__(
             dim=dim,
@@ -329,20 +362,20 @@ class MultiQueryAttention(GroupedQueryAttention):
 
 
 class MultiHeadAttention(GroupedQueryAttention):
-    """Standard Multi-Head Attention: each head has its own key/value."""
+    """Standard Multi-Head Attention: 각 헤드가 독립적인 K/V를 가진다."""
 
     def __init__(
         self,
         dim: int,
         num_heads: int,
         bias: bool = True,
-        norm_layer: Optional[type[nn.Module] | partial[nn.Module]] = RMSNorm,
-        softmax_scale: Optional[float] = None,
+        norm_layer: type[nn.Module] | partial[nn.Module] | None = RMSNorm,
+        softmax_scale: float | None = None,
         attn_dropout_p: float = 0.0,
-        var_attn_bias: Optional[Callable[[], AttentionBias]] = None,
-        time_attn_bias: Optional[Callable[[], AttentionBias]] = None,
-        var_qk_proj: Optional[Callable[[], QueryKeyProjection]] = None,
-        time_qk_proj: Optional[Callable[[], QueryKeyProjection]] = None,
+        var_attn_bias: Callable[[], AttentionBias] | None = None,
+        time_attn_bias: Callable[[], AttentionBias] | None = None,
+        var_qk_proj: Callable[[], QueryKeyProjection] | None = None,
+        time_qk_proj: Callable[[], QueryKeyProjection] | None = None,
     ):
         super().__init__(
             dim=dim,

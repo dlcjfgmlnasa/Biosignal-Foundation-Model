@@ -1,4 +1,6 @@
 # -*- coding:utf-8 -*-
+from __future__ import annotations
+
 from torch.utils.data import DataLoader, Sampler
 
 from data.collate import PackCollate, PackedBatch

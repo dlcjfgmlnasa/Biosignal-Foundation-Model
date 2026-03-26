@@ -1,21 +1,23 @@
 # -*- coding:utf-8 -*-
-"""Checkpoint save/load 유틸리티.
+"""Checkpoint 저장/로드 유틸리티.
 
 모델 constructor args를 ``config``에 저장하여 재구성 가능하게 한다.
 """
+from __future__ import annotations
+
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any
 
 import torch
 from torch import nn
 
 
 def save_checkpoint(
-    path: Union[str, Path],
+    path: str | Path,
     model: nn.Module,
-    optimizer: Optional[torch.optim.Optimizer] = None,
+    optimizer: torch.optim.Optimizer | None = None,
     epoch: int = 0,
-    config: Optional[dict[str, Any]] = None,
+    config: dict[str, Any] | None = None,
     **extra: Any,
 ) -> None:
     """모델 checkpoint를 저장한다.
@@ -48,10 +50,10 @@ def save_checkpoint(
 
 
 def load_checkpoint(
-    path: Union[str, Path],
+    path: str | Path,
     model: nn.Module,
-    optimizer: Optional[torch.optim.Optimizer] = None,
-    device: Union[str, torch.device] = "cpu",
+    optimizer: torch.optim.Optimizer | None = None,
+    device: str | torch.device = "cpu",
 ) -> dict[str, Any]:
     """Checkpoint를 불러와 모델(및 옵티마이저)에 적용한다.
 

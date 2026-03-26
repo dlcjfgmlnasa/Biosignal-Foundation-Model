@@ -98,7 +98,7 @@ SIGNAL_TYPES: dict[str, int] = {
 
 
 def _apply_range_check(data: np.ndarray, valid_range: tuple[float, float]) -> tuple[np.ndarray, int]:
-    """범위 밖 값을 NaN으로 마킹한다. (1D inplace-safe copy)"""
+    """범위 밖 값을 NaN으로 마킹한다 (1D, 원본 비파괴 복사)."""
     lo, hi = valid_range
     out = data.copy()
     mask = (out < lo) | (out > hi)
@@ -109,7 +109,7 @@ def _apply_range_check(data: np.ndarray, valid_range: tuple[float, float]) -> tu
 
 
 def _apply_bandpass(data: np.ndarray, lo: float, hi: float, sr: float) -> np.ndarray:
-    """Butterworth bandpass filter. (1D)"""
+    """Butterworth 대역통과 필터 (1D)."""
     from scipy.signal import butter, sosfiltfilt
 
     nyq = sr / 2.0
@@ -156,7 +156,7 @@ def _extract_nan_free_segments(
     data: np.ndarray,  # (T,) float
     min_samples: int,
 ) -> list[np.ndarray]:
-    """NaN 구간을 제거하고 연속 valid 세그먼트를 반환한다."""
+    """NaN 구간을 제거하고 연속 유효 세그먼트를 반환한다."""
     valid = ~np.isnan(data)
     segments: list[np.ndarray] = []
 
@@ -281,7 +281,7 @@ def process_vital(
         if key in processed_keys:
             continue
 
-        # Native sampling rate로 데이터 추출
+        # 원본 sampling rate로 데이터 추출
         try:
             trk = vf.find_track(track_name)
             native_sr = trk.srate if trk is not None and trk.srate > 0 else 0
@@ -322,16 +322,16 @@ def process_vital(
         seg_count = 0
         track_recordings: list[dict] = []
         for seg_idx, segment in enumerate(segments):
-            # Flatline 검사
+            # 플랫라인 검사
             if segment.std() < 1e-6:
                 print(f"    [SKIP] {track_name} seg{seg_idx}: 플랫라인", file=sys.stderr)
                 continue
 
-            # Bandpass filtering (range check/cautery 이후 clean 세그먼트에 적용)
+            # 대역통과 필터링 (range check/cautery 이후 정상 세그먼트에 적용)
             if cfg.bandpass is not None:
                 segment = _apply_bandpass(segment, cfg.bandpass[0], cfg.bandpass[1], native_sr)
 
-            # Resampling → TARGET_SR (100Hz)
+            # 리샘플링 → TARGET_SR (100Hz)
             if native_sr != TARGET_SR:
                 segment = resample_to_target(segment, orig_sr=native_sr, target_sr=TARGET_SR)
 

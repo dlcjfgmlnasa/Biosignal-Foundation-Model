@@ -1,4 +1,6 @@
 # -*- coding:utf-8 -*-
+from __future__ import annotations
+
 from data.collate import PackCollate, PackedBatch
 from data.dataloader import create_dataloader
 from data.dataset import BiosignalDataset, BiosignalSample, RecordingManifest

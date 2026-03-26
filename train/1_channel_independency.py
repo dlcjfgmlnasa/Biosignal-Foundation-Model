@@ -1,4 +1,6 @@
 # -*- coding:utf-8 -*-
+from __future__ import annotations
+
 """Phase 1: Channel-Independent 사전학습.
 
 각 채널(variate)을 독립적으로 학습하여 단일 신호의 시간적 패턴을 학습한다.

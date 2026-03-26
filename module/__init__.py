@@ -1,4 +1,6 @@
 # -*- coding:utf-8 -*-
+from __future__ import annotations
+
 from .norm import RMSNorm
 from .attention import GroupedQueryAttention, MultiHeadAttention, MultiQueryAttention
 from .ffn import FeedForward, GatedLinearUnitFeedForward, MoEFeedForward

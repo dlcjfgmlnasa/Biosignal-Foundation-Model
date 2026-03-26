@@ -1,4 +1,6 @@
 # -*- coding:utf-8 -*-
+from __future__ import annotations
+
 """Cross-Modal Contrastive Loss (InfoNCE).
 
 같은 시간대(time_id)의 서로 다른 modality(variate_id) 패치를 positive pair로,
@@ -12,7 +14,7 @@ from torch import nn
 
 
 class CrossModalContrastiveLoss(nn.Module):
-    """InfoNCE contrastive loss for cross-modal representation alignment.
+    """Cross-modal representation alignment을 위한 InfoNCE contrastive loss.
 
     같은 ``(sample_id, time_id)``를 공유하지만 서로 다른 ``variate_id``를 가진
     패치 쌍을 positive로, 같은 batch row 내 나머지 패치를 negative로 사용한다.
@@ -65,7 +67,8 @@ class CrossModalContrastiveLoss(nn.Module):
         valid = patch_mask & (patch_variate_id > 0)  # (B, N)
 
         # Similarity matrix — 단일 batched matmul (for-loop 제거)
-        sim = torch.bmm(z, z.transpose(1, 2)) / self.temperature  # (B, N, N)
+        temp = self.temperature.clamp(min=0.01, max=1.0)  # NaN 방지
+        sim = torch.bmm(z, z.transpose(1, 2)) / temp  # (B, N, N)
 
         # Pairwise valid: query와 key 모두 유효해야 함
         valid_pair = valid.unsqueeze(-1) & valid.unsqueeze(-2)  # (B, N, N)

@@ -1,4 +1,6 @@
 # -*- coding:utf-8 -*-
+from __future__ import annotations
+
 """Masked Patch Modeling Loss.
 
 Phase 1 (CI): 랜덤 패치 마스킹 → 같은 variate 내 형태학 복원.

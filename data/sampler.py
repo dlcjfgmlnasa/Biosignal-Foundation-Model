@@ -1,4 +1,6 @@
 # -*- coding:utf-8 -*-
+from __future__ import annotations
+
 """GroupedBatchSampler: any_variate 모드를 위한 배치 샘플러.
 
 같은 (session_id, physical_time_ms)의 채널들을 항상 같은 배치에 넣어서
@@ -6,7 +8,7 @@ PackCollate의 any_variate 그루핑이 제대로 동작하도록 보장한다.
 """
 import bisect
 from collections import defaultdict
-from typing import Iterator
+from collections.abc import Iterator
 
 import torch
 from torch.utils.data import Sampler
@@ -36,7 +38,7 @@ class GroupedBatchSampler(Sampler[list[int]]):
         batch_size 미만이면 버린다. 단, 단일 그룹이 batch_size를
         초과하는 경우는 버리지 않는다.
     generator:
-        torch.Generator for reproducible shuffling. None이면 전역 RNG 사용.
+        재현 가능한 셔플링을 위한 torch.Generator. ``None``이면 전역 RNG 사용.
     """
 
     def __init__(

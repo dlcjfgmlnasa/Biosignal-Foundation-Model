@@ -1,4 +1,6 @@
 # -*- coding:utf-8 -*-
+from __future__ import annotations
+
 """2-Phase 커리큘럼 학습 공유 유틸리티.
 
 ``train/1_channel_independency.py``와 ``train/2_any_variate.py``에서 공통으로 사용하는

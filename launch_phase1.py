@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 # -*- coding:utf-8 -*-
+from __future__ import annotations
 """Phase 1 DDP launcher.
 
 torchrun은 -m (module) 실행을 지원하지 않으므로,

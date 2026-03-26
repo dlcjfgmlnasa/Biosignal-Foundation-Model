@@ -9,7 +9,6 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import fields
 from functools import partial
-from typing import Optional
 
 import torch
 from torch import nn
@@ -59,14 +58,14 @@ class BiosignalFoundationModel(nn.Module):
         d_model: int,
         num_layers: int,
         patch_size: int,
-        stride: Optional[int] = None,
-        num_heads: Optional[int] = None,
-        num_groups: Optional[int] = None,
+        stride: int | None = None,
+        num_heads: int | None = None,
+        num_groups: int | None = None,
         use_glu: bool = True,
         use_moe: bool = False,
         use_rope: bool = True,
         use_var_attn_bias: bool = True,
-        scaler: Optional[PackedScaler] = None,
+        scaler: PackedScaler | None = None,
         dropout_p: float = 0.0,
         num_signal_types: int = 6,
         num_spatial_ids: int = 55,
@@ -104,11 +103,11 @@ class BiosignalFoundationModel(nn.Module):
         # 3. Transformer Encoder
         num_heads = num_heads or d_model // 64
 
-        var_attn_bias_layer: Optional[Callable] = None
+        var_attn_bias_layer: Callable | None = None
         if use_var_attn_bias:
             var_attn_bias_layer = partial(BinaryAttentionBias)
 
-        time_qk_proj_layer: Optional[Callable] = None
+        time_qk_proj_layer: Callable | None = None
         if use_rope:
             time_qk_proj_layer = partial(
                 QueryKeyProjection,

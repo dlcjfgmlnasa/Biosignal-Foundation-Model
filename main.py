@@ -1,4 +1,6 @@
 # -*- coding:utf-8 -*-
+from __future__ import annotations
+
 """Biosignal Foundation Model — 통합 학습 엔트리포인트.
 
 YAML config 기반으로 Phase 1/2 학습을 실행한다.

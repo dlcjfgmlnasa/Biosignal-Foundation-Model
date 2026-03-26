@@ -1,10 +1,11 @@
 # -*- coding:utf-8 -*-
-"""Attention bias modules for variable-aware attention.
+"""Variate-aware 어텐션 바이어스 모듈.
 
-Ported from Salesforce uni2ts (Apache 2.0).
+Salesforce uni2ts (Apache 2.0)에서 포팅.
 """
+from __future__ import annotations
+
 import abc
-from typing import Optional
 
 import torch
 from einops import rearrange
@@ -12,6 +13,18 @@ from torch import nn
 
 
 class AttentionBias(nn.Module, abc.ABC):
+    """어텐션 바이어스 기본 클래스.
+
+    Parameters
+    ----------
+    dim:
+        입력 차원.
+    num_heads:
+        어텐션 헤드 수.
+    num_groups:
+        GQA 그룹 수.
+    """
+
     def __init__(
         self,
         dim: int,
@@ -39,10 +52,19 @@ class AttentionBias(nn.Module, abc.ABC):
 
 
 class BinaryAttentionBias(AttentionBias):
-    """Binary attention bias based on whether query and key share the same ID.
+    """이진 어텐션 바이어스 (같은 ID 여부에 따른 바이어스).
 
-    Used for variate-aware attention: tokens from the same variate (sample_id)
-    receive a different bias than tokens from different variates.
+    같은 variate(sample_id)의 토큰과 다른 variate의 토큰에
+    서로 다른 학습 가능한 바이어스를 적용한다.
+
+    Parameters
+    ----------
+    dim:
+        입력 차원.
+    num_heads:
+        어텐션 헤드 수.
+    num_groups:
+        GQA 그룹 수.
     """
 
     def __init__(self, dim: int, num_heads: int, num_groups: int):

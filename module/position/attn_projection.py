@@ -1,11 +1,13 @@
 # -*- coding:utf-8 -*-
-"""Query/Key projection modules including Rotary Position Encoding.
+"""Query/Key projection 모듈 (Rotary Position Encoding 포함).
 
-Ported from Salesforce uni2ts (Apache 2.0).
+Salesforce uni2ts (Apache 2.0)에서 포팅.
 """
+from __future__ import annotations
+
 import abc
 from functools import cached_property
-from typing import Any, Optional
+from typing import Any
 
 import torch
 from einops import einsum, rearrange, repeat
@@ -13,6 +15,18 @@ from torch import nn
 
 
 class Projection(nn.Module, abc.ABC):
+    """Q/K projection 기본 클래스.
+
+    Parameters
+    ----------
+    proj_width:
+        projection 대상 차원 크기.
+    num_heads:
+        어텐션 헤드 수.
+    num_groups:
+        GQA 그룹 수.
+    """
+
     def __init__(self, proj_width: int, num_heads: int, num_groups: int, **kwargs: Any):
         super().__init__()
         self.proj_width = proj_width
@@ -24,13 +38,27 @@ class Projection(nn.Module, abc.ABC):
     def forward(
         self,
         x: torch.Tensor,  # (*batch, group, hpg, seq, dim)
-        seq_id: Optional[torch.Tensor],  # (*batch, #group, #hpg, seq) long
+        seq_id: torch.Tensor | None,  # (*batch, #group, #hpg, seq) long
     ) -> torch.Tensor:  # (*batch, group, hpg, seq, dim)
         ...
 
 
 class RotaryProjection(Projection):
-    """Rotary Position Embedding (RoPE) for temporal position encoding."""
+    """Rotary Position Embedding (RoPE) — 시간 위치 인코딩용.
+
+    Parameters
+    ----------
+    proj_width:
+        projection 대상 차원 크기 (짝수여야 함).
+    num_heads:
+        어텐션 헤드 수.
+    num_groups:
+        GQA 그룹 수.
+    max_len:
+        초기 최대 시퀀스 길이 (자동 확장됨).
+    base:
+        주파수 기저 (기본 10000).
+    """
 
     def __init__(
         self,
@@ -60,6 +88,7 @@ class RotaryProjection(Projection):
         self._init_freq(max_len=max_len)
 
     def _init_freq(self, max_len: int):
+        """cos/sin 캐시를 초기화하거나 확장한다."""
         if self.cos is None or self.cos.size(-2) < max_len:
             position = torch.arange(
                 max_len, device=self.theta.device, dtype=self.theta.dtype
@@ -79,7 +108,7 @@ class RotaryProjection(Projection):
     def forward(
         self,
         x: torch.Tensor,  # (*batch, group, hpg, seq, dim)
-        seq_id: Optional[torch.Tensor],  # (*batch, #group, #hpg, seq) long
+        seq_id: torch.Tensor | None,  # (*batch, #group, #hpg, seq) long
     ) -> torch.Tensor:  # (*batch, group, hpg, seq, dim)
         self._init_freq(max_len=seq_id.max() + 1)
         rot_cos = self.cos[seq_id]
@@ -88,9 +117,28 @@ class RotaryProjection(Projection):
 
 
 class QueryKeyProjection(nn.Module):
-    """Applies projection (e.g. RoPE) to query and key tensors.
+    """Query/Key에 projection(예: RoPE)을 적용한다.
 
-    Supports partial_factor to apply projection to only a fraction of head_dim.
+    partial_factor로 head_dim의 일부분에만 projection을 적용할 수 있다.
+
+    Parameters
+    ----------
+    dim:
+        입력 차원.
+    num_heads:
+        어텐션 헤드 수.
+    num_groups:
+        GQA 그룹 수.
+    proj_layer:
+        Query projection 레이어 클래스.
+    kwargs:
+        Query projection 추가 인자.
+    key_proj_layer:
+        Key 전용 projection 레이어 클래스. ``None``이면 Query와 동일.
+    key_kwargs:
+        Key projection 추가 인자.
+    partial_factor:
+        head_dim에서 projection을 적용할 범위 (start, end). ``None``이면 전체.
     """
 
     def __init__(
@@ -99,10 +147,10 @@ class QueryKeyProjection(nn.Module):
         num_heads: int,
         num_groups: int,
         proj_layer: type[Projection],
-        kwargs: Optional[dict[str, Any]] = None,
-        key_proj_layer: Optional[type[Projection]] = None,
-        key_kwargs: Optional[dict[str, Any]] = None,
-        partial_factor: Optional[tuple[float, float]] = None,
+        kwargs: dict[str, Any] | None = None,
+        key_proj_layer: type[Projection] | None = None,
+        key_kwargs: dict[str, Any] | None = None,
+        partial_factor: tuple[float, float] | None = None,
     ):
         super().__init__()
         if partial_factor is not None:
@@ -150,8 +198,8 @@ class QueryKeyProjection(nn.Module):
         self,
         query: torch.Tensor,  # (*batch, group, hpg, q_len, dim)
         key: torch.Tensor,  # (*batch, group, hpg, kv_len, dim)
-        query_id: Optional[torch.Tensor],  # (*batch, #group, #hpg, q_len) long
-        kv_id: Optional[torch.Tensor],  # (*batch, #group, #hpg, kv_len) long
+        query_id: torch.Tensor | None,  # (*batch, #group, #hpg, q_len) long
+        kv_id: torch.Tensor | None,  # (*batch, #group, #hpg, kv_len) long
     ) -> tuple[
         torch.Tensor,  # (*batch, group, hpg, q_len, dim)
         torch.Tensor,  # (*batch, group, hpg, kv_len, dim)
