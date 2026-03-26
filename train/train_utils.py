@@ -66,6 +66,7 @@ class TrainConfig:
     beta: float = 0.0   # next-patch prediction
     gamma: float = 0.0  # cross-modal (beta 내부 가중)
     delta: float = 0.0  # cross-modal contrastive
+    eeg_loss_weight: float = 0.05  # V2 EEG embedding reconstruction weight
     aux_loss_weight: float = 0.01  # MoE load balancing auxiliary loss
     contrastive_temperature: float = 0.07
     learnable_temperature: bool = True
@@ -634,7 +635,7 @@ def train_one_epoch_v2(
                     )
 
             # ── 최종 total loss ──
-            total_loss = losses["total"] + eeg_loss
+            total_loss = losses["total"] + config.eeg_loss_weight * eeg_loss
 
             # ── MoE auxiliary loss 수집 (autocast 내부) ──
             aux_loss = torch.zeros(1, device=device)
@@ -846,7 +847,7 @@ def validate_v2(
                         eeg_recon_target[eeg_pred_mask],
                     )
 
-            total_loss = losses["total"] + eeg_loss
+            total_loss = losses["total"] + config.eeg_loss_weight * eeg_loss
 
         # MoE auxiliary loss 수집 (로깅 전용, backward 없음)
         aux_loss = 0.0

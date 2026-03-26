@@ -104,6 +104,7 @@ def parse_args() -> argparse.Namespace:
     g.add_argument("--alpha", type=float, default=1.0, help="Masked reconstruction weight")
     g.add_argument("--beta", type=float, default=1.0, help="Next-patch prediction weight")
     g.add_argument("--delta", type=float, default=0.0, help="Contrastive loss weight (0=disabled)")
+    g.add_argument("--eeg_loss_weight", type=float, default=0.05, help="V2 EEG embedding reconstruction weight")
     g.add_argument("--val_ratio", type=float, default=0.2,
                    help="Validation 비율 (subject 단위, 0=비활성)")
     g.add_argument("--patience", type=int, default=10,
@@ -192,6 +193,7 @@ def main():
         beta=args.beta,
         gamma=0.0,
         delta=args.delta,
+        eeg_loss_weight=args.eeg_loss_weight,
 
         # Phase 1은 variate-level 마스킹 비활성
         variate_mask_prob=0.0,
