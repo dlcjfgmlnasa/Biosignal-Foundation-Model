@@ -370,58 +370,74 @@ def process_vital(
             print(f"    [SKIP] {track_name}: 유효 세그먼트 없음 (min={min_duration_s}s)", file=sys.stderr)
             continue
 
-        # ── Step 4: 각 세그먼트별 처리 & 저장 ──
+        # ── Step 4: 각 세그먼트 → 필터/리샘플 → 윈도우 단위 품질 검사 → 저장 ──
         seg_count = 0
         track_recordings: list[dict] = []
+        quality_window_s = 30.0  # 품질 검사 윈도우 크기 (초)
+
         for seg_idx, segment in enumerate(segments):
-            # 대역통과 필터링 먼저 (native sr)
             # 신호별 필터링 (bandpass: ECG/EEG, lowpass: ABP/PPG/CVP/CO2/AWP)
             segment = _apply_filter(segment, cfg, native_sr)
 
-            # 리샘플링 → TARGET_SR (100Hz) — quality gate 전에 수행
-            # (500Hz 양자화로 인한 false flatline 방지)
+            # 리샘플링 → TARGET_SR (100Hz)
             if native_sr != TARGET_SR:
                 segment = resample_to_target(segment, orig_sr=native_sr, target_sr=TARGET_SR)
 
-            # 품질 검사 (100Hz 기준, bandpass 후)
-            qscore = segment_quality_score(
-                segment,
-                max_flatline_ratio=cfg.max_flatline_ratio,
-                max_clip_ratio=cfg.max_clip_ratio,
-                max_high_freq_ratio=cfg.max_high_freq_ratio,
-                min_amplitude=cfg.min_amplitude,
-                min_high_freq_ratio=cfg.min_high_freq_ratio,
-            )
-            if not qscore["pass"]:
-                reasons = []
-                if qscore["flatline_ratio"] >= cfg.max_flatline_ratio:
-                    reasons.append(f"flat={qscore['flatline_ratio']:.2f}")
-                if qscore["clip_ratio"] >= cfg.max_clip_ratio:
-                    reasons.append(f"clip={qscore['clip_ratio']:.2f}")
-                if qscore["high_freq_ratio"] >= cfg.max_high_freq_ratio:
-                    reasons.append(f"hf={qscore['high_freq_ratio']:.2f}")
-                if qscore["amplitude"] < cfg.min_amplitude:
-                    reasons.append(f"amp={qscore['amplitude']:.2f}<{cfg.min_amplitude}")
-                if qscore["high_freq_ratio"] < cfg.min_high_freq_ratio:
-                    reasons.append(f"hf_low={qscore['high_freq_ratio']:.4f}<{cfg.min_high_freq_ratio}")
-                print(f"    [SKIP] {track_name} seg{seg_idx}: 품질 불량 ({', '.join(reasons)})", file=sys.stderr)
+            # 윈도우 단위 품질 검사 → 통과한 윈도우만 수집
+            win_samples = int(quality_window_s * TARGET_SR)
+            good_windows: list[np.ndarray] = []
+            n_windows = 0
+            n_fail_basic = 0
+            n_fail_domain = 0
+
+            for win_start in range(0, len(segment) - win_samples + 1, win_samples):
+                win = segment[win_start:win_start + win_samples]
+                n_windows += 1
+
+                # 기본 품질 검사
+                qscore = segment_quality_score(
+                    win,
+                    max_flatline_ratio=cfg.max_flatline_ratio,
+                    max_clip_ratio=cfg.max_clip_ratio,
+                    max_high_freq_ratio=cfg.max_high_freq_ratio,
+                    min_amplitude=cfg.min_amplitude,
+                    min_high_freq_ratio=cfg.min_high_freq_ratio,
+                )
+                if not qscore["pass"]:
+                    n_fail_basic += 1
+                    continue
+
+                # Domain-specific 품질 검사
+                domain_result = domain_quality_check(stype_key, win, sr=TARGET_SR)
+                if not domain_result["pass"]:
+                    n_fail_domain += 1
+                    continue
+
+                good_windows.append(win)
+
+            if not good_windows:
+                if n_windows > 0:
+                    print(
+                        f"    [SKIP] {track_name} seg{seg_idx}: "
+                        f"모든 윈도우 불량 ({n_windows}개 중 basic={n_fail_basic}, domain={n_fail_domain})",
+                        file=sys.stderr,
+                    )
                 continue
 
-            # ── Domain-specific 품질 검사 (100Hz 기준) ──
-            domain_result = domain_quality_check(stype_key, segment, sr=TARGET_SR)
-            if not domain_result["pass"]:
-                detail_parts = [f"{k}={v}" for k, v in domain_result.items() if k != "pass"]
+            # 통과한 윈도우 이어붙여서 저장
+            clean_segment = np.concatenate(good_windows)
+            channel_data = clean_segment.reshape(1, -1).astype(np.float32)
+
+            # 최소 길이 체크 (min_duration_s)
+            duration_s = channel_data.shape[1] / TARGET_SR
+            if duration_s < min_duration_s:
                 print(
                     f"    [SKIP] {track_name} seg{seg_idx}: "
-                    f"domain check failed ({', '.join(detail_parts)})",
+                    f"통과 윈도우 {len(good_windows)}/{n_windows}개, {duration_s:.0f}s < {min_duration_s}s",
                     file=sys.stderr,
                 )
                 continue
 
-            # (1, T) 형태로 저장
-            channel_data = segment.reshape(1, -1).astype(np.float32)
-
-            # 파일명: seg 인덱스 포함
             fname = f"{session_id}_{stype_key}_{spatial_id}_seg{seg_idx}.zarr"
             save_recording_zarr(channel_data, subj_out / fname)
 
@@ -436,12 +452,14 @@ def process_vital(
             track_recordings.append(rec)
             recordings.append(rec)
             seg_count += 1
-            duration_s = channel_data.shape[1] / TARGET_SR
-            print(f"    saved {fname}  shape={tuple(channel_data.shape)}  {duration_s:.0f}s")
+            pct = len(good_windows) / n_windows * 100 if n_windows > 0 else 0
+            print(
+                f"    saved {fname}  shape={tuple(channel_data.shape)}  {duration_s:.0f}s"
+                f"  ({len(good_windows)}/{n_windows} windows, {pct:.0f}% pass)"
+            )
 
         if seg_count > 0:
             processed_keys.add(key)
-            # 트랙 처리 완료 즉시 manifest 갱신
             _save_subject_manifest(subj_out, subject_id, session_id, track_recordings)
             if seg_count > 1:
                 print(f"    [{track_name}] {seg_count}개 세그먼트 저장")

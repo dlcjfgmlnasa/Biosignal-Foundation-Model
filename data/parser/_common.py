@@ -202,9 +202,10 @@ def ecg_quality_check(
     if len(segment) < int(sr * 2):
         return {"hr": 0.0, "hr_valid": False, "n_peaks": 0, "regularity": 1.0, "pass": False}
 
-    # R-peak 검출: prominence 기반 (amplitude 대비 상대적 높이)
-    amp = np.max(segment) - np.min(segment)
-    if amp < 1e-6:
+    # R-peak 검출: IQR 기반 prominence (outlier spike에 robust)
+    q75, q25 = np.percentile(segment, [75, 25])
+    iqr = q75 - q25
+    if iqr < 1e-6:
         return {"hr": 0.0, "hr_valid": False, "n_peaks": 0, "regularity": 1.0, "pass": False}
 
     # R-R interval 최소 거리: max_hr=200bpm → 0.3s → sr*0.3 samples
@@ -213,7 +214,7 @@ def ecg_quality_check(
 
     peaks, properties = find_peaks(
         segment,
-        prominence=amp * 0.2,  # peak-to-peak의 20% 이상 prominence
+        prominence=iqr * 0.5,  # IQR의 50% — outlier에 robust
         distance=min_distance,
     )
 
@@ -277,15 +278,16 @@ def abp_quality_check(
     if len(segment) < int(sr * 2):
         return {"hr": 0.0, "n_peaks": 0, "regularity": 1.0, "pass": False}
 
-    amp = np.max(segment) - np.min(segment)
-    if amp < 1e-6:
+    q75, q25 = np.percentile(segment, [75, 25])
+    iqr = q75 - q25
+    if iqr < 1e-6:
         return {"hr": 0.0, "n_peaks": 0, "regularity": 1.0, "pass": False}
 
     # Systolic peaks: 최소 0.4s 간격 (max ~150bpm)
     min_distance = int(sr * 0.4)
     peaks, _ = find_peaks(
         segment,
-        prominence=amp * 0.15,
+        prominence=iqr * 0.5,
         distance=min_distance,
     )
 
@@ -342,8 +344,9 @@ def ppg_quality_check(
     if len(segment) < int(sr * 2):
         return {"hr": 0.0, "regularity": 1.0, "pass": False}
 
-    amp = np.max(segment) - np.min(segment)
-    if amp < 1e-6:
+    q75, q25 = np.percentile(segment, [75, 25])
+    iqr = q75 - q25
+    if iqr < 1e-6:
         return {"hr": 0.0, "regularity": 1.0, "pass": False}
 
     min_distance = int(sr * 60.0 / max_hr * 0.8)
@@ -351,7 +354,7 @@ def ppg_quality_check(
 
     peaks, _ = find_peaks(
         segment,
-        prominence=amp * 0.15,
+        prominence=iqr * 0.5,
         distance=min_distance,
     )
 
@@ -405,8 +408,9 @@ def co2_quality_check(
     if duration_s < 5.0:
         return {"resp_rate": 0.0, "pass": False}
 
-    amp = np.max(segment) - np.min(segment)
-    if amp < 1.0:  # CO2 최소 진폭 ~1 mmHg 이상이어야 호흡 존재
+    q75, q25 = np.percentile(segment, [75, 25])
+    iqr = q75 - q25
+    if iqr < 0.5:  # CO2 최소 IQR ~0.5 이상이어야 호흡 존재
         return {"resp_rate": 0.0, "pass": False}
 
     # End-tidal CO2 peaks: 호흡 주기 최소 60/max_rr 초
@@ -415,7 +419,7 @@ def co2_quality_check(
 
     peaks, _ = find_peaks(
         segment,
-        prominence=amp * 0.2,
+        prominence=iqr * 0.5,
         distance=min_distance,
     )
 
@@ -464,8 +468,9 @@ def awp_quality_check(
     if duration_s < 5.0:
         return {"resp_rate": 0.0, "pass": False}
 
-    amp = np.max(segment) - np.min(segment)
-    if amp < 1.0:  # AWP 최소 진폭 ~1 cmH2O
+    q75, q25 = np.percentile(segment, [75, 25])
+    iqr = q75 - q25
+    if iqr < 0.5:  # AWP 최소 IQR ~0.5 cmH2O
         return {"resp_rate": 0.0, "pass": False}
 
     min_distance = int(sr * 60.0 / max_rr * 0.8)
@@ -473,7 +478,7 @@ def awp_quality_check(
 
     peaks, _ = find_peaks(
         segment,
-        prominence=amp * 0.2,
+        prominence=iqr * 0.5,
         distance=min_distance,
     )
 
