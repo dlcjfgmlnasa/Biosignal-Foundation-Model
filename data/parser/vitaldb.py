@@ -373,7 +373,7 @@ def process_vital(
         # ── Step 4: 각 세그먼트 → 필터/리샘플 → 윈도우 단위 품질 검사 → 저장 ──
         seg_count = 0
         track_recordings: list[dict] = []
-        quality_window_s = 30.0  # 품질 검사 윈도우 크기 (초)
+        quality_window_s = 10.0  # 품질 검사 윈도우 크기 (초)
 
         for seg_idx, segment in enumerate(segments):
             # 신호별 필터링 (bandpass: ECG/EEG, lowpass: ABP/PPG/CVP/CO2/AWP)
