@@ -70,6 +70,62 @@ def quality_gate(signal: np.ndarray, min_duration_s: float, sr: float) -> bool:
     return n_timesteps >= min_duration_s * sr
 
 
+def segment_quality_score(segment: np.ndarray) -> dict[str, float]:
+    """세그먼트 품질 점수를 계산한다.
+
+    Parameters
+    ----------
+    segment:
+        (n_timesteps,) 1D 배열.
+
+    Returns
+    -------
+    dict with keys:
+        ``flatline_ratio``: 연속 동일 값 비율 (0~1).
+        ``clip_ratio``: min/max 값에 고정된 비율 (0~1).
+        ``high_freq_ratio``: 고주파 에너지 비율 (0~1, 높으면 노이즈).
+        ``pass``: True이면 품질 통과.
+    """
+    n = len(segment)
+    if n < 2:
+        return {"flatline_ratio": 1.0, "clip_ratio": 1.0, "high_freq_ratio": 1.0, "pass": False}
+
+    # 1. Flatline: 연속 동일 값 비율
+    diffs = np.diff(segment)
+    flatline_ratio = float(np.sum(np.abs(diffs) < 1e-10)) / max(len(diffs), 1)
+
+    # 2. Clipping/Saturation: min/max 값에 고정된 비율
+    smin, smax = segment.min(), segment.max()
+    if smax - smin < 1e-10:
+        clip_ratio = 1.0
+    else:
+        at_min = np.sum(np.abs(segment - smin) < 1e-8)
+        at_max = np.sum(np.abs(segment - smax) < 1e-8)
+        clip_ratio = float(at_min + at_max) / n
+
+    # 3. High-frequency noise ratio (1차 미분 에너지 / 신호 에너지)
+    sig_energy = float(np.mean(segment ** 2))
+    diff_energy = float(np.mean(diffs ** 2))
+    if sig_energy < 1e-10:
+        high_freq_ratio = 1.0
+    else:
+        high_freq_ratio = diff_energy / sig_energy
+
+    # 통과 기준
+    passed = (
+        flatline_ratio < 0.5      # 50% 이상 flat이면 불량
+        and clip_ratio < 0.1      # 10% 이상 clipping이면 불량
+        and high_freq_ratio < 2.0  # 미분 에너지가 신호 에너지의 2배 이상이면 노이즈
+    )
+
+    return {
+        "flatline_ratio": flatline_ratio,
+        "clip_ratio": clip_ratio,
+        "high_freq_ratio": high_freq_ratio,
+        "pass": passed,
+    }
+
+
 def save_recording(tensor: torch.Tensor, out_path: str) -> None:
     """float32로 강제 변환 후 .pt 파일로 저장한다.
 

@@ -29,7 +29,7 @@ from pathlib import Path
 
 import numpy as np
 
-from data.parser._common import resample_to_target, save_recording_zarr
+from data.parser._common import resample_to_target, save_recording_zarr, segment_quality_score
 
 # 목표 sampling rate (Hz)
 TARGET_SR: float = 100.0
@@ -322,9 +322,17 @@ def process_vital(
         seg_count = 0
         track_recordings: list[dict] = []
         for seg_idx, segment in enumerate(segments):
-            # 플랫라인 검사
-            if segment.std() < 1e-6:
-                print(f"    [SKIP] {track_name} seg{seg_idx}: 플랫라인", file=sys.stderr)
+            # 품질 검사 (flatline, clipping, noise)
+            qscore = segment_quality_score(segment)
+            if not qscore["pass"]:
+                reasons = []
+                if qscore["flatline_ratio"] >= 0.5:
+                    reasons.append(f"flat={qscore['flatline_ratio']:.2f}")
+                if qscore["clip_ratio"] >= 0.1:
+                    reasons.append(f"clip={qscore['clip_ratio']:.2f}")
+                if qscore["high_freq_ratio"] >= 2.0:
+                    reasons.append(f"hf={qscore['high_freq_ratio']:.2f}")
+                print(f"    [SKIP] {track_name} seg{seg_idx}: 품질 불량 ({', '.join(reasons)})", file=sys.stderr)
                 continue
 
             # 대역통과 필터링 (range check/cautery 이후 정상 세그먼트에 적용)
