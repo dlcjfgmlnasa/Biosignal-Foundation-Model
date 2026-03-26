@@ -74,6 +74,8 @@ TRACK_MAP: dict[str, tuple[str, int]] = {
     "SNUADC/EEG_BIS": ("eeg", 0),
     "SNUADC/EEG1": ("eeg", 0),
     "SNUADC/EEG2": ("eeg", 0),
+    "BIS/EEG1_WAV": ("eeg", 0),
+    "BIS/EEG2_WAV": ("eeg", 0),
     # PPG (3)
     "Solar8000/PLETH": ("ppg", 1),
     "SNUADC/PLETH": ("ppg", 1),
