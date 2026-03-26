@@ -371,16 +371,21 @@ def train_one_epoch(
         n_batches += 1
 
         if is_main_process() and (n_batches % 50 == 0 or config.dry_run):
-            print(
-                f"  [{phase_name}] batch {n_batches} | "
-                f"total: {loss.item():.6f} | "
-                f"masked: {losses['masked_loss'].item():.6f} | "
-                f"next: {losses['next_loss'].item():.6f} | "
-                f"cross: {losses['cross_modal_loss'].item():.6f} | "
-                f"contrastive: {losses['contrastive_loss'].item():.6f} | "
-                f"aux: {aux_loss.item():.6f} | "
-                f"grad_norm: {grad_norm:.4f}"
-            )
+            parts = [
+                f"  [{phase_name}] batch {n_batches}",
+                f"total: {loss.item():.6f}",
+                f"masked: {losses['masked_loss'].item():.6f}",
+            ]
+            if losses['next_loss'].item() > 0:
+                parts.append(f"next: {losses['next_loss'].item():.6f}")
+            if losses['cross_modal_loss'].item() > 0:
+                parts.append(f"cross: {losses['cross_modal_loss'].item():.6f}")
+            if losses['contrastive_loss'].item() > 0:
+                parts.append(f"contrastive: {losses['contrastive_loss'].item():.6f}")
+            if aux_loss.item() > 0:
+                parts.append(f"aux: {aux_loss.item():.6f}")
+            parts.append(f"grad_norm: {grad_norm:.4f}")
+            print(" | ".join(parts))
 
         # Dry-run: 1 batch만 실행
         if config.dry_run:
@@ -706,17 +711,23 @@ def train_one_epoch_v2(
         n_batches += 1
 
         if is_main_process() and (n_batches % 50 == 0 or config.dry_run):
-            print(
-                f"  [{phase_name}] batch {n_batches} | "
-                f"total: {loss.item():.6f} | "
-                f"masked: {losses['masked_loss'].item():.6f} | "
-                f"next: {losses['next_loss'].item():.6f} | "
-                f"cross: {losses['cross_modal_loss'].item():.6f} | "
-                f"contrastive: {losses['contrastive_loss'].item():.6f} | "
-                f"eeg: {eeg_loss.item():.6f} | "
-                f"aux: {aux_loss.item():.6f} | "
-                f"grad_norm: {grad_norm:.4f}"
-            )
+            parts = [
+                f"  [{phase_name}] batch {n_batches}",
+                f"total: {loss.item():.6f}",
+                f"masked: {losses['masked_loss'].item():.6f}",
+            ]
+            if losses['next_loss'].item() > 0:
+                parts.append(f"next: {losses['next_loss'].item():.6f}")
+            if losses['cross_modal_loss'].item() > 0:
+                parts.append(f"cross: {losses['cross_modal_loss'].item():.6f}")
+            if losses['contrastive_loss'].item() > 0:
+                parts.append(f"contrastive: {losses['contrastive_loss'].item():.6f}")
+            if eeg_loss.item() > 0:
+                parts.append(f"eeg: {eeg_loss.item():.6f}")
+            if aux_loss.item() > 0:
+                parts.append(f"aux: {aux_loss.item():.6f}")
+            parts.append(f"grad_norm: {grad_norm:.4f}")
+            print(" | ".join(parts))
 
         # Dry-run: 1 batch만 실행
         if config.dry_run:
