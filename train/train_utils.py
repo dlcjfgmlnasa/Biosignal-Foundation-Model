@@ -12,7 +12,6 @@ import math
 import os
 import random
 import time
-from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
@@ -257,14 +256,11 @@ def train_one_epoch(
             H = random.randint(1, config.model_config.max_horizon)
 
         with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
-            # Dual forward: Pass 1 no_sync → Pass 2 sync (DDP allreduce)
+            # Dual forward: raw_model로 양쪽 실행 + 수동 allreduce
             raw_model = model.module if isinstance(model, DDP) else model
-            use_ddp = isinstance(model, DDP)
 
-            # Pass 1: masked (bidirectional) — no_sync로 gradient 누적만
-            no_sync_ctx = model.no_sync() if (use_ddp and enable_next) else nullcontext()
-            with no_sync_ctx:
-                out = model(batch, task="masked")
+            # Pass 1: masked (bidirectional attention)
+            out = raw_model(batch, task="masked")
 
             reconstructed = out["reconstructed"]  # (B, N, patch_size)
             cross_pred = out["cross_pred"]        # (B, N, patch_size)
@@ -277,10 +273,10 @@ def train_one_epoch(
                 if hasattr(layer.ffn, "aux_loss") and layer.ffn.aux_loss is not None:
                     aux_loss = aux_loss + layer.ffn.aux_loss
 
-            # Pass 2: next_pred (causal) — DDP forward로 allreduce (Pass 1+2 gradient 합산)
+            # Pass 2: next_pred (causal attention)
             next_pred = None
             if enable_next:
-                out_next = model(batch, task="next_pred", horizon=H)
+                out_next = raw_model(batch, task="next_pred", horizon=H)
                 next_pred = out_next["next_pred"]  # (B, N, patch_size)
                 # Pass 2 aux_loss 누적
                 for layer in raw_model.encoder.layers:
@@ -353,9 +349,15 @@ def train_one_epoch(
         else:
             loss.backward()
 
+        # DDP 수동 gradient allreduce (dual forward로 DDP wrapper 미사용)
+        if isinstance(model, DDP) and dist.is_initialized():
+            for p in raw_model.parameters():
+                if p.grad is not None:
+                    dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+
         # Gradient NaN/Inf 감지
         grad_norm = nn.utils.clip_grad_norm_(
-            model.parameters(), max_norm=config.gradient_clip,
+            raw_model.parameters(), max_norm=config.gradient_clip,
         )
         if not torch.isfinite(grad_norm):
             if is_main_process():
@@ -593,14 +595,11 @@ def train_one_epoch_v2(
             H = random.randint(1, config.model_config.max_horizon)
 
         with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
-            # Dual forward: Pass 1 no_sync → Pass 2 sync (DDP allreduce)
+            # Dual forward: raw_model로 양쪽 실행 + 수동 allreduce
             raw_model = model.module if isinstance(model, DDP) else model
-            use_ddp = isinstance(model, DDP)
 
-            # Pass 1: masked (bidirectional) — no_sync로 gradient 누적만
-            no_sync_ctx = model.no_sync() if (use_ddp and enable_next) else nullcontext()
-            with no_sync_ctx:
-                out = model(batch, task="masked")
+            # Pass 1: masked (bidirectional attention)
+            out = raw_model(batch, task="masked")
 
             reconstructed = out["reconstructed"]  # (B, N, patch_size)
             cross_pred = out["cross_pred"]        # (B, N, patch_size)
@@ -618,10 +617,10 @@ def train_one_epoch_v2(
                 if hasattr(layer.ffn, "aux_loss") and layer.ffn.aux_loss is not None:
                     aux_loss = aux_loss + layer.ffn.aux_loss
 
-            # Pass 2: next_pred (causal) — DDP forward로 allreduce
+            # Pass 2: next_pred (causal attention)
             next_pred = None
             if enable_next:
-                out_next = model(batch, task="next_pred", horizon=H)
+                out_next = raw_model(batch, task="next_pred", horizon=H)
                 next_pred = out_next["next_pred"]  # (B, N, patch_size)
                 # Pass 2 aux_loss 누적
                 for layer in raw_model.encoder.layers:
@@ -712,9 +711,15 @@ def train_one_epoch_v2(
         else:
             loss.backward()
 
+        # DDP 수동 gradient allreduce (dual forward로 DDP wrapper 미사용)
+        if isinstance(model, DDP) and dist.is_initialized():
+            for p in raw_model.parameters():
+                if p.grad is not None:
+                    dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+
         # Gradient NaN/Inf 감지
         grad_norm = nn.utils.clip_grad_norm_(
-            model.parameters(), max_norm=config.gradient_clip,
+            raw_model.parameters(), max_norm=config.gradient_clip,
         )
         if not torch.isfinite(grad_norm):
             if is_main_process():
