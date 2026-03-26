@@ -40,19 +40,39 @@ TARGET_SR: float = 100.0
 
 @dataclass
 class SignalConfig:
-    """신호 타입별 전처리 파라미터."""
+    """신호 타입별 전처리 파라미터.
+
+    품질 기준 (segment_quality_score 연동):
+        max_flatline_ratio: 연속 동일 값 비율 상한 (초과 시 불량)
+        max_clip_ratio: min/max 고정 비율 상한
+        max_high_freq_ratio: 고주파 에너지 비율 상한 (신호별 특성에 맞게 설정)
+
+    high_freq_ratio 근거 (실측 + 시각 검증, 2026-03-26):
+        ECG: QRS spike → 정상도 ~0.4, P99=1.97 → 3.0
+        ABP: 매우 부드러운 파형, P99=0.03 → 0.5
+        EEG: alpha/beta 고주파 → 합성 clean=0.38 → 2.0
+        PPG: 부드러운 파형, hf>0.05부터 노이즈 → 0.05 (시각 검증)
+        CVP: 저주파, 합성 clean=0.0004 → 0.5
+        CO2: 느린 capnogram, flatline 구간 → hf=1.0, flatline=0.3
+        AWP: P95=0.54, 1.0 이상 스파이크 → 1.0
+    """
     valid_range: tuple[float, float] | None  # (min, max) — None이면 range check 안 함
     bandpass: tuple[float, float] | None     # (lo, hi) Hz — None이면 필터 안 함
+    max_flatline_ratio: float = 0.5          # 50% 이상 flat이면 불량
+    max_clip_ratio: float = 0.1              # 10% 이상 clipping이면 불량
+    max_high_freq_ratio: float = 2.0         # 기본값; 신호별로 아래에서 재정의
+    min_amplitude: float = 0.0               # 최소 peak-to-peak 진폭 (0=비활성)
+    min_high_freq_ratio: float = 0.0         # 최소 hf ratio (0=비활성, ECG용: QRS 없으면 불량)
 
 
 SIGNAL_CONFIGS: dict[str, SignalConfig] = {
-    "ecg": SignalConfig(valid_range=(-5.0, 5.0),       bandpass=(0.5, 40.0)),
-    "abp": SignalConfig(valid_range=(0.0, 300.0),      bandpass=(0.5, 40.0)),
-    "eeg": SignalConfig(valid_range=(-500.0, 500.0),   bandpass=(0.5, 45.0)),
-    "ppg": SignalConfig(valid_range=None,               bandpass=(0.5, 8.0)),
-    "cvp": SignalConfig(valid_range=(-5.0, 40.0),      bandpass=(0.5, 20.0)),
-    "co2": SignalConfig(valid_range=(0.0, 100.0),      bandpass=None),
-    "awp": SignalConfig(valid_range=(-10.0, 80.0),     bandpass=None),
+    "ecg": SignalConfig(valid_range=(-5.0, 5.0),       bandpass=(0.5, 40.0),  max_high_freq_ratio=1.0, min_amplitude=0.3, min_high_freq_ratio=0.05),
+    "abp": SignalConfig(valid_range=(0.0, 300.0),      bandpass=(0.5, 40.0),  max_high_freq_ratio=0.5),
+    "eeg": SignalConfig(valid_range=(-500.0, 500.0),   bandpass=(0.5, 45.0),  max_high_freq_ratio=2.0),
+    "ppg": SignalConfig(valid_range=None,               bandpass=(0.5, 8.0),   max_high_freq_ratio=0.05, min_amplitude=5.0),
+    "cvp": SignalConfig(valid_range=(-5.0, 40.0),      bandpass=(0.5, 20.0),  max_high_freq_ratio=0.5),
+    "co2": SignalConfig(valid_range=(0.0, 100.0),      bandpass=None,          max_high_freq_ratio=1.0, max_flatline_ratio=0.3, min_amplitude=5.0),
+    "awp": SignalConfig(valid_range=(-10.0, 80.0),     bandpass=None,          max_high_freq_ratio=1.0, min_amplitude=2.0),
 }
 
 
@@ -322,16 +342,27 @@ def process_vital(
         seg_count = 0
         track_recordings: list[dict] = []
         for seg_idx, segment in enumerate(segments):
-            # 품질 검사 (flatline, clipping, noise)
-            qscore = segment_quality_score(segment)
+            # 품질 검사 (flatline, clipping, noise, amplitude) — 신호별 threshold 적용
+            qscore = segment_quality_score(
+                segment,
+                max_flatline_ratio=cfg.max_flatline_ratio,
+                max_clip_ratio=cfg.max_clip_ratio,
+                max_high_freq_ratio=cfg.max_high_freq_ratio,
+                min_amplitude=cfg.min_amplitude,
+                min_high_freq_ratio=cfg.min_high_freq_ratio,
+            )
             if not qscore["pass"]:
                 reasons = []
-                if qscore["flatline_ratio"] >= 0.5:
+                if qscore["flatline_ratio"] >= cfg.max_flatline_ratio:
                     reasons.append(f"flat={qscore['flatline_ratio']:.2f}")
-                if qscore["clip_ratio"] >= 0.1:
+                if qscore["clip_ratio"] >= cfg.max_clip_ratio:
                     reasons.append(f"clip={qscore['clip_ratio']:.2f}")
-                if qscore["high_freq_ratio"] >= 2.0:
+                if qscore["high_freq_ratio"] >= cfg.max_high_freq_ratio:
                     reasons.append(f"hf={qscore['high_freq_ratio']:.2f}")
+                if qscore["amplitude"] < cfg.min_amplitude:
+                    reasons.append(f"amp={qscore['amplitude']:.2f}<{cfg.min_amplitude}")
+                if qscore["high_freq_ratio"] < cfg.min_high_freq_ratio:
+                    reasons.append(f"hf_low={qscore['high_freq_ratio']:.4f}<{cfg.min_high_freq_ratio}")
                 print(f"    [SKIP] {track_name} seg{seg_idx}: 품질 불량 ({', '.join(reasons)})", file=sys.stderr)
                 continue
 

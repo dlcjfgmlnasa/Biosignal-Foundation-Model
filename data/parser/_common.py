@@ -70,25 +70,45 @@ def quality_gate(signal: np.ndarray, min_duration_s: float, sr: float) -> bool:
     return n_timesteps >= min_duration_s * sr
 
 
-def segment_quality_score(segment: np.ndarray) -> dict[str, float]:
+def segment_quality_score(
+    segment: np.ndarray,
+    max_flatline_ratio: float = 0.5,
+    max_clip_ratio: float = 0.1,
+    max_high_freq_ratio: float = 2.0,
+    min_amplitude: float = 0.0,
+    min_high_freq_ratio: float = 0.0,
+) -> dict[str, float]:
     """세그먼트 품질 점수를 계산한다.
 
     Parameters
     ----------
     segment:
         (n_timesteps,) 1D 배열.
+    max_flatline_ratio:
+        flatline 비율 상한 (이상이면 불량). 기본 0.5.
+    max_clip_ratio:
+        clipping 비율 상한 (이상이면 불량). 기본 0.1.
+    max_high_freq_ratio:
+        고주파 에너지 비율 상한 (이상이면 불량). 기본 2.0.
+        신호 타입별로 다른 값을 전달하여 적절한 품질 판정 가능.
+    min_amplitude:
+        최소 peak-to-peak 진폭. 미만이면 불량. 기본 0.0 (비활성).
+    min_high_freq_ratio:
+        최소 고주파 에너지 비율. 미만이면 불량. 기본 0.0 (비활성).
+        ECG처럼 QRS spike가 있어야 정상인 신호에서, hf가 너무 낮으면 spike 없는 것.
 
     Returns
     -------
     dict with keys:
         ``flatline_ratio``: 연속 동일 값 비율 (0~1).
         ``clip_ratio``: min/max 값에 고정된 비율 (0~1).
-        ``high_freq_ratio``: 고주파 에너지 비율 (0~1, 높으면 노이즈).
+        ``high_freq_ratio``: 고주파 에너지 비율 (높으면 노이즈).
+        ``amplitude``: peak-to-peak 진폭.
         ``pass``: True이면 품질 통과.
     """
     n = len(segment)
     if n < 2:
-        return {"flatline_ratio": 1.0, "clip_ratio": 1.0, "high_freq_ratio": 1.0, "pass": False}
+        return {"flatline_ratio": 1.0, "clip_ratio": 1.0, "high_freq_ratio": 1.0, "amplitude": 0.0, "pass": False}
 
     # 1. Flatline: 연속 동일 값 비율
     diffs = np.diff(segment)
@@ -111,17 +131,23 @@ def segment_quality_score(segment: np.ndarray) -> dict[str, float]:
     else:
         high_freq_ratio = diff_energy / sig_energy
 
-    # 통과 기준
+    # 4. Peak-to-peak amplitude
+    amplitude = float(smax - smin)
+
+    # 통과 기준 — 호출자가 신호별 threshold를 전달
     passed = (
-        flatline_ratio < 0.5      # 50% 이상 flat이면 불량
-        and clip_ratio < 0.1      # 10% 이상 clipping이면 불량
-        and high_freq_ratio < 2.0  # 미분 에너지가 신호 에너지의 2배 이상이면 노이즈
+        flatline_ratio < max_flatline_ratio
+        and clip_ratio < max_clip_ratio
+        and high_freq_ratio < max_high_freq_ratio
+        and amplitude >= min_amplitude
+        and high_freq_ratio >= min_high_freq_ratio
     )
 
     return {
         "flatline_ratio": flatline_ratio,
         "clip_ratio": clip_ratio,
         "high_freq_ratio": high_freq_ratio,
+        "amplitude": amplitude,
         "pass": passed,
     }
 
