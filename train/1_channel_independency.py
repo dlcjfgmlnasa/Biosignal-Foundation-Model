@@ -70,6 +70,7 @@ def parse_args() -> argparse.Namespace:
     g.add_argument("--stem_hidden_channels", type=int, default=64)
     g.add_argument("--stem_num_layers", type=int, default=3)
     g.add_argument("--stem_kernel_size", type=int, default=3)
+    g.add_argument("--contrastive_proj_dim", type=int, default=0)
 
     # Data
     g = p.add_argument_group("Data")
@@ -154,6 +155,7 @@ def main():
         stem_hidden_channels=args.stem_hidden_channels,
         stem_num_layers=args.stem_num_layers,
         stem_kernel_size=args.stem_kernel_size,
+        contrastive_proj_dim=args.contrastive_proj_dim,
     )
 
     config = TrainConfig(
