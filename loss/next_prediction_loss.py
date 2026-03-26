@@ -111,8 +111,8 @@ class NextPredictionLoss(nn.Module):
         """
         # group_key: (batch, sample_id, time_id)가 같은 패치를 그룹핑
         B, N = time_id.shape
-        K = time_id.max().item() + 1
-        S = patch_sample_id.max().item() + 1
+        K = time_id.max() + 1          # 0-dim 텐서 (CUDA sync 없음)
+        S = patch_sample_id.max() + 1  # 0-dim 텐서 (CUDA sync 없음)
         batch_idx = torch.arange(B, device=time_id.device).unsqueeze(-1)  # (B, 1)
         group_key = batch_idx * (S * K) + patch_sample_id * K + time_id  # (B, N)
 

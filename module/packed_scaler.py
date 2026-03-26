@@ -35,9 +35,9 @@ class PackedScaler(nn.Module):
             )
 
         loc, scale = self._get_loc_scale(
-            target.double(), observed_mask, sample_id, variate_id
+            target, observed_mask, sample_id, variate_id
         )
-        return loc.float(), scale.float()
+        return loc, scale
 
     def _get_loc_scale(
         self,
@@ -55,10 +55,21 @@ class PackedScaler(nn.Module):
 def _make_group_key(
     sample_id: torch.Tensor,  # (B, L)
     variate_id: torch.Tensor,  # (B, L)
-) -> torch.Tensor:  # (B, L)
-    """(sample_id, variate_id) 쌍을 단일 정수 group key로 변환한다."""
-    max_vid = variate_id.max().item() + 1
-    return sample_id * max_vid + variate_id
+) -> tuple[torch.Tensor, int]:  # (B, L), n_groups
+    """(sample_id, variate_id) 쌍을 단일 정수 group key로 변환한다.
+
+    Returns
+    -------
+    group_key:
+        ``(B, L)`` — 그룹 키.
+    n_groups:
+        그룹 수 (scatter_add 대상 텐서 크기).
+    """
+    max_vid = variate_id.max()  # 0-dim tensor (GPU)
+    group_key = sample_id * (max_vid + 1) + variate_id
+    # n_groups: scatter_add 대상 크기로 Python int 필요 — 단일 sync로 통합
+    n_groups: int = group_key.max().item() + 1
+    return group_key, n_groups
 
 
 class PackedNOPScaler(PackedScaler):
@@ -101,8 +112,7 @@ class PackedStdScaler(PackedScaler):
         torch.Tensor,  # (B, L, D) — scale
     ]:
         B, L, D = target.shape
-        group_key = _make_group_key(sample_id, variate_id)  # (B, L)
-        n_groups = group_key.max().item() + 1
+        group_key, n_groups = _make_group_key(sample_id, variate_id)  # (B, L), int
 
         # group_key를 D 차원으로 확장
         gk = group_key.unsqueeze(-1).expand(B, L, D)  # (B, L, D)
@@ -158,8 +168,7 @@ class PackedAbsMeanScaler(PackedScaler):
         torch.Tensor,  # (B, L, D) — scale
     ]:
         B, L, D = target.shape
-        group_key = _make_group_key(sample_id, variate_id)  # (B, L)
-        n_groups = group_key.max().item() + 1
+        group_key, n_groups = _make_group_key(sample_id, variate_id)  # (B, L), int
 
         gk = group_key.unsqueeze(-1).expand(B, L, D)  # (B, L, D)
         obs_float = observed_mask.to(target.dtype)  # (B, L, D)

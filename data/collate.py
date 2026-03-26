@@ -197,30 +197,23 @@ class PackCollate:
         # 3. FFD 패킹
         bins = self._ffd_pack(units)
 
-        # 4. 텐서 생성 (최적화: 실제 필요한 크기만 할당)
+        # 4. 텐서 생성 — 최종 크기로 바로 할당 (중간 텐서 없음)
         n_rows = len(bins)
 
-        # [최적화] 각 행의 실제 필요 길이 계산
-        row_lengths: list[int] = []
-        for contents in bins:
-            row_len = sum(u.total_length for u in contents)
-            row_lengths.append(min(row_len, self.max_length))
+        padded_values = torch.zeros(n_rows, self.max_length)
+        padded_ids = torch.zeros(n_rows, self.max_length, dtype=torch.long)
+        padded_var_ids = torch.zeros(n_rows, self.max_length, dtype=torch.long)
 
-        # 행마다 다른 길이로 할당 (padding 최소화)
-        packed_values: list[torch.Tensor] = []
-        packed_ids: list[torch.Tensor] = []
-        packed_var_ids: list[torch.Tensor] = []
         all_lengths: list[int] = []
         all_padded_lengths: list[int] = []
         all_rates: list[float] = []
         all_types: list[int] = []
         all_spatial_ids: list[int] = []
 
-        for row_idx, (contents, row_len) in enumerate(zip(bins, row_lengths)):
-            row_values = torch.zeros(row_len)
-            row_ids = torch.zeros(row_len, dtype=torch.long)
-            row_var_ids = torch.zeros(row_len, dtype=torch.long)
-
+        for row_idx, contents in enumerate(bins):
+            row_len = min(
+                sum(u.total_length for u in contents), self.max_length,
+            )
             row_offset = 0
             for local_id, unit in enumerate(contents, start=1):
                 seg_len = unit.total_length
@@ -228,8 +221,8 @@ class PackCollate:
                 actual_seg_len = end_offset - row_offset
 
                 if actual_seg_len > 0:
-                    row_values[row_offset:end_offset] = unit.values[:actual_seg_len]
-                    row_ids[row_offset:end_offset] = local_id
+                    padded_values[row_idx, row_offset:end_offset] = unit.values[:actual_seg_len]
+                    padded_ids[row_idx, row_offset:end_offset] = local_id
 
                     # variate_id 할당
                     for var_id, (_ch_idx, start, end) in enumerate(
@@ -238,7 +231,7 @@ class PackCollate:
                         var_start = max(row_offset, row_offset + start)
                         var_end = min(end_offset, row_offset + end)
                         if var_end > var_start:
-                            row_var_ids[var_start:var_end] = var_id
+                            padded_var_ids[row_idx, var_start:var_end] = var_id
 
                 # metadata 수집
                 if actual_seg_len == seg_len:  # 전체 unit이 포함됨
@@ -267,20 +260,6 @@ class PackCollate:
                 row_offset += actual_seg_len
                 if row_offset >= row_len:
                     break
-
-            packed_values.append(row_values)
-            packed_ids.append(row_ids)
-            packed_var_ids.append(row_var_ids)
-
-        # 모든 행을 max_length로 pad
-        padded_values = torch.zeros(n_rows, self.max_length)
-        padded_ids = torch.zeros(n_rows, self.max_length, dtype=torch.long)
-        padded_var_ids = torch.zeros(n_rows, self.max_length, dtype=torch.long)
-
-        for i, (v, ids, var_ids) in enumerate(zip(packed_values, packed_ids, packed_var_ids)):
-            padded_values[i, : v.shape[0]] = v
-            padded_ids[i, : ids.shape[0]] = ids
-            padded_var_ids[i, : var_ids.shape[0]] = var_ids
 
         padded_lengths_tensor = (
             torch.tensor(all_padded_lengths, dtype=torch.long)

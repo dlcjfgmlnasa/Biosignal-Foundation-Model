@@ -139,11 +139,30 @@ class MoEFeedForward(nn.Module):
         ).type_as(x)
 
         results = torch.zeros_like(x_squashed)
+        # expert별 인덱스를 1회 sync로 사전 그룹핑 (expert 수만큼 torch.where 방지)
+        flat_experts = selected_experts.reshape(-1)               # (T * K,)
+        flat_batch = torch.arange(
+            selected_experts.shape[0], device=x.device,
+        ).unsqueeze(-1).expand_as(selected_experts).reshape(-1)   # (T * K,)
+        flat_slot = torch.arange(
+            selected_experts.shape[1], device=x.device,
+        ).unsqueeze(0).expand_as(selected_experts).reshape(-1)    # (T * K,)
+        order = flat_experts.argsort()                            # GPU 1회 sort
+        sorted_experts = flat_experts[order]
+        sorted_batch = flat_batch[order]
+        sorted_slot = flat_slot[order]
+        # expert 경계를 한 번에 계산
+        counts = torch.zeros(self.num_experts, dtype=torch.long, device=x.device)
+        counts.scatter_add_(0, sorted_experts, torch.ones_like(sorted_experts, dtype=torch.long))
+        splits = counts.cumsum(0).tolist()                        # CPU sync 1회 (불가피)
+        start = 0
         for i, expert in enumerate(self.experts):
-            batch_idx, nth_expert = torch.where(selected_experts == i)
-            results[batch_idx] += weights[batch_idx, nth_expert, None] * expert(
-                x_squashed[batch_idx]
-            )
+            end = splits[i]
+            if start < end:
+                idx = sorted_batch[start:end]
+                slot = sorted_slot[start:end]
+                results[idx] += weights[idx, slot, None] * expert(x_squashed[idx])
+            start = end
 
         results = results.view_as(x)
         return results

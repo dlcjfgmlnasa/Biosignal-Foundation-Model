@@ -308,7 +308,7 @@ def main():
     model.to(device)
 
     if use_ddp:
-        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
 
     if rank0:
         raw_model = model.module if use_ddp else model

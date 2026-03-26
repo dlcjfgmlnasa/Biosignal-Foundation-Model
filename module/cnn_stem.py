@@ -150,14 +150,13 @@ class ModalityCNNStem(nn.Module):
 
         for t, stem in enumerate(self.stems):
             mask = flat_types == t                         # (B*N,)
-            if mask.any():
-                selected = flat_patches[mask]              # (M_t, P)
-                embedded = stem(selected)                  # (M_t, d_model)
-                if flat_output is None:
-                    flat_output = torch.zeros(
-                        B * N, self.d_model, device=device, dtype=embedded.dtype,
-                    )
-                flat_output[mask] = embedded
+            selected = flat_patches[mask]                  # (M_t, P) — 0일 수 있음
+            embedded = stem(selected)                      # (M_t, d_model) — batch=0이면 no-op
+            if flat_output is None:
+                flat_output = torch.zeros(
+                    B * N, self.d_model, device=device, dtype=embedded.dtype,
+                )
+            flat_output[mask] = embedded
 
         if flat_output is None:
             flat_output = torch.zeros(B * N, self.d_model, device=device, dtype=dtype)

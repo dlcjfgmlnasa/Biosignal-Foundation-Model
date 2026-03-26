@@ -234,20 +234,29 @@ class GroupedQueryAttention(nn.Module):
                 hpg=self.heads_per_group,
             )
         )
+        # Reshape K to (*batch, group, 1, kv_len, dim), apply norm, then expand
+        # the hpg=1 dim to hpg without physical copy (zero-copy broadcast).
         key = self.k_norm(
-            repeat(
+            rearrange(
                 key,
-                "... kv_len (group dim) -> ... group hpg kv_len dim",
+                "... kv_len (group dim) -> ... group 1 kv_len dim",
                 group=self.num_groups,
-                hpg=self.heads_per_group,
             )
         )
-        value = repeat(
+        key = key.expand(
+            *key.shape[:-4], self.num_groups, self.heads_per_group,
+            key.shape[-2], key.shape[-1],
+        )  # (*batch, group, hpg, kv_len, dim)
+        # Reshape V to (*batch, group, 1, kv_len, dim), then expand — no copy.
+        value = rearrange(
             value,
-            "... kv_len (group dim) -> ... group hpg kv_len dim",
+            "... kv_len (group dim) -> ... group 1 kv_len dim",
             group=self.num_groups,
-            hpg=self.heads_per_group,
         )
+        value = value.expand(
+            *value.shape[:-4], self.num_groups, self.heads_per_group,
+            value.shape[-2], value.shape[-1],
+        )  # (*batch, group, hpg, kv_len, dim)
 
         query_var_id, kv_var_id = self._get_var_id(query, key, query_var_id, kv_var_id)
         query_time_id, kv_time_id = self._get_time_id(

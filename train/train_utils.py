@@ -226,11 +226,12 @@ def train_one_epoch(
 ) -> dict[str, float]:
     """1에폭 학습을 수행하고 평균 loss를 반환한다."""
     model.train()
-    epoch_total = 0.0
-    epoch_masked = 0.0
-    epoch_next = 0.0
-    epoch_cross = 0.0
-    epoch_contrastive = 0.0
+    # GPU 텐서로 누적하여 배치마다 .item() CUDA sync 방지
+    epoch_total = torch.zeros(1, device=device)
+    epoch_masked = torch.zeros(1, device=device)
+    epoch_next = torch.zeros(1, device=device)
+    epoch_cross = torch.zeros(1, device=device)
+    epoch_contrastive = torch.zeros(1, device=device)
     n_batches = 0
     nan_count = 0
     max_nan_batches = 10
@@ -317,11 +318,11 @@ def train_one_epoch(
                         f"Stopping epoch early."
                     )
                 break
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             continue
 
         nan_count = 0  # 정상 batch면 카운터 리셋
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
 
         if scaler is not None:
             scaler.scale(loss).backward()
@@ -339,7 +340,7 @@ def train_one_epoch(
                     f"  [{phase_name}] WARNING: NaN/Inf gradient at batch {n_batches + 1}, "
                     f"skipping update."
                 )
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             n_batches += 1
             if scaler is not None:
                 scaler.update()
@@ -351,12 +352,12 @@ def train_one_epoch(
         else:
             optimizer.step()
 
-        # ── 로깅 ──
-        epoch_total += losses["total"].item()
-        epoch_masked += losses["masked_loss"].item()
-        epoch_next += losses["next_loss"].item()
-        epoch_cross += losses["cross_modal_loss"].item()
-        epoch_contrastive += losses["contrastive_loss"].item()
+        # ── 로깅 (GPU 텐서로 누적, CUDA sync 없음) ──
+        epoch_total += losses["total"].detach()
+        epoch_masked += losses["masked_loss"].detach()
+        epoch_next += losses["next_loss"].detach()
+        epoch_cross += losses["cross_modal_loss"].detach()
+        epoch_contrastive += losses["contrastive_loss"].detach()
         n_batches += 1
 
         if is_main_process() and (n_batches % 50 == 0 or config.dry_run):
@@ -384,11 +385,11 @@ def train_one_epoch(
 
     denom = max(n_batches, 1)
     return {
-        "total": epoch_total / denom,
-        "masked_loss": epoch_masked / denom,
-        "next_loss": epoch_next / denom,
-        "cross_modal_loss": epoch_cross / denom,
-        "contrastive_loss": epoch_contrastive / denom,
+        "total": (epoch_total / denom).item(),
+        "masked_loss": (epoch_masked / denom).item(),
+        "next_loss": (epoch_next / denom).item(),
+        "cross_modal_loss": (epoch_cross / denom).item(),
+        "contrastive_loss": (epoch_contrastive / denom).item(),
     }
 
 

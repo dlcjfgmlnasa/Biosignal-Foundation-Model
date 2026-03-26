@@ -61,56 +61,45 @@ class CrossModalContrastiveLoss(nn.Module):
         # L2 normalize
         z = F.normalize(z, dim=-1)
 
-        total_loss = z.new_tensor(0.0)
-        n_valid_anchors = 0
+        # Valid mask: padding 제외 유효 패치
+        valid = patch_mask & (patch_variate_id > 0)  # (B, N)
 
-        for b in range(B):
-            # padding 제외한 유효 패치만 선택
-            valid = patch_mask[b] & (patch_variate_id[b] > 0)
-            if valid.sum() < 2:
-                continue
+        # Similarity matrix — 단일 batched matmul (for-loop 제거)
+        sim = torch.bmm(z, z.transpose(1, 2)) / self.temperature  # (B, N, N)
 
-            valid_idx = valid.nonzero(as_tuple=True)[0]  # (M,)
-            z_valid = z[b, valid_idx]                      # (M, D)
-            sid = patch_sample_id[b, valid_idx]            # (M,)
-            vid = patch_variate_id[b, valid_idx]           # (M,)
-            tid = time_id[b, valid_idx]                    # (M,)
-            M = z_valid.shape[0]
+        # Pairwise valid: query와 key 모두 유효해야 함
+        valid_pair = valid.unsqueeze(-1) & valid.unsqueeze(-2)  # (B, N, N)
 
-            # Positive mask: same (sample_id, time_id), different variate_id
-            K = tid.max().item() + 1
-            group_key = sid * K + tid  # (M,)
-            pos_mask = (
-                (group_key.unsqueeze(-1) == group_key.unsqueeze(-2))
-                & (vid.unsqueeze(-1) != vid.unsqueeze(-2))
-            )  # (M, M)
+        # Positive mask: same (sample_id, time_id), different variate_id
+        K = time_id.max() + 1  # 0-dim 텐서 (CUDA sync 없음)
+        group_key = patch_sample_id * K + time_id  # (B, N)
+        same_group = group_key.unsqueeze(-1) == group_key.unsqueeze(-2)  # (B, N, N)
+        diff_var = patch_variate_id.unsqueeze(-1) != patch_variate_id.unsqueeze(-2)  # (B, N, N)
+        pos_mask = same_group & diff_var & valid_pair  # (B, N, N)
 
-            # positive pair가 있는 anchor만 선택
-            has_pos = pos_mask.any(dim=-1)  # (M,)
-            if not has_pos.any():
-                continue
+        # Self-mask (diagonal 제외)
+        self_mask = torch.eye(N, dtype=torch.bool, device=z.device).unsqueeze(0)  # (1, N, N)
 
-            # Similarity matrix
-            sim = z_valid @ z_valid.T / self.temperature  # (M, M)
+        # has_pos: positive pair가 있는 유효 anchor
+        has_pos = pos_mask.any(dim=-1) & valid  # (B, N)
+        if not has_pos.any():
+            return z.new_tensor(0.0)
 
-            # Self-mask (diagonal 제외)
-            self_mask = torch.eye(M, dtype=torch.bool, device=z.device)
+        # Denominator: 자기 자신 제외, 유효 패치만
+        denom_mask = valid_pair & ~self_mask  # (B, N, N)
+        log_denom = torch.logsumexp(
+            sim.masked_fill(~denom_mask, float("-inf")), dim=-1,
+        )  # (B, N)
 
-            # Denominator: 자기 자신 제외한 모든 패치
-            sim_all = sim.masked_fill(self_mask, float("-inf"))
-            log_denom = torch.logsumexp(sim_all, dim=-1)  # (M,)
+        # Numerator: positive pair만
+        log_numer = torch.logsumexp(
+            sim.masked_fill(~pos_mask, float("-inf")), dim=-1,
+        )  # (B, N)
 
-            # Numerator: positive pair만
-            sim_pos = sim.masked_fill(~pos_mask, float("-inf"))
-            log_numer = torch.logsumexp(sim_pos, dim=-1)  # (M,)
+        # InfoNCE = -log(sum_pos / sum_all) = -(log_numer - log_denom)
+        per_anchor_loss = -(log_numer - log_denom)  # (B, N)
 
-            # InfoNCE = -log(sum_pos / sum_all) = -(log_numer - log_denom)
-            per_anchor_loss = -(log_numer - log_denom)  # (M,)
+        total_loss = per_anchor_loss[has_pos].sum()
+        n_valid_anchors = has_pos.sum()
 
-            valid_loss = per_anchor_loss[has_pos]
-            total_loss = total_loss + valid_loss.sum()
-            n_valid_anchors += has_pos.sum().item()
-
-        if n_valid_anchors > 0:
-            return total_loss / n_valid_anchors
-        return total_loss  # 0.0
+        return total_loss / n_valid_anchors

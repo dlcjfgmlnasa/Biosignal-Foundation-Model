@@ -295,6 +295,7 @@ def main():
         batch_size=config.batch_size,
         shuffle=True,
         num_workers=config.num_workers,
+        pin_memory=True,
         collate_mode=config.collate_mode,
         patch_size=config.model_config.patch_size,
     )

@@ -182,7 +182,7 @@ class PatchEmbedding(nn.Module):
         device = sample_id.device
 
         # 고유 variate 키: sample_id와 variate_id를 조합
-        combined = sample_id * (variate_id.max().item() + 1) + variate_id  # (B, N)
+        combined = sample_id * (variate_id.max() + 1) + variate_id  # (B, N)
 
         # 경계 감지: combined가 이전과 다르면 새 variate 시작
         boundary = torch.ones(B, N, dtype=torch.bool, device=device)
