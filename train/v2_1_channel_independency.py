@@ -317,8 +317,9 @@ def main():
     model.to(device)
 
     if use_ddp:
-        # cross_head, eeg_recon_head는 gamma=0일 때 loss에 미사용 → unused params 존재
+        # dual forward pass (masked + next_pred) → static_graph로 동일 파라미터 재사용 허용
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+        model._set_static_graph()
 
     if rank0:
         raw_model = model.module if use_ddp else model
