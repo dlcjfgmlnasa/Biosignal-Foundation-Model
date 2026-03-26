@@ -250,21 +250,25 @@ def train_one_epoch(
         batch.sample_id = batch.sample_id.to(device)
         batch.variate_id = batch.variate_id.to(device)
 
-        # ── Forward (single pass: masked + next_pred 동시) ──
+        # ── Forward (dual pass: masked=bidirectional, next_pred=causal) ──
         H = 1
         if enable_next:
             H = random.randint(1, config.model_config.max_horizon)
 
-        task = "both" if enable_next else "masked"
-
         with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
-            out = model(batch, task=task, horizon=H)
+            # Pass 1: masked (bidirectional attention)
+            out = model(batch, task="masked")
 
             reconstructed = out["reconstructed"]  # (B, N, patch_size)
             cross_pred = out["cross_pred"]        # (B, N, patch_size)
             patch_mask = out["patch_mask"]        # (B, N) bool
             time_id = out["time_id"]              # (B, N)
-            next_pred = out.get("next_pred")      # (B, N, patch_size) or None
+
+            # Pass 2: next_pred (causal attention) — 별도 forward
+            next_pred = None
+            if enable_next:
+                out_next = model(batch, task="next_pred", horizon=H)
+                next_pred = out_next["next_pred"]  # (B, N, patch_size)
 
             # 패치 단위 마스킹 (variate-level 마스킹 지원)
             pred_mask = create_patch_mask(
@@ -444,16 +448,20 @@ def validate(
         if enable_next:
             H = random.randint(1, config.model_config.max_horizon)
 
-        task = "both" if enable_next else "masked"
-
         with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
-            out = raw_model(batch, task=task, horizon=H)
+            # Pass 1: masked (bidirectional)
+            out = raw_model(batch, task="masked")
 
             reconstructed = out["reconstructed"]
             cross_pred = out["cross_pred"]
             patch_mask = out["patch_mask"]
             time_id = out["time_id"]
-            next_pred = out.get("next_pred")
+
+            # Pass 2: next_pred (causal)
+            next_pred = None
+            if enable_next:
+                out_next = raw_model(batch, task="next_pred", horizon=H)
+                next_pred = out_next["next_pred"]
 
             pred_mask = create_patch_mask(
                 patch_mask,
@@ -562,26 +570,30 @@ def train_one_epoch_v2(
         batch.sample_id = batch.sample_id.to(device)
         batch.variate_id = batch.variate_id.to(device)
 
-        # ── Forward (single pass: masked + next_pred 동시) ──
+        # ── Forward (dual pass: masked=bidirectional, next_pred=causal) ──
         H = 1
         if enable_next:
             H = random.randint(1, config.model_config.max_horizon)
 
-        task = "both" if enable_next else "masked"
-
         with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
-            out = model(batch, task=task, horizon=H)
+            # Pass 1: masked (bidirectional attention)
+            out = model(batch, task="masked")
 
             reconstructed = out["reconstructed"]  # (B, N, patch_size)
             cross_pred = out["cross_pred"]        # (B, N, patch_size)
             patch_mask = out["patch_mask"]        # (B, N) bool
             time_id = out["time_id"]              # (B, N)
-            next_pred = out.get("next_pred")      # (B, N, patch_size) or None
 
             # V2 전용 출력
             eeg_reconstructed = out.get("eeg_reconstructed")  # (B, N, d_model) or None
             eeg_recon_target = out.get("eeg_recon_target")    # (B, N, d_model) or None
             eeg_mask = out.get("eeg_mask")                    # (B, N) bool or None
+
+            # Pass 2: next_pred (causal attention) — 별도 forward
+            next_pred = None
+            if enable_next:
+                out_next = model(batch, task="next_pred", horizon=H)
+                next_pred = out_next["next_pred"]  # (B, N, patch_size)
 
             # 패치 단위 마스킹 (variate-level 마스킹 지원)
             pred_mask = create_patch_mask(
@@ -785,21 +797,25 @@ def validate_v2(
         if enable_next:
             H = random.randint(1, config.model_config.max_horizon)
 
-        task = "both" if enable_next else "masked"
-
         with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
-            out = raw_model(batch, task=task, horizon=H)
+            # Pass 1: masked (bidirectional)
+            out = raw_model(batch, task="masked")
 
             reconstructed = out["reconstructed"]
             cross_pred = out["cross_pred"]
             patch_mask = out["patch_mask"]
             time_id = out["time_id"]
-            next_pred = out.get("next_pred")
 
             # V2 전용 출력
             eeg_reconstructed = out.get("eeg_reconstructed")
             eeg_recon_target = out.get("eeg_recon_target")
             eeg_mask = out.get("eeg_mask")
+
+            # Pass 2: next_pred (causal)
+            next_pred = None
+            if enable_next:
+                out_next = raw_model(batch, task="next_pred", horizon=H)
+                next_pred = out_next["next_pred"]
 
             pred_mask = create_patch_mask(
                 patch_mask,
