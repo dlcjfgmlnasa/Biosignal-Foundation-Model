@@ -308,8 +308,7 @@ def main():
     model.to(device)
 
     if use_ddp:
-        has_unused = config.model_config.contrastive_proj_dim > 0 and config.delta == 0
-        model = DDP(model, device_ids=[local_rank], find_unused_parameters=has_unused)
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
 
     if rank0:
         raw_model = model.module if use_ddp else model
