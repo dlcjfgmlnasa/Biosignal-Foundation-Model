@@ -311,9 +311,7 @@ def main():
     model.to(device)
 
     if use_ddp:
-        # dual forward pass (masked + next_pred) → static_graph로 동일 파라미터 재사용 허용
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
-        model._set_static_graph()
 
     if rank0:
         raw_model = model.module if use_ddp else model
