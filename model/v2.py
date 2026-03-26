@@ -128,7 +128,7 @@ class BiosignalFoundationModelV2(BiosignalFoundationModelV1):
         """
         enc = self._encode(batch, task=task)
 
-        encoded = enc["encoded"]  # (B, N, d_model)
+        encoded = enc["encoded"]  # (B, N, d_model) — bidirectional (or sole encoding)
         stem_output = enc["stem_output"]  # (B, N, d_model)
         patch_signal_types = enc["patch_signal_types"]  # (B, N) or None
 
@@ -151,14 +151,17 @@ class BiosignalFoundationModelV2(BiosignalFoundationModelV1):
                 out_dict["contrastive_z"] = self.contrastive_proj(encoded)  # (B, N, proj_dim)
 
         if task in ("next_pred", "both"):
+            # task="both"이면 causal encoding 사용, 아니면 (next_pred) sole encoding 사용
+            encoded_for_next = enc.get("encoded_causal", encoded)  # (B, N, d_model)
             h_emb = self.horizon_embed(
-                torch.tensor(horizon - 1, device=encoded.device)
+                torch.tensor(horizon - 1, device=encoded_for_next.device)
             )  # (d_model,)
-            encoded_h = encoded + h_emb.unsqueeze(0).unsqueeze(0)  # (B, N, d_model)
+            encoded_h = encoded_for_next + h_emb.unsqueeze(0).unsqueeze(0)  # (B, N, d_model)
             out_dict["next_pred"] = self.next_head(encoded_h)  # (B, N, patch_size)
 
         # ── EEG-specific reconstruction (masked task에서만) ─────────
         # next_pred 시에는 eeg_recon_head 불필요 (gradient 오염 방지)
+        # eeg_recon은 bidirectional encoding(encoded)에서만 동작
         if patch_signal_types is not None:
             eeg_mask = patch_signal_types == EEG_SIGNAL_TYPE  # (B, N)
             out_dict["eeg_mask"] = eeg_mask

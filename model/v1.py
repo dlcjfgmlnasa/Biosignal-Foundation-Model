@@ -202,11 +202,13 @@ class BiosignalFoundationModelV1(nn.Module):
         task:
             ``"masked"``: 양방향 attention.
             ``"next_pred"``: causal attention.
+            ``"both"``: 양방향 + causal 동시 (encoder 2회 호출, DDP single forward 호환).
 
         Returns
         -------
         dict with keys:
-            ``encoded``: ``(B, N, d_model)`` — 인코딩된 패치 표현.
+            ``encoded``: ``(B, N, d_model)`` — 양방향 인코딩된 패치 표현 (task="both"/"masked").
+            ``encoded_causal``: ``(B, N, d_model)`` — causal 인코딩 (task="both"일 때만).
             ``stem_output``: ``(B, N, d_model)`` — project() 직후 출력 (spatial embed 전).
             ``patches``: ``(B, N, patch_size)`` — raw patches.
             ``patch_signal_types``: ``(B, N)`` — 패치별 signal type.
@@ -287,27 +289,8 @@ class BiosignalFoundationModelV1(nn.Module):
             & patch_mask.unsqueeze(-1)
         )  # (B, N, N)
 
-        # 8. Task에 따른 Masking 스위치
-        if task == "next_pred":
-            N_mask = base_attn_mask.shape[-1]
-            causal_tri = torch.tril(
-                torch.ones(N_mask, N_mask, dtype=torch.bool, device=embedded.device)
-            )
-            final_attn_mask = base_attn_mask & causal_tri.unsqueeze(0)  # (B, N, N)
-        else:
-            final_attn_mask = base_attn_mask
-
-        # 9. Transformer Encoder
-        encoded = self.encoder(
-            embedded,
-            attn_mask=final_attn_mask,
-            var_id=p_vid,
-            time_id=time_id,
-        )
-        # encoded: (B, N, d_model)
-
-        return {
-            "encoded": encoded,
+        # 8. Task에 따른 Masking 스위치 + Transformer Encoder
+        result: dict[str, torch.Tensor] = {
             "stem_output": stem_output,
             "patches": patches,
             "patch_signal_types": patch_signal_types,
@@ -319,6 +302,46 @@ class BiosignalFoundationModelV1(nn.Module):
             "patch_variate_id": p_vid,
             "time_id": time_id,
         }
+
+        encoder_kwargs = dict(var_id=p_vid, time_id=time_id)
+
+        if task == "both":
+            # 양방향 encoding (masked reconstruction용)
+            encoded_bi = self.encoder(
+                embedded, attn_mask=base_attn_mask, **encoder_kwargs,
+            )  # (B, N, d_model)
+
+            # causal encoding (next prediction용)
+            N_mask = base_attn_mask.shape[-1]
+            causal_tri = torch.tril(
+                torch.ones(N_mask, N_mask, dtype=torch.bool, device=device)
+            )
+            causal_mask = base_attn_mask & causal_tri.unsqueeze(0)  # (B, N, N)
+            encoded_causal = self.encoder(
+                embedded, attn_mask=causal_mask, **encoder_kwargs,
+            )  # (B, N, d_model)
+
+            result["encoded"] = encoded_bi
+            result["encoded_causal"] = encoded_causal
+
+        elif task == "next_pred":
+            N_mask = base_attn_mask.shape[-1]
+            causal_tri = torch.tril(
+                torch.ones(N_mask, N_mask, dtype=torch.bool, device=device)
+            )
+            causal_mask = base_attn_mask & causal_tri.unsqueeze(0)  # (B, N, N)
+            encoded = self.encoder(
+                embedded, attn_mask=causal_mask, **encoder_kwargs,
+            )  # (B, N, d_model)
+            result["encoded"] = encoded
+
+        else:  # "masked"
+            encoded = self.encoder(
+                embedded, attn_mask=base_attn_mask, **encoder_kwargs,
+            )  # (B, N, d_model)
+            result["encoded"] = encoded
+
+        return result
 
     # ── Forward ────────────────────────────────────────────────────
 
@@ -358,7 +381,7 @@ class BiosignalFoundationModelV1(nn.Module):
         """
         enc = self._encode(batch, task=task)
 
-        encoded = enc["encoded"]
+        encoded = enc["encoded"]  # bidirectional (or sole encoding for single-task)
 
         out_dict: dict[str, torch.Tensor] = {
             "encoded": encoded,
@@ -379,10 +402,12 @@ class BiosignalFoundationModelV1(nn.Module):
                 out_dict["contrastive_z"] = self.contrastive_proj(encoded)  # (B, N, proj_dim)
 
         if task in ("next_pred", "both"):
+            # task="both"이면 causal encoding 사용, 아니면 (next_pred) sole encoding 사용
+            encoded_for_next = enc.get("encoded_causal", encoded)  # (B, N, d_model)
             h_emb = self.horizon_embed(
-                torch.tensor(horizon - 1, device=encoded.device)
+                torch.tensor(horizon - 1, device=encoded_for_next.device)
             )  # (d_model,)
-            encoded_h = encoded + h_emb.unsqueeze(0).unsqueeze(0)  # (B, N, d_model)
+            encoded_h = encoded_for_next + h_emb.unsqueeze(0).unsqueeze(0)  # (B, N, d_model)
             out_dict["next_pred"] = self.next_head(encoded_h)  # (B, N, patch_size)
 
         return out_dict
