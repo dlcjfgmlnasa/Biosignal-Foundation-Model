@@ -307,8 +307,9 @@ class BiosignalFoundationModelV1(nn.Module):
 
         if task == "both":
             # 양방향 encoding (masked reconstruction용)
+            # clone()으로 보호: encoder 내부에서 in-place 최적화로 embedded가 오염되는 것 방지
             encoded_bi = self.encoder(
-                embedded, attn_mask=base_attn_mask, **encoder_kwargs,
+                embedded.clone(), attn_mask=base_attn_mask, **encoder_kwargs,
             )  # (B, N, d_model)
 
             # causal encoding (next prediction용)
@@ -318,7 +319,7 @@ class BiosignalFoundationModelV1(nn.Module):
             )
             causal_mask = base_attn_mask & causal_tri.unsqueeze(0)  # (B, N, N)
             encoded_causal = self.encoder(
-                embedded, attn_mask=causal_mask, **encoder_kwargs,
+                embedded.clone(), attn_mask=causal_mask, **encoder_kwargs,
             )  # (B, N, d_model)
 
             result["encoded"] = encoded_bi
