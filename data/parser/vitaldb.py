@@ -78,10 +78,10 @@ SIGNAL_CONFIGS: dict[str, SignalConfig] = {
     # ABP/PPG/CVP: lowpass — DC(절대값) 보존, 고주파 노이즈만 제거
     "abp": SignalConfig(valid_range=(0.0, 300.0),      filter_type="lowpass",  filter_freq=(0.0, 15.0),  max_high_freq_ratio=0.5),
     "ppg": SignalConfig(valid_range=None,               filter_type="lowpass",  filter_freq=(0.0, 8.0),   max_high_freq_ratio=0.05, min_amplitude=5.0),
-    "cvp": SignalConfig(valid_range=(-5.0, 40.0),      filter_type="lowpass",  filter_freq=(0.0, 20.0),  max_high_freq_ratio=0.5),
+    "cvp": SignalConfig(valid_range=(-5.0, 40.0),      filter_type="lowpass",  filter_freq=(0.0, 10.0),  max_high_freq_ratio=0.5),
     # CO2/AWP: lowpass — 느린 호흡 신호, DC 보존
     "co2": SignalConfig(valid_range=(0.0, 100.0),      filter_type="lowpass",  filter_freq=(0.0, 5.0),   max_high_freq_ratio=1.0, max_flatline_ratio=0.3, min_amplitude=5.0),
-    "awp": SignalConfig(valid_range=(-10.0, 80.0),     filter_type="lowpass",  filter_freq=(0.0, 2.0),   max_high_freq_ratio=1.0, min_amplitude=2.0),
+    "awp": SignalConfig(valid_range=(-10.0, 80.0),     filter_type="lowpass",  filter_freq=(0.0, 5.0),   max_high_freq_ratio=1.0, min_amplitude=2.0),
 }
 
 
