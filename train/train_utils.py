@@ -12,6 +12,7 @@ import math
 import os
 import random
 import time
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
@@ -256,9 +257,14 @@ def train_one_epoch(
             H = random.randint(1, config.model_config.max_horizon)
 
         with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
-            # Pass 1: masked (bidirectional) — DDP forward로 gradient sync
+            # Dual forward: Pass 1 no_sync → Pass 2 sync (DDP allreduce)
             raw_model = model.module if isinstance(model, DDP) else model
-            out = model(batch, task="masked")
+            use_ddp = isinstance(model, DDP)
+
+            # Pass 1: masked (bidirectional) — no_sync로 gradient 누적만
+            no_sync_ctx = model.no_sync() if (use_ddp and enable_next) else nullcontext()
+            with no_sync_ctx:
+                out = model(batch, task="masked")
 
             reconstructed = out["reconstructed"]  # (B, N, patch_size)
             cross_pred = out["cross_pred"]        # (B, N, patch_size)
@@ -271,10 +277,10 @@ def train_one_epoch(
                 if hasattr(layer.ffn, "aux_loss") and layer.ffn.aux_loss is not None:
                     aux_loss = aux_loss + layer.ffn.aux_loss
 
-            # Pass 2: next_pred (causal) — raw_model로 실행 (DDP 재진입 방지)
+            # Pass 2: next_pred (causal) — DDP forward로 allreduce (Pass 1+2 gradient 합산)
             next_pred = None
             if enable_next:
-                out_next = raw_model(batch, task="next_pred", horizon=H)
+                out_next = model(batch, task="next_pred", horizon=H)
                 next_pred = out_next["next_pred"]  # (B, N, patch_size)
                 # Pass 2 aux_loss 누적
                 for layer in raw_model.encoder.layers:
@@ -587,11 +593,14 @@ def train_one_epoch_v2(
             H = random.randint(1, config.model_config.max_horizon)
 
         with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
-            # Pass 1: masked (bidirectional attention)
-            # DDP: 두 번 forward 시 no_sync()로 첫 pass의 gradient sync 지연
-            # Pass 1: masked (bidirectional) — DDP forward로 gradient sync
+            # Dual forward: Pass 1 no_sync → Pass 2 sync (DDP allreduce)
             raw_model = model.module if isinstance(model, DDP) else model
-            out = model(batch, task="masked")
+            use_ddp = isinstance(model, DDP)
+
+            # Pass 1: masked (bidirectional) — no_sync로 gradient 누적만
+            no_sync_ctx = model.no_sync() if (use_ddp and enable_next) else nullcontext()
+            with no_sync_ctx:
+                out = model(batch, task="masked")
 
             reconstructed = out["reconstructed"]  # (B, N, patch_size)
             cross_pred = out["cross_pred"]        # (B, N, patch_size)
@@ -609,10 +618,10 @@ def train_one_epoch_v2(
                 if hasattr(layer.ffn, "aux_loss") and layer.ffn.aux_loss is not None:
                     aux_loss = aux_loss + layer.ffn.aux_loss
 
-            # Pass 2: next_pred (causal) — raw_model로 실행 (DDP 재진입 방지)
+            # Pass 2: next_pred (causal) — DDP forward로 allreduce
             next_pred = None
             if enable_next:
-                out_next = raw_model(batch, task="next_pred", horizon=H)
+                out_next = model(batch, task="next_pred", horizon=H)
                 next_pred = out_next["next_pred"]  # (B, N, patch_size)
                 # Pass 2 aux_loss 누적
                 for layer in raw_model.encoder.layers:
