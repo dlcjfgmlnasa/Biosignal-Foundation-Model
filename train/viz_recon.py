@@ -48,11 +48,16 @@ def _process_batch(
     N = L // P
     original_patches = normalized[:, :N * P].reshape(B, N, P)
 
+    # V2: EEG 패치는 embedding space 복원이라 raw 시각화 불가 → 제외
+    eeg_mask = out.get("eeg_mask")  # (B, N) or None
+
     sig_map = build_signal_map(batch, p_sid, p_vid, patch_mask, B)
 
     candidates: list[RowCandidate] = []
     for b in range(B):
         valid = patch_mask[b]
+        if eeg_mask is not None:
+            valid = valid & ~eeg_mask[b]
         if not valid.any():
             continue
 
