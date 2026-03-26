@@ -342,10 +342,10 @@ def main():
     viz_every = args.viz_every
     viz_batches: list | None = None
     viz_dir = None
-    if rank0 and viz_every > 0:
-        viz_iter = iter(dataloader)
+    if rank0 and viz_every > 0 and val_dataloader is not None:
+        viz_iter = iter(val_dataloader)
         viz_batches = []
-        for _ in range(min(10, len(dataloader))):
+        for _ in range(min(10, len(val_dataloader))):
             try:
                 viz_batches.append(next(viz_iter))
             except StopIteration:
