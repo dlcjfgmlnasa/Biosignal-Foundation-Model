@@ -347,7 +347,16 @@ def process_vital(
         seg_count = 0
         track_recordings: list[dict] = []
         for seg_idx, segment in enumerate(segments):
-            # 품질 검사 (flatline, clipping, noise, amplitude) — 신호별 threshold 적용
+            # 대역통과 필터링 먼저 (native sr)
+            if cfg.bandpass is not None:
+                segment = _apply_bandpass(segment, cfg.bandpass[0], cfg.bandpass[1], native_sr)
+
+            # 리샘플링 → TARGET_SR (100Hz) — quality gate 전에 수행
+            # (500Hz 양자화로 인한 false flatline 방지)
+            if native_sr != TARGET_SR:
+                segment = resample_to_target(segment, orig_sr=native_sr, target_sr=TARGET_SR)
+
+            # 품질 검사 (100Hz 기준, bandpass 후)
             qscore = segment_quality_score(
                 segment,
                 max_flatline_ratio=cfg.max_flatline_ratio,
@@ -371,15 +380,7 @@ def process_vital(
                 print(f"    [SKIP] {track_name} seg{seg_idx}: 품질 불량 ({', '.join(reasons)})", file=sys.stderr)
                 continue
 
-            # 대역통과 필터링 (range check/cautery 이후 정상 세그먼트에 적용)
-            if cfg.bandpass is not None:
-                segment = _apply_bandpass(segment, cfg.bandpass[0], cfg.bandpass[1], native_sr)
-
-            # 리샘플링 → TARGET_SR (100Hz)
-            if native_sr != TARGET_SR:
-                segment = resample_to_target(segment, orig_sr=native_sr, target_sr=TARGET_SR)
-
-            # ── Domain-specific 품질 검사 (bandpass + resample 후, 100Hz 기준) ──
+            # ── Domain-specific 품질 검사 (100Hz 기준) ──
             domain_result = domain_quality_check(stype_key, segment, sr=TARGET_SR)
             if not domain_result["pass"]:
                 detail_parts = [f"{k}={v}" for k, v in domain_result.items() if k != "pass"]
