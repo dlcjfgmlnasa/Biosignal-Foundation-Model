@@ -157,18 +157,14 @@ class BiosignalFoundationModelV2(BiosignalFoundationModelV1):
             encoded_h = encoded + h_emb.unsqueeze(0).unsqueeze(0)  # (B, N, d_model)
             out_dict["next_pred"] = self.next_head(encoded_h)  # (B, N, patch_size)
 
-        # ── EEG-specific reconstruction ────────────────────────────
-        # EEG 패치의 reconstruction target = stem 출력 (stop-gradient)
-        # ModalityCNNStem이 signal_type별 전용 Conv1dStem을 사용하므로
-        # gradient가 EEG stem에만 흐르며, 다른 modality stem과 충돌하지 않음.
+        # ── EEG-specific reconstruction (masked task에서만) ─────────
+        # next_pred 시에는 eeg_recon_head 불필요 (gradient 오염 방지)
         if patch_signal_types is not None:
             eeg_mask = patch_signal_types == EEG_SIGNAL_TYPE  # (B, N)
             out_dict["eeg_mask"] = eeg_mask
 
-            # EEG reconstruction head 적용 (전체 위치에 적용, loss에서 eeg_mask로 필터링)
-            out_dict["eeg_reconstructed"] = self.eeg_recon_head(encoded)  # (B, N, d_model)
-
-            # Target: stem 출력에 stop-gradient 적용 (collapse 방지)
-            out_dict["eeg_recon_target"] = stem_output.detach()  # (B, N, d_model)
+            if task in ("masked", "both"):
+                out_dict["eeg_reconstructed"] = self.eeg_recon_head(encoded)  # (B, N, d_model)
+                out_dict["eeg_recon_target"] = stem_output.detach()  # (B, N, d_model)
 
         return out_dict

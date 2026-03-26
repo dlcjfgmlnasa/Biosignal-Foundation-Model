@@ -257,6 +257,7 @@ def train_one_epoch(
 
         with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
             # Pass 1: masked (bidirectional attention)
+            raw_model = model.module if isinstance(model, DDP) else model
             out = model(batch, task="masked")
 
             reconstructed = out["reconstructed"]  # (B, N, patch_size)
@@ -264,11 +265,21 @@ def train_one_epoch(
             patch_mask = out["patch_mask"]        # (B, N) bool
             time_id = out["time_id"]              # (B, N)
 
+            # MoE aux_loss: Pass 1 직후 수집 (Pass 2에서 덮어쓰이기 전)
+            aux_loss = torch.zeros(1, device=device)
+            for layer in raw_model.encoder.layers:
+                if hasattr(layer.ffn, "aux_loss") and layer.ffn.aux_loss is not None:
+                    aux_loss = aux_loss + layer.ffn.aux_loss
+
             # Pass 2: next_pred (causal attention) — 별도 forward
             next_pred = None
             if enable_next:
                 out_next = model(batch, task="next_pred", horizon=H)
                 next_pred = out_next["next_pred"]  # (B, N, patch_size)
+                # Pass 2 aux_loss 누적
+                for layer in raw_model.encoder.layers:
+                    if hasattr(layer.ffn, "aux_loss") and layer.ffn.aux_loss is not None:
+                        aux_loss = aux_loss + layer.ffn.aux_loss
 
             # 패치 단위 마스킹 (variate-level 마스킹 지원)
             pred_mask = create_patch_mask(
@@ -279,7 +290,6 @@ def train_one_epoch(
             )
 
             # 원본 패치 추출 (정규화된 값)
-            raw_model = model.module if isinstance(model, DDP) else model
             P = raw_model.patch_size
             normalized = ((batch.values.unsqueeze(-1) - out["loc"]) / out["scale"]).squeeze(-1)
             B, L = normalized.shape
@@ -304,12 +314,6 @@ def train_one_epoch(
                 time_id=time_id if needs_time_id else None,
                 contrastive_z=contrastive_z if config.delta > 0 else None,
             )
-
-            # ── MoE auxiliary loss 수집 (autocast 내부) ──
-            aux_loss = torch.zeros(1, device=device)
-            for layer in raw_model.encoder.layers:
-                if hasattr(layer.ffn, "aux_loss") and layer.ffn.aux_loss is not None:
-                    aux_loss = aux_loss + layer.ffn.aux_loss
 
             loss = losses["total"] + config.aux_loss_weight * aux_loss
 
@@ -457,11 +461,21 @@ def validate(
             patch_mask = out["patch_mask"]
             time_id = out["time_id"]
 
+            # MoE aux_loss: Pass 1 직후 수집
+            aux_loss = 0.0
+            for layer in raw_model.encoder.layers:
+                if hasattr(layer.ffn, "aux_loss") and layer.ffn.aux_loss is not None:
+                    aux_loss += layer.ffn.aux_loss.item()
+
             # Pass 2: next_pred (causal)
             next_pred = None
             if enable_next:
                 out_next = raw_model(batch, task="next_pred", horizon=H)
                 next_pred = out_next["next_pred"]
+                # Pass 2 aux_loss 누적
+                for layer in raw_model.encoder.layers:
+                    if hasattr(layer.ffn, "aux_loss") and layer.ffn.aux_loss is not None:
+                        aux_loss += layer.ffn.aux_loss.item()
 
             pred_mask = create_patch_mask(
                 patch_mask,
@@ -492,9 +506,6 @@ def validate(
                 time_id=time_id if needs_time_id else None,
                 contrastive_z=contrastive_z if config.delta > 0 else None,
             )
-
-        # MoE auxiliary loss 수집 (로깅 전용, backward 없음)
-        aux_loss = 0.0
         for layer in raw_model.encoder.layers:
             if hasattr(layer.ffn, "aux_loss") and layer.ffn.aux_loss is not None:
                 aux_loss += layer.ffn.aux_loss.item()
@@ -577,6 +588,7 @@ def train_one_epoch_v2(
 
         with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
             # Pass 1: masked (bidirectional attention)
+            raw_model = model.module if isinstance(model, DDP) else model
             out = model(batch, task="masked")
 
             reconstructed = out["reconstructed"]  # (B, N, patch_size)
@@ -589,11 +601,21 @@ def train_one_epoch_v2(
             eeg_recon_target = out.get("eeg_recon_target")    # (B, N, d_model) or None
             eeg_mask = out.get("eeg_mask")                    # (B, N) bool or None
 
+            # MoE aux_loss: Pass 1 직후 수집 (Pass 2에서 덮어쓰이기 전)
+            aux_loss = torch.zeros(1, device=device)
+            for layer in raw_model.encoder.layers:
+                if hasattr(layer.ffn, "aux_loss") and layer.ffn.aux_loss is not None:
+                    aux_loss = aux_loss + layer.ffn.aux_loss
+
             # Pass 2: next_pred (causal attention) — 별도 forward
             next_pred = None
             if enable_next:
                 out_next = model(batch, task="next_pred", horizon=H)
                 next_pred = out_next["next_pred"]  # (B, N, patch_size)
+                # Pass 2 aux_loss 누적
+                for layer in raw_model.encoder.layers:
+                    if hasattr(layer.ffn, "aux_loss") and layer.ffn.aux_loss is not None:
+                        aux_loss = aux_loss + layer.ffn.aux_loss
 
             # 패치 단위 마스킹 (variate-level 마스킹 지원)
             pred_mask = create_patch_mask(
@@ -604,7 +626,6 @@ def train_one_epoch_v2(
             )
 
             # 원본 패치 추출 (정규화된 값)
-            raw_model = model.module if isinstance(model, DDP) else model
             P = raw_model.patch_size
             normalized = ((batch.values.unsqueeze(-1) - out["loc"]) / out["scale"]).squeeze(-1)
             B, L = normalized.shape
@@ -647,15 +668,7 @@ def train_one_epoch_v2(
                     )
 
             # ── 최종 total loss ──
-            total_loss = losses["total"] + config.eeg_loss_weight * eeg_loss
-
-            # ── MoE auxiliary loss 수집 (autocast 내부) ──
-            aux_loss = torch.zeros(1, device=device)
-            for layer in raw_model.encoder.layers:
-                if hasattr(layer.ffn, "aux_loss") and layer.ffn.aux_loss is not None:
-                    aux_loss = aux_loss + layer.ffn.aux_loss
-
-            loss = total_loss + config.aux_loss_weight * aux_loss
+            loss = losses["total"] + config.eeg_loss_weight * eeg_loss + config.aux_loss_weight * aux_loss
 
         # NaN/Inf 감지
         if not torch.isfinite(loss):
@@ -811,11 +824,21 @@ def validate_v2(
             eeg_recon_target = out.get("eeg_recon_target")
             eeg_mask = out.get("eeg_mask")
 
+            # MoE aux_loss: Pass 1 직후 수집
+            aux_loss = 0.0
+            for layer in raw_model.encoder.layers:
+                if hasattr(layer.ffn, "aux_loss") and layer.ffn.aux_loss is not None:
+                    aux_loss += layer.ffn.aux_loss.item()
+
             # Pass 2: next_pred (causal)
             next_pred = None
             if enable_next:
                 out_next = raw_model(batch, task="next_pred", horizon=H)
                 next_pred = out_next["next_pred"]
+                # Pass 2 aux_loss 누적
+                for layer in raw_model.encoder.layers:
+                    if hasattr(layer.ffn, "aux_loss") and layer.ffn.aux_loss is not None:
+                        aux_loss += layer.ffn.aux_loss.item()
 
             pred_mask = create_patch_mask(
                 patch_mask,
@@ -864,12 +887,6 @@ def validate_v2(
                     )
 
             total_loss = losses["total"] + config.eeg_loss_weight * eeg_loss
-
-        # MoE auxiliary loss 수집 (로깅 전용, backward 없음)
-        aux_loss = 0.0
-        for layer in raw_model.encoder.layers:
-            if hasattr(layer.ffn, "aux_loss") and layer.ffn.aux_loss is not None:
-                aux_loss += layer.ffn.aux_loss.item()
 
         if not torch.isfinite(total_loss):
             continue
