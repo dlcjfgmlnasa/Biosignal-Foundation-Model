@@ -354,7 +354,6 @@ class TestMoEWithBiosignal:
             d_model=d_model, num_layers=2, use_moe=True,
         )
         encoder.eval()
-        torch.nn.init.normal_(encoder.centroid)
         input_proj = nn.Linear(1, d_model)
 
         with tempfile.TemporaryDirectory() as tmpdir:

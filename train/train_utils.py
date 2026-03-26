@@ -66,6 +66,7 @@ class TrainConfig:
     beta: float = 0.0   # next-patch prediction
     gamma: float = 0.0  # cross-modal (beta 내부 가중)
     delta: float = 0.0  # cross-modal contrastive
+    aux_loss_weight: float = 0.01  # MoE load balancing auxiliary loss
     contrastive_temperature: float = 0.07
     learnable_temperature: bool = True
 
@@ -233,6 +234,7 @@ def train_one_epoch(
     epoch_next = torch.zeros(1, device=device)
     epoch_cross = torch.zeros(1, device=device)
     epoch_contrastive = torch.zeros(1, device=device)
+    epoch_aux = torch.zeros(1, device=device)
     n_batches = 0
     nan_count = 0
     max_nan_batches = 10
@@ -298,8 +300,15 @@ def train_one_epoch(
                 contrastive_z=contrastive_z if config.delta > 0 else None,
             )
 
+        # ── MoE auxiliary loss 수집 ──
+        aux_loss = torch.zeros(1, device=device)
+        raw_model = model.module if isinstance(model, DDP) else model
+        for layer in raw_model.encoder.layers:
+            if hasattr(layer.ffn, "aux_loss") and layer.ffn.aux_loss is not None:
+                aux_loss = aux_loss + layer.ffn.aux_loss
+
         # ── Backward ──
-        loss = losses["total"]
+        loss = losses["total"] + config.aux_loss_weight * aux_loss
 
         # NaN/Inf 감지
         if not torch.isfinite(loss):
@@ -354,21 +363,23 @@ def train_one_epoch(
             optimizer.step()
 
         # ── 로깅 (GPU 텐서로 누적, CUDA sync 없음) ──
-        epoch_total += losses["total"].detach()
+        epoch_total += loss.detach()
         epoch_masked += losses["masked_loss"].detach()
         epoch_next += losses["next_loss"].detach()
         epoch_cross += losses["cross_modal_loss"].detach()
         epoch_contrastive += losses["contrastive_loss"].detach()
+        epoch_aux += aux_loss.detach()
         n_batches += 1
 
         if is_main_process() and (n_batches % 50 == 0 or config.dry_run):
             print(
                 f"  [{phase_name}] batch {n_batches} | "
-                f"total: {losses['total'].item():.6f} | "
+                f"total: {loss.item():.6f} | "
                 f"masked: {losses['masked_loss'].item():.6f} | "
                 f"next: {losses['next_loss'].item():.6f} | "
                 f"cross: {losses['cross_modal_loss'].item():.6f} | "
                 f"contrastive: {losses['contrastive_loss'].item():.6f} | "
+                f"aux: {aux_loss.item():.6f} | "
                 f"grad_norm: {grad_norm:.4f}"
             )
 
@@ -391,6 +402,7 @@ def train_one_epoch(
         "next_loss": (epoch_next / denom).item(),
         "cross_modal_loss": (epoch_cross / denom).item(),
         "contrastive_loss": (epoch_contrastive / denom).item(),
+        "aux_loss": (epoch_aux / denom).item(),
     }
 
 
@@ -417,6 +429,7 @@ def validate(
     epoch_next = 0.0
     epoch_cross = 0.0
     epoch_contrastive = 0.0
+    epoch_aux = 0.0
     n_batches = 0
 
     enable_next = config.beta > 0
@@ -473,6 +486,12 @@ def validate(
                 contrastive_z=contrastive_z if config.delta > 0 else None,
             )
 
+        # MoE auxiliary loss 수집 (로깅 전용, backward 없음)
+        aux_loss = 0.0
+        for layer in raw_model.encoder.layers:
+            if hasattr(layer.ffn, "aux_loss") and layer.ffn.aux_loss is not None:
+                aux_loss += layer.ffn.aux_loss.item()
+
         loss = losses["total"]
         if not torch.isfinite(loss):
             continue
@@ -482,6 +501,7 @@ def validate(
         epoch_next += losses["next_loss"].item()
         epoch_cross += losses["cross_modal_loss"].item()
         epoch_contrastive += losses["contrastive_loss"].item()
+        epoch_aux += aux_loss
         n_batches += 1
 
         if config.max_batches > 0 and n_batches >= config.max_batches:
@@ -495,6 +515,7 @@ def validate(
         "next_loss": epoch_next / denom,
         "cross_modal_loss": epoch_cross / denom,
         "contrastive_loss": epoch_contrastive / denom,
+        "aux_loss": epoch_aux / denom,
     }
 
 
@@ -527,6 +548,7 @@ def train_one_epoch_v2(
     epoch_cross = torch.zeros(1, device=device)
     epoch_contrastive = torch.zeros(1, device=device)
     epoch_eeg = torch.zeros(1, device=device)
+    epoch_aux = torch.zeros(1, device=device)
     n_batches = 0
     nan_count = 0
     max_nan_batches = 10
@@ -616,8 +638,15 @@ def train_one_epoch_v2(
             # ── 최종 total loss ──
             total_loss = losses["total"] + eeg_loss
 
+        # ── MoE auxiliary loss 수집 ──
+        aux_loss = torch.zeros(1, device=device)
+        raw_model = model.module if isinstance(model, DDP) else model
+        for layer in raw_model.encoder.layers:
+            if hasattr(layer.ffn, "aux_loss") and layer.ffn.aux_loss is not None:
+                aux_loss = aux_loss + layer.ffn.aux_loss
+
         # ── Backward ──
-        loss = total_loss
+        loss = total_loss + config.aux_loss_weight * aux_loss
 
         # NaN/Inf 감지
         if not torch.isfinite(loss):
@@ -673,23 +702,25 @@ def train_one_epoch_v2(
             optimizer.step()
 
         # ── 로깅 (GPU 텐서로 누적, CUDA sync 없음) ──
-        epoch_total += total_loss.detach()
+        epoch_total += loss.detach()
         epoch_masked += losses["masked_loss"].detach()
         epoch_next += losses["next_loss"].detach()
         epoch_cross += losses["cross_modal_loss"].detach()
         epoch_contrastive += losses["contrastive_loss"].detach()
         epoch_eeg += eeg_loss.detach()
+        epoch_aux += aux_loss.detach()
         n_batches += 1
 
         if is_main_process() and (n_batches % 50 == 0 or config.dry_run):
             print(
                 f"  [{phase_name}] batch {n_batches} | "
-                f"total: {total_loss.item():.6f} | "
+                f"total: {loss.item():.6f} | "
                 f"masked: {losses['masked_loss'].item():.6f} | "
                 f"next: {losses['next_loss'].item():.6f} | "
                 f"cross: {losses['cross_modal_loss'].item():.6f} | "
                 f"contrastive: {losses['contrastive_loss'].item():.6f} | "
                 f"eeg: {eeg_loss.item():.6f} | "
+                f"aux: {aux_loss.item():.6f} | "
                 f"grad_norm: {grad_norm:.4f}"
             )
 
@@ -713,6 +744,7 @@ def train_one_epoch_v2(
         "cross_modal_loss": (epoch_cross / denom).item(),
         "contrastive_loss": (epoch_contrastive / denom).item(),
         "eeg_loss": (epoch_eeg / denom).item(),
+        "aux_loss": (epoch_aux / denom).item(),
     }
 
 
@@ -740,6 +772,7 @@ def validate_v2(
     epoch_cross = 0.0
     epoch_contrastive = 0.0
     epoch_eeg = 0.0
+    epoch_aux = 0.0
     n_batches = 0
 
     enable_next = config.beta > 0
@@ -819,6 +852,12 @@ def validate_v2(
 
             total_loss = losses["total"] + eeg_loss
 
+        # MoE auxiliary loss 수집 (로깅 전용, backward 없음)
+        aux_loss = 0.0
+        for layer in raw_model.encoder.layers:
+            if hasattr(layer.ffn, "aux_loss") and layer.ffn.aux_loss is not None:
+                aux_loss += layer.ffn.aux_loss.item()
+
         if not torch.isfinite(total_loss):
             continue
 
@@ -828,6 +867,7 @@ def validate_v2(
         epoch_cross += losses["cross_modal_loss"].item()
         epoch_contrastive += losses["contrastive_loss"].item()
         epoch_eeg += eeg_loss.item()
+        epoch_aux += aux_loss
         n_batches += 1
 
         if config.max_batches > 0 and n_batches >= config.max_batches:
@@ -842,6 +882,7 @@ def validate_v2(
         "cross_modal_loss": epoch_cross / denom,
         "contrastive_loss": epoch_contrastive / denom,
         "eeg_loss": epoch_eeg / denom,
+        "aux_loss": epoch_aux / denom,
     }
 
 

@@ -171,8 +171,6 @@ class TestTransformerEncoder:
             d_model=64, num_layers=2, use_moe=True
         )
         encoder.eval()
-        # centroid 초기화
-        torch.nn.init.normal_(encoder.centroid)
         x = torch.randn(1, 8, 64)
         out = encoder(x)
         assert out.shape == (1, 8, 64)

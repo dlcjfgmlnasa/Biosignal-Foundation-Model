@@ -59,7 +59,6 @@ class FeedForward(nn.Module):
     def forward(
         self,
         x: torch.Tensor,  # (..., in_dim)
-        centroid: torch.Tensor | None = None,  # (expert, in_dim)
     ) -> torch.Tensor:  # (..., out_dim)
         x = self._in_proj(x)
         return self.dropout2(self.fc2(self.dropout1(x)))
@@ -119,7 +118,11 @@ class GatedLinearUnitFeedForward(FeedForward):
 
 
 class MoEFeedForward(nn.Module):
-    """Mixture of Experts FFN (centroid 기반 라우팅, top-k expert 선택).
+    """Mixture of Experts FFN (Linear gate 기반 라우팅, top-k expert 선택).
+
+    Switch Transformer 방식의 learned linear gate를 사용하여 토큰별로
+    top-k expert를 선택하고, softmax 가중치로 expert 출력을 합산한다.
+    학습 시 load balancing auxiliary loss를 ``self.aux_loss``에 저장한다.
 
     Parameters
     ----------
@@ -156,6 +159,7 @@ class MoEFeedForward(nn.Module):
         self.num_experts = num_experts
         self.num_experts_per_token = num_experts_per_token
 
+        self.gate = nn.Linear(in_dim, num_experts, bias=False)
         self.experts = nn.ModuleList(
             [
                 GatedLinearUnitFeedForward(
@@ -169,32 +173,40 @@ class MoEFeedForward(nn.Module):
                 for _ in range(num_experts)
             ]
         )
+        self.aux_loss: torch.Tensor | None = None
 
     def forward(
         self,
         x: torch.Tensor,  # (..., in_dim)
-        centroid: torch.Tensor | None = None,  # (expert, in_dim)
     ) -> torch.Tensor:  # (..., dim)
-        x_squashed = x.view(-1, x.shape[-1])
+        x_squashed = x.view(-1, x.shape[-1])  # (T, in_dim)
 
-        centroid = centroid.to(x.device).type_as(x)
-        if len(x.shape) > 3:
-            x_temp = x.view(-1, x.shape[-2], x.shape[-1])
+        # ── Gate: linear → softmax → topk ──
+        gate_logits = self.gate(x_squashed)  # (T, num_experts)
+        gate_probs = F.softmax(gate_logits, dim=1, dtype=torch.float).type_as(x)  # (T, E)
+
+        weights, selected_experts = torch.topk(
+            gate_logits, self.num_experts_per_token, dim=1,
+        )  # (T, K), (T, K)
+        weights = F.softmax(weights, dim=1, dtype=torch.float).type_as(x)  # (T, K)
+
+        # ── Load balancing auxiliary loss (Switch Transformer) ──
+        if self.training:
+            # f_i: 각 expert에 할당된 토큰 비율
+            num_tokens = x_squashed.shape[0]
+            one_hot = F.one_hot(
+                selected_experts.reshape(-1), self.num_experts,
+            ).float()  # (T*K, E)
+            tokens_per_expert = one_hot.sum(dim=0)  # (E,)
+            f = tokens_per_expert / num_tokens  # (E,)
+            # P_i: 각 expert의 평균 gate 확률
+            P = gate_probs.mean(dim=0)  # (E,)
+            self.aux_loss = self.num_experts * (f * P).sum()
         else:
-            x_temp = x
-        centroid = centroid.unsqueeze(0).repeat(x_temp.shape[0], 1, 1)
-        cdist = torch.cdist(x_temp, centroid)
-        gate_logits = cdist.view(-1, cdist.shape[-1])
+            self.aux_loss = None
 
-        weights, selected_experts = torch.topk(gate_logits, self.num_experts_per_token)
-        weights = F.softmax(
-            weights,
-            dim=1,
-            dtype=torch.float,
-        ).type_as(x)
-
+        # ── Expert dispatch (argsort 기반 그룹핑) ──
         results = torch.zeros_like(x_squashed)
-        # expert별 인덱스를 1회 sync로 사전 그룹핑 (expert 수만큼 torch.where 방지)
         flat_experts = selected_experts.reshape(-1)               # (T * K,)
         flat_batch = torch.arange(
             selected_experts.shape[0], device=x.device,

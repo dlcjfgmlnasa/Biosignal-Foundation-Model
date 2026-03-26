@@ -67,18 +67,17 @@ class TransformerEncoderLayer(nn.Module):
         attn_mask: torch.Tensor | None = None,  # (*batch, time_len, time_len) bool
         var_id: torch.Tensor | None = None,  # (*batch, time_len) long
         time_id: torch.Tensor | None = None,  # (*batch, time_len) long
-        centroid: torch.Tensor | None = None,  # (expert, dim)
     ) -> torch.Tensor:  # (*batch, time_len, dim)
         if self.pre_norm:
             x = x + self._sa_block(
                 self.norm1(x), attn_mask, var_id=var_id, time_id=time_id
             )
-            x = x + self.ffn(self.norm2(x), centroid=centroid)
+            x = x + self.ffn(self.norm2(x))
         else:
             x = self.norm1(
                 x + self._sa_block(x, attn_mask, var_id=var_id, time_id=time_id)
             )
-            x = self.norm2(x + self.ffn(x, centroid=centroid))
+            x = self.norm2(x + self.ffn(x))
 
         return x
 
@@ -216,9 +215,6 @@ class TransformerEncoder(nn.Module):
                 bias=False,
                 ffn_dropout_p=dropout_p,
             )
-            self.register_buffer(
-                "centroid", torch.empty(num_layers, 32, d_model, dtype=torch.float64)
-            )
         get_encoder_layer_norm = partial(norm_layer, d_model)
 
         self.layers = nn.ModuleList(
@@ -259,16 +255,6 @@ class TransformerEncoder(nn.Module):
         var_id: torch.Tensor | None = None,  # (*batch, time_len) long
         time_id: torch.Tensor | None = None,  # (*batch, time_len) long
     ) -> torch.Tensor:  # (*batch, time_len, dim)
-        if self.use_moe:
-            for idx, layer in enumerate(self.layers):
-                x = layer(
-                    x,
-                    attn_mask,
-                    var_id=var_id,
-                    time_id=time_id,
-                    centroid=self.centroid[idx],
-                )
-        else:
-            for layer in self.layers:
-                x = layer(x, attn_mask, var_id=var_id, time_id=time_id)
+        for layer in self.layers:
+            x = layer(x, attn_mask, var_id=var_id, time_id=time_id)
         return self.norm(x)
