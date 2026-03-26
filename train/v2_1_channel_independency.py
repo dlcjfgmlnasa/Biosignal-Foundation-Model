@@ -1,19 +1,23 @@
 # -*- coding:utf-8 -*-
 from __future__ import annotations
 
-"""Phase 1: Channel-Independent 사전학습.
+"""Phase 1: Channel-Independent 사전학습 (V2).
 
-각 채널(variate)을 독립적으로 학습하여 단일 신호의 시간적 패턴을 학습한다.
-- Masked Patch Modeling (MPM): 마스킹된 패치 복원
-- Next-Patch Prediction: 랜덤 horizon으로 미래 패치 예측
+V2 모델(BiosignalFoundationModelV2)을 사용하며, EEG 패치에 대해
+stem 출력 복원(stop-gradient) 전용 loss를 별도 계산한다.
+
+V1 Phase 1과의 차이점:
+- BiosignalFoundationModelV2 사용 (eeg_recon_head 추가)
+- train_one_epoch_v2 / validate_v2 호출 (EEG loss 별도 계산)
+- 로그에 eeg_loss 항목 추가
 
 Usage (단일 GPU)
 -----
-    python -m train.1_channel_independency --device cuda:0
+    python -m train.v2_1_channel_independency --device cuda:0
 
-Usage (멀티 GPU — DDP)
+Usage (멀티 GPU -- DDP)
 -----
-    torchrun --nproc_per_node=2 -m train.1_channel_independency
+    torchrun --nproc_per_node=2 -m train.v2_1_channel_independency
 """
 import argparse
 import gc
@@ -28,7 +32,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 from data import BiosignalDataset, create_dataloader
 from loss.criterion import CombinedLoss
-from model import BiosignalFoundationModel, ModelConfig
+from model import BiosignalFoundationModelV2, ModelConfig
 from .train_utils import (
     CSVLogger,
     EarlyStopping,
@@ -46,14 +50,14 @@ from .train_utils import (
     set_seed,
     setup_ddp,
     split_manifest_by_subject,
-    train_one_epoch,
-    validate,
+    train_one_epoch_v2,
+    validate_v2,
 )
 from .visualize import save_reconstruction_figure, save_next_pred_figure
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Phase 1: Channel-Independent Pre-training")
+    p = argparse.ArgumentParser(description="Phase 1: Channel-Independent Pre-training (V2)")
 
     # Model
     g = p.add_argument_group("Model")
@@ -111,7 +115,7 @@ def parse_args() -> argparse.Namespace:
                    help="AMP (Automatic Mixed Precision) 활성")
     g.add_argument("--device", type=str, default="auto")
     g.add_argument("--num_workers", type=int, default=4)
-    g.add_argument("--output_dir", type=str, default="outputs/phase1_ci")
+    g.add_argument("--output_dir", type=str, default="outputs/v2_phase1_ci")
     g.add_argument("--checkpoint_every", type=int, default=10)
     g.add_argument("--max_batches", type=int, default=0,
                    help="에폭당 최대 배치 수 (0=무제한)")
@@ -156,7 +160,7 @@ def main():
         stem_hidden_channels=args.stem_hidden_channels,
         stem_num_layers=args.stem_num_layers,
         stem_kernel_size=args.stem_kernel_size,
-        contrastive_proj_dim=0,  # Phase 1: contrastive loss 미사용 → projection head 불���요
+        contrastive_proj_dim=0,  # Phase 1: contrastive loss 미사용
     )
 
     config = TrainConfig(
@@ -214,11 +218,11 @@ def main():
     output_dir = resolve_output_dir(config)
     if rank0:
         output_dir.mkdir(parents=True, exist_ok=True)
-        save_experiment_info(config, output_dir, phase_name="Phase1_CI")
+        save_experiment_info(config, output_dir, phase_name="V2_Phase1_CI")
 
     if rank0:
         print(f"{'='*60}")
-        print(f"Phase 1: Channel-Independent Pre-training")
+        print(f"Phase 1: Channel-Independent Pre-training (V2)")
         if config.exp_name:
             print(f"Experiment: {config.exp_name}")
         print(f"Device: {device}" + (f" (DDP: {world_size} GPUs)" if use_ddp else ""))
@@ -306,12 +310,12 @@ def main():
         if rank0:
             print(f"Val dataset: {len(val_dataset)} windows, {len(val_dataloader)} batches")
 
-    # ── 모델 ──
-    model = BiosignalFoundationModel.from_config(config.model_config)
+    # ── 모델 (V2) ──
+    model = BiosignalFoundationModelV2.from_config(config.model_config)
     model.to(device)
 
     if use_ddp:
-        # cross_head는 gamma=0일 때 loss에 미사용 → unused params 존재
+        # cross_head, eeg_recon_head는 gamma=0일 때 loss에 미사용 → unused params 존재
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
 
     if rank0:
@@ -334,7 +338,6 @@ def main():
         print(f"AMP enabled (GradScaler)")
 
     # ── 시각화용 배치 캐시 (rank 0만) ──
-    # 여러 배치를 수집하여 신호 타입 다양성을 확보한다.
     viz_every = args.viz_every
     viz_batches: list | None = None
     viz_dir = None
@@ -357,7 +360,7 @@ def main():
             for b in viz_batches
             for j in range(len(b.signal_types))
         })
-        print(f"Visualization every {viz_every} epochs → {viz_dir}"
+        print(f"Visualization every {viz_every} epochs -> {viz_dir}"
               f"  ({len(viz_batches)} batches, {n_types} signal types)")
 
     # ── 학습 루프 ──
@@ -379,12 +382,12 @@ def main():
             sampler.set_epoch(epoch)
 
         epoch_start = time.time()
-        losses = train_one_epoch(
+        losses = train_one_epoch_v2(
             model, dataloader, optimizer, criterion,
             config=config,
             device=device,
             epoch=epoch,
-            phase_name="Phase1_CI",
+            phase_name="V2_Phase1_CI",
             scaler=scaler,
         )
         scheduler.step()
@@ -392,9 +395,9 @@ def main():
         # ── Validation ──
         val_losses = None
         if val_dataloader is not None:
-            val_losses = validate(
+            val_losses = validate_v2(
                 model, val_dataloader, criterion,
-                config=config, device=device, phase_name="Phase1_CI",
+                config=config, device=device, phase_name="V2_Phase1_CI",
             )
         epoch_sec = time.time() - epoch_start
 
@@ -404,7 +407,8 @@ def main():
                 f"Epoch {epoch:3d} | "
                 f"train: {losses['total']:.6f} | "
                 f"masked: {losses['masked_loss']:.6f} | "
-                f"next: {losses['next_loss']:.6f}"
+                f"next: {losses['next_loss']:.6f} | "
+                f"eeg: {losses['eeg_loss']:.6f}"
             )
             if val_losses is not None:
                 line += f" | val: {val_losses['total']:.6f}"
@@ -413,7 +417,7 @@ def main():
 
             # CSV 로깅
             if csv_logger is not None:
-                csv_logger.log(epoch, "Phase1_CI", losses, val_losses, current_lr, epoch_sec)
+                csv_logger.log(epoch, "V2_Phase1_CI", losses, val_losses, current_lr, epoch_sec)
 
             # Reconstruction & Next-Pred 시각화
             if viz_batches is not None and (epoch % viz_every == 0 or epoch == config.n_epochs - 1):
@@ -423,13 +427,13 @@ def main():
                     output_dir=viz_recon_dir, mask_ratio=config.mask_ratio,
                     device=device,
                 )
-                print(f"  → Reconstruction figure saved: {fig_path}")
+                print(f"  -> Reconstruction figure saved: {fig_path}")
                 np_path = save_next_pred_figure(
                     viz_model, viz_batches, epoch=epoch,
                     output_dir=viz_np_dir, horizon=1,
                     device=device,
                 )
-                print(f"  → Next-pred figure saved: {np_path}")
+                print(f"  -> Next-pred figure saved: {np_path}")
 
             # Best model 저장 (val_loss 기준, 없으면 train_loss)
             track_loss = val_losses["total"] if val_losses is not None else losses["total"]
@@ -438,17 +442,17 @@ def main():
                 save_model = model.module if use_ddp else model
                 path = save_training_checkpoint(
                     save_model, optimizer, epoch, config,
-                    phase_name="phase1_ci", loss=best_loss,
+                    phase_name="v2_phase1_ci", loss=best_loss,
                     output_dir=output_dir, tag="best",
                 )
-                print(f"  → Best model saved: {path}")
+                print(f"  -> Best model saved: {path}")
 
             # 주기적 체크포인트
             if (epoch + 1) % config.checkpoint_every == 0:
                 save_model = model.module if use_ddp else model
                 save_training_checkpoint(
                     save_model, optimizer, epoch, config,
-                    phase_name="phase1_ci", loss=losses["total"],
+                    phase_name="v2_phase1_ci", loss=losses["total"],
                     output_dir=output_dir,
                 )
 
@@ -467,11 +471,11 @@ def main():
         save_model = model.module if use_ddp else model
         final_path = save_training_checkpoint(
             save_model, optimizer, epoch, config,
-            phase_name="phase1_ci", loss=losses["total"],
+            phase_name="v2_phase1_ci", loss=losses["total"],
             output_dir=output_dir, tag="final",
         )
         print(f"\n{'='*60}")
-        print(f"Phase 1 complete. Final train loss: {losses['total']:.6f}")
+        print(f"V2 Phase 1 complete. Final train loss: {losses['total']:.6f}")
         if val_losses is not None:
             print(f"Final val loss: {val_losses['total']:.6f}")
         print(f"Best {'val' if val_dataloader else 'train'} loss: {best_loss:.6f}")
