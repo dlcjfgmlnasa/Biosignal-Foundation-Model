@@ -62,7 +62,8 @@ class SignalConfig:
         AWP: P95=0.54, 1.0 이상 스파이크 → 1.0
     """
     valid_range: tuple[float, float] | None  # (min, max) — None이면 range check 안 함
-    bandpass: tuple[float, float] | None     # (lo, hi) Hz — None이면 필터 안 함
+    filter_type: str = "none"                # "bandpass" | "lowpass" | "none"
+    filter_freq: tuple[float, float] | None = None  # bandpass=(lo,hi), lowpass=(hi,) → (0, hi)로 저장
     max_flatline_ratio: float = 0.5          # 50% 이상 flat이면 불량
     max_clip_ratio: float = 0.1              # 10% 이상 clipping이면 불량
     max_high_freq_ratio: float = 2.0         # 기본값; 신호별로 아래에서 재정의
@@ -71,13 +72,16 @@ class SignalConfig:
 
 
 SIGNAL_CONFIGS: dict[str, SignalConfig] = {
-    "ecg": SignalConfig(valid_range=(-5.0, 5.0),       bandpass=(0.5, 40.0),  max_high_freq_ratio=1.0, min_amplitude=0.3, min_high_freq_ratio=0.05),
-    "abp": SignalConfig(valid_range=(0.0, 300.0),      bandpass=(0.5, 40.0),  max_high_freq_ratio=0.5),
-    "eeg": SignalConfig(valid_range=(-500.0, 500.0),   bandpass=(0.5, 45.0),  max_high_freq_ratio=2.0),
-    "ppg": SignalConfig(valid_range=None,               bandpass=(0.5, 8.0),   max_high_freq_ratio=0.05, min_amplitude=5.0),
-    "cvp": SignalConfig(valid_range=(-5.0, 40.0),      bandpass=(0.5, 20.0),  max_high_freq_ratio=0.5),
-    "co2": SignalConfig(valid_range=(0.0, 100.0),      bandpass=None,          max_high_freq_ratio=1.0, max_flatline_ratio=0.3, min_amplitude=5.0),
-    "awp": SignalConfig(valid_range=(-10.0, 80.0),     bandpass=None,          max_high_freq_ratio=1.0, min_amplitude=2.0),
+    # ECG/EEG: bandpass — baseline wander(저주파) + 고주파 노이즈 동시 제거
+    "ecg": SignalConfig(valid_range=(-5.0, 5.0),       filter_type="bandpass", filter_freq=(0.5, 40.0),  max_high_freq_ratio=1.0, min_amplitude=0.3, min_high_freq_ratio=0.05),
+    "eeg": SignalConfig(valid_range=(-500.0, 500.0),   filter_type="bandpass", filter_freq=(0.5, 45.0),  max_high_freq_ratio=2.0),
+    # ABP/PPG/CVP: lowpass — DC(절대값) 보존, 고주파 노이즈만 제거
+    "abp": SignalConfig(valid_range=(0.0, 300.0),      filter_type="lowpass",  filter_freq=(0.0, 15.0),  max_high_freq_ratio=0.5),
+    "ppg": SignalConfig(valid_range=None,               filter_type="lowpass",  filter_freq=(0.0, 8.0),   max_high_freq_ratio=0.05, min_amplitude=5.0),
+    "cvp": SignalConfig(valid_range=(-5.0, 40.0),      filter_type="lowpass",  filter_freq=(0.0, 20.0),  max_high_freq_ratio=0.5),
+    # CO2/AWP: lowpass — 느린 호흡 신호, DC 보존
+    "co2": SignalConfig(valid_range=(0.0, 100.0),      filter_type="lowpass",  filter_freq=(0.0, 5.0),   max_high_freq_ratio=1.0, max_flatline_ratio=0.3, min_amplitude=5.0),
+    "awp": SignalConfig(valid_range=(-10.0, 80.0),     filter_type="lowpass",  filter_freq=(0.0, 2.0),   max_high_freq_ratio=1.0, min_amplitude=2.0),
 }
 
 
@@ -145,6 +149,29 @@ def _apply_bandpass(data: np.ndarray, lo: float, hi: float, sr: float) -> np.nda
 
     sos = butter(4, [lo / nyq, hi / nyq], btype="band", output="sos")
     return sosfiltfilt(sos, data).astype(data.dtype)
+
+
+def _apply_lowpass(data: np.ndarray, hi: float, sr: float) -> np.ndarray:
+    """Butterworth 저역통과 필터 (1D). DC 성분(절대값)을 보존한다."""
+    from scipy.signal import butter, sosfiltfilt
+
+    nyq = sr / 2.0
+    if hi >= nyq:
+        hi = nyq - 1.0
+    if hi <= 0:
+        return data
+
+    sos = butter(4, hi / nyq, btype="low", output="sos")
+    return sosfiltfilt(sos, data).astype(data.dtype)
+
+
+def _apply_filter(data: np.ndarray, cfg: SignalConfig, sr: float) -> np.ndarray:
+    """SignalConfig의 filter_type에 따라 적절한 필터를 적용한다."""
+    if cfg.filter_type == "bandpass" and cfg.filter_freq is not None:
+        return _apply_bandpass(data, cfg.filter_freq[0], cfg.filter_freq[1], sr)
+    elif cfg.filter_type == "lowpass" and cfg.filter_freq is not None:
+        return _apply_lowpass(data, cfg.filter_freq[1], sr)
+    return data
 
 
 def _detect_electrocautery(data: np.ndarray, sr: float, threshold_std: float = 10.0,
@@ -348,8 +375,8 @@ def process_vital(
         track_recordings: list[dict] = []
         for seg_idx, segment in enumerate(segments):
             # 대역통과 필터링 먼저 (native sr)
-            if cfg.bandpass is not None:
-                segment = _apply_bandpass(segment, cfg.bandpass[0], cfg.bandpass[1], native_sr)
+            # 신호별 필터링 (bandpass: ECG/EEG, lowpass: ABP/PPG/CVP/CO2/AWP)
+            segment = _apply_filter(segment, cfg, native_sr)
 
             # 리샘플링 → TARGET_SR (100Hz) — quality gate 전에 수행
             # (500Hz 양자화로 인한 false flatline 방지)
