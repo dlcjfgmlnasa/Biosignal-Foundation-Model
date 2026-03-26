@@ -99,10 +99,17 @@ def save_recording_zarr(
     compressor:
         zarr compressor. None이면 blosc(zstd, clevel=3)을 사용한다.
     """
+    import numcodecs
     import zarr
 
+    if compressor is None:
+        compressor = numcodecs.Blosc(cname="zstd", clevel=9, shuffle=numcodecs.Blosc.BITSHUFFLE)
+
+    # float16으로 저장하여 용량 절반 절감 (학습 시 scaler가 정규화하므로 정밀도 충분)
+    store_dtype = "float16"
     z = zarr.open(
-        str(out_path), mode="w", shape=data.shape, dtype="float32",
+        str(out_path), mode="w", shape=data.shape, dtype=store_dtype,
         chunks=(data.shape[0], min(data.shape[1], 100_000)),
+        compressor=compressor,
     )
-    z[:] = data.astype(np.float32)
+    z[:] = data.astype(np.float16)

@@ -125,7 +125,7 @@ class BiosignalDataset(Dataset[BiosignalSample]):
         if path.endswith(".zarr"):
             import zarr
             arr = zarr.open(path, mode="r")
-            return torch.from_numpy(arr[:])
+            return torch.from_numpy(arr[:]).float()  # float16 zarr → float32
         return torch.load(path, weights_only=True, mmap=self._use_mmap)
 
     def __getstate__(self) -> dict:
