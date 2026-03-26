@@ -1,6 +1,5 @@
 # -*- coding:utf-8 -*-
 import bisect
-import os
 import random
 import tempfile
 from dataclasses import dataclass
@@ -124,26 +123,9 @@ class BiosignalDataset(Dataset[BiosignalSample]):
     ) -> torch.Tensor:  # (channels, time)
         path = self._manifest[rec_idx].path
         if path.endswith(".zarr"):
-            # zarr → .pt 디스크 캐시 (worker 간 OS 페이지 캐시로 공유)
-            cache_path = path + ".cache.pt"
-            if os.path.exists(cache_path):
-                return torch.load(cache_path, weights_only=True, mmap=True)
             import zarr
             arr = zarr.open(path, mode="r")
-            tensor = torch.from_numpy(arr[:]).float()  # float16 zarr → float32
-            # 원자적 쓰기: temp → rename (race condition 방지)
-            tmp_fd, tmp_path = tempfile.mkstemp(
-                dir=os.path.dirname(cache_path), suffix=".tmp",
-            )
-            os.close(tmp_fd)
-            try:
-                torch.save(tensor, tmp_path)
-                os.replace(tmp_path, cache_path)
-            except Exception:
-                # 캐시 저장 실패 시 무시 (다음에 재시도)
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-            return tensor
+            return torch.from_numpy(arr[:]).float()  # float16 zarr → float32
         return torch.load(path, weights_only=True, mmap=self._use_mmap)
 
     def __getstate__(self) -> dict:

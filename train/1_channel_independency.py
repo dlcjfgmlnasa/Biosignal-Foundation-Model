@@ -108,7 +108,7 @@ def parse_args() -> argparse.Namespace:
     g.add_argument("--use_amp", action="store_true",
                    help="AMP (Automatic Mixed Precision) 활성")
     g.add_argument("--device", type=str, default="auto")
-    g.add_argument("--num_workers", type=int, default=0)
+    g.add_argument("--num_workers", type=int, default=4)
     g.add_argument("--output_dir", type=str, default="outputs/phase1_ci")
     g.add_argument("--checkpoint_every", type=int, default=10)
     g.add_argument("--max_batches", type=int, default=0,

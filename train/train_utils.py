@@ -73,7 +73,7 @@ class TrainConfig:
 
     # 시스템
     device: str = "auto"  # "auto", "cuda", "cpu"
-    num_workers: int = 0
+    num_workers: int = 4
     output_dir: str = "outputs"
     checkpoint_every: int = 10  # 에폭 간격 체크포인트 저장
 
