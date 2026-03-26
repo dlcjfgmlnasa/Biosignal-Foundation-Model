@@ -300,15 +300,13 @@ def train_one_epoch(
                 contrastive_z=contrastive_z if config.delta > 0 else None,
             )
 
-        # ── MoE auxiliary loss 수집 ──
-        aux_loss = torch.zeros(1, device=device)
-        raw_model = model.module if isinstance(model, DDP) else model
-        for layer in raw_model.encoder.layers:
-            if hasattr(layer.ffn, "aux_loss") and layer.ffn.aux_loss is not None:
-                aux_loss = aux_loss + layer.ffn.aux_loss
+            # ── MoE auxiliary loss 수집 (autocast 내부) ──
+            aux_loss = torch.zeros(1, device=device)
+            for layer in raw_model.encoder.layers:
+                if hasattr(layer.ffn, "aux_loss") and layer.ffn.aux_loss is not None:
+                    aux_loss = aux_loss + layer.ffn.aux_loss
 
-        # ── Backward ──
-        loss = losses["total"] + config.aux_loss_weight * aux_loss
+            loss = losses["total"] + config.aux_loss_weight * aux_loss
 
         # NaN/Inf 감지
         if not torch.isfinite(loss):
@@ -638,15 +636,13 @@ def train_one_epoch_v2(
             # ── 최종 total loss ──
             total_loss = losses["total"] + eeg_loss
 
-        # ── MoE auxiliary loss 수집 ──
-        aux_loss = torch.zeros(1, device=device)
-        raw_model = model.module if isinstance(model, DDP) else model
-        for layer in raw_model.encoder.layers:
-            if hasattr(layer.ffn, "aux_loss") and layer.ffn.aux_loss is not None:
-                aux_loss = aux_loss + layer.ffn.aux_loss
+            # ── MoE auxiliary loss 수집 (autocast 내부) ──
+            aux_loss = torch.zeros(1, device=device)
+            for layer in raw_model.encoder.layers:
+                if hasattr(layer.ffn, "aux_loss") and layer.ffn.aux_loss is not None:
+                    aux_loss = aux_loss + layer.ffn.aux_loss
 
-        # ── Backward ──
-        loss = total_loss + config.aux_loss_weight * aux_loss
+            loss = total_loss + config.aux_loss_weight * aux_loss
 
         # NaN/Inf 감지
         if not torch.isfinite(loss):
