@@ -115,7 +115,7 @@ def segment_quality_score(
 
     # 1. Flatline: 연속 동일 값 비율
     diffs = np.diff(segment)
-    flatline_ratio = float(np.sum(np.abs(diffs) < 1e-10)) / max(len(diffs), 1)
+    flatline_ratio = float(np.sum(np.abs(diffs) < 1e-4)) / max(len(diffs), 1)
 
     # 2. Clipping/Saturation: min/max 값에 고정된 비율
     smin, smax = segment.min(), segment.max()
@@ -183,7 +183,7 @@ def ecg_quality_check(
     min_hr: float = 30.0,
     max_hr: float = 200.0,
     regularity_threshold: float = 0.7,
-    min_autocorr: float = 0.25,
+    min_autocorr: float = 0.10,
 ) -> dict:
     """ECG 세그먼트의 QRS peak 기반 심박수 품질 검사.
 
@@ -270,7 +270,7 @@ def abp_quality_check(
     min_hr: float = 30.0,
     max_hr: float = 200.0,
     regularity_threshold: float = 0.5,
-    min_autocorr: float = 0.3,
+    min_autocorr: float = 0.10,
 ) -> dict:
     """ABP 세그먼트의 pulse peak regularity 기반 품질 검사.
 
@@ -352,7 +352,7 @@ def ppg_quality_check(
     min_hr: float = 30.0,
     max_hr: float = 200.0,
     regularity_threshold: float = 0.5,
-    min_autocorr: float = 0.3,
+    min_autocorr: float = 0.10,
 ) -> dict:
     """PPG 세그먼트의 pulse peak regularity 기반 품질 검사.
 
@@ -465,12 +465,10 @@ def co2_quality_check(
         distance=min_distance,
     )
 
-    if len(peaks) < 1:
+    if len(peaks) < 2:
+        # 15초 윈도우에서 peak < 2 = 호흡수 추정 불가 (interval 없음)
+        # ECG/ABP와 동일 기준: 최소 2개 peak 필요
         return {"resp_rate": 0.0, "pass": False}
-
-    if len(peaks) == 1:
-        # 10초 윈도우에서 peak 1개 = 저호흡(~6/min), 통과
-        return {"resp_rate": 6.0, "pass": True}
 
     # 호흡수 계산: peak 간격 기반
     peak_intervals = np.diff(peaks) / sr
@@ -528,12 +526,10 @@ def awp_quality_check(
         distance=min_distance,
     )
 
-    if len(peaks) < 1:
+    if len(peaks) < 2:
+        # 15초 윈도우에서 peak < 2 = 호흡수 추정 불가 (interval 없음)
+        # ECG/ABP와 동일 기준: 최소 2개 peak 필요
         return {"resp_rate": 0.0, "pass": False}
-
-    if len(peaks) == 1:
-        # 10초 윈도우에서 peak 1개 = 저호흡(~6/min), 통과
-        return {"resp_rate": 6.0, "pass": True}
 
     peak_intervals = np.diff(peaks) / sr
     mean_interval = float(np.mean(peak_intervals))
@@ -684,7 +680,7 @@ def cvp_quality_check(
     max_hr: float = 200.0,
     regularity_threshold: float = 0.7,
     max_flatline_ratio: float = 0.3,
-    min_autocorr: float = 0.25,
+    min_autocorr: float = 0.15,
 ) -> dict:
     """CVP 세그먼트의 정맥파(a/c/v wave) 기반 품질 검사.
 
@@ -730,7 +726,7 @@ def cvp_quality_check(
 
     # 1. Flatline 체크: 센서 분리 감지
     diffs = np.diff(segment)
-    flatline_ratio = float(np.sum(np.abs(diffs) < 1e-10)) / max(len(diffs), 1)
+    flatline_ratio = float(np.sum(np.abs(diffs) < 1e-4)) / max(len(diffs), 1)
     if flatline_ratio >= max_flatline_ratio:
         _fail["flatline_ratio"] = round(flatline_ratio, 4)
         return _fail

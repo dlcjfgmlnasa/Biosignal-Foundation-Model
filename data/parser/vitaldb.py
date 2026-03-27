@@ -54,7 +54,7 @@ class SignalConfig:
 
     high_freq_ratio 근거 (실측 + 시각 검증, 2026-03-26):
         ECG: QRS spike → 정상도 ~0.4, P99=1.97 → 3.0
-        ABP: 매우 부드러운 파형, P99=0.03 → 0.5
+        ABP: 매우 부드러운 파형, P99=0.03 → 0.5, valid_range 하한 20mmHg
         EEG: alpha/beta 고주파 → 합성 clean=0.38 → 2.0
         PPG: 부드러운 파형, hf>0.05부터 노이즈 → 0.05 (시각 검증)
         CVP: 저주파, 합성 clean=0.0004 → 0.5
@@ -74,21 +74,22 @@ class SignalConfig:
     spike_detection: bool = False            # 스파이크/아티팩트 검출 적용 여부
     spike_threshold_std: float = 10.0        # spike 검출 threshold (MAD 배수)
     median_kernel: int = 0                   # median filter kernel size (0=비활성, 홀수만)
+    quality_window_s: float = 5.0            # 품질 검사 윈도우 크기 (초). 호흡 신호는 10초 권장
 
 
 SIGNAL_CONFIGS: dict[str, SignalConfig] = {
     # ECG/EEG: bandpass — baseline wander(저주파) + 고주파 노이즈 동시 제거
     #   notch 60Hz (VitalDB=한국, 60Hz 전원), spike detection 활성
     "ecg": SignalConfig(valid_range=(-5.0, 5.0),       filter_type="bandpass", filter_freq=(0.5, 40.0),  max_high_freq_ratio=1.0, min_amplitude=0.3, min_high_freq_ratio=0.05, notch_freq=60.0, spike_detection=True, spike_threshold_std=10.0),
-    "eeg": SignalConfig(valid_range=(-500.0, 500.0),   filter_type="bandpass", filter_freq=(0.5, 45.0),  max_high_freq_ratio=2.0, min_amplitude=10.0, max_amplitude=200.0, notch_freq=60.0, spike_detection=True, spike_threshold_std=10.0),
+    "eeg": SignalConfig(valid_range=(-500.0, 500.0),   filter_type="bandpass", filter_freq=(0.5, 45.0),  max_high_freq_ratio=2.0, min_amplitude=5.0, max_amplitude=200.0, notch_freq=60.0, spike_detection=True, spike_threshold_std=10.0),
     # ABP/PPG/CVP: lowpass — DC(절대값) 보존, 고주파 노이즈만 제거
     #   PPG/ABP: median filter로 임펄스 노이즈 제거, spike detection 활성
-    "abp": SignalConfig(valid_range=(0.0, 300.0),      filter_type="lowpass",  filter_freq=(0.0, 15.0),  max_high_freq_ratio=0.5, spike_detection=True, spike_threshold_std=8.0, median_kernel=5),
-    "ppg": SignalConfig(valid_range=(0.0, 2000.0),     filter_type="lowpass",  filter_freq=(0.0, 8.0),   max_high_freq_ratio=0.05, min_amplitude=5.0, notch_freq=60.0, spike_detection=True, spike_threshold_std=8.0, median_kernel=5),
+    "abp": SignalConfig(valid_range=(20.0, 300.0),     filter_type="lowpass",  filter_freq=(0.0, 15.0),  max_high_freq_ratio=0.5, max_flatline_ratio=0.3, min_amplitude=10.0, spike_detection=True, spike_threshold_std=6.0, median_kernel=5),
+    "ppg": SignalConfig(valid_range=(0.0, 2000.0),     filter_type="lowpass",  filter_freq=(0.0, 8.0),   max_high_freq_ratio=0.05, max_flatline_ratio=0.3, min_amplitude=5.0, notch_freq=60.0, spike_detection=True, spike_threshold_std=6.0, median_kernel=5),
     "cvp": SignalConfig(valid_range=(-5.0, 40.0),      filter_type="lowpass",  filter_freq=(0.0, 10.0),  max_high_freq_ratio=0.5, spike_detection=True, spike_threshold_std=8.0),
     # CO2/AWP: lowpass — 느린 호흡 신호, DC 보존
-    "co2": SignalConfig(valid_range=(0.0, 100.0),      filter_type="lowpass",  filter_freq=(0.0, 5.0),   max_high_freq_ratio=1.0, max_flatline_ratio=0.3, min_amplitude=5.0),
-    "awp": SignalConfig(valid_range=(-10.0, 80.0),     filter_type="lowpass",  filter_freq=(0.0, 5.0),   max_high_freq_ratio=1.0, min_amplitude=2.0),
+    "co2": SignalConfig(valid_range=(0.0, 100.0),      filter_type="lowpass",  filter_freq=(0.0, 5.0),   max_high_freq_ratio=1.0, max_flatline_ratio=0.3, min_amplitude=5.0, quality_window_s=15.0),
+    "awp": SignalConfig(valid_range=(-10.0, 80.0),     filter_type="lowpass",  filter_freq=(0.0, 5.0),   max_high_freq_ratio=1.0, min_amplitude=2.0, quality_window_s=15.0),
 }
 
 
@@ -153,6 +154,35 @@ def _apply_median_filter(data: np.ndarray, kernel_size: int = 5) -> np.ndarray:
     if kernel_size % 2 == 0:
         kernel_size += 1
     return medfilt(data, kernel_size=kernel_size).astype(data.dtype)
+
+
+def _detect_step_change(
+    data: np.ndarray, sr: float,
+    threshold_std: float = 6.0, blank_ms: float = 300.0,
+) -> tuple[np.ndarray, int]:
+    """ABP/PPG 계단형 아티팩트 검출: 1차 미분 기반 급격한 level shift를 NaN으로 마킹.
+
+    사각파(센서 탈락/클리핑)처럼 값이 급격히 전환되는 구간을 감지한다.
+    기존 spike detection(MAD 기반)은 단일 피크만 잡지만, 이 함수는
+    level shift(계단 함수)를 잡는다.
+    """
+    out = data.copy()
+    diff1 = np.abs(np.diff(out, prepend=out[0]))
+    med = np.median(diff1)
+    mad = np.median(np.abs(diff1 - med)) * 1.4826
+    if mad < 1e-10:
+        return out, 0
+    step_mask = diff1 > (med + threshold_std * mad)
+    if not step_mask.any():
+        return out, 0
+    blank_samples = int(blank_ms / 1000.0 * sr)
+    step_idx = np.where(step_mask)[0]
+    for idx in step_idx:
+        start = max(0, idx - blank_samples)
+        end = min(len(out), idx + blank_samples + 1)
+        out[start:end] = np.nan
+    n_blanked = int(np.isnan(out).sum() - np.isnan(data).sum())
+    return out, n_blanked
 
 
 def _detect_motion_artifact(
@@ -416,7 +446,14 @@ def process_vital(
                 pct = n_blanked / len(data) * 100
                 print(f"    [SPIKE] {track_name}: {n_blanked} samples ({pct:.1f}%) blanked", file=sys.stderr)
 
-        # ── Step 2b: PPG motion artifact 제거 ──
+        # ── Step 2b: ABP/PPG step change (계단형 아티팩트) 제거 ──
+        if stype_key in ("abp", "ppg"):
+            data, n_step = _detect_step_change(data, native_sr)
+            if n_step > 0:
+                pct = n_step / len(data) * 100
+                print(f"    [STEP] {track_name}: {n_step} samples ({pct:.1f}%) blanked", file=sys.stderr)
+
+        # ── Step 2c: PPG motion artifact 제거 ──
         if stype_key == "ppg":
             data, n_motion = _detect_motion_artifact(data, native_sr)
             if n_motion > 0:
@@ -433,7 +470,7 @@ def process_vital(
         # ── Step 4: 각 세그먼트 → 필터/리샘플 → 윈도우 단위 품질 검사 → 저장 ──
         seg_count = 0
         track_recordings: list[dict] = []
-        quality_window_s = 10.0  # 품질 검사 윈도우 크기 (초)
+        quality_window_s = cfg.quality_window_s
 
         for seg_idx, segment in enumerate(segments):
             # Median filter → Notch filter → Bandpass/Lowpass 순서
@@ -447,14 +484,17 @@ def process_vital(
             if native_sr != TARGET_SR:
                 segment = resample_to_target(segment, orig_sr=native_sr, target_sr=TARGET_SR)
 
-            # 윈도우 단위 품질 검사 → 통과한 윈도우만 수집
+            # 윈도우 단위 품질 검사 → 연속 통과 윈도우를 그룹으로 수집
             win_samples = int(quality_window_s * TARGET_SR)
-            good_windows: list[np.ndarray] = []
+            # pass/fail 결과를 윈도우 인덱스와 함께 기록
+            window_results: list[tuple[int, np.ndarray]] = []  # (win_idx, win_data)
             n_windows = 0
             n_fail_basic = 0
             n_fail_domain = 0
 
-            for win_start in range(0, len(segment) - win_samples + 1, win_samples):
+            for win_idx, win_start in enumerate(
+                range(0, len(segment) - win_samples + 1, win_samples)
+            ):
                 win = segment[win_start:win_start + win_samples]
                 n_windows += 1
 
@@ -470,17 +510,40 @@ def process_vital(
                 )
                 if not qscore["pass"]:
                     n_fail_basic += 1
+                    window_results.append((win_idx, None))
                     continue
 
                 # Domain-specific 품질 검사
                 domain_result = domain_quality_check(stype_key, win, sr=TARGET_SR)
                 if not domain_result["pass"]:
                     n_fail_domain += 1
+                    window_results.append((win_idx, None))
                     continue
 
-                good_windows.append(win)
+                window_results.append((win_idx, win))
 
-            if not good_windows:
+            # 연속 통과 윈도우를 그룹으로 묶기 (불연속 경계에서 분리)
+            contiguous_groups: list[list[np.ndarray]] = []
+            current_group: list[np.ndarray] = []
+            prev_idx = -2  # 불가능한 초기값
+
+            for win_idx, win_data in window_results:
+                if win_data is not None:
+                    if win_idx == prev_idx + 1:
+                        # 이전 통과 윈도우와 연속
+                        current_group.append(win_data)
+                    else:
+                        # 새 연속 그룹 시작
+                        if current_group:
+                            contiguous_groups.append(current_group)
+                        current_group = [win_data]
+                    prev_idx = win_idx
+                # win_data is None (fail) → prev_idx 갱신하지 않음
+
+            if current_group:
+                contiguous_groups.append(current_group)
+
+            if not contiguous_groups:
                 if n_windows > 0:
                     print(
                         f"    [SKIP] {track_name} seg{seg_idx}: "
@@ -489,38 +552,41 @@ def process_vital(
                     )
                 continue
 
-            # 통과한 윈도우 이어붙여서 저장
-            clean_segment = np.concatenate(good_windows)
-            channel_data = clean_segment.reshape(1, -1).astype(np.float32)
+            # 각 연속 그룹을 별도 세그먼트로 저장
+            n_good_total = sum(len(g) for g in contiguous_groups)
+            for group_idx, group in enumerate(contiguous_groups):
+                clean_segment = np.concatenate(group)
+                channel_data = clean_segment.reshape(1, -1).astype(np.float32)
 
-            # 최소 길이 체크 (min_duration_s)
-            duration_s = channel_data.shape[1] / TARGET_SR
-            if duration_s < min_duration_s:
-                print(
-                    f"    [SKIP] {track_name} seg{seg_idx}: "
-                    f"통과 윈도우 {len(good_windows)}/{n_windows}개, {duration_s:.0f}s < {min_duration_s}s",
-                    file=sys.stderr,
-                )
-                continue
+                # 최소 길이 체크 (min_duration_s)
+                duration_s = channel_data.shape[1] / TARGET_SR
+                if duration_s < min_duration_s:
+                    continue
 
-            fname = f"{session_id}_{stype_key}_{spatial_id}_seg{seg_idx}.zarr"
-            save_recording_zarr(channel_data, subj_out / fname)
+                fname = f"{session_id}_{stype_key}_{spatial_id}_seg{seg_idx}_{group_idx}.zarr"
+                save_recording_zarr(channel_data, subj_out / fname)
 
-            rec = {
-                "signal_type": signal_type,
-                "file": fname,
-                "n_channels": 1,
-                "sampling_rate": TARGET_SR,
-                "n_timesteps": channel_data.shape[1],
-                "spatial_ids": [spatial_id],
-            }
-            track_recordings.append(rec)
-            recordings.append(rec)
-            seg_count += 1
-            pct = len(good_windows) / n_windows * 100 if n_windows > 0 else 0
+                rec = {
+                    "signal_type": signal_type,
+                    "file": fname,
+                    "n_channels": 1,
+                    "sampling_rate": TARGET_SR,
+                    "n_timesteps": channel_data.shape[1],
+                    "spatial_ids": [spatial_id],
+                }
+                track_recordings.append(rec)
+                recordings.append(rec)
+                seg_count += 1
+
+            pct = n_good_total / n_windows * 100 if n_windows > 0 else 0
+            n_groups = len(contiguous_groups)
+            total_dur = sum(
+                np.concatenate(g).shape[0] for g in contiguous_groups
+            ) / TARGET_SR
             print(
-                f"    saved {fname}  shape={tuple(channel_data.shape)}  {duration_s:.0f}s"
-                f"  ({len(good_windows)}/{n_windows} windows, {pct:.0f}% pass)"
+                f"    saved {stype_key} seg{seg_idx}: {n_groups} contiguous group(s), "
+                f"{total_dur:.0f}s total"
+                f"  ({n_good_total}/{n_windows} windows, {pct:.0f}% pass)"
             )
 
         if seg_count > 0:
