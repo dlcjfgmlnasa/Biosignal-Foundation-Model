@@ -89,26 +89,36 @@ SIGNAL_CONFIGS: dict[str, SignalConfig] = {
 # ── VitalDB 트랙 매핑 ──────────────────────────────────────────
 
 
-# VitalDB 공식 Waveform 트랙 → (signal_type_key, local_spatial_id)
-# 참조: https://vitaldb.net/dataset/ — Hemodynamic Parameters (W=waveform만)
+# VitalDB Waveform 트랙 → (signal_type_key, local_spatial_id)
+# 공식: https://vitaldb.net/dataset/ — Hemodynamic Parameters (W=waveform)
+# 비공식: 일부 파일에 존재하는 대체 장비 트랙 (같은 신호, 다른 소스)
 TRACK_MAP: dict[str, tuple[str, int]] = {
-    # ECG (0) — SNUADC 500Hz, mV
-    "SNUADC/ECG_II": ("ecg", 1),   # Lead II
-    "SNUADC/ECG_V5": ("ecg", 2),   # Lead V5
-    # ABP (1) — SNUADC 500Hz, mmHg
-    "SNUADC/ART": ("abp", 1),      # Radial artery
-    "SNUADC/FEM": ("abp", 2),      # Femoral artery
+    # ECG (0) — 500Hz, mV
+    "SNUADC/ECG_II": ("ecg", 1),    # Lead II (공식)
+    "SNUADC/ECG_V5": ("ecg", 2),    # Lead V5 (공식)
+    "SNUADC/ECG_I": ("ecg", 0),     # Lead I (비공식)
+    "SNUADC/ECG_III": ("ecg", 0),   # Lead III (비공식)
+    "Solar8000/ECG_II": ("ecg", 1), # Lead II — Solar8000 대체 (비공식)
+    # ABP (1) — 500Hz, mmHg
+    "SNUADC/ART": ("abp", 1),       # Radial artery (공식)
+    "SNUADC/FEM": ("abp", 2),       # Femoral artery (공식)
     # EEG (2) — BIS 128Hz, μV
-    "BIS/EEG1_WAV": ("eeg", 0),    # BIS channel 1 (forehead)
-    "BIS/EEG2_WAV": ("eeg", 0),    # BIS channel 2 (forehead)
-    # PPG (3) — SNUADC 500Hz, unitless
-    "SNUADC/PLETH": ("ppg", 1),    # Finger plethysmography
-    # CVP (4) — SNUADC 500Hz, mmHg
-    "SNUADC/CVP": ("cvp", 0),      # Central venous pressure
+    "BIS/EEG1_WAV": ("eeg", 0),     # BIS channel 1 (공식)
+    "BIS/EEG2_WAV": ("eeg", 0),     # BIS channel 2 (공식)
+    "SNUADC/EEG_BIS": ("eeg", 0),   # BIS EEG (비공식)
+    "SNUADC/EEG1": ("eeg", 0),      # EEG ch1 (비공식)
+    "SNUADC/EEG2": ("eeg", 0),      # EEG ch2 (비공식)
+    # PPG (3) — 500Hz, unitless
+    "SNUADC/PLETH": ("ppg", 1),     # Finger (공식)
+    "Solar8000/PLETH": ("ppg", 1),  # Finger — Solar8000 대체 (비공식)
+    # CVP (4) — 500Hz, mmHg
+    "SNUADC/CVP": ("cvp", 0),       # Central venous pressure (공식)
     # CO2 (5) — Primus 62.5Hz, mmHg
-    "Primus/CO2": ("co2", 0),      # Capnography (sidestream)
+    "Primus/CO2": ("co2", 0),       # Capnography (공식)
+    "Solar8000/CO2": ("co2", 0),    # Capnography — Solar8000 대체 (비공식)
     # AWP (6) — Primus 62.5Hz, hPa
-    "Primus/AWP": ("awp", 0),      # Airway pressure
+    "Primus/AWP": ("awp", 0),       # Airway pressure (공식)
+    "Solar8000/AWP": ("awp", 0),    # Airway pressure — Solar8000 대체 (비공식)
 }
 
 SIGNAL_TYPES: dict[str, int] = {
