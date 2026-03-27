@@ -6,6 +6,7 @@ nn.Module로 통합한다.
 """
 from __future__ import annotations
 
+import warnings
 from collections.abc import Callable
 from dataclasses import fields
 from functools import partial
@@ -78,6 +79,12 @@ class BiosignalFoundationModel(nn.Module):
         contrastive_proj_dim: int = 0,
     ) -> None:
         super().__init__()
+        warnings.warn(
+            "BiosignalFoundationModel is deprecated. "
+            "Use BiosignalFoundationModelV1 or BiosignalFoundationModelV2 instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self.d_model = d_model
         self.patch_size = patch_size
 

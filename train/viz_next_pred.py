@@ -11,7 +11,7 @@ import numpy as np
 import torch
 
 from data.collate import PackedBatch
-from model import BiosignalFoundationModel
+from model import BiosignalFoundationModelV1
 
 from ._viz_common import (
     SIGNAL_TYPE_NAMES,
@@ -24,7 +24,7 @@ from ._viz_common import (
 
 
 def _process_batch(
-    model: BiosignalFoundationModel,
+    model: BiosignalFoundationModelV1,
     batch: PackedBatch,
     horizon: int,
     device: torch.device | None,
@@ -105,7 +105,7 @@ def _process_batch(
 
 @torch.no_grad()
 def save_next_pred_figure(
-    model: BiosignalFoundationModel,
+    model: BiosignalFoundationModelV1,
     batch: PackedBatch | list[PackedBatch],
     epoch: int,
     output_dir: str | Path,

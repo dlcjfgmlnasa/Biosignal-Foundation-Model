@@ -495,11 +495,11 @@ def validate(
                 contrastive_z=contrastive_z if config.delta > 0 else None,
             )
 
-        loss = losses["total"]
+        loss = losses["total"] + config.aux_loss_weight * aux_loss
         if not torch.isfinite(loss):
             continue
 
-        epoch_total += losses["total"].item()
+        epoch_total += loss.item()
         epoch_masked += losses["masked_loss"].item()
         epoch_next += losses["next_loss"].item()
         epoch_cross += losses["cross_modal_loss"].item()
@@ -860,7 +860,7 @@ def validate_v2(
                         eeg_recon_target[eeg_pred_mask],
                     )
 
-            total_loss = losses["total"] + config.eeg_loss_weight * eeg_loss
+            total_loss = losses["total"] + config.eeg_loss_weight * eeg_loss + config.aux_loss_weight * aux_loss
 
         if not torch.isfinite(total_loss):
             continue
@@ -935,7 +935,9 @@ class CSVLogger:
     COLUMNS = [
         "epoch", "phase",
         "train_total", "train_masked", "train_next", "train_cross", "train_contrastive",
+        "train_eeg", "train_aux",
         "val_total", "val_masked", "val_next", "val_cross", "val_contrastive",
+        "val_eeg", "val_aux",
         "lr", "epoch_sec",
     ]
 
@@ -963,11 +965,15 @@ class CSVLogger:
             train_losses["next_loss"],
             train_losses["cross_modal_loss"],
             train_losses["contrastive_loss"],
+            train_losses.get("eeg_loss", ""),
+            train_losses.get("aux_loss", ""),
             val_losses["total"] if val_losses else "",
             val_losses["masked_loss"] if val_losses else "",
             val_losses["next_loss"] if val_losses else "",
             val_losses["cross_modal_loss"] if val_losses else "",
             val_losses["contrastive_loss"] if val_losses else "",
+            val_losses.get("eeg_loss", "") if val_losses else "",
+            val_losses.get("aux_loss", "") if val_losses else "",
             lr,
             f"{epoch_sec:.1f}",
         ]
