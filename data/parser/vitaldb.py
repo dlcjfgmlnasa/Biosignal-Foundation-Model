@@ -627,11 +627,15 @@ def main() -> None:
         # manifest.json은 process_vital() 내부에서 트랙마다 즉시 저장됨
         # 여기서는 manifest.jsonl 인덱스만 관리
         if subject_id not in existing_subjects:
-            with open(jsonl_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(
-                    {"subject_id": subject_id, "manifest": f"{subject_id}/manifest.json"},
-                    ensure_ascii=False,
-                ) + "\n")
+            # FUSE는 append("a") 미지원 → read + write로 대체
+            prev = ""
+            if jsonl_path.exists():
+                prev = jsonl_path.read_text(encoding="utf-8")
+            new_line = json.dumps(
+                {"subject_id": subject_id, "manifest": f"{subject_id}/manifest.json"},
+                ensure_ascii=False,
+            ) + "\n"
+            jsonl_path.write_text(prev + new_line, encoding="utf-8")
             existing_subjects.add(subject_id)
 
         n_processed += 1
