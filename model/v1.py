@@ -90,7 +90,7 @@ class BiosignalFoundationModelV1(nn.Module):
         scaler: PackedScaler | None = None,
         dropout_p: float = 0.0,
         num_signal_types: int = 7,
-        num_spatial_ids: int = 55,
+        num_spatial_ids: int = 12,
         use_spatial_embed: bool = True,
         max_horizon: int = 1,
         use_cnn_stem: bool = False,
