@@ -59,6 +59,12 @@ from .visualize import save_reconstruction_figure, save_next_pred_figure
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Phase 1: Channel-Independent Pre-training (V2)")
 
+    # Config file + dry-run
+    p.add_argument("--config", type=str, default=None,
+                   help="YAML config file path. CLI args override YAML values.")
+    p.add_argument("--dry-run", action="store_true",
+                   help="1 batch만 실행 후 종료 (OOM/NaN 검증용)")
+
     # Model
     g = p.add_argument_group("Model")
     g.add_argument("--d_model", type=int, default=64)
@@ -145,76 +151,94 @@ def main():
     rank0 = is_main_process()
 
     # ── Phase 1 설정 ──
-    model_config = ModelConfig(
-        d_model=args.d_model,
-        num_layers=args.num_layers,
-        patch_size=args.patch_size,
-        num_heads=args.num_heads,
-        num_groups=args.num_groups,
-        use_glu=args.use_glu,
-        use_moe=args.use_moe,
-        use_rope=args.use_rope,
-        use_var_attn_bias=args.use_var_attn_bias,
-        dropout_p=args.dropout_p,
-        max_horizon=args.max_horizon,
-        use_cnn_stem=args.use_cnn_stem,
-        stem_hidden_channels=args.stem_hidden_channels,
-        stem_num_layers=args.stem_num_layers,
-        stem_kernel_size=args.stem_kernel_size,
-        contrastive_proj_dim=0,  # Phase 1: contrastive loss 미사용
-    )
+    if args.config:
+        # YAML config 파일에서 로드
+        config = TrainConfig.from_yaml(args.config)
+        # Phase 1 CI 고정값
+        config.collate_mode = "ci"
+        config.variate_mask_prob = 0.0
+        if rank0:
+            print(f"Config loaded from: {args.config}")
+    else:
+        # CLI 인자 기반 구성 (하위 호환성)
+        model_config = ModelConfig(
+            d_model=args.d_model,
+            num_layers=args.num_layers,
+            patch_size=args.patch_size,
+            num_heads=args.num_heads,
+            num_groups=args.num_groups,
+            use_glu=args.use_glu,
+            use_moe=args.use_moe,
+            use_rope=args.use_rope,
+            use_var_attn_bias=args.use_var_attn_bias,
+            dropout_p=args.dropout_p,
+            max_horizon=args.max_horizon,
+            use_cnn_stem=args.use_cnn_stem,
+            stem_hidden_channels=args.stem_hidden_channels,
+            stem_num_layers=args.stem_num_layers,
+            stem_kernel_size=args.stem_kernel_size,
+            contrastive_proj_dim=0,
+        )
 
-    config = TrainConfig(
-        model_config=model_config,
+        config = TrainConfig(
+            model_config=model_config,
 
-        # 데이터
-        processed_dir=args.processed_dir,
-        signal_types=args.signal_types,
-        max_subjects=args.max_subjects,
-        window_seconds=args.window_seconds,
-        max_length=args.max_length,
-        cache_size=args.cache_size,
-        crop_ratio_min=args.crop_ratio_min,
-        crop_ratio_max=args.crop_ratio_max,
+            # 데이터
+            processed_dir=args.processed_dir,
+            signal_types=args.signal_types,
+            max_subjects=args.max_subjects,
+            window_seconds=args.window_seconds,
+            max_length=args.max_length,
+            cache_size=args.cache_size,
+            crop_ratio_min=args.crop_ratio_min,
+            crop_ratio_max=args.crop_ratio_max,
 
-        # 학습
-        batch_size=args.batch_size,
-        lr=args.lr,
-        n_epochs=args.n_epochs,
-        warmup_epochs=args.warmup_epochs,
-        min_lr_ratio=args.min_lr_ratio,
-        mask_ratio=args.mask_ratio,
-        gradient_clip=args.gradient_clip,
-        seed=args.seed,
-        collate_mode="ci",
+            # 학습
+            batch_size=args.batch_size,
+            lr=args.lr,
+            n_epochs=args.n_epochs,
+            warmup_epochs=args.warmup_epochs,
+            min_lr_ratio=args.min_lr_ratio,
+            mask_ratio=args.mask_ratio,
+            gradient_clip=args.gradient_clip,
+            seed=args.seed,
+            collate_mode="ci",
 
-        # Loss: MPM + Next-Pred (Phase 1은 cross-modal/contrastive 비활성)
-        alpha=args.alpha,
-        beta=args.beta,
-        gamma=0.0,
-        delta=args.delta,
-        eeg_loss_weight=args.eeg_loss_weight,
+            # Loss
+            alpha=args.alpha,
+            beta=args.beta,
+            gamma=0.0,
+            delta=args.delta,
+            eeg_loss_weight=args.eeg_loss_weight,
 
-        # Phase 1은 variate-level 마스킹 비활성
-        variate_mask_prob=0.0,
+            # Phase 1
+            variate_mask_prob=0.0,
 
-        # Validation & Early Stopping
-        val_ratio=args.val_ratio,
-        patience=args.patience,
+            # Validation & Early Stopping
+            val_ratio=args.val_ratio,
+            patience=args.patience,
 
-        # Mixed Precision
-        use_amp=args.use_amp,
+            # Mixed Precision
+            use_amp=args.use_amp,
 
-        # 실험 관리
-        exp_name=args.exp_name,
+            # 실험 관리
+            exp_name=args.exp_name,
 
-        # 시스템
-        device=args.device,
-        num_workers=args.num_workers,
-        output_dir=args.output_dir,
-        checkpoint_every=args.checkpoint_every,
-        max_batches=args.max_batches,
-    )
+            # 시스템
+            device=args.device,
+            num_workers=args.num_workers,
+            output_dir=args.output_dir,
+            checkpoint_every=args.checkpoint_every,
+            max_batches=args.max_batches,
+        )
+
+    # ── Dry-run 모드 ──
+    if args.dry_run:
+        config.n_epochs = 1
+        config.max_batches = 1
+        config.dry_run = True
+        if rank0:
+            print("[dry-run] 1 epoch, 1 batch")
 
     set_seed(config.seed + (local_rank if use_ddp else 0))
     output_dir = resolve_output_dir(config)
