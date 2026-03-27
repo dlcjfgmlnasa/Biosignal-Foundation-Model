@@ -5,6 +5,7 @@ Salesforce uni2ts (Apache 2.0)에서 포팅.
 """
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 
 import torch
@@ -124,6 +125,10 @@ class MoEFeedForward(nn.Module):
     top-k expert를 선택하고, softmax 가중치로 expert 출력을 합산한다.
     학습 시 load balancing auxiliary loss를 ``self.aux_loss``에 저장한다.
 
+    라우팅 모니터링:
+        ``get_routing_stats()``를 호출하면 expert별 할당 비율, 라우팅 엔트로피,
+        최대/최소 expert 할당 비율을 반환한다.
+
     Parameters
     ----------
     num_experts:
@@ -174,6 +179,9 @@ class MoEFeedForward(nn.Module):
             ]
         )
         self.aux_loss: torch.Tensor | None = None
+        # Routing 모니터링: forward마다 갱신 (detached, no grad)
+        self._expert_counts: torch.Tensor | None = None  # (E,) — expert별 할당 토큰 수
+        self._routing_entropy: float | None = None        # 라우팅 엔트로피 (균등=log(E))
 
     def forward(
         self,
@@ -191,19 +199,27 @@ class MoEFeedForward(nn.Module):
         weights = F.softmax(weights, dim=1, dtype=torch.float).type_as(x)  # (T, K)
 
         # ── Load balancing auxiliary loss (Switch Transformer) ──
+        # f_i: 각 expert에 할당된 토큰 비율
+        num_tokens = x_squashed.shape[0]
+        one_hot = F.one_hot(
+            selected_experts.reshape(-1), self.num_experts,
+        ).float()  # (T*K, E)
+        tokens_per_expert = one_hot.sum(dim=0)  # (E,)
+        f = tokens_per_expert / (num_tokens * self.num_experts_per_token)  # (E,)
+        # P_i: 각 expert의 평균 gate 확률
+        P = gate_probs.mean(dim=0)  # (E,)
+
         if self.training:
-            # f_i: 각 expert에 할당된 토큰 비율
-            num_tokens = x_squashed.shape[0]
-            one_hot = F.one_hot(
-                selected_experts.reshape(-1), self.num_experts,
-            ).float()  # (T*K, E)
-            tokens_per_expert = one_hot.sum(dim=0)  # (E,)
-            f = tokens_per_expert / (num_tokens * self.num_experts_per_token)  # (E,)
-            # P_i: 각 expert의 평균 gate 확률
-            P = gate_probs.mean(dim=0)  # (E,)
             self.aux_loss = self.num_experts * (f * P).sum()
         else:
             self.aux_loss = None
+
+        # ── Routing 모니터링 통계 (no grad) ──
+        with torch.no_grad():
+            self._expert_counts = tokens_per_expert.detach()  # (E,)
+            # 라우팅 엔트로피: H = -sum(f_i * log(f_i)), 균등 분포 시 log(E)
+            f_clamped = f.detach().clamp(min=1e-8)
+            self._routing_entropy = -(f_clamped * f_clamped.log()).sum().item()
 
         # ── Expert dispatch (argsort 기반 그룹핑) ──
         results = torch.zeros_like(x_squashed)
@@ -233,3 +249,28 @@ class MoEFeedForward(nn.Module):
 
         results = results.view_as(x)
         return results
+
+    def get_routing_stats(self) -> dict[str, object]:
+        """최근 forward의 라우팅 통계 반환.
+
+        Returns
+        -------
+        dict with keys:
+            ``expert_load``: list[float] — expert별 할당 비율 (합=1).
+            ``routing_entropy``: float — 라우팅 엔트로피 (균등=log(E)).
+            ``max_entropy``: float — 최대 엔트로피 (log(num_experts)).
+            ``max_min_ratio``: float — 최다/최소 expert 할당 비율 (1.0이 이상적).
+        """
+        if self._expert_counts is None:
+            return {}
+        counts = self._expert_counts.float()
+        total = counts.sum().clamp(min=1.0)
+        load = counts / total  # (E,)
+        max_count = counts.max().item()
+        min_count = counts.min().item()
+        return {
+            "expert_load": [round(v, 4) for v in load.tolist()],
+            "routing_entropy": round(self._routing_entropy or 0.0, 4),
+            "max_entropy": round(math.log(self.num_experts), 4),
+            "max_min_ratio": round(max_count / max(min_count, 1.0), 2),
+        }

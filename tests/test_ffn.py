@@ -164,3 +164,65 @@ class TestMoEFeedForward:
         x = torch.randn(2, 8, 32)
         moe(x)
         assert moe.aux_loss is None
+
+    def test_routing_stats_keys(self):
+        """get_routing_stats()가 올바른 키를 반환."""
+        moe = MoEFeedForward(num_experts=4, num_experts_per_token=1, in_dim=32)
+        moe.train()
+        x = torch.randn(4, 16, 32)
+        moe(x)
+        stats = moe.get_routing_stats()
+        assert "expert_load" in stats
+        assert "routing_entropy" in stats
+        assert "max_entropy" in stats
+        assert "max_min_ratio" in stats
+        assert len(stats["expert_load"]) == 4
+
+    def test_routing_stats_load_sums_to_one(self):
+        """expert_load 비율의 합이 1."""
+        moe = MoEFeedForward(num_experts=4, num_experts_per_token=1, in_dim=32)
+        moe.train()
+        x = torch.randn(4, 16, 32)
+        moe(x)
+        stats = moe.get_routing_stats()
+        assert abs(sum(stats["expert_load"]) - 1.0) < 1e-3
+
+    def test_routing_stats_empty_before_forward(self):
+        """forward 호출 전에는 빈 dict 반환."""
+        moe = MoEFeedForward(num_experts=4, num_experts_per_token=1, in_dim=32)
+        assert moe.get_routing_stats() == {}
+
+    def test_routing_no_collapse_top1(self):
+        """num_experts=4, top_k=1에서 expert 활용 편향이 4:1 미만.
+
+        충분한 토큰(B=8, N=32)을 보내면 랜덤 초기화 gate 기준으로
+        최소 1개 이상의 토큰이 모든 expert에 할당되어야 한다.
+        """
+        moe = MoEFeedForward(num_experts=4, num_experts_per_token=1, in_dim=32)
+        moe.train()
+        x = torch.randn(8, 32, 32)  # 256 tokens
+        moe(x)
+        stats = moe.get_routing_stats()
+        assert stats["max_min_ratio"] < 4.0, (
+            f"Expert utilization bias too high: {stats['max_min_ratio']:.1f}:1, "
+            f"load={stats['expert_load']}"
+        )
+
+    def test_routing_entropy_positive(self):
+        """라우팅 엔트로피가 0보다 크고 max_entropy 이하."""
+        moe = MoEFeedForward(num_experts=4, num_experts_per_token=1, in_dim=32)
+        moe.train()
+        x = torch.randn(4, 16, 32)
+        moe(x)
+        stats = moe.get_routing_stats()
+        assert stats["routing_entropy"] > 0.0
+        assert stats["routing_entropy"] <= stats["max_entropy"] + 1e-6
+
+    def test_aux_loss_positive_training_top1(self):
+        """num_experts=4, top_k=1 학습 시 aux_loss > 0."""
+        moe = MoEFeedForward(num_experts=4, num_experts_per_token=1, in_dim=32)
+        moe.train()
+        x = torch.randn(8, 32, 32)
+        moe(x)
+        assert moe.aux_loss is not None
+        assert moe.aux_loss.item() > 0
