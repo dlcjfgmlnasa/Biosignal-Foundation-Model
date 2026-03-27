@@ -183,6 +183,7 @@ def ecg_quality_check(
     min_hr: float = 30.0,
     max_hr: float = 200.0,
     regularity_threshold: float = 0.7,
+    min_autocorr: float = 0.25,
 ) -> dict:
     """ECG 세그먼트의 QRS peak 기반 심박수 품질 검사.
 
@@ -196,21 +197,26 @@ def ecg_quality_check(
         정상 심박수 범위 (bpm).
     regularity_threshold:
         R-R interval의 변이계수(std/mean) 상한. 초과하면 불규칙.
+    min_autocorr:
+        HR lag 범위 autocorrelation 최소값. R-peak가 sharp하여 0.25로 설정.
 
     Returns
     -------
-    {"hr": float, "hr_valid": bool, "n_peaks": int, "regularity": float, "pass": bool}
+    {"hr": float, "hr_valid": bool, "n_peaks": int, "regularity": float,
+     "autocorr_peak": float, "pass": bool}
     """
     from scipy.signal import find_peaks
 
+    _fail = {"hr": 0.0, "hr_valid": False, "n_peaks": 0, "regularity": 1.0, "autocorr_peak": 0.0, "pass": False}
+
     if len(segment) < int(sr * 2):
-        return {"hr": 0.0, "hr_valid": False, "n_peaks": 0, "regularity": 1.0, "pass": False}
+        return _fail
 
     # R-peak 검출: IQR 기반 prominence (outlier spike에 robust)
     q75, q25 = np.percentile(segment, [75, 25])
     iqr = q75 - q25
     if iqr < 1e-6:
-        return {"hr": 0.0, "hr_valid": False, "n_peaks": 0, "regularity": 1.0, "pass": False}
+        return _fail
 
     # R-R interval 최소 거리: max_hr=200bpm → 0.3s → sr*0.3 samples
     min_distance = int(sr * 60.0 / max_hr * 0.8)  # 약간 여유
@@ -224,13 +230,15 @@ def ecg_quality_check(
 
     n_peaks = len(peaks)
     if n_peaks < 2:
-        return {"hr": 0.0, "hr_valid": False, "n_peaks": n_peaks, "regularity": 1.0, "pass": False}
+        _fail["n_peaks"] = n_peaks
+        return _fail
 
     # R-R intervals → 심박수
     rr_intervals = np.diff(peaks) / sr  # seconds
     rr_mean = float(np.mean(rr_intervals))
     if rr_mean < 1e-6:
-        return {"hr": 0.0, "hr_valid": False, "n_peaks": n_peaks, "regularity": 1.0, "pass": False}
+        _fail["n_peaks"] = n_peaks
+        return _fail
 
     hr = 60.0 / rr_mean
     hr_valid = min_hr <= hr <= max_hr
@@ -239,13 +247,19 @@ def ecg_quality_check(
     rr_std = float(np.std(rr_intervals))
     regularity = rr_std / rr_mean
 
-    passed = hr_valid and regularity < regularity_threshold
+    # Autocorrelation 주기성 체크
+    min_lag_s = 60.0 / max_hr
+    max_lag_s = 60.0 / min_hr
+    autocorr_peak = _autocorrelation_peak(segment, sr, min_lag_s, max_lag_s)
+
+    passed = hr_valid and regularity < regularity_threshold and autocorr_peak >= min_autocorr
 
     return {
         "hr": round(hr, 1),
         "hr_valid": hr_valid,
         "n_peaks": n_peaks,
         "regularity": round(regularity, 4),
+        "autocorr_peak": round(autocorr_peak, 4),
         "pass": passed,
     }
 
@@ -256,6 +270,7 @@ def abp_quality_check(
     min_hr: float = 30.0,
     max_hr: float = 200.0,
     regularity_threshold: float = 0.5,
+    min_autocorr: float = 0.3,
 ) -> dict:
     """ABP 세그먼트의 pulse peak regularity 기반 품질 검사.
 
@@ -272,20 +287,24 @@ def abp_quality_check(
         정상 맥박수 범위 (bpm).
     regularity_threshold:
         peak-to-peak interval 변이계수 상한.
+    min_autocorr:
+        HR lag 범위 autocorrelation 최소값.
 
     Returns
     -------
-    {"hr": float, "n_peaks": int, "regularity": float, "pass": bool}
+    {"hr": float, "n_peaks": int, "regularity": float, "autocorr_peak": float, "pass": bool}
     """
     from scipy.signal import find_peaks
 
+    _fail = {"hr": 0.0, "n_peaks": 0, "regularity": 1.0, "autocorr_peak": 0.0, "pass": False}
+
     if len(segment) < int(sr * 2):
-        return {"hr": 0.0, "n_peaks": 0, "regularity": 1.0, "pass": False}
+        return _fail
 
     q75, q25 = np.percentile(segment, [75, 25])
     iqr = q75 - q25
     if iqr < 1e-6:
-        return {"hr": 0.0, "n_peaks": 0, "regularity": 1.0, "pass": False}
+        return _fail
 
     # Systolic peaks: 최소 0.4s 간격 (max ~150bpm)
     min_distance = int(sr * 0.4)
@@ -296,12 +315,14 @@ def abp_quality_check(
     )
 
     if len(peaks) < 2:
-        return {"hr": 0.0, "n_peaks": len(peaks), "regularity": 1.0, "pass": False}
+        _fail["n_peaks"] = len(peaks)
+        return _fail
 
     pp_intervals = np.diff(peaks) / sr
     pp_mean = float(np.mean(pp_intervals))
     if pp_mean < 1e-6:
-        return {"hr": 0.0, "n_peaks": len(peaks), "regularity": 1.0, "pass": False}
+        _fail["n_peaks"] = len(peaks)
+        return _fail
 
     hr = 60.0 / pp_mean
     hr_valid = min_hr <= hr <= max_hr
@@ -309,12 +330,18 @@ def abp_quality_check(
     pp_std = float(np.std(pp_intervals))
     regularity = pp_std / pp_mean
 
-    passed = hr_valid and regularity < regularity_threshold
+    # Autocorrelation 주기성 체크
+    min_lag_s = 60.0 / max_hr
+    max_lag_s = 60.0 / min_hr
+    autocorr_peak = _autocorrelation_peak(segment, sr, min_lag_s, max_lag_s)
+
+    passed = hr_valid and regularity < regularity_threshold and autocorr_peak >= min_autocorr
 
     return {
         "hr": round(hr, 1),
         "n_peaks": len(peaks),
         "regularity": round(regularity, 4),
+        "autocorr_peak": round(autocorr_peak, 4),
         "pass": passed,
     }
 
@@ -325,6 +352,7 @@ def ppg_quality_check(
     min_hr: float = 30.0,
     max_hr: float = 200.0,
     regularity_threshold: float = 0.5,
+    min_autocorr: float = 0.3,
 ) -> dict:
     """PPG 세그먼트의 pulse peak regularity 기반 품질 검사.
 
@@ -338,20 +366,24 @@ def ppg_quality_check(
         정상 심박수 범위 (bpm).
     regularity_threshold:
         peak-to-peak interval 변이계수 상한.
+    min_autocorr:
+        HR lag 범위 autocorrelation 최소값.
 
     Returns
     -------
-    {"hr": float, "regularity": float, "pass": bool}
+    {"hr": float, "regularity": float, "autocorr_peak": float, "pass": bool}
     """
     from scipy.signal import find_peaks
 
+    _fail = {"hr": 0.0, "regularity": 1.0, "autocorr_peak": 0.0, "pass": False}
+
     if len(segment) < int(sr * 2):
-        return {"hr": 0.0, "regularity": 1.0, "pass": False}
+        return _fail
 
     q75, q25 = np.percentile(segment, [75, 25])
     iqr = q75 - q25
     if iqr < 1e-6:
-        return {"hr": 0.0, "regularity": 1.0, "pass": False}
+        return _fail
 
     min_distance = int(sr * 60.0 / max_hr * 0.8)
     min_distance = max(min_distance, 1)
@@ -363,12 +395,12 @@ def ppg_quality_check(
     )
 
     if len(peaks) < 2:
-        return {"hr": 0.0, "regularity": 1.0, "pass": False}
+        return _fail
 
     pp_intervals = np.diff(peaks) / sr
     pp_mean = float(np.mean(pp_intervals))
     if pp_mean < 1e-6:
-        return {"hr": 0.0, "regularity": 1.0, "pass": False}
+        return _fail
 
     hr = 60.0 / pp_mean
     hr_valid = min_hr <= hr <= max_hr
@@ -376,11 +408,17 @@ def ppg_quality_check(
     pp_std = float(np.std(pp_intervals))
     regularity = pp_std / pp_mean
 
-    passed = hr_valid and regularity < regularity_threshold
+    # Autocorrelation 주기성 체크
+    min_lag_s = 60.0 / max_hr
+    max_lag_s = 60.0 / min_hr
+    autocorr_peak = _autocorrelation_peak(segment, sr, min_lag_s, max_lag_s)
+
+    passed = hr_valid and regularity < regularity_threshold and autocorr_peak >= min_autocorr
 
     return {
         "hr": round(hr, 1),
         "regularity": round(regularity, 4),
+        "autocorr_peak": round(autocorr_peak, 4),
         "pass": passed,
     }
 
@@ -571,6 +609,193 @@ def eeg_quality_check(
     }
 
 
+def _autocorrelation_peak(
+    segment: np.ndarray,
+    sr: float,
+    min_lag_s: float,
+    max_lag_s: float,
+) -> float:
+    """HR 범위 내 lag에서 정규화 autocorrelation의 최대값을 반환한다.
+
+    정상 주기 신호는 해당 lag에서 뚜렷한 peak(>0.3)를 보이고,
+    랜덤 노이즈는 빠르게 0으로 수렴하여 peak가 없다.
+
+    Parameters
+    ----------
+    segment: 1D 신호 (mean-subtracted 권장).
+    sr: sampling rate (Hz).
+    min_lag_s: 탐색할 최소 lag (초). HR 200bpm → 0.3s.
+    max_lag_s: 탐색할 최대 lag (초). HR 30bpm → 2.0s.
+
+    Returns
+    -------
+    HR 범위 lag에서의 최대 정규화 autocorrelation 값 (0~1).
+    """
+    x = segment - np.mean(segment)
+    n = len(x)
+    autocorr_full = np.correlate(x, x, mode="full")
+    # 정규화: lag=0의 autocorrelation(= 에너지)으로 나눔
+    zero_lag = autocorr_full[n - 1]
+    if zero_lag < 1e-10:
+        return 0.0
+    autocorr = autocorr_full[n - 1:] / zero_lag  # lag >= 0 부분만
+
+    min_lag = max(1, int(min_lag_s * sr))
+    max_lag = min(len(autocorr) - 1, int(max_lag_s * sr))
+    if min_lag >= max_lag:
+        return 0.0
+
+    return float(np.max(autocorr[min_lag:max_lag + 1]))
+
+
+def _respiratory_band_power(
+    segment: np.ndarray,
+    sr: float,
+    lo: float = 0.1,
+    hi: float = 0.5,
+) -> float:
+    """호흡 대역(0.1~0.5Hz) 파워 비율을 반환한다.
+
+    기계환기 환자는 거의 항상 respiratory variation이 존재.
+    정상 CVP: resp_power_ratio > 0.05 정도.
+
+    Returns
+    -------
+    호흡 대역 파워 / 전체 파워 (0~1).
+    """
+    n = len(segment)
+    fft_vals = np.fft.rfft(segment - np.mean(segment))
+    power = np.abs(fft_vals) ** 2
+    freqs = np.fft.rfftfreq(n, d=1.0 / sr)
+
+    total_power = float(power.sum())
+    if total_power < 1e-10:
+        return 0.0
+
+    resp_mask = (freqs >= lo) & (freqs <= hi)
+    resp_power = float(power[resp_mask].sum())
+    return resp_power / total_power
+
+
+def cvp_quality_check(
+    segment: np.ndarray,
+    sr: float = 100.0,
+    min_hr: float = 30.0,
+    max_hr: float = 200.0,
+    regularity_threshold: float = 0.7,
+    max_flatline_ratio: float = 0.3,
+    min_autocorr: float = 0.25,
+) -> dict:
+    """CVP 세그먼트의 정맥파(a/c/v wave) 기반 품질 검사.
+
+    CVP는 저압 정맥 파형으로 ABP보다 진폭이 작고 불규칙하다.
+    심박과 동기화된 a/c/v wave가 존재하며, 호흡에 의한 저주파 변동이 있다.
+
+    검증 항목:
+        1. Flatline 체크 (센서 분리)
+        2. Peak detection (a/c/v wave) + HR/regularity
+        3. Autocorrelation 주기성 (랜덤 노이즈 배제)
+        4. Respiratory variation (호흡 저주파 변동 존재 여부, 정보 제공용)
+
+    Parameters
+    ----------
+    segment:
+        (n_timesteps,) 1D CVP 배열 (lowpass + resample 후 100Hz 기준).
+    sr:
+        sampling rate (Hz).
+    min_hr, max_hr:
+        정상 맥박수 범위 (bpm).
+    regularity_threshold:
+        peak-to-peak interval 변이계수 상한. ABP(0.5)보다 관대하게 0.7.
+    max_flatline_ratio:
+        flatline 비율 상한. 초과하면 센서 분리로 판단.
+    min_autocorr:
+        HR lag 범위 autocorrelation 최소값. 미만이면 주기성 없음(노이즈).
+
+    Returns
+    -------
+    dict with keys: hr, n_peaks, regularity, flatline_ratio, autocorr_peak,
+                    resp_power_ratio, pass.
+    """
+    from scipy.signal import find_peaks
+
+    _fail = {
+        "hr": 0.0, "n_peaks": 0, "regularity": 1.0,
+        "flatline_ratio": 1.0, "autocorr_peak": 0.0,
+        "resp_power_ratio": 0.0, "pass": False,
+    }
+
+    if len(segment) < int(sr * 2):
+        return _fail
+
+    # 1. Flatline 체크: 센서 분리 감지
+    diffs = np.diff(segment)
+    flatline_ratio = float(np.sum(np.abs(diffs) < 1e-10)) / max(len(diffs), 1)
+    if flatline_ratio >= max_flatline_ratio:
+        _fail["flatline_ratio"] = round(flatline_ratio, 4)
+        return _fail
+
+    q75, q25 = np.percentile(segment, [75, 25])
+    iqr = q75 - q25
+    if iqr < 0.1:  # CVP 진폭이 작으므로 ABP보다 낮은 IQR 기준
+        _fail["flatline_ratio"] = round(flatline_ratio, 4)
+        return _fail
+
+    # 2. Peak detection: a/c/v wave
+    min_distance = int(sr * 60.0 / max_hr * 0.8)
+    min_distance = max(min_distance, 1)
+
+    peaks, _ = find_peaks(
+        segment,
+        prominence=iqr * 0.3,
+        distance=min_distance,
+    )
+
+    if len(peaks) < 2:
+        _fail["flatline_ratio"] = round(flatline_ratio, 4)
+        _fail["n_peaks"] = len(peaks)
+        return _fail
+
+    pp_intervals = np.diff(peaks) / sr
+    pp_mean = float(np.mean(pp_intervals))
+    if pp_mean < 1e-6:
+        _fail["flatline_ratio"] = round(flatline_ratio, 4)
+        _fail["n_peaks"] = len(peaks)
+        return _fail
+
+    hr = 60.0 / pp_mean
+    hr_valid = min_hr <= hr <= max_hr
+
+    pp_std = float(np.std(pp_intervals))
+    regularity = pp_std / pp_mean
+
+    # 3. Autocorrelation 주기성 체크
+    #    HR 30~200bpm → lag 0.3~2.0초
+    min_lag_s = 60.0 / max_hr  # 0.3s at 200bpm
+    max_lag_s = 60.0 / min_hr  # 2.0s at 30bpm
+    autocorr_peak = _autocorrelation_peak(segment, sr, min_lag_s, max_lag_s)
+
+    # 4. Respiratory variation (정보 제공 + 보조 지표)
+    resp_power_ratio = _respiratory_band_power(segment, sr)
+
+    # 통과 조건: peak + HR + regularity + autocorrelation 주기성
+    passed = (
+        hr_valid
+        and regularity < regularity_threshold
+        and autocorr_peak >= min_autocorr
+    )
+
+    return {
+        "hr": round(hr, 1),
+        "n_peaks": len(peaks),
+        "regularity": round(regularity, 4),
+        "flatline_ratio": round(flatline_ratio, 4),
+        "autocorr_peak": round(autocorr_peak, 4),
+        "resp_power_ratio": round(resp_power_ratio, 4),
+        "pass": passed,
+    }
+
+
 # ── Dispatcher: signal type → domain check function ──────────
 
 DOMAIN_QUALITY_CHECKS: dict[str, callable] = {
@@ -578,6 +803,7 @@ DOMAIN_QUALITY_CHECKS: dict[str, callable] = {
     "eeg": eeg_quality_check,
     "abp": abp_quality_check,
     "ppg": ppg_quality_check,
+    "cvp": cvp_quality_check,
     "co2": co2_quality_check,
     "awp": awp_quality_check,
 }
@@ -589,8 +815,8 @@ def domain_quality_check(stype_key: str, segment: np.ndarray, sr: float = 100.0)
     Parameters
     ----------
     stype_key:
-        신호 타입 키 ("ecg", "abp", "ppg", "co2", "awp").
-        "eeg", "cvp" 등 미지원 타입은 항상 {"pass": True}를 반환한다.
+        신호 타입 키 ("ecg", "eeg", "abp", "ppg", "cvp", "co2", "awp").
+        미등록 타입은 항상 {"pass": True}를 반환한다.
     segment:
         (n_timesteps,) 1D 배열.
     sr:

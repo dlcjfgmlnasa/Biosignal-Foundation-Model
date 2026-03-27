@@ -70,16 +70,22 @@ class SignalConfig:
     min_amplitude: float = 0.0               # 최소 peak-to-peak 진폭 (0=비활성)
     max_amplitude: float = 0.0               # 최대 peak-to-peak 진폭 (0=비활성, EEG artifact용)
     min_high_freq_ratio: float = 0.0         # 최소 hf ratio (0=비활성, ECG용: QRS 없으면 불량)
+    notch_freq: float | None = None          # 50 또는 60Hz notch filter (None=비활성)
+    spike_detection: bool = False            # 스파이크/아티팩트 검출 적용 여부
+    spike_threshold_std: float = 10.0        # spike 검출 threshold (MAD 배수)
+    median_kernel: int = 0                   # median filter kernel size (0=비활성, 홀수만)
 
 
 SIGNAL_CONFIGS: dict[str, SignalConfig] = {
     # ECG/EEG: bandpass — baseline wander(저주파) + 고주파 노이즈 동시 제거
-    "ecg": SignalConfig(valid_range=(-5.0, 5.0),       filter_type="bandpass", filter_freq=(0.5, 40.0),  max_high_freq_ratio=1.0, min_amplitude=0.3, min_high_freq_ratio=0.05),
-    "eeg": SignalConfig(valid_range=(-500.0, 500.0),   filter_type="bandpass", filter_freq=(0.5, 45.0),  max_high_freq_ratio=2.0, min_amplitude=10.0, max_amplitude=200.0),
+    #   notch 60Hz (VitalDB=한국, 60Hz 전원), spike detection 활성
+    "ecg": SignalConfig(valid_range=(-5.0, 5.0),       filter_type="bandpass", filter_freq=(0.5, 40.0),  max_high_freq_ratio=1.0, min_amplitude=0.3, min_high_freq_ratio=0.05, notch_freq=60.0, spike_detection=True, spike_threshold_std=10.0),
+    "eeg": SignalConfig(valid_range=(-500.0, 500.0),   filter_type="bandpass", filter_freq=(0.5, 45.0),  max_high_freq_ratio=2.0, min_amplitude=10.0, max_amplitude=200.0, notch_freq=60.0, spike_detection=True, spike_threshold_std=10.0),
     # ABP/PPG/CVP: lowpass — DC(절대값) 보존, 고주파 노이즈만 제거
-    "abp": SignalConfig(valid_range=(0.0, 300.0),      filter_type="lowpass",  filter_freq=(0.0, 15.0),  max_high_freq_ratio=0.5),
-    "ppg": SignalConfig(valid_range=None,               filter_type="lowpass",  filter_freq=(0.0, 8.0),   max_high_freq_ratio=0.05, min_amplitude=5.0),
-    "cvp": SignalConfig(valid_range=(-5.0, 40.0),      filter_type="lowpass",  filter_freq=(0.0, 10.0),  max_high_freq_ratio=0.5),
+    #   PPG/ABP: median filter로 임펄스 노이즈 제거, spike detection 활성
+    "abp": SignalConfig(valid_range=(0.0, 300.0),      filter_type="lowpass",  filter_freq=(0.0, 15.0),  max_high_freq_ratio=0.5, spike_detection=True, spike_threshold_std=8.0, median_kernel=5),
+    "ppg": SignalConfig(valid_range=(0.0, 2000.0),     filter_type="lowpass",  filter_freq=(0.0, 8.0),   max_high_freq_ratio=0.05, min_amplitude=5.0, notch_freq=60.0, spike_detection=True, spike_threshold_std=8.0, median_kernel=5),
+    "cvp": SignalConfig(valid_range=(-5.0, 40.0),      filter_type="lowpass",  filter_freq=(0.0, 10.0),  max_high_freq_ratio=0.5, spike_detection=True, spike_threshold_std=8.0),
     # CO2/AWP: lowpass — 느린 호흡 신호, DC 보존
     "co2": SignalConfig(valid_range=(0.0, 100.0),      filter_type="lowpass",  filter_freq=(0.0, 5.0),   max_high_freq_ratio=1.0, max_flatline_ratio=0.3, min_amplitude=5.0),
     "awp": SignalConfig(valid_range=(-10.0, 80.0),     filter_type="lowpass",  filter_freq=(0.0, 5.0),   max_high_freq_ratio=1.0, min_amplitude=2.0),
@@ -127,6 +133,50 @@ SIGNAL_TYPES: dict[str, int] = {
 
 
 # ── 전처리 함수 ────────────────────────────────────────────────
+
+
+def _apply_notch_filter(data: np.ndarray, freq: float, sr: float, Q: float = 30.0) -> np.ndarray:
+    """전원 간섭(50/60Hz) 제거를 위한 notch filter (1D)."""
+    from scipy.signal import filtfilt, iirnotch
+    nyq = sr / 2.0
+    if freq >= nyq:
+        return data
+    b, a = iirnotch(freq / nyq, Q)
+    return filtfilt(b, a, data).astype(data.dtype)
+
+
+def _apply_median_filter(data: np.ndarray, kernel_size: int = 5) -> np.ndarray:
+    """임펄스 노이즈 제거를 위한 median filter (1D)."""
+    from scipy.signal import medfilt
+    if kernel_size < 3:
+        return data
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+    return medfilt(data, kernel_size=kernel_size).astype(data.dtype)
+
+
+def _detect_motion_artifact(
+    data: np.ndarray, sr: float,
+    threshold_std: float = 5.0, blank_ms: float = 200.0,
+) -> tuple[np.ndarray, int]:
+    """PPG motion artifact 검출: 2차 미분 기반 baseline shift를 NaN으로 마킹."""
+    out = data.copy()
+    diff2 = np.abs(np.diff(out, n=2, prepend=[out[0], out[0]]))
+    med = np.median(diff2)
+    mad = np.median(np.abs(diff2 - med)) * 1.4826
+    if mad < 1e-10:
+        return out, 0
+    spike_mask = diff2 > (med + threshold_std * mad)
+    if not spike_mask.any():
+        return out, 0
+    blank_samples = int(blank_ms / 1000.0 * sr)
+    spike_idx = np.where(spike_mask)[0]
+    for idx in spike_idx:
+        start = max(0, idx - blank_samples)
+        end = min(len(out), idx + blank_samples + 1)
+        out[start:end] = np.nan
+    n_blanked = int(np.isnan(out).sum() - np.isnan(data).sum())
+    return out, n_blanked
 
 
 def _apply_range_check(data: np.ndarray, valid_range: tuple[float, float]) -> tuple[np.ndarray, int]:
@@ -359,12 +409,19 @@ def process_vital(
                 pct = n_bad / len(data) * 100
                 print(f"    [RANGE] {track_name}: {n_bad} samples ({pct:.1f}%) out of range", file=sys.stderr)
 
-        # ── Step 2: 전기소작기 아티팩트 제거 (ECG/EEG만) ──
-        if stype_key in ("ecg", "eeg"):
-            data, n_blanked = _detect_electrocautery(data, native_sr)
+        # ── Step 2: 스파이크/아티팩트 제거 (SignalConfig.spike_detection 기반) ──
+        if cfg.spike_detection:
+            data, n_blanked = _detect_electrocautery(data, native_sr, threshold_std=cfg.spike_threshold_std)
             if n_blanked > 0:
                 pct = n_blanked / len(data) * 100
-                print(f"    [CAUTERY] {track_name}: {n_blanked} samples ({pct:.1f}%) blanked", file=sys.stderr)
+                print(f"    [SPIKE] {track_name}: {n_blanked} samples ({pct:.1f}%) blanked", file=sys.stderr)
+
+        # ── Step 2b: PPG motion artifact 제거 ──
+        if stype_key == "ppg":
+            data, n_motion = _detect_motion_artifact(data, native_sr)
+            if n_motion > 0:
+                pct = n_motion / len(data) * 100
+                print(f"    [MOTION] {track_name}: {n_motion} samples ({pct:.1f}%) blanked", file=sys.stderr)
 
         # ── Step 3: NaN-free 세그먼트 추출 ──
         min_samples = int(min_duration_s * native_sr)
@@ -379,7 +436,11 @@ def process_vital(
         quality_window_s = 10.0  # 품질 검사 윈도우 크기 (초)
 
         for seg_idx, segment in enumerate(segments):
-            # 신호별 필터링 (bandpass: ECG/EEG, lowpass: ABP/PPG/CVP/CO2/AWP)
+            # Median filter → Notch filter → Bandpass/Lowpass 순서
+            if cfg.median_kernel > 0:
+                segment = _apply_median_filter(segment, kernel_size=cfg.median_kernel)
+            if cfg.notch_freq is not None:
+                segment = _apply_notch_filter(segment, freq=cfg.notch_freq, sr=native_sr)
             segment = _apply_filter(segment, cfg, native_sr)
 
             # 리샘플링 → TARGET_SR (100Hz)
