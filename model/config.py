@@ -73,7 +73,7 @@ class ModelConfig:
 
     # Signal types
     num_signal_types: int = 7
-    num_spatial_ids: int = 55
+    num_spatial_ids: int = 12
 
     # Task
     max_horizon: int = 1

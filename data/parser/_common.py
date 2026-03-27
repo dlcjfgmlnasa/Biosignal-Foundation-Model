@@ -76,6 +76,7 @@ def segment_quality_score(
     max_clip_ratio: float = 0.1,
     max_high_freq_ratio: float = 2.0,
     min_amplitude: float = 0.0,
+    max_amplitude: float = 0.0,
     min_high_freq_ratio: float = 0.0,
 ) -> dict[str, float]:
     """세그먼트 품질 점수를 계산한다.
@@ -93,6 +94,8 @@ def segment_quality_score(
         신호 타입별로 다른 값을 전달하여 적절한 품질 판정 가능.
     min_amplitude:
         최소 peak-to-peak 진폭. 미만이면 불량. 기본 0.0 (비활성).
+    max_amplitude:
+        최대 peak-to-peak 진폭. 초과하면 불량 (artifact). 기본 0.0 (비활성).
     min_high_freq_ratio:
         최소 고주파 에너지 비율. 미만이면 불량. 기본 0.0 (비활성).
         ECG처럼 QRS spike가 있어야 정상인 신호에서, hf가 너무 낮으면 spike 없는 것.
@@ -140,6 +143,7 @@ def segment_quality_score(
         and clip_ratio < max_clip_ratio
         and high_freq_ratio < max_high_freq_ratio
         and amplitude >= min_amplitude
+        and (max_amplitude <= 0 or amplitude <= max_amplitude)
         and high_freq_ratio >= min_high_freq_ratio
     )
 
@@ -178,7 +182,7 @@ def ecg_quality_check(
     sr: float = 100.0,
     min_hr: float = 30.0,
     max_hr: float = 200.0,
-    regularity_threshold: float = 0.5,
+    regularity_threshold: float = 0.7,
 ) -> dict:
     """ECG 세그먼트의 QRS peak 기반 심박수 품질 검사.
 
@@ -423,8 +427,12 @@ def co2_quality_check(
         distance=min_distance,
     )
 
-    if len(peaks) < 2:
+    if len(peaks) < 1:
         return {"resp_rate": 0.0, "pass": False}
+
+    if len(peaks) == 1:
+        # 10초 윈도우에서 peak 1개 = 저호흡(~6/min), 통과
+        return {"resp_rate": 6.0, "pass": True}
 
     # 호흡수 계산: peak 간격 기반
     peak_intervals = np.diff(peaks) / sr
@@ -482,8 +490,12 @@ def awp_quality_check(
         distance=min_distance,
     )
 
-    if len(peaks) < 2:
+    if len(peaks) < 1:
         return {"resp_rate": 0.0, "pass": False}
+
+    if len(peaks) == 1:
+        # 10초 윈도우에서 peak 1개 = 저호흡(~6/min), 통과
+        return {"resp_rate": 6.0, "pass": True}
 
     peak_intervals = np.diff(peaks) / sr
     mean_interval = float(np.mean(peak_intervals))
@@ -499,10 +511,71 @@ def awp_quality_check(
     }
 
 
+def eeg_quality_check(
+    segment: np.ndarray,
+    sr: float = 100.0,
+    min_band_ratio: float = 0.1,
+) -> dict:
+    """EEG 세그먼트의 주파수 대역 파워 비율 기반 품질 검사.
+
+    정상 EEG는 delta/theta/alpha/beta 대역에 에너지가 분포.
+    artifact나 flatline은 특정 대역에 에너지가 편중되거나 전체 에너지가 없음.
+
+    Parameters
+    ----------
+    segment:
+        (n_timesteps,) 1D EEG 배열 (bandpass + resample 후 100Hz 기준).
+    sr:
+        sampling rate (Hz).
+    min_band_ratio:
+        정상 대역(1-30Hz) 에너지가 전체의 이 비율 이상이어야 통과.
+
+    Returns
+    -------
+    {"band_ratio": float, "pass": bool}
+    """
+    if len(segment) < int(sr * 2):
+        return {"band_ratio": 0.0, "pass": False}
+
+    # FFT 기반 파워 스펙트럼
+    n = len(segment)
+    fft_vals = np.fft.rfft(segment)
+    power = np.abs(fft_vals) ** 2
+    freqs = np.fft.rfftfreq(n, d=1.0 / sr)
+
+    total_power = float(power.sum())
+    if total_power < 1e-10:
+        return {"band_ratio": 0.0, "pass": False}
+
+    # 정상 EEG 대역: 1-30Hz (delta~beta)
+    band_mask = (freqs >= 1.0) & (freqs <= 30.0)
+    band_power = float(power[band_mask].sum())
+    band_ratio = band_power / total_power
+
+    # 스펙트럼 엔트로피 — 너무 낮으면 단일 주파수(artifact), 너무 높으면 white noise
+    power_norm = power / total_power
+    power_norm = power_norm[power_norm > 1e-12]
+    entropy = float(-np.sum(power_norm * np.log(power_norm)))
+    max_entropy = np.log(len(power))
+    norm_entropy = entropy / max_entropy if max_entropy > 0 else 0
+
+    # 통과 조건:
+    # 1. 1-30Hz 대역이 전체의 min_band_ratio 이상
+    # 2. 정규화 엔트로피가 0.3~0.95 (너무 규칙적이지도, 완전 white noise도 아닌)
+    passed = band_ratio >= min_band_ratio and 0.3 <= norm_entropy <= 0.95
+
+    return {
+        "band_ratio": round(band_ratio, 4),
+        "entropy": round(norm_entropy, 4),
+        "pass": passed,
+    }
+
+
 # ── Dispatcher: signal type → domain check function ──────────
 
 DOMAIN_QUALITY_CHECKS: dict[str, callable] = {
     "ecg": ecg_quality_check,
+    "eeg": eeg_quality_check,
     "abp": abp_quality_check,
     "ppg": ppg_quality_check,
     "co2": co2_quality_check,

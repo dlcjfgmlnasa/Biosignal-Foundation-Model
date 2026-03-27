@@ -68,13 +68,14 @@ class SignalConfig:
     max_clip_ratio: float = 0.1              # 10% 이상 clipping이면 불량
     max_high_freq_ratio: float = 2.0         # 기본값; 신호별로 아래에서 재정의
     min_amplitude: float = 0.0               # 최소 peak-to-peak 진폭 (0=비활성)
+    max_amplitude: float = 0.0               # 최대 peak-to-peak 진폭 (0=비활성, EEG artifact용)
     min_high_freq_ratio: float = 0.0         # 최소 hf ratio (0=비활성, ECG용: QRS 없으면 불량)
 
 
 SIGNAL_CONFIGS: dict[str, SignalConfig] = {
     # ECG/EEG: bandpass — baseline wander(저주파) + 고주파 노이즈 동시 제거
     "ecg": SignalConfig(valid_range=(-5.0, 5.0),       filter_type="bandpass", filter_freq=(0.5, 40.0),  max_high_freq_ratio=1.0, min_amplitude=0.3, min_high_freq_ratio=0.05),
-    "eeg": SignalConfig(valid_range=(-500.0, 500.0),   filter_type="bandpass", filter_freq=(0.5, 45.0),  max_high_freq_ratio=2.0),
+    "eeg": SignalConfig(valid_range=(-500.0, 500.0),   filter_type="bandpass", filter_freq=(0.5, 45.0),  max_high_freq_ratio=2.0, min_amplitude=10.0, max_amplitude=200.0),
     # ABP/PPG/CVP: lowpass — DC(절대값) 보존, 고주파 노이즈만 제거
     "abp": SignalConfig(valid_range=(0.0, 300.0),      filter_type="lowpass",  filter_freq=(0.0, 15.0),  max_high_freq_ratio=0.5),
     "ppg": SignalConfig(valid_range=None,               filter_type="lowpass",  filter_freq=(0.0, 8.0),   max_high_freq_ratio=0.05, min_amplitude=5.0),
@@ -88,34 +89,26 @@ SIGNAL_CONFIGS: dict[str, SignalConfig] = {
 # ── VitalDB 트랙 매핑 ──────────────────────────────────────────
 
 
-# VitalDB 트랙명 → (signal_type_key, local_spatial_id)
+# VitalDB 공식 Waveform 트랙 → (signal_type_key, local_spatial_id)
+# 참조: https://vitaldb.net/dataset/ — Hemodynamic Parameters (W=waveform만)
 TRACK_MAP: dict[str, tuple[str, int]] = {
-    # ECG (0)
-    "SNUADC/ECG_II": ("ecg", 2),
-    "SNUADC/ECG_I": ("ecg", 1),
-    "SNUADC/ECG_III": ("ecg", 3),
-    "SNUADC/ECG_V5": ("ecg", 11),
-    "Solar8000/ECG_II": ("ecg", 2),
-    # ABP (1)
-    "SNUADC/ART": ("abp", 1),
-    "SNUADC/FEM": ("abp", 2),
-    # EEG (2)
-    "SNUADC/EEG_BIS": ("eeg", 0),
-    "SNUADC/EEG1": ("eeg", 0),
-    "SNUADC/EEG2": ("eeg", 0),
-    "BIS/EEG1_WAV": ("eeg", 0),
-    "BIS/EEG2_WAV": ("eeg", 0),
-    # PPG (3)
-    "Solar8000/PLETH": ("ppg", 1),
-    "SNUADC/PLETH": ("ppg", 1),
-    # CVP (4)
-    "SNUADC/CVP": ("cvp", 0),
-    # CO2 (5)
-    "Solar8000/CO2": ("co2", 0),
-    "Primus/CO2": ("co2", 0),
-    # AWP (6)
-    "Solar8000/AWP": ("awp", 0),
-    "Primus/AWP": ("awp", 0),
+    # ECG (0) — SNUADC 500Hz, mV
+    "SNUADC/ECG_II": ("ecg", 1),   # Lead II
+    "SNUADC/ECG_V5": ("ecg", 2),   # Lead V5
+    # ABP (1) — SNUADC 500Hz, mmHg
+    "SNUADC/ART": ("abp", 1),      # Radial artery
+    "SNUADC/FEM": ("abp", 2),      # Femoral artery
+    # EEG (2) — BIS 128Hz, μV
+    "BIS/EEG1_WAV": ("eeg", 0),    # BIS channel 1 (forehead)
+    "BIS/EEG2_WAV": ("eeg", 0),    # BIS channel 2 (forehead)
+    # PPG (3) — SNUADC 500Hz, unitless
+    "SNUADC/PLETH": ("ppg", 1),    # Finger plethysmography
+    # CVP (4) — SNUADC 500Hz, mmHg
+    "SNUADC/CVP": ("cvp", 0),      # Central venous pressure
+    # CO2 (5) — Primus 62.5Hz, mmHg
+    "Primus/CO2": ("co2", 0),      # Capnography (sidestream)
+    # AWP (6) — Primus 62.5Hz, hPa
+    "Primus/AWP": ("awp", 0),      # Airway pressure
 }
 
 SIGNAL_TYPES: dict[str, int] = {
@@ -401,6 +394,7 @@ def process_vital(
                     max_clip_ratio=cfg.max_clip_ratio,
                     max_high_freq_ratio=cfg.max_high_freq_ratio,
                     min_amplitude=cfg.min_amplitude,
+                    max_amplitude=cfg.max_amplitude,
                     min_high_freq_ratio=cfg.min_high_freq_ratio,
                 )
                 if not qscore["pass"]:
