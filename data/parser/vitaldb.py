@@ -601,6 +601,23 @@ def process_vital(
     return subject_id, session_id, recordings
 
 
+def _process_one_worker(
+    vf_path: Path,
+    out_dir: Path,
+    min_duration_s: float,
+    signal_types: set[int] | None,
+) -> tuple[str, str, list[dict]] | None:
+    """단일 vital 파일 처리 (multiprocessing worker 호환)."""
+    try:
+        return process_vital(
+            vf_path, out_dir, min_duration_s=min_duration_s,
+            signal_types=signal_types,
+        )
+    except Exception as exc:
+        print(f"    [{vf_path.name}] [ERROR] {exc}", file=sys.stderr)
+        return None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="VitalDB (.vital) → datasets/processed/ zarr 변환"
@@ -680,25 +697,21 @@ def main() -> None:
                     existing_subjects.add(json.loads(line)["subject_id"])
 
     sig_filter = set(args.signal_types) if args.signal_types else None
-
-    def _process_one(vf_path: Path) -> tuple[str, str, list[dict]] | None:
-        """단일 vital 파일 처리 (worker 함수)."""
-        try:
-            return process_vital(
-                vf_path, out_dir, min_duration_s=args.min_duration,
-                signal_types=sig_filter,
-            )
-        except Exception as exc:
-            print(f"    [{vf_path.name}] [ERROR] {exc}", file=sys.stderr)
-            return None
+    min_dur = args.min_duration
 
     n_processed = 0
 
     if args.workers > 1:
         from multiprocessing import Pool
+        from functools import partial
+
+        _worker = partial(
+            _process_one_worker,
+            out_dir=out_dir, min_duration_s=min_dur, signal_types=sig_filter,
+        )
         print(f"병렬 처리: {args.workers} workers\n")
         with Pool(processes=args.workers) as pool:
-            for result in pool.imap_unordered(_process_one, vital_files):
+            for result in pool.imap_unordered(_worker, vital_files):
                 if result is None:
                     continue
                 subject_id, session_id, recordings = result
@@ -718,7 +731,10 @@ def main() -> None:
     else:
         for vf_path in vital_files:
             print(f"[{vf_path.name}]")
-            result = _process_one(vf_path)
+            result = _process_one_worker(
+                vf_path, out_dir=out_dir, min_duration_s=min_dur,
+                signal_types=sig_filter,
+            )
             if result is None:
                 continue
             subject_id, session_id, recordings = result
