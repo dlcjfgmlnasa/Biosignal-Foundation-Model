@@ -90,32 +90,49 @@ def build_signal_map(
 
 
 def select_diverse(candidates: list[RowCandidate], max_rows: int) -> list[RowCandidate]:
-    """신호 타입이 고루 분포하도록 후보를 선택한다.
+    """신호 타입이 고루 분포하도록 후보를 선택한다 (하위 호환).
 
     각 신호 타입에서 가장 긴(n_valid가 큰) 후보 1개를 선택한다.
-    타입 수가 max_rows보다 적으면 타입 수만큼만 선택하여 중복을 방지한다.
+    """
+    grid = select_diverse_grid(candidates, samples_per_type=1)
+    selected: list[RowCandidate] = []
+    for t in sorted(grid.keys()):
+        if grid[t]:
+            selected.append(grid[t][0])
+        if len(selected) >= max_rows:
+            break
+    return selected
+
+
+def select_diverse_grid(
+    candidates: list[RowCandidate],
+    samples_per_type: int = 3,
+) -> dict[int, list[RowCandidate]]:
+    """신호 타입별 여러 샘플을 선택한다.
+
+    Returns
+    -------
+    {signal_type: [RowCandidate, ...]} — 타입별 최대 samples_per_type개.
     """
     by_type: dict[int, list[RowCandidate]] = {}
     for c in candidates:
         by_type.setdefault(c.signal_type, []).append(c)
 
-    # 타입별로 n_valid 내림차순 정렬 → 가장 긴 후보 우선
+    # 타입별로 n_valid 내림차순 정렬 → 긴 후보 우선
     for t in by_type:
         by_type[t].sort(key=lambda c: c.n_valid, reverse=True)
 
-    n_types = len(by_type)
-    effective_rows = min(max_rows, n_types)
+    grid: dict[int, list[RowCandidate]] = {}
+    for t in sorted(by_type.keys()):
+        items = by_type[t]
+        n = min(samples_per_type, len(items))
+        if n <= 0:
+            continue
+        # 균등 간격으로 선택 (다양한 샘플)
+        indices = [int(i / max(n - 1, 1) * (len(items) - 1)) for i in range(n)]
+        grid[t] = [items[idx] for idx in indices]
 
-    selected: list[RowCandidate] = []
-    types = sorted(by_type.keys())
-
-    for t in types:
-        if len(selected) >= effective_rows:
-            break
-        if by_type[t]:
-            selected.append(by_type[t][0])
-
-    return selected
+    return grid
 
 
 def plot_figure(
@@ -128,18 +145,43 @@ def plot_figure(
     horizon: int = 1,
     next_pred_ratio: float = 0.3,
 ) -> Path:
-    """선택된 후보들로 figure를 그려 저장한다.
+    """선택된 후보들로 figure를 그려 저장한다 (하위 호환 — 1열)."""
+    grid = {}
+    for c in selected:
+        grid.setdefault(c.signal_type, []).append(c)
+    return plot_figure_grid(
+        grid, epoch, output_dir, max_duration_s, sampling_rate,
+        mode, horizon, next_pred_ratio,
+    )
+
+
+def plot_figure_grid(
+    grid: dict[int, list[RowCandidate]],
+    epoch: int,
+    output_dir: Path,
+    max_duration_s: float,
+    sampling_rate: float,
+    mode: str,  # "masked" or "next_pred"
+    horizon: int = 1,
+    next_pred_ratio: float = 0.3,
+) -> Path:
+    """행=신호 타입, 열=샘플로 grid figure를 그려 저장한다.
 
     Parameters
     ----------
-    next_pred_ratio:
-        next_pred 모드에서 crop된 패치 중 표시할 비율 (기본 30%).
+    grid:
+        {signal_type: [RowCandidate, ...]} — select_diverse_grid()의 출력.
     """
-    P = selected[0].patch_size
-    max_patches = max(1, int(max_duration_s * sampling_rate / P))
-    n_rows = len(selected)
+    types = sorted(grid.keys())
+    n_rows = len(types)
+    n_cols = max(len(v) for v in grid.values()) if grid else 1
+    if n_rows == 0:
+        return output_dir / f"empty_epoch{epoch:03d}.png"
 
-    fig, axes = plt.subplots(n_rows, 1, figsize=(16, 3 * n_rows), squeeze=False)
+    P = next(iter(grid.values()))[0].patch_size
+    max_patches = max(1, int(max_duration_s * sampling_rate / P))
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(8 * n_cols, 3 * n_rows), squeeze=False)
 
     if mode == "masked":
         pred_color = "orangered"
@@ -152,57 +194,63 @@ def plot_figure(
         pred_label = f"Predicted (H={horizon})"
         highlight_label = "Prediction region"
 
-    for i, cand in enumerate(selected):
-        ax = axes[i, 0]
+    for row, sig_type in enumerate(types):
+        cands = grid[sig_type]
+        for col in range(n_cols):
+            ax = axes[row, col]
+            if col >= len(cands):
+                ax.axis("off")
+                continue
 
-        n_show = min(cand.n_valid, max_patches)
-        orig_wave = cand.orig_patches[:n_show].reshape(-1)
-        pred_patches_cropped = cand.pred_patches[:n_show]  # (n_show, P)
+            cand = cands[col]
+            n_show = min(cand.n_valid, max_patches)
+            orig_wave = cand.orig_patches[:n_show].reshape(-1)
+            pred_patches_cropped = cand.pred_patches[:n_show].copy()
 
-        # next_pred: crop 후 범위에서 균등 샘플링
-        if mode == "next_pred":
-            valid_pred_indices = [
-                p_idx for p_idx in range(n_show)
-                if not np.isnan(pred_patches_cropped[p_idx, 0])
-            ]
-            n_to_show = max(1, int(len(valid_pred_indices) * next_pred_ratio))
-            if len(valid_pred_indices) > n_to_show:
-                sampled = np.linspace(0, len(valid_pred_indices) - 1, n_to_show, dtype=int)
-                keep = set(valid_pred_indices[s] for s in sampled)
-            else:
-                keep = set(valid_pred_indices)
-            for p_idx in valid_pred_indices:
-                if p_idx not in keep:
-                    pred_patches_cropped[p_idx] = np.nan
+            # next_pred: crop 후 범위에서 균등 샘플링
+            if mode == "next_pred":
+                valid_pred_indices = [
+                    p_idx for p_idx in range(n_show)
+                    if not np.isnan(pred_patches_cropped[p_idx, 0])
+                ]
+                n_to_show = max(1, int(len(valid_pred_indices) * next_pred_ratio))
+                if len(valid_pred_indices) > n_to_show:
+                    sampled = np.linspace(0, len(valid_pred_indices) - 1, n_to_show, dtype=int)
+                    keep = set(valid_pred_indices[s] for s in sampled)
+                else:
+                    keep = set(valid_pred_indices)
+                for p_idx in valid_pred_indices:
+                    if p_idx not in keep:
+                        pred_patches_cropped[p_idx] = np.nan
 
-        pred_wave = pred_patches_cropped.reshape(-1)
-        t = np.arange(len(orig_wave)) / sampling_rate
+            pred_wave = pred_patches_cropped.reshape(-1)
+            t = np.arange(len(orig_wave)) / sampling_rate
 
-        ax.plot(t, orig_wave, color="steelblue", linewidth=0.8,
-                label="Original", alpha=0.9)
+            ax.plot(t, orig_wave, color="steelblue", linewidth=0.8, alpha=0.9)
 
-        n_pred = 0
-        for patch_idx in range(n_show):
-            start = patch_idx * P
-            end = start + P
-            patch_pred = pred_wave[start:end]
-            if not np.isnan(patch_pred[0]):
-                ax.axvspan(start / sampling_rate, end / sampling_rate,
-                           alpha=0.12, color=highlight_color)
-                ax.plot(t[start:end], patch_pred,
-                        color=pred_color, linewidth=1.2)
-                n_pred += 1
+            n_pred = 0
+            for patch_idx in range(n_show):
+                start = patch_idx * P
+                end = start + P
+                patch_pred = pred_wave[start:end]
+                if not np.isnan(patch_pred[0]):
+                    ax.axvspan(start / sampling_rate, end / sampling_rate,
+                               alpha=0.12, color=highlight_color)
+                    ax.plot(t[start:end], patch_pred,
+                            color=pred_color, linewidth=1.2)
+                    n_pred += 1
 
-        ax.set_ylabel(cand.signal_name, fontsize=10)
+            if col == 0:
+                ax.set_ylabel(cand.signal_name, fontsize=10)
 
-        duration_shown = n_show * P / sampling_rate
-        ax.set_title(
-            f"Predicted: {n_pred}/{n_show} patches  |  "
-            f"{duration_shown:.0f}s shown",
-            fontsize=9, loc="right",
-        )
-        ax.set_xlabel("Time (s)", fontsize=8)
-        ax.tick_params(labelsize=8)
+            duration_shown = n_show * P / sampling_rate
+            ax.set_title(
+                f"{n_pred}/{n_show} patches | {duration_shown:.0f}s",
+                fontsize=8, loc="right",
+            )
+            ax.tick_params(labelsize=7)
+            if row == n_rows - 1:
+                ax.set_xlabel("Time (s)", fontsize=8)
 
     # 범례
     legend_elements = [
@@ -210,7 +258,7 @@ def plot_figure(
         Line2D([0], [0], color=pred_color, linewidth=1.2, label=pred_label),
         Patch(facecolor=highlight_color, alpha=0.12, label=highlight_label),
     ]
-    axes[0, 0].legend(handles=legend_elements, loc="upper right", fontsize=8)
+    axes[0, 0].legend(handles=legend_elements, loc="upper right", fontsize=7)
 
     if mode == "masked":
         title = f"Masked Reconstruction — Epoch {epoch}"

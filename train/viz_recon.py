@@ -19,8 +19,8 @@ from ._viz_common import (
     RowCandidate,
     batch_to_device,
     build_signal_map,
-    plot_figure,
-    select_diverse,
+    plot_figure_grid,
+    select_diverse_grid,
 )
 
 
@@ -118,11 +118,18 @@ def save_reconstruction_figure(
     output_dir: str | Path,
     mask_ratio: float = 0.15,
     max_rows: int = 4,
+    samples_per_type: int = 3,
     max_duration_s: float = 60.0,
     sampling_rate: float = 100.0,
     device: torch.device | None = None,
 ) -> Path:
-    """마스킹된 패치의 원본 vs 복원 비교 figure를 저장한다."""
+    """마스킹된 패치의 원본 vs 복원 비교 figure를 저장한다.
+
+    Parameters
+    ----------
+    samples_per_type:
+        신호 타입당 표시할 샘플 수. 행=신호 타입, 열=샘플.
+    """
     model.eval()
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -133,14 +140,14 @@ def save_reconstruction_figure(
     for b in batches:
         all_candidates.extend(_process_batch(model, b, mask_ratio, device))
 
-    selected = select_diverse(all_candidates, max_rows)
+    grid = select_diverse_grid(all_candidates, samples_per_type=samples_per_type)
 
-    if not selected:
+    if not grid:
         model.train()
         return output_dir / f"recon_epoch{epoch:03d}.png"
 
-    path = plot_figure(
-        selected, epoch, output_dir,
+    path = plot_figure_grid(
+        grid, epoch, output_dir,
         max_duration_s, sampling_rate, mode="masked",
     )
     model.train()
