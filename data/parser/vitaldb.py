@@ -17,6 +17,9 @@ bandpass filtering을 적용하고, 모든 유효 세그먼트를 개별 zarr로
 
   # 전체 파싱
   python -m data.parser.vitaldb --raw datasets/raw/vitaldb --out datasets/processed
+
+  # 병렬 파싱 (4 workers)
+  python -m data.parser.vitaldb --raw datasets/raw/vitaldb --out datasets/processed --workers 4
 """
 
 from __future__ import annotations
@@ -626,6 +629,10 @@ def main() -> None:
         "--signal-types", type=int, nargs="+", default=None,
         help="파싱할 signal type IDs (0=ECG,1=ABP,2=EEG,3=PPG,4=CVP,5=CO2,6=AWP). 미지정 시 전부.",
     )
+    parser.add_argument(
+        "--workers", type=int, default=1,
+        help="병렬 처리 worker 수 (기본 1=순차 처리)",
+    )
     args = parser.parse_args()
 
     raw_dir = Path(args.raw)
@@ -672,39 +679,63 @@ def main() -> None:
                 if line:
                     existing_subjects.add(json.loads(line)["subject_id"])
 
-    n_processed = 0
+    sig_filter = set(args.signal_types) if args.signal_types else None
 
-    for vf_path in vital_files:
-        print(f"[{vf_path.name}]")
+    def _process_one(vf_path: Path) -> tuple[str, str, list[dict]] | None:
+        """단일 vital 파일 처리 (worker 함수)."""
         try:
-            sig_filter = set(args.signal_types) if args.signal_types else None
-            subject_id, session_id, recordings = process_vital(
+            return process_vital(
                 vf_path, out_dir, min_duration_s=args.min_duration,
                 signal_types=sig_filter,
             )
         except Exception as exc:
-            print(f"    [ERROR] {exc}", file=sys.stderr)
-            continue
+            print(f"    [{vf_path.name}] [ERROR] {exc}", file=sys.stderr)
+            return None
 
-        if not recordings:
-            print(f"    [SKIP] 유효 레코딩 없음")
-            continue
+    n_processed = 0
 
-        # manifest.json은 process_vital() 내부에서 트랙마다 즉시 저장됨
-        # 여기서는 manifest.jsonl 인덱스만 관리
-        if subject_id not in existing_subjects:
-            # FUSE는 append("a") 미지원 → read + write로 대체
-            prev = ""
-            if jsonl_path.exists():
-                prev = jsonl_path.read_text(encoding="utf-8")
-            new_line = json.dumps(
-                {"subject_id": subject_id, "manifest": f"{subject_id}/manifest.json"},
-                ensure_ascii=False,
-            ) + "\n"
-            jsonl_path.write_text(prev + new_line, encoding="utf-8")
-            existing_subjects.add(subject_id)
-
-        n_processed += 1
+    if args.workers > 1:
+        from multiprocessing import Pool
+        print(f"병렬 처리: {args.workers} workers\n")
+        with Pool(processes=args.workers) as pool:
+            for result in pool.imap_unordered(_process_one, vital_files):
+                if result is None:
+                    continue
+                subject_id, session_id, recordings = result
+                if not recordings:
+                    continue
+                if subject_id not in existing_subjects:
+                    prev = ""
+                    if jsonl_path.exists():
+                        prev = jsonl_path.read_text(encoding="utf-8")
+                    new_line = json.dumps(
+                        {"subject_id": subject_id, "manifest": f"{subject_id}/manifest.json"},
+                        ensure_ascii=False,
+                    ) + "\n"
+                    jsonl_path.write_text(prev + new_line, encoding="utf-8")
+                    existing_subjects.add(subject_id)
+                n_processed += 1
+    else:
+        for vf_path in vital_files:
+            print(f"[{vf_path.name}]")
+            result = _process_one(vf_path)
+            if result is None:
+                continue
+            subject_id, session_id, recordings = result
+            if not recordings:
+                print(f"    [SKIP] 유효 레코딩 없음")
+                continue
+            if subject_id not in existing_subjects:
+                prev = ""
+                if jsonl_path.exists():
+                    prev = jsonl_path.read_text(encoding="utf-8")
+                new_line = json.dumps(
+                    {"subject_id": subject_id, "manifest": f"{subject_id}/manifest.json"},
+                    ensure_ascii=False,
+                ) + "\n"
+                jsonl_path.write_text(prev + new_line, encoding="utf-8")
+                existing_subjects.add(subject_id)
+            n_processed += 1
 
     print(
         f"\n완료: {n_processed}명 처리 → {out_dir}"
