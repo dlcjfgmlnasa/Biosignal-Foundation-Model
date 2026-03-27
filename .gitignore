@@ -29,6 +29,12 @@ Thumbs.db
 wandb/
 runs/
 
+# Visualization / analysis scripts (디버깅용, 학습 파이프라인 미사용)
+scripts/
+
+# Generated images
+*.png
+
 # Claude Code
 .claude/
 .plans/
