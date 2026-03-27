@@ -40,10 +40,19 @@ def _process_batch(
     p_vid = out["patch_variate_id"]   # (B, N)
 
     P = model.patch_size
-    normalized = ((batch.values.unsqueeze(-1) - out["loc"]) / out["scale"]).squeeze(-1)
+    loc = out["loc"]    # (B, L, 1)
+    scale = out["scale"]  # (B, L, 1)
+    normalized = ((batch.values.unsqueeze(-1) - loc) / scale).squeeze(-1)
     B, L = normalized.shape
     N = L // P
-    original_patches = normalized[:, :N * P].reshape(B, N, P)
+    original_patches = batch.values[:, :N * P].reshape(B, N, P)  # 원본 스케일
+
+    # denormalize용 per-patch loc/scale
+    stride = model.patch_embed.stride
+    patch_starts = torch.arange(N, device=loc.device) * stride
+    patch_starts = patch_starts.clamp(max=loc.shape[1] - 1)
+    patch_loc = loc[:, patch_starts, 0]      # (B, N)
+    patch_scale = scale[:, patch_starts, 0]  # (B, N)
 
     sig_map = build_signal_map(batch, p_sid, p_vid, patch_mask, B)
 
@@ -68,7 +77,11 @@ def _process_batch(
                 continue
 
             seg_orig = original_patches[b, seg_indices].cpu().numpy()
-            seg_next = next_pred[b, seg_indices].cpu().numpy()
+            # next_pred는 정규화된 공간 → 원본 스케일로 denormalize
+            seg_next_norm = next_pred[b, seg_indices]  # (n_seg, P)
+            seg_loc = patch_loc[b, seg_indices].unsqueeze(-1)    # (n_seg, 1)
+            seg_scale = patch_scale[b, seg_indices].unsqueeze(-1)  # (n_seg, 1)
+            seg_next = (seg_next_norm * seg_scale + seg_loc).cpu().numpy()
             pred = np.full((n_seg, P), np.nan)
             pred[horizon:n_seg] = seg_next[:n_seg - horizon]
 
