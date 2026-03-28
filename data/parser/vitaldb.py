@@ -84,7 +84,7 @@ SIGNAL_CONFIGS: dict[str, SignalConfig] = {
     # ECG/EEG: bandpass — baseline wander(저주파) + 고주파 노이즈 동시 제거
     #   notch 60Hz (VitalDB=한국, 60Hz 전원), spike detection 활성
     "ecg": SignalConfig(valid_range=(-5.0, 5.0),       filter_type="bandpass", filter_freq=(0.5, 40.0),  max_high_freq_ratio=1.0, min_amplitude=0.3, min_high_freq_ratio=0.05, notch_freq=60.0, spike_detection=True, spike_threshold_std=10.0),
-    "eeg": SignalConfig(valid_range=(-500.0, 500.0),   filter_type="bandpass", filter_freq=(0.5, 45.0),  max_high_freq_ratio=2.0, min_amplitude=5.0, max_amplitude=200.0, notch_freq=60.0, spike_detection=True, spike_threshold_std=10.0),
+    "eeg": SignalConfig(valid_range=(-500.0, 500.0),   filter_type="bandpass", filter_freq=(0.5, 45.0),  max_high_freq_ratio=2.0, min_amplitude=2.0, max_amplitude=500.0, notch_freq=60.0, spike_detection=True, spike_threshold_std=10.0),
     # ABP/PPG/CVP: lowpass — DC(절대값) 보존, 고주파 노이즈만 제거
     #   PPG/ABP: median filter로 임펄스 노이즈 제거, spike detection 활성
     "abp": SignalConfig(valid_range=(20.0, 300.0),     filter_type="lowpass",  filter_freq=(0.0, 15.0),  max_high_freq_ratio=0.5, max_flatline_ratio=0.3, min_amplitude=10.0, spike_detection=True, spike_threshold_std=6.0, median_kernel=5),
