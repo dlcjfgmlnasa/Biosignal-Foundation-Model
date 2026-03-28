@@ -305,6 +305,7 @@ def train_one_epoch(
                 cross_pred=cross_pred if config.gamma > 0 else None,
                 time_id=time_id if needs_time_id else None,
                 contrastive_z=contrastive_z if config.delta > 0 else None,
+                patch_signal_types=out.get("patch_signal_types"),
             )
 
             loss = losses["total"] + config.aux_loss_weight * aux_loss
@@ -493,6 +494,7 @@ def validate(
                 cross_pred=cross_pred if config.gamma > 0 else None,
                 time_id=time_id if needs_time_id else None,
                 contrastive_z=contrastive_z if config.delta > 0 else None,
+                patch_signal_types=out.get("patch_signal_types"),
             )
 
         loss = losses["total"] + config.aux_loss_weight * aux_loss
@@ -632,6 +634,7 @@ def train_one_epoch_v2(
                 cross_pred=cross_pred if config.gamma > 0 else None,
                 time_id=time_id if needs_time_id else None,
                 contrastive_z=contrastive_z if config.delta > 0 else None,
+                patch_signal_types=out.get("patch_signal_types"),
             )
 
             # ── EEG 전용 masked reconstruction loss ──
@@ -848,6 +851,7 @@ def validate_v2(
                 cross_pred=cross_pred if config.gamma > 0 else None,
                 time_id=time_id if needs_time_id else None,
                 contrastive_z=contrastive_z if config.delta > 0 else None,
+                patch_signal_types=out.get("patch_signal_types"),
             )
 
             # EEG 전용 loss

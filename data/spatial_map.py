@@ -82,6 +82,31 @@ def get_global_spatial_id(signal_type: int, local_id: int) -> int:
     return offset + local_id
 
 
+# ── Mechanism Group ────────────────────────────────────────────
+# Cross-Modal MSE reconstruction은 같은 mechanism group 내에서만 허용.
+# Contrastive (InfoNCE)는 전체 허용 (그룹 무관).
+#
+# Cardiovascular (0): ECG, ABP, PPG, CVP — 심혈관계, 유사 파형/주기
+# Neural (1): EEG — 대뇌 피질, 다른 그룹과 파형 형태 상이
+# Respiratory (2): CO2, AWP — 호흡계, 환기 동기화
+
+MECHANISM_GROUP: dict[int, int] = {
+    0: 0,  # ECG → Cardiovascular
+    1: 0,  # ABP → Cardiovascular
+    2: 1,  # EEG → Neural
+    3: 0,  # PPG → Cardiovascular
+    4: 0,  # CVP → Cardiovascular
+    5: 2,  # CO2 → Respiratory
+    6: 2,  # AWP → Respiratory
+}
+
+MECHANISM_GROUP_NAMES: dict[int, str] = {
+    0: "Cardiovascular",
+    1: "Neural",
+    2: "Respiratory",
+}
+
+
 # 채널명 → (signal_type, local_spatial_id) 역매핑
 CHANNEL_NAME_TO_SPATIAL: dict[str, tuple[int, int]] = {
     # ECG

@@ -85,6 +85,7 @@ class CombinedLoss(nn.Module):
         cross_pred: torch.Tensor | None = None,  # (B, N, patch_size) — cross-modal 예측
         time_id: torch.Tensor | None = None,     # (B, N) long — cross-modal 페어링용
         contrastive_z: torch.Tensor | None = None,  # (B, N, proj_dim) — contrastive 임베딩
+        patch_signal_types: torch.Tensor | None = None,  # (B, N) long — mechanism group 필터용
     ) -> dict[str, torch.Tensor]:
         # ── Masked Reconstruction Loss ──
         masked_loss = self.masked_loss_fn(reconstructed, original_patches, pred_mask)
@@ -94,7 +95,8 @@ class CombinedLoss(nn.Module):
             next_dict = self.next_loss_fn(
                 next_pred, cross_pred, original_patches,
                 patch_mask, patch_sample_id, patch_variate_id,
-                time_id=time_id, horizon=horizon,
+                time_id=time_id, patch_signal_types=patch_signal_types,
+                horizon=horizon,
             )
             next_loss = next_dict["next_loss"]
             cross_modal_loss = next_dict["cross_modal_loss"]

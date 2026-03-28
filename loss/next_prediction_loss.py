@@ -9,6 +9,15 @@ Phase 2 (Any-variate): 같은 variate 시간 예측 + cross-modal 예측 (causal
 import torch
 from torch import nn
 
+from data.spatial_map import MECHANISM_GROUP
+
+
+# signal_type → mechanism_group 변환용 lookup tensor (최대 signal_type + 1 크기)
+_MAX_ST = max(MECHANISM_GROUP.keys()) + 1
+_MECH_GROUP_LUT = torch.zeros(_MAX_ST, dtype=torch.long)
+for _st, _mg in MECHANISM_GROUP.items():
+    _MECH_GROUP_LUT[_st] = _mg
+
 
 class NextPredictionLoss(nn.Module):
     """Next-Patch Prediction Loss (same-variate + cross-modal).
@@ -32,6 +41,7 @@ class NextPredictionLoss(nn.Module):
         patch_sample_id: torch.Tensor,    # (B, N) long
         patch_variate_id: torch.Tensor,   # (B, N) long
         time_id: torch.Tensor | None = None,  # (B, N) long — cross-modal 페어링용
+        patch_signal_types: torch.Tensor | None = None,  # (B, N) long — mechanism group 필터용
         horizon: int = 1,
     ) -> dict[str, torch.Tensor]:
         """Next-patch prediction loss 계산.
@@ -57,6 +67,7 @@ class NextPredictionLoss(nn.Module):
             cross_modal_loss = self._cross_modal_loss(
                 cross_pred, original_patches, patch_mask,
                 patch_sample_id, patch_variate_id, time_id,
+                patch_signal_types,
             )
             cross_modal_loss = self.cross_modal_weight * cross_modal_loss
         else:
@@ -105,11 +116,16 @@ class NextPredictionLoss(nn.Module):
         patch_sample_id: torch.Tensor,    # (B, N) long
         patch_variate_id: torch.Tensor,   # (B, N) long
         time_id: torch.Tensor,            # (B, N) long
+        patch_signal_types: torch.Tensor | None = None,  # (B, N) long
     ) -> torch.Tensor:
         """Cross-modal prediction loss.
 
         같은 (sample_id, time_id)에서 서로 다른 variate_id를 가진 패치 쌍을 매칭하고,
         cross_pred[b, i]가 original_patches[b, j]를 예측하도록 MSE를 계산한다.
+
+        ``patch_signal_types``가 주어지면, 같은 mechanism group 내의 쌍만
+        매칭한다 (Cardiovascular↔Cardiovascular, Respiratory↔Respiratory).
+        다른 그룹 간 (ECG↔CO2, ECG↔EEG 등)은 차단된다.
         """
         # group_key: (batch, sample_id, time_id)가 같은 패치를 그룹핑
         B, N = time_id.shape
@@ -129,6 +145,13 @@ class NextPredictionLoss(nn.Module):
         )
 
         cross_mask = same_group & diff_variate & both_valid & non_pad  # (B, N, N)
+
+        # Mechanism Group 필터: 같은 생리학적 그룹 내에서만 MSE 허용
+        if patch_signal_types is not None:
+            mech_lut = _MECH_GROUP_LUT.to(patch_signal_types.device)
+            mech_group = mech_lut[patch_signal_types]  # (B, N)
+            same_mechanism = mech_group.unsqueeze(-1) == mech_group.unsqueeze(-2)  # (B, N, N)
+            cross_mask = cross_mask & same_mechanism
 
         b_idx, i_idx, j_idx = torch.where(cross_mask)
 
