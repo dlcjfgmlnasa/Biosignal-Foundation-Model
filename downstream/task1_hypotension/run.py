@@ -44,7 +44,7 @@ from downstream.common.data_utils import (
     split_by_subject,
     TARGET_SR,
 )
-from downstream.common.eval_utils import (
+from eval._metrics import (
     compute_auroc,
     compute_auprc,
     compute_sensitivity_specificity,

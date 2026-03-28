@@ -243,7 +243,7 @@ def evaluate_cross_modal(
     -------
     dict with keys: mse, mae, pearson_r, n_samples.
     """
-    from downstream.common.eval_utils import (
+    from eval._metrics import (
         compute_mae,
         compute_mse,
         compute_pearson_r,

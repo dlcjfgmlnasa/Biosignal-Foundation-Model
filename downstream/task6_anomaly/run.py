@@ -246,7 +246,7 @@ def find_optimal_threshold(
     -------
     (best_threshold, best_f1)
     """
-    from downstream.common.eval_utils import compute_f1
+    from eval._metrics import compute_f1
 
     scores_arr = np.array(scores)
     labels_arr = np.array(labels)
@@ -445,7 +445,7 @@ def main() -> None:
     )
 
     # ── 메트릭 계산 ──
-    from downstream.common.eval_utils import compute_auroc, compute_auprc, compute_f1
+    from eval._metrics import compute_auroc, compute_auprc, compute_f1
 
     scores_arr = np.array(scores)
     labels_arr = np.array(labels)
@@ -476,7 +476,7 @@ def main() -> None:
     }
 
     # ── 시각화 ──
-    from downstream.common.eval_utils import plot_roc_curve
+    from eval._viz import plot_roc_curve
 
     plot_score_distribution(
         scores, labels, best_thresh,

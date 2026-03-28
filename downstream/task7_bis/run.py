@@ -241,7 +241,7 @@ def train_and_evaluate(
     -------
     dict with keys: mae, mse, rmse, pearson_r, bland_altman, bin_accuracy, n_train, n_test.
     """
-    from downstream.common.eval_utils import (
+    from eval._metrics import (
         compute_bland_altman,
         compute_mae,
         compute_mse,
@@ -506,7 +506,7 @@ def main() -> None:
     )
 
     # ── 시각화 ──
-    from downstream.common.eval_utils import plot_bland_altman
+    from eval._viz import plot_bland_altman
 
     plot_bland_altman(
         results["y_true"], results["y_pred"],

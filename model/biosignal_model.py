@@ -15,7 +15,7 @@ import torch
 from torch import nn
 
 from data.collate import PackedBatch
-from model.config import ModelConfig
+from model._config import ModelConfig
 from module.cnn_stem import ModalityCNNStem
 from module.packed_scaler import PackedStdScaler, PackedScaler
 from module.patch import PatchEmbedding

@@ -233,7 +233,7 @@ def _gen_synthetic(stype: str, n_samples: int = 3000, sr: float = 100.0) -> np.n
 
 def run_dummy_test() -> list[AnyToAnyResult]:
     """Run all scenarios with a random (untrained) model."""
-    from model.config import ModelConfig
+    from model import ModelConfig
     from model.v1 import BiosignalFoundationModelV1
 
     print("=" * 70)

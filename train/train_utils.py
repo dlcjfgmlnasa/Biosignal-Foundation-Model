@@ -27,7 +27,7 @@ from data import RecordingManifest
 from loss.criterion import CombinedLoss
 from loss.masked_mse_loss import create_patch_mask
 from model.checkpoint import save_checkpoint
-from model.config import ModelConfig
+from model import ModelConfig
 
 
 # ── 설정 ────────────────────────────────────────────────────────

@@ -35,6 +35,13 @@ scripts/
 # Generated images
 *.png
 
+# Test scripts (일회성 테스트/디버깅용)
+test_*.py
+user_test.py
+
+# Docs (내부 참고용, 코드와 별도 관리)
+docs/
+
 # Claude Code
 .claude/
 .plans/

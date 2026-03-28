@@ -41,7 +41,7 @@ from downstream.common.data_utils import (
     load_pilot_cases,
     split_by_subject,
 )
-from downstream.common.eval_utils import compute_mse, compute_mae, compute_pearson_r
+from eval._metrics import compute_mse, compute_mae, compute_pearson_r
 
 
 # ── 설정 ──────────────────────────────────────────────────────

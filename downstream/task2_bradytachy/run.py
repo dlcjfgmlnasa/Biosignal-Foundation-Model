@@ -41,7 +41,7 @@ from downstream.common.data_utils import (
     load_pilot_cases,
     split_by_subject,
 )
-from downstream.common.eval_utils import compute_auroc, compute_f1
+from eval._metrics import compute_auroc, compute_f1
 from downstream.common.model_wrapper import LinearProbe
 
 

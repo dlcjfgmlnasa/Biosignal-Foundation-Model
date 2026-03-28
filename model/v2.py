@@ -13,7 +13,7 @@ import torch
 from torch import nn
 
 from data.collate import PackedBatch
-from model.config import ModelConfig
+from model._config import ModelConfig
 from model.v1 import BiosignalFoundationModelV1
 
 # EEG signal_type 인덱스

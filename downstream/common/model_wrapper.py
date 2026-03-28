@@ -20,7 +20,7 @@ from torch import nn
 
 from data.collate import PackedBatch
 from model.checkpoint import load_checkpoint
-from model.config import ModelConfig
+from model import ModelConfig
 from model.v1 import BiosignalFoundationModelV1
 from model.v2 import BiosignalFoundationModelV2
 

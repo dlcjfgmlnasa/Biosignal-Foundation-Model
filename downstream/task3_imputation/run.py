@@ -210,7 +210,7 @@ def _pearson_r(x: torch.Tensor, y: torch.Tensor) -> float:
 
 def run_dummy_test() -> list[ImputationResult]:
     """Checkpoint 없이 랜덤 모델로 더미 imputation 테스트를 수행한다."""
-    from model.config import ModelConfig
+    from model import ModelConfig
     from model.v1 import BiosignalFoundationModelV1
 
     print("=" * 60)
