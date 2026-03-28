@@ -92,7 +92,7 @@ SIGNAL_CONFIGS: dict[str, SignalConfig] = {
     "cvp": SignalConfig(valid_range=(-5.0, 40.0),      filter_type="lowpass",  filter_freq=(0.0, 10.0),  max_high_freq_ratio=0.5, spike_detection=True, spike_threshold_std=8.0),
     # CO2/AWP: lowpass — 느린 호흡 신호, DC 보존
     "co2": SignalConfig(valid_range=(0.0, 100.0),      filter_type="lowpass",  filter_freq=(0.0, 5.0),   max_high_freq_ratio=1.0, max_flatline_ratio=0.3, min_amplitude=5.0, quality_window_s=15.0),
-    "awp": SignalConfig(valid_range=(-10.0, 80.0),     filter_type="lowpass",  filter_freq=(0.0, 5.0),   max_high_freq_ratio=1.0, min_amplitude=2.0, quality_window_s=15.0),
+    "awp": SignalConfig(valid_range=(-20.0, 80.0),     filter_type="lowpass",  filter_freq=(0.0, 20.0),  max_high_freq_ratio=1.0, min_amplitude=2.0, quality_window_s=15.0),
 }
 
 
