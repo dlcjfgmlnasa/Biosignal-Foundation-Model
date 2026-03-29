@@ -37,8 +37,8 @@ max_subjects: null
 window_seconds: 60.0       # 60초 윈도우 (60 patches)
 max_length: 50000
 cache_size: 16
-crop_ratio_min: 0.0
-crop_ratio_max: 0.0
+crop_ratio_min: 0.5
+crop_ratio_max: 0.1
 
 # ── 학습 ──
 batch_size: 64             # L4 여유 충분, DDP 2GPU → effective 128
@@ -68,7 +68,7 @@ variate_mask_prob: 0.0     # Phase 1은 비활성
 use_amp: true              # L4 FP16 tensor cores, 필수
 
 # ── Validation & Early Stopping ──
-val_ratio: 0.15            # subject 단위 15% validation
+val_ratio: 0.05            # subject 단위 15% validation
 patience: 15               # early stopping patience
 
 # ── 시스템 ──

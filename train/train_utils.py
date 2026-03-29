@@ -41,7 +41,7 @@ class TrainConfig:
     model_config: ModelConfig = field(default_factory=ModelConfig)
 
     # 데이터
-    processed_dir: str = "datasets/processed"
+    data_dir: str = "datasets/processed"
     signal_types: list[int] = field(default_factory=lambda: [0, 1, 2, 3, 4, 5, 6])
     max_subjects: int | None = None
     window_seconds: float = 30.0
@@ -141,13 +141,13 @@ class TrainConfig:
 
 
 def load_manifest_from_processed(
-    processed_dir: str | Path,
+    data_dir: str | Path,
     signal_types: list[int] | None = None,
     max_subjects: int | None = None,
 ) -> list[RecordingManifest]:
     """processed 디렉토리에서 manifest.json을 읽어 RecordingManifest 목록을 반환한다."""
-    processed_dir = Path(processed_dir)
-    manifest_files = sorted(processed_dir.glob("*/manifest.json"))
+    data_dir = Path(data_dir)
+    manifest_files = sorted(data_dir.glob("*/manifest.json"))
     if max_subjects is not None:
         manifest_files = manifest_files[:max_subjects]
 
@@ -839,7 +839,7 @@ def save_experiment_info(config: TrainConfig, output_dir: Path, phase_name: str,
         f"variate_mask_prob   = {config.variate_mask_prob}",
         f"",
         f"[Data]",
-        f"processed_dir  = {config.processed_dir}",
+        f"data_dir  = {config.data_dir}",
         f"signal_types   = {config.signal_types}",
         f"max_subjects   = {config.max_subjects}",
         f"window_seconds = {config.window_seconds}",

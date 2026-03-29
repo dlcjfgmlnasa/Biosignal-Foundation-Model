@@ -52,7 +52,7 @@ from .visualize import save_reconstruction_figure, save_next_pred_figure
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Phase 1: Channel-Independent Pre-training (V2)")
+    p = argparse.ArgumentParser(description="Phase 1: Channel-Independent Pre-training")
 
     # Config file + dry-run
     p.add_argument("--config", type=str, default=None,
@@ -80,7 +80,7 @@ def parse_args() -> argparse.Namespace:
 
     # Data
     g = p.add_argument_group("Data")
-    g.add_argument("--processed_dir", type=str, default="datasets/processed")
+    g.add_argument("--data_dir", type=str, default="datasets/processed")
     g.add_argument("--signal_types", type=int, nargs="+", default=[0, 1, 2, 3, 4, 5, 6],
                    help="Signal type IDs (0=ECG, 1=ABP, 2=EEG, 3=PPG, 4=CVP, 5=CO2, 6=AWP)")
     g.add_argument("--max_subjects", type=int, default=None)
@@ -117,7 +117,7 @@ def parse_args() -> argparse.Namespace:
                    help="AMP (Automatic Mixed Precision) 활성")
     g.add_argument("--device", type=str, default="auto")
     g.add_argument("--num_workers", type=int, default=4)
-    g.add_argument("--output_dir", type=str, default="outputs/v2_phase1_ci")
+    g.add_argument("--output_dir", type=str, default="outputs/phase1_ci")
     g.add_argument("--checkpoint_every", type=int, default=10)
     g.add_argument("--max_batches", type=int, default=0,
                    help="에폭당 최대 배치 수 (0=무제한)")
@@ -179,7 +179,7 @@ def main():
             model_config=model_config,
 
             # 데이터
-            processed_dir=args.processed_dir,
+            data_dir=args.data_dir,
             signal_types=args.signal_types,
             max_subjects=args.max_subjects,
             window_seconds=args.window_seconds,
@@ -243,7 +243,7 @@ def main():
 
     if rank0:
         print(f"{'='*60}")
-        print(f"Phase 1: Channel-Independent Pre-training (V2)")
+        print(f"Phase 1: Channel-Independent Pre-training")
         if config.exp_name:
             print(f"Experiment: {config.exp_name}")
         print(f"Device: {device}" + (f" (DDP: {world_size} GPUs)" if use_ddp else ""))
@@ -251,7 +251,7 @@ def main():
 
     # ── 데이터 로딩 ──
     manifest = load_manifest_from_processed(
-        config.processed_dir,
+        config.data_dir,
         signal_types=config.signal_types,
         max_subjects=config.max_subjects,
     )
@@ -462,7 +462,7 @@ def main():
                 save_model = model.module if use_ddp else model
                 path = save_training_checkpoint(
                     save_model, optimizer, epoch, config,
-                    phase_name="v2_phase1_ci", loss=best_loss,
+                    phase_name="phase1_ci", loss=best_loss,
                     output_dir=output_dir, tag="best",
                 )
                 print(f"  -> Best model saved: {path}")
@@ -472,7 +472,7 @@ def main():
                 save_model = model.module if use_ddp else model
                 save_training_checkpoint(
                     save_model, optimizer, epoch, config,
-                    phase_name="v2_phase1_ci", loss=losses["total"],
+                    phase_name="phase1_ci", loss=losses["total"],
                     output_dir=output_dir,
                 )
 
@@ -491,11 +491,11 @@ def main():
         save_model = model.module if use_ddp else model
         final_path = save_training_checkpoint(
             save_model, optimizer, epoch, config,
-            phase_name="v2_phase1_ci", loss=losses["total"],
+            phase_name="phase1_ci", loss=losses["total"],
             output_dir=output_dir, tag="final",
         )
         print(f"\n{'='*60}")
-        print(f"V2 Phase 1 complete. Final train loss: {losses['total']:.6f}")
+        print(f"Phase 1 complete. Final train loss: {losses['total']:.6f}")
         if val_losses is not None:
             print(f"Final val loss: {val_losses['total']:.6f}")
         print(f"Best {'val' if val_dataloader else 'train'} loss: {best_loss:.6f}")

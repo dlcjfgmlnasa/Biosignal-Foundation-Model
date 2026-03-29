@@ -88,7 +88,7 @@ def parse_args() -> argparse.Namespace:
 
     # Data
     g = p.add_argument_group("Data")
-    g.add_argument("--processed_dir", type=str, default="datasets/processed")
+    g.add_argument("--data_dir", type=str, default="datasets/processed")
     g.add_argument("--signal_types", type=int, nargs="+", default=[0, 1, 2, 3, 4, 5, 6],
                    help="Signal type IDs (0=ECG, 1=ABP, 2=EEG, 3=PPG, 4=CVP, 5=CO2, 6=AWP)")
     g.add_argument("--max_subjects", type=int, default=None)
@@ -168,7 +168,7 @@ def main():
         model_config=model_config,
 
         # 데이터
-        processed_dir=args.processed_dir,
+        data_dir=args.data_dir,
         signal_types=args.signal_types,
         max_subjects=args.max_subjects,
         window_seconds=args.window_seconds,
@@ -262,7 +262,7 @@ def main():
 
     # ── 데이터 로딩 ──
     manifest = load_manifest_from_processed(
-        config.processed_dir,
+        config.data_dir,
         signal_types=config.signal_types,
         max_subjects=config.max_subjects,
     )
