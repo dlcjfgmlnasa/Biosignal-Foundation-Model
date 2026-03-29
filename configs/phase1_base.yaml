@@ -31,14 +31,14 @@ model_config:
   contrastive_proj_dim: 0  # Phase 1에서는 비활성
 
 # ── 데이터 ──
-data_dir: datasets/processed
+data_dir: ../updown/datasets/vitaldb
 signal_types: [0, 1, 2, 3, 4, 5, 6]  # ECG, ABP, EEG, PPG, CVP, CO2, AWP
 max_subjects: null
 window_seconds: 60.0       # 60초 윈도우 (60 patches)
 max_length: 50000
 cache_size: 16
-crop_ratio_min: 0.5
-crop_ratio_max: 0.1
+crop_ratio_min: 0.15      # 최소 9초 (60s × 0.15)
+crop_ratio_max: 1.0       # 최대 전체 윈도우 (60s)
 
 # ── 학습 ──
 batch_size: 32             # OOM 방지 (d=256, L=12), 안정 확인 후 64로 증가 가능
