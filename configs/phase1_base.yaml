@@ -1,21 +1,21 @@
-# Phase 1: Channel-Independent Pre-training — Base (6.4M params)
+# Phase 1: Channel-Independent Pre-training — Base (d=256, L=12)
 # ──────────────────────────────────────────────────────────────
 # Server: 2xL4 24GB, 8vCPU, 96GB RAM
 #
 # Usage (단일 GPU):
-#   python -m train.v1_1_channel_independency --config configs/phase1_base.yaml
+#   python -m train.1_channel_independency --config configs/phase1_base.yaml
 #
 # Usage (2-GPU DDP):
-#   torchrun --nproc_per_node=2 -m train.v1_1_channel_independency \
+#   torchrun --nproc_per_node=2 -m train.1_channel_independency \
 #       --config configs/phase1_base.yaml
 #
 # Smoke test:
-#   python -m train.v1_1_channel_independency --config configs/phase1_base.yaml --dry-run
+#   python -m train.1_channel_independency --config configs/phase1_base.yaml --dry-run
 
-# ── 모델 (Base: d=256, L=8, 6.4M params) ──
+# ── 모델 (Base: d=256, L=12) ──
 model_config:
   d_model: 256
-  num_layers: 8
+  num_layers: 12
   patch_size: 100
   stride: null
   num_heads: 8            # head_dim = 256/8 = 32
@@ -31,7 +31,7 @@ model_config:
   contrastive_proj_dim: 0  # Phase 1에서는 비활성
 
 # ── 데이터 ──
-processed_dir: datasets/processed
+data_dir: datasets/processed
 signal_types: [0, 1, 2, 3, 4, 5, 6]  # ECG, ABP, EEG, PPG, CVP, CO2, AWP
 max_subjects: null
 window_seconds: 60.0       # 60초 윈도우 (60 patches)
@@ -41,8 +41,8 @@ crop_ratio_min: 0.5
 crop_ratio_max: 0.1
 
 # ── 학습 ──
-batch_size: 64             # L4 여유 충분, DDP 2GPU → effective 128
-lr: 8.0e-4                 # batch 64 linear scaling
+batch_size: 32             # OOM 방지 (d=256, L=12), 안정 확인 후 64로 증가 가능
+lr: 8.0e-4
 n_epochs: 100
 warmup_epochs: 10          # 10% warmup
 min_lr_ratio: 0.1          # 최종 LR = 8e-5
@@ -65,15 +65,15 @@ learnable_temperature: true
 variate_mask_prob: 0.0     # Phase 1은 비활성
 
 # ── Mixed Precision ──
-use_amp: true              # L4 FP16 tensor cores, 필수
+use_amp: true              # L4 FP16 tensor cores
 
 # ── Validation & Early Stopping ──
-val_ratio: 0.05            # subject 단위 15% validation
+val_ratio: 0.05            # subject 단위 5% validation
 patience: 15               # early stopping patience
 
 # ── 시스템 ──
 device: auto
 num_workers: 4             # 8vCPU → 4 workers
-output_dir: outputs/phase1_v1_base
+output_dir: outputs/phase1_base
 checkpoint_every: 10
-exp_name: phase1_v1_base_d256_L8
+exp_name: phase1_base_d256_L12
