@@ -10,26 +10,6 @@ from loss.masked_mse_loss import MaskedPatchLoss
 from loss.next_prediction_loss import NextPredictionLoss
 
 
-class MaskedMSELoss(nn.Module):
-    """마스킹된 위치만 MSE를 계산하는 손실 함수 (하위 호환).
-
-    mask=1인 위치의 (pred - target)^2 평균을 반환한다.
-    마스킹된 위치가 없으면 0을 반환한다.
-    """
-
-    def forward(
-        self,
-        pred: torch.Tensor,  # (batch, seq_len)
-        target: torch.Tensor,  # (batch, seq_len)
-        mask: torch.Tensor,  # (batch, seq_len) — 1=마스킹된 부분, 0=정상
-    ) -> torch.Tensor:  # scalar
-        mask = mask.float()
-        n_masked = mask.sum()
-        if n_masked == 0:
-            return pred.new_tensor(0.0)
-        loss = ((pred - target) ** 2 * mask).sum() / n_masked
-        return loss
-
 
 class CombinedLoss(nn.Module):
     """α * MPM + β * NextPred (same-variate + γ * cross-modal) + δ * Contrastive 하이브리드 손실 함수.

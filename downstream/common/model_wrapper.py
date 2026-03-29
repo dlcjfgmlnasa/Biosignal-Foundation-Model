@@ -21,8 +21,7 @@ from torch import nn
 from data.collate import PackedBatch
 from model.checkpoint import load_checkpoint
 from model import ModelConfig
-from model.v1 import BiosignalFoundationModelV1
-from model.v2 import BiosignalFoundationModelV2
+from model.biosignal_model import BiosignalFoundationModel
 
 
 class DownstreamModelWrapper(nn.Module):
@@ -55,8 +54,8 @@ class DownstreamModelWrapper(nn.Module):
         else:
             raise ValueError("Checkpoint에 'config' 키가 없습니다.")
 
-        model_cls = BiosignalFoundationModelV2 if model_version == "v2" else BiosignalFoundationModelV1
-        self.model: BiosignalFoundationModelV1 = model_cls.from_config(config)
+        model_cls = BiosignalFoundationModel
+        self.model: BiosignalFoundationModel = model_cls.from_config(config)
         self.model.to(self.device)
 
         # 2. State dict 로드

@@ -35,9 +35,10 @@ scripts/
 # Generated images
 *.png
 
-# Test scripts (일회성 테스트/디버깅용)
+# Test scripts
 test_*.py
 user_test.py
+tests/
 
 # Docs (내부 참고용, 코드와 별도 관리)
 docs/

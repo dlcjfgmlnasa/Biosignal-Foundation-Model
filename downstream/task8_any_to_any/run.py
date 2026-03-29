@@ -234,14 +234,14 @@ def _gen_synthetic(stype: str, n_samples: int = 3000, sr: float = 100.0) -> np.n
 def run_dummy_test() -> list[AnyToAnyResult]:
     """Run all scenarios with a random (untrained) model."""
     from model import ModelConfig
-    from model.v1 import BiosignalFoundationModelV1
+    from model.biosignal_model import BiosignalFoundationModel
 
     print("=" * 70)
     print("Task 8: Any-to-Any Prediction - Dummy Test (random model)")
     print("=" * 70)
 
     config = ModelConfig(d_model=64, num_layers=2, patch_size=100)
-    model = BiosignalFoundationModelV1.from_config(config)
+    model = BiosignalFoundationModel.from_config(config)
     model.eval()
     device = torch.device("cpu")
 

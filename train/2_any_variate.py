@@ -1,20 +1,16 @@
 # -*- coding:utf-8 -*-
 from __future__ import annotations
 
-"""Phase 2: Any-Variate 학습 (V2, Cross-Modal).
+"""Phase 2: Any-Variate 학습 (Cross-Modal).
 
-V2 Phase 1 checkpoint를 로드하여, 다변량 세션에서 cross-modal 학습을 수행한다.
-
-V1 Phase 2와의 차이점:
-- BiosignalFoundationModelV2 사용 (eeg_recon_head 추가)
-- train_one_epoch_v2 / validate_v2 호출 (EEG loss 별도 계산)
-- 로그에 eeg_loss 항목 추가
+Phase 1 checkpoint를 로드하여, 다변량 세션에서 cross-modal 학습을 수행한다.
+EEG는 spectral target으로 복원, 나머지 신호는 raw patch MSE로 복원.
 
 Usage
 -----
-    python -m train.v2_2_any_variate
-    python -m train.v2_2_any_variate --resume outputs/v2_phase1_ci/checkpoint_v2_phase1_ci_epoch069_final.pt
-    python -m train.v2_2_any_variate --d_model 128 --num_layers 4 --batch_size 8
+    python -m train.2_any_variate
+    python -m train.2_any_variate --resume outputs/phase1_ci/best.pt
+    python -m train.2_any_variate --d_model 128 --num_layers 4 --batch_size 8
 """
 import argparse
 import gc
@@ -24,7 +20,7 @@ from pathlib import Path
 import torch
 from data import BiosignalDataset, create_dataloader
 from loss.criterion import CombinedLoss
-from model import BiosignalFoundationModelV2, ModelConfig
+from model import BiosignalFoundationModel, ModelConfig
 from model.checkpoint import load_checkpoint
 from .train_utils import (
     CSVLogger,
@@ -39,8 +35,8 @@ from .train_utils import (
     save_training_checkpoint,
     set_seed,
     split_manifest_by_subject,
-    train_one_epoch_v2,
-    validate_v2,
+    train_one_epoch,
+    validate,
 )
 from .visualize import save_reconstruction_figure, save_next_pred_figure
 
@@ -245,7 +241,7 @@ def main():
     print(f"Loading V2 Phase 1 checkpoint: {ckpt_path}")
 
     # 모델 생성 + checkpoint 로드
-    model = BiosignalFoundationModelV2.from_config(config.model_config)
+    model = BiosignalFoundationModel.from_config(config.model_config)
     state = load_checkpoint(ckpt_path, model, device=device)
     model.to(device)
 
@@ -257,7 +253,7 @@ def main():
     print(f"Model params: {total_params:,}")
 
     # 실험 정보 저장
-    save_experiment_info(config, output_dir, phase_name="V2_Phase2_AV", extra_info={
+    save_experiment_info(config, output_dir, phase_name="Phase2_AV", extra_info={
         "phase1_ckpt": ckpt_path,
         "phase1_epoch": str(phase1_epoch),
         "phase1_loss": str(phase1_loss),
@@ -381,12 +377,12 @@ def main():
 
     for epoch in range(config.n_epochs):
         epoch_start = time.time()
-        losses = train_one_epoch_v2(
+        losses = train_one_epoch(
             model, dataloader, optimizer, criterion,
             config=config,
             device=device,
             epoch=epoch,
-            phase_name="V2_Phase2_AV",
+            phase_name="Phase2_AV",
             scaler=scaler,
         )
         scheduler.step()
@@ -394,9 +390,9 @@ def main():
         # ── Validation ──
         val_losses = None
         if val_dataloader is not None:
-            val_losses = validate_v2(
+            val_losses = validate(
                 model, val_dataloader, criterion,
-                config=config, device=device, phase_name="V2_Phase2_AV",
+                config=config, device=device, phase_name="Phase2_AV",
             )
         epoch_sec = time.time() - epoch_start
 
@@ -416,7 +412,7 @@ def main():
         print(line)
 
         # CSV 로깅
-        csv_logger.log(epoch, "V2_Phase2_AV", losses, val_losses, current_lr, epoch_sec)
+        csv_logger.log(epoch, "Phase2_AV", losses, val_losses, current_lr, epoch_sec)
 
         # Reconstruction & Next-Pred 시각화
         if viz_batches is not None and (epoch % viz_every == 0 or epoch == config.n_epochs - 1):

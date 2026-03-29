@@ -144,20 +144,20 @@ class PackCollate:
                 seg_len = min(s.values.shape[0], remaining)
 
                 # per-variate patch 파라미터 결정
-                var_P: int | None = None
-                var_S: int | None = None
+                var_p: int | None = None
+                var_s: int | None = None
                 if self.patch_size is not None:
-                    var_P = self.patch_size
-                    var_S = self.stride
+                    var_p = self.patch_size
+                    var_s = self.stride
 
-                if var_P is not None:
+                if var_p is not None:
                     # 통합 패딩: P + ceil(max(0, seg_len - P) / S) * S
-                    excess = max(0, seg_len - var_P)
-                    padded_seg_len = var_P + -(-excess // var_S) * var_S
+                    excess = max(0, seg_len - var_p)
+                    padded_seg_len = var_p + -(-excess // var_s) * var_s
                     if padded_seg_len > remaining:
-                        if remaining < var_P:
+                        if remaining < var_p:
                             break
-                        padded_seg_len = var_P + ((remaining - var_P) // var_S) * var_S
+                        padded_seg_len = var_p + ((remaining - var_p) // var_s) * var_s
                         seg_len = min(seg_len, padded_seg_len)
                     v = torch.zeros(padded_seg_len)
                     v[:seg_len] = s.values[:seg_len]

@@ -18,7 +18,7 @@ from matplotlib.lines import Line2D  # noqa: E402
 
 from data.collate import PackedBatch
 from loss.masked_mse_loss import create_patch_mask
-from model import BiosignalFoundationModelV1
+from model import BiosignalFoundationModel
 
 
 # ── 상수 & 데이터 구조 ────────────────────────────────────────
@@ -231,7 +231,7 @@ def _plot_figure_grid(
 
 
 def _extract_patches_and_scales(
-    model: BiosignalFoundationModelV1,
+    model: BiosignalFoundationModel,
     batch: PackedBatch,
     out: dict,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
@@ -330,7 +330,7 @@ def _extract_candidates(
 
 
 def _process_recon_batch(
-    model: BiosignalFoundationModelV1,
+    model: BiosignalFoundationModel,
     batch: PackedBatch,
     mask_ratio: float,
     device: torch.device | None,
@@ -413,7 +413,7 @@ def _process_recon_batch(
 
 
 def _process_next_pred_batch(
-    model: BiosignalFoundationModelV1,
+    model: BiosignalFoundationModel,
     batch: PackedBatch,
     horizon: int,
     device: torch.device | None,
@@ -478,12 +478,114 @@ def _process_next_pred_batch(
     return candidates
 
 
+# ── EEG Spectral Visualization (V2) ──────────────────────────
+
+
+def _save_eeg_spectral_figure(
+    model: BiosignalFoundationModel,
+    batches: list[PackedBatch],
+    epoch: int,
+    output_dir: Path,
+    mask_ratio: float,
+    device: torch.device | None,
+    max_examples: int = 4,
+) -> Path | None:
+    """V2 EEG spectral reconstruction 시각화.
+
+    마스킹된 EEG 패치의 원본 spectrogram vs 예측 spectrogram을 비교한다.
+    V2 모델이 아니면 None을 반환한다.
+    """
+    from loss.masked_mse_loss import create_patch_mask as _create_mask
+
+    examples: list[dict] = []
+
+    for batch in batches:
+        if device is not None:
+            _batch_to_device(batch, device)
+
+        out = model(batch, task="masked")
+
+        # V2 spectral 출력이 있는지 확인
+        eeg_mask = out.get("eeg_mask")           # (B, N)
+        eeg_recon = out.get("eeg_reconstructed")  # (B, N, spec_dim)
+        eeg_target = out.get("eeg_recon_target")  # (B, N, spec_dim)
+        if eeg_mask is None or eeg_recon is None or eeg_target is None:
+            continue
+
+        patch_mask = out["patch_mask"]
+        pred_mask = _create_mask(patch_mask, mask_ratio=mask_ratio)
+
+        # SpectralTokenizer 정보
+        if hasattr(model, "eeg_spectral_tokenizer") and model.eeg_spectral_tokenizer is not None:
+            n_freq = model.eeg_spectral_tokenizer.n_freq_bins
+            n_frames = model.eeg_spectral_tokenizer.n_frames
+        else:
+            continue
+
+        B, N = eeg_mask.shape
+        for b in range(B):
+            masked_eeg = pred_mask[b] & eeg_mask[b]  # (N,)
+            if not masked_eeg.any():
+                continue
+
+            indices = masked_eeg.nonzero(as_tuple=True)[0]
+            for idx in indices[:2]:  # 패치 2개까지
+                pred_spec = eeg_recon[b, idx].detach().cpu().numpy().reshape(n_freq, n_frames)
+                target_spec = eeg_target[b, idx].detach().cpu().numpy().reshape(n_freq, n_frames)
+                examples.append({"pred": pred_spec, "target": target_spec})
+                if len(examples) >= max_examples:
+                    break
+            if len(examples) >= max_examples:
+                break
+        if len(examples) >= max_examples:
+            break
+
+    if not examples:
+        return None
+
+    # Plot
+    n = len(examples)
+    fig, axes = plt.subplots(n, 2, figsize=(10, 3 * n), squeeze=False)
+    fig.suptitle(f"EEG Spectral Reconstruction — Epoch {epoch}", fontsize=13, y=1.01)
+
+    sr = 100.0
+    freq_labels = np.arange(n_freq) * (sr / (2 * (n_freq - 1)))  # Hz
+
+    for row in range(n):
+        ex = examples[row]
+
+        # Target spectrogram
+        ax = axes[row, 0]
+        im = ax.imshow(ex["target"], aspect="auto", origin="lower",
+                       cmap="viridis", interpolation="nearest")
+        ax.set_title("Original Spectrogram", fontsize=9)
+        ax.set_ylabel("Freq bin")
+        if row == n - 1:
+            ax.set_xlabel("Time frame")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+        # Predicted spectrogram
+        ax = axes[row, 1]
+        im = ax.imshow(ex["pred"], aspect="auto", origin="lower",
+                       cmap="viridis", interpolation="nearest")
+        ax.set_title("Predicted Spectrogram", fontsize=9)
+        if row == n - 1:
+            ax.set_xlabel("Time frame")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    plt.tight_layout()
+    path = output_dir / f"eeg_spectral_epoch{epoch:03d}.png"
+    fig.savefig(path, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
 # ── Public API ────────────────────────────────────────────────
 
 
 @torch.no_grad()
 def save_reconstruction_figure(
-    model: BiosignalFoundationModelV1,
+    model: BiosignalFoundationModel,
     batch: PackedBatch | list[PackedBatch],
     epoch: int,
     output_dir: str | Path,
@@ -495,6 +597,8 @@ def save_reconstruction_figure(
     device: torch.device | None = None,
 ) -> Path:
     """마스킹된 패치의 원본 vs 복원 비교 figure를 저장한다.
+
+    V2 모델일 경우, EEG spectral reconstruction figure도 별도 저장한다.
 
     Parameters
     ----------
@@ -521,13 +625,17 @@ def save_reconstruction_figure(
         grid, epoch, output_dir,
         max_duration_s, sampling_rate, mode="masked",
     )
+
+    # V2: EEG spectral reconstruction 별도 시각화
+    _save_eeg_spectral_figure(model, batches, epoch, output_dir, mask_ratio, device)
+
     model.train()
     return path
 
 
 @torch.no_grad()
 def save_next_pred_figure(
-    model: BiosignalFoundationModelV1,
+    model: BiosignalFoundationModel,
     batch: PackedBatch | list[PackedBatch],
     epoch: int,
     output_dir: str | Path,

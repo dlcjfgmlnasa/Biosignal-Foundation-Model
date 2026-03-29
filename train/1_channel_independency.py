@@ -1,23 +1,18 @@
 # -*- coding:utf-8 -*-
 from __future__ import annotations
 
-"""Phase 1: Channel-Independent 사전학습 (V2).
+"""Phase 1: Channel-Independent 사전학습.
 
-V2 모델(BiosignalFoundationModelV2)을 사용하며, EEG 패치에 대해
-stem 출력 복원(stop-gradient) 전용 loss를 별도 계산한다.
-
-V1 Phase 1과의 차이점:
-- BiosignalFoundationModelV2 사용 (eeg_recon_head 추가)
-- train_one_epoch_v2 / validate_v2 호출 (EEG loss 별도 계산)
-- 로그에 eeg_loss 항목 추가
+collate_mode="ci"로 각 채널을 독립적으로 학습한다.
+EEG는 spectral target으로 복원, 나머지 신호는 raw patch MSE로 복원.
 
 Usage (단일 GPU)
 -----
-    python -m train.v2_1_channel_independency --device cuda:0
+    python -m train.1_channel_independency --device cuda:0
 
 Usage (멀티 GPU -- DDP)
 -----
-    torchrun --nproc_per_node=2 -m train.v2_1_channel_independency
+    torchrun --nproc_per_node=2 -m train.1_channel_independency
 """
 import argparse
 import gc
@@ -32,7 +27,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 from data import BiosignalDataset, create_dataloader
 from loss.criterion import CombinedLoss
-from model import BiosignalFoundationModelV2, ModelConfig
+from model import BiosignalFoundationModel, ModelConfig
 from .train_utils import (
     CSVLogger,
     EarlyStopping,
@@ -50,8 +45,8 @@ from .train_utils import (
     set_seed,
     setup_ddp,
     split_manifest_by_subject,
-    train_one_epoch_v2,
-    validate_v2,
+    train_one_epoch,
+    validate,
 )
 from .visualize import save_reconstruction_figure, save_next_pred_figure
 
@@ -244,7 +239,7 @@ def main():
     output_dir = resolve_output_dir(config)
     if rank0:
         output_dir.mkdir(parents=True, exist_ok=True)
-        save_experiment_info(config, output_dir, phase_name="V2_Phase1_CI")
+        save_experiment_info(config, output_dir, phase_name="Phase1_CI")
 
     if rank0:
         print(f"{'='*60}")
@@ -337,7 +332,7 @@ def main():
             print(f"Val dataset: {len(val_dataset)} windows, {len(val_dataloader)} batches")
 
     # ── 모델 (V2) ──
-    model = BiosignalFoundationModelV2.from_config(config.model_config)
+    model = BiosignalFoundationModel.from_config(config.model_config)
     model.to(device)
 
     if use_ddp:
@@ -407,12 +402,12 @@ def main():
             sampler.set_epoch(epoch)
 
         epoch_start = time.time()
-        losses = train_one_epoch_v2(
+        losses = train_one_epoch(
             model, dataloader, optimizer, criterion,
             config=config,
             device=device,
             epoch=epoch,
-            phase_name="V2_Phase1_CI",
+            phase_name="Phase1_CI",
             scaler=scaler,
         )
         scheduler.step()
@@ -420,9 +415,9 @@ def main():
         # ── Validation ──
         val_losses = None
         if val_dataloader is not None:
-            val_losses = validate_v2(
+            val_losses = validate(
                 model, val_dataloader, criterion,
-                config=config, device=device, phase_name="V2_Phase1_CI",
+                config=config, device=device, phase_name="Phase1_CI",
             )
         epoch_sec = time.time() - epoch_start
 
@@ -442,7 +437,7 @@ def main():
 
             # CSV 로깅
             if csv_logger is not None:
-                csv_logger.log(epoch, "V2_Phase1_CI", losses, val_losses, current_lr, epoch_sec)
+                csv_logger.log(epoch, "Phase1_CI", losses, val_losses, current_lr, epoch_sec)
 
             # Reconstruction & Next-Pred 시각화
             if viz_batches is not None and (epoch % viz_every == 0 or epoch == config.n_epochs - 1):

@@ -87,6 +87,10 @@ class ModelConfig:
     # Contrastive
     contrastive_proj_dim: int = 0  # 0=비활성, >0=projection head 출력 차원
 
+    # EEG Spectral Target (V2 전용)
+    eeg_spectral_n_fft: int = 64       # STFT FFT 윈도우 크기 (64 at 100Hz → ~1.56Hz 해상도)
+    eeg_spectral_hop: int = 16         # STFT hop length
+
     def to_dict(self) -> dict:
         """Checkpoint 저장용 직렬화."""
         return asdict(self)

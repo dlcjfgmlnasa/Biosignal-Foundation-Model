@@ -124,7 +124,7 @@ def evaluate_imputation(
     Parameters
     ----------
     model:
-        BiosignalFoundationModelV1 or V2 (eval 모드).
+        BiosignalFoundationModel (eval 모드).
     batch:
         다변량 PackedBatch.
     target_signal_type:
@@ -211,14 +211,14 @@ def _pearson_r(x: torch.Tensor, y: torch.Tensor) -> float:
 def run_dummy_test() -> list[ImputationResult]:
     """Checkpoint 없이 랜덤 모델로 더미 imputation 테스트를 수행한다."""
     from model import ModelConfig
-    from model.v1 import BiosignalFoundationModelV1
+    from model.biosignal_model import BiosignalFoundationModel
 
     print("=" * 60)
     print("Task 3: Channel Imputation -Dummy Test (random model)")
     print("=" * 60)
 
     config = ModelConfig(d_model=64, num_layers=2, patch_size=100)
-    model = BiosignalFoundationModelV1.from_config(config)
+    model = BiosignalFoundationModel.from_config(config)
     model.eval()
     device = torch.device("cpu")
 

@@ -227,322 +227,10 @@ def train_one_epoch(
     phase_name: str,
     scaler: torch.amp.GradScaler | None = None,
 ) -> dict[str, float]:
-    """1에폭 학습을 수행하고 평균 loss를 반환한다."""
-    model.train()
-    # GPU 텐서로 누적하여 배치마다 .item() CUDA sync 방지
-    epoch_total = torch.zeros(1, device=device)
-    epoch_masked = torch.zeros(1, device=device)
-    epoch_next = torch.zeros(1, device=device)
-    epoch_cross = torch.zeros(1, device=device)
-    epoch_contrastive = torch.zeros(1, device=device)
-    epoch_aux = torch.zeros(1, device=device)
-    n_batches = 0
-    nan_count = 0
-    max_nan_batches = 10
+    """1에폭 학습을 수행하고 평균 loss를 반환한다.
 
-    enable_next = config.beta > 0
-    use_amp = scaler is not None
-    amp_dtype = torch.float16 if device.type == "cuda" else torch.bfloat16
-
-    for batch in dataloader:
-        # GPU로 이동
-        batch.values = batch.values.to(device)
-        batch.sample_id = batch.sample_id.to(device)
-        batch.variate_id = batch.variate_id.to(device)
-
-        # ── Forward (single call: task="both" for DDP compatibility) ──
-        H = 1
-        if enable_next:
-            H = random.randint(1, config.model_config.max_horizon)
-
-        with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
-            raw_model = model.module if isinstance(model, DDP) else model
-            task = "both" if enable_next else "masked"
-
-            out = model(batch, task=task, horizon=H)
-
-            reconstructed = out["reconstructed"]  # (B, N, patch_size)
-            cross_pred = out["cross_pred"]        # (B, N, patch_size)
-            patch_mask = out["patch_mask"]        # (B, N) bool
-            time_id = out["time_id"]              # (B, N)
-            next_pred = out.get("next_pred")      # (B, N, patch_size) or None
-
-            # MoE aux_loss 수집
-            aux_loss = torch.zeros(1, device=device)
-            for layer in raw_model.encoder.layers:
-                if hasattr(layer.ffn, "aux_loss") and layer.ffn.aux_loss is not None:
-                    aux_loss = aux_loss + layer.ffn.aux_loss
-
-            # 패치 단위 마스킹 (variate-level 마스킹 지원)
-            pred_mask = create_patch_mask(
-                patch_mask,
-                mask_ratio=config.mask_ratio,
-                patch_variate_id=out["patch_variate_id"] if config.variate_mask_prob > 0 else None,
-                variate_mask_prob=config.variate_mask_prob,
-            )
-
-            # 원본 패치 추출 (정규화된 값)
-            P = raw_model.patch_size
-            normalized = ((batch.values.unsqueeze(-1) - out["loc"]) / out["scale"]).squeeze(-1)
-            B, L = normalized.shape
-            N = L // P
-            original_patches = normalized.reshape(B, N, P)  # (B, N, P)
-
-            # ── Contrastive embeddings ──
-            contrastive_z = out.get("contrastive_z")  # (B, N, proj_dim) or None
-
-            # ── CombinedLoss ──
-            needs_time_id = config.gamma > 0 or config.delta > 0
-            losses = criterion(
-                reconstructed=reconstructed,
-                next_pred=next_pred,
-                original_patches=original_patches,
-                pred_mask=pred_mask,
-                patch_mask=patch_mask,
-                patch_sample_id=out["patch_sample_id"],
-                patch_variate_id=out["patch_variate_id"],
-                horizon=H,
-                cross_pred=cross_pred if config.gamma > 0 else None,
-                time_id=time_id if needs_time_id else None,
-                contrastive_z=contrastive_z if config.delta > 0 else None,
-                patch_signal_types=out.get("patch_signal_types"),
-            )
-
-            loss = losses["total"] + config.aux_loss_weight * aux_loss
-
-        # NaN/Inf 감지
-        if not torch.isfinite(loss):
-            if is_main_process():
-                print(
-                    f"  [{phase_name}] WARNING: NaN/Inf loss detected at batch {n_batches + 1}, "
-                    f"skipping batch (masked={losses['masked_loss'].item():.4f}, "
-                    f"next={losses['next_loss'].item():.4f}, "
-                    f"cross={losses['cross_modal_loss'].item():.4f}, "
-                    f"contrastive={losses['contrastive_loss'].item():.4f})"
-                )
-            nan_count += 1
-            if nan_count >= max_nan_batches:
-                if is_main_process():
-                    print(
-                        f"  [{phase_name}] ERROR: {nan_count} consecutive NaN/Inf batches. "
-                        f"Stopping epoch early."
-                    )
-                break
-            optimizer.zero_grad(set_to_none=True)
-            continue
-
-        nan_count = 0  # 정상 batch면 카운터 리셋
-        optimizer.zero_grad(set_to_none=True)
-
-        if scaler is not None:
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-        else:
-            loss.backward()
-
-        # Gradient NaN/Inf 감지
-        grad_norm = nn.utils.clip_grad_norm_(
-            raw_model.parameters(), max_norm=config.gradient_clip,
-        )
-        if not torch.isfinite(grad_norm):
-            if is_main_process():
-                print(
-                    f"  [{phase_name}] WARNING: NaN/Inf gradient at batch {n_batches + 1}, "
-                    f"skipping update."
-                )
-            optimizer.zero_grad(set_to_none=True)
-            n_batches += 1
-            if scaler is not None:
-                scaler.update()
-            continue
-
-        if scaler is not None:
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            optimizer.step()
-
-        # ── 로깅 (GPU 텐서로 누적, CUDA sync 없음) ──
-        epoch_total += loss.detach()
-        epoch_masked += losses["masked_loss"].detach()
-        epoch_next += losses["next_loss"].detach()
-        epoch_cross += losses["cross_modal_loss"].detach()
-        epoch_contrastive += losses["contrastive_loss"].detach()
-        epoch_aux += aux_loss.detach()
-        n_batches += 1
-
-        if is_main_process() and (n_batches % 50 == 0 or config.dry_run):
-            parts = [
-                f"  [{phase_name}] batch {n_batches}",
-                f"total: {loss.item():.6f}",
-                f"masked: {losses['masked_loss'].item():.6f}",
-            ]
-            if losses['next_loss'].item() > 0:
-                parts.append(f"next: {losses['next_loss'].item():.6f}")
-            if losses['cross_modal_loss'].item() > 0:
-                parts.append(f"cross: {losses['cross_modal_loss'].item():.6f}")
-            if losses['contrastive_loss'].item() > 0:
-                parts.append(f"contrastive: {losses['contrastive_loss'].item():.6f}")
-            if aux_loss.item() > 0:
-                parts.append(f"aux: {aux_loss.item():.6f}")
-            parts.append(f"grad_norm: {grad_norm:.4f}")
-            print(" | ".join(parts))
-
-        # Dry-run: 1 batch만 실행
-        if config.dry_run:
-            if is_main_process():
-                print(f"  [{phase_name}] dry-run: 1 batch 완료, 종료.")
-            break
-
-        # max_batches 제한
-        if config.max_batches > 0 and n_batches >= config.max_batches:
-            if is_main_process():
-                print(f"  [{phase_name}] max_batches={config.max_batches} 도달, 에폭 종료.")
-            break
-
-    denom = max(n_batches, 1)
-    return {
-        "total": (epoch_total / denom).item(),
-        "masked_loss": (epoch_masked / denom).item(),
-        "next_loss": (epoch_next / denom).item(),
-        "cross_modal_loss": (epoch_cross / denom).item(),
-        "contrastive_loss": (epoch_contrastive / denom).item(),
-        "aux_loss": (epoch_aux / denom).item(),
-    }
-
-
-@torch.no_grad()
-def validate(
-    model: nn.Module,
-    dataloader,
-    criterion: CombinedLoss,
-    config: TrainConfig,
-    device: torch.device,
-    phase_name: str,
-) -> dict[str, float]:
-    """Validation 루프. train_one_epoch()과 동일한 loss 계산, backward 없이.
-
-    DDP 환경에서는 unwrapped 모델로 forward하여 rank별 배치 수
-    불일치로 인한 데드락을 방지한다.
-    """
-    model.eval()
-    # DDP wrapper를 벗겨서 forward — validation에서는 gradient sync 불필요
-    raw_model = model.module if isinstance(model, DDP) else model
-
-    epoch_total = 0.0
-    epoch_masked = 0.0
-    epoch_next = 0.0
-    epoch_cross = 0.0
-    epoch_contrastive = 0.0
-    epoch_aux = 0.0
-    n_batches = 0
-
-    enable_next = config.beta > 0
-    use_amp = config.use_amp and device.type == "cuda"
-    amp_dtype = torch.float16 if device.type == "cuda" else torch.bfloat16
-
-    for batch in dataloader:
-        batch.values = batch.values.to(device)
-        batch.sample_id = batch.sample_id.to(device)
-        batch.variate_id = batch.variate_id.to(device)
-
-        H = 1
-        if enable_next:
-            H = random.randint(1, config.model_config.max_horizon)
-
-        with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
-            task = "both" if enable_next else "masked"
-            out = raw_model(batch, task=task, horizon=H)
-
-            reconstructed = out["reconstructed"]
-            cross_pred = out["cross_pred"]
-            patch_mask = out["patch_mask"]
-            time_id = out["time_id"]
-            next_pred = out.get("next_pred")
-
-            # MoE aux_loss 수집
-            aux_loss = 0.0
-            for layer in raw_model.encoder.layers:
-                if hasattr(layer.ffn, "aux_loss") and layer.ffn.aux_loss is not None:
-                    aux_loss += layer.ffn.aux_loss.item()
-
-            pred_mask = create_patch_mask(
-                patch_mask,
-                mask_ratio=config.mask_ratio,
-                patch_variate_id=out["patch_variate_id"] if config.variate_mask_prob > 0 else None,
-                variate_mask_prob=config.variate_mask_prob,
-            )
-
-            P = raw_model.patch_size
-            normalized = ((batch.values.unsqueeze(-1) - out["loc"]) / out["scale"]).squeeze(-1)
-            B, L = normalized.shape
-            N = L // P
-            original_patches = normalized.reshape(B, N, P)
-
-            contrastive_z = out.get("contrastive_z")
-
-            needs_time_id = config.gamma > 0 or config.delta > 0
-            losses = criterion(
-                reconstructed=reconstructed,
-                next_pred=next_pred,
-                original_patches=original_patches,
-                pred_mask=pred_mask,
-                patch_mask=patch_mask,
-                patch_sample_id=out["patch_sample_id"],
-                patch_variate_id=out["patch_variate_id"],
-                horizon=H,
-                cross_pred=cross_pred if config.gamma > 0 else None,
-                time_id=time_id if needs_time_id else None,
-                contrastive_z=contrastive_z if config.delta > 0 else None,
-                patch_signal_types=out.get("patch_signal_types"),
-            )
-
-        loss = losses["total"] + config.aux_loss_weight * aux_loss
-        if not torch.isfinite(loss):
-            continue
-
-        epoch_total += loss.item()
-        epoch_masked += losses["masked_loss"].item()
-        epoch_next += losses["next_loss"].item()
-        epoch_cross += losses["cross_modal_loss"].item()
-        epoch_contrastive += losses["contrastive_loss"].item()
-        epoch_aux += aux_loss
-        n_batches += 1
-
-        if config.max_batches > 0 and n_batches >= config.max_batches:
-            break
-
-    model.train()
-    denom = max(n_batches, 1)
-    return {
-        "total": epoch_total / denom,
-        "masked_loss": epoch_masked / denom,
-        "next_loss": epoch_next / denom,
-        "cross_modal_loss": epoch_cross / denom,
-        "contrastive_loss": epoch_contrastive / denom,
-        "aux_loss": epoch_aux / denom,
-    }
-
-
-# ── V2 학습 루프 (EEG stem-target reconstruction) ────────────────
-
-
-def train_one_epoch_v2(
-    model: nn.Module,
-    dataloader,
-    optimizer: torch.optim.Optimizer,
-    criterion: CombinedLoss,
-    config: TrainConfig,
-    device: torch.device,
-    epoch: int,
-    phase_name: str,
-    scaler: torch.amp.GradScaler | None = None,
-) -> dict[str, float]:
-    """1에폭 V2 학습을 수행하고 평균 loss를 반환한다.
-
-    V1과의 차이점:
-    - EEG 패치(eeg_mask)를 masked reconstruction에서 제외하고 별도 EEG loss 계산.
-    - EEG loss = MSE(eeg_reconstructed, eeg_recon_target) on (pred_mask & eeg_mask).
+    non-EEG 신호는 raw patch MSE로, EEG는 spectral target MSE로 복원.
+    EEG 패치(eeg_mask)를 CombinedLoss에서 제외하고 별도 EEG loss를 계산한다.
     - 최종 total = CombinedLoss(non-EEG) + eeg_loss.
     """
     model.train()
@@ -621,13 +309,15 @@ def train_one_epoch_v2(
             contrastive_z = out.get("contrastive_z")  # (B, N, proj_dim) or None
 
             # ── CombinedLoss (non-EEG 패치만) ──
+            # patch_mask에서도 EEG 제외 → next-pred에서 EEG raw target 사용 방지
+            non_eeg_patch_mask = patch_mask & ~eeg_mask if eeg_mask is not None else patch_mask
             needs_time_id = config.gamma > 0 or config.delta > 0
             losses = criterion(
                 reconstructed=reconstructed,
                 next_pred=next_pred,
                 original_patches=original_patches,
                 pred_mask=non_eeg_pred_mask,
-                patch_mask=patch_mask,
+                patch_mask=non_eeg_patch_mask,
                 patch_sample_id=out["patch_sample_id"],
                 patch_variate_id=out["patch_variate_id"],
                 horizon=H,
@@ -643,12 +333,32 @@ def train_one_epoch_v2(
                 eeg_pred_mask = pred_mask & eeg_mask  # (B, N)
                 if eeg_pred_mask.any():
                     eeg_loss = torch.nn.functional.mse_loss(
-                        eeg_reconstructed[eeg_pred_mask],   # (M, d_model)
-                        eeg_recon_target[eeg_pred_mask],    # (M, d_model)
+                        eeg_reconstructed[eeg_pred_mask],   # (M, spectral_dim)
+                        eeg_recon_target[eeg_pred_mask],    # (M, spectral_dim)
                     )
 
+            # ── EEG 전용 next-pred loss (spectral) ──
+            eeg_next_pred = out.get("eeg_next_pred")  # (B, N, spectral_dim) or None
+            eeg_next_loss = reconstructed.new_tensor(0.0)
+            if eeg_mask is not None and eeg_next_pred is not None and eeg_recon_target is not None:
+                # same-variate, same-sample, horizon shift 조건
+                p_sid = out["patch_sample_id"]
+                p_vid = out["patch_variate_id"]
+                eeg_next_valid = (
+                    eeg_mask[:, :-H] & eeg_mask[:, H:]
+                    & patch_mask[:, :-H] & patch_mask[:, H:]
+                    & (p_sid[:, :-H] == p_sid[:, H:])
+                    & (p_vid[:, :-H] == p_vid[:, H:])
+                )  # (B, N-H)
+                if eeg_next_valid.any():
+                    eeg_next_loss = torch.nn.functional.mse_loss(
+                        eeg_next_pred[:, :-H][eeg_next_valid],       # (M, spectral_dim)
+                        eeg_recon_target[:, H:][eeg_next_valid],     # (M, spectral_dim)
+                    ) * (1.0 / H)  # horizon weight (V1 next-pred와 동일)
+
             # ── 최종 total loss ──
-            loss = losses["total"] + config.eeg_loss_weight * eeg_loss + config.aux_loss_weight * aux_loss
+            eeg_total = eeg_loss + eeg_next_loss
+            loss = losses["total"] + config.eeg_loss_weight * eeg_total + config.aux_loss_weight * aux_loss
 
         # NaN/Inf 감지
         if not torch.isfinite(loss):
@@ -757,7 +467,7 @@ def train_one_epoch_v2(
 
 
 @torch.no_grad()
-def validate_v2(
+def validate(
     model: nn.Module,
     dataloader,
     criterion: CombinedLoss,
@@ -765,7 +475,7 @@ def validate_v2(
     device: torch.device,
     phase_name: str,
 ) -> dict[str, float]:
-    """V2 Validation 루프. train_one_epoch_v2()과 동일한 loss 계산, backward 없이.
+    """Validation 루프. train_one_epoch()과 동일한 loss 계산, backward 없이.
 
     DDP 환경에서는 unwrapped 모델로 forward하여 rank별 배치 수
     불일치로 인한 데드락을 방지한다.
@@ -838,13 +548,15 @@ def validate_v2(
 
             contrastive_z = out.get("contrastive_z")
 
+            # patch_mask에서도 EEG 제외 → next-pred에서 EEG raw target 사용 방지
+            non_eeg_patch_mask = patch_mask & ~eeg_mask if eeg_mask is not None else patch_mask
             needs_time_id = config.gamma > 0 or config.delta > 0
             losses = criterion(
                 reconstructed=reconstructed,
                 next_pred=next_pred,
                 original_patches=original_patches,
                 pred_mask=non_eeg_pred_mask,
-                patch_mask=patch_mask,
+                patch_mask=non_eeg_patch_mask,
                 patch_sample_id=out["patch_sample_id"],
                 patch_variate_id=out["patch_variate_id"],
                 horizon=H,
@@ -854,7 +566,7 @@ def validate_v2(
                 patch_signal_types=out.get("patch_signal_types"),
             )
 
-            # EEG 전용 loss
+            # EEG 전용 masked reconstruction loss
             eeg_loss = reconstructed.new_tensor(0.0)
             if eeg_mask is not None and eeg_reconstructed is not None:
                 eeg_pred_mask = pred_mask & eeg_mask
@@ -864,7 +576,26 @@ def validate_v2(
                         eeg_recon_target[eeg_pred_mask],
                     )
 
-            total_loss = losses["total"] + config.eeg_loss_weight * eeg_loss + config.aux_loss_weight * aux_loss
+            # EEG 전용 next-pred loss (spectral)
+            eeg_next_pred = out.get("eeg_next_pred")
+            eeg_next_loss = reconstructed.new_tensor(0.0)
+            if eeg_mask is not None and eeg_next_pred is not None and eeg_recon_target is not None:
+                p_sid = out["patch_sample_id"]
+                p_vid = out["patch_variate_id"]
+                eeg_next_valid = (
+                    eeg_mask[:, :-H] & eeg_mask[:, H:]
+                    & patch_mask[:, :-H] & patch_mask[:, H:]
+                    & (p_sid[:, :-H] == p_sid[:, H:])
+                    & (p_vid[:, :-H] == p_vid[:, H:])
+                )
+                if eeg_next_valid.any():
+                    eeg_next_loss = torch.nn.functional.mse_loss(
+                        eeg_next_pred[:, :-H][eeg_next_valid],
+                        eeg_recon_target[:, H:][eeg_next_valid],
+                    ) * (1.0 / H)
+
+            eeg_total = eeg_loss + eeg_next_loss
+            total_loss = losses["total"] + config.eeg_loss_weight * eeg_total + config.aux_loss_weight * aux_loss
 
         if not torch.isfinite(total_loss):
             continue

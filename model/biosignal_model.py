@@ -1,12 +1,11 @@
 # -*- coding:utf-8 -*-
-"""Biosignal Foundation Model — 전체 모델 조립.
+"""Biosignal Foundation Model.
 
-Scaler → PatchEmbedding → TransformerEncoder → Head 파이프라인을 하나의
-nn.Module로 통합한다.
+Scaler → PatchEmbedding → SpatialEmbedding → TransformerEncoder → Head 파이프라인.
+non-EEG 신호는 raw patch reconstruction, EEG는 spectral target reconstruction.
 """
 from __future__ import annotations
 
-import warnings
 from collections.abc import Callable
 from dataclasses import fields
 from functools import partial
@@ -20,11 +19,19 @@ from module.cnn_stem import ModalityCNNStem
 from module.packed_scaler import PackedStdScaler, PackedScaler
 from module.patch import PatchEmbedding
 from module.position import BinaryAttentionBias, QueryKeyProjection, RotaryProjection
+from module.spectral_tokenizer import SpectralTokenizer
 from module.transformer import TransformerEncoder
+
+# EEG signal_type 인덱스
+EEG_SIGNAL_TYPE = 2
 
 
 class BiosignalFoundationModel(nn.Module):
-    """생체신호 파운데이션 모델.
+    """생체신호 파운데이션 모델 — 모든 신호를 raw patch reconstruction.
+
+    모든 signal type에 대해 동일하게 raw patch 복원을 수행한다.
+    ``_encode()``로 공통 인코딩 파이프라인(Scaler → Patchify → Project →
+    SpatialEmbed → LocScale → Encoder)을 분리하여 서브클래스에서 확장 가능.
 
     Parameters
     ----------
@@ -52,6 +59,28 @@ class BiosignalFoundationModel(nn.Module):
         입력 정규화 스케일러. ``None``이면 ``PackedStdScaler``.
     dropout_p:
         드롭아웃 확률.
+    num_signal_types:
+        신호 타입 수 (ecg=0, abp=1, eeg=2, ppg=3, cvp=4, co2=5, awp=6).
+    num_spatial_ids:
+        글로벌 spatial ID 수.
+    use_spatial_embed:
+        signal_type + spatial_id 이중 임베딩 사용 여부.
+    max_horizon:
+        Next-patch prediction 최대 예측 거리.
+    use_cnn_stem:
+        Modality-specific 1D-CNN stem 사용 여부.
+    stem_hidden_channels:
+        CNN stem 중간 채널 수.
+    stem_num_layers:
+        CNN stem Conv1d 레이어 수.
+    stem_kernel_size:
+        CNN stem 커널 크기.
+    contrastive_proj_dim:
+        Contrastive projection head 출력 차원. 0이면 비활성.
+    eeg_spectral_n_fft:
+        EEG Spectral Tokenizer의 STFT FFT 윈도우 크기.
+    eeg_spectral_hop:
+        EEG Spectral Tokenizer의 STFT hop length.
     """
 
     def __init__(
@@ -77,14 +106,10 @@ class BiosignalFoundationModel(nn.Module):
         stem_num_layers: int = 3,
         stem_kernel_size: int = 3,
         contrastive_proj_dim: int = 0,
+        eeg_spectral_n_fft: int = 64,
+        eeg_spectral_hop: int = 16,
     ) -> None:
         super().__init__()
-        warnings.warn(
-            "BiosignalFoundationModel is deprecated. "
-            "Use BiosignalFoundationModelV1 or BiosignalFoundationModelV2 instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
         self.d_model = d_model
         self.patch_size = patch_size
 
@@ -143,20 +168,20 @@ class BiosignalFoundationModel(nn.Module):
         self.loc_proj = nn.Linear(1, d_model)
         self.scale_proj = nn.Linear(1, d_model)
 
-        # 6. Reconstruction Head
+        # 6. Reconstruction Head (자기 variate 복원)
         self.head = nn.Linear(d_model, patch_size)
 
-        # 6. Next-Patch Prediction Head
+        # 7. Next-Patch Prediction Head
         self.next_head = nn.Linear(d_model, patch_size)
 
-        # 7. Cross-Modal Prediction Head (다른 variate 예측용)
+        # 8. Cross-Modal Prediction Head (다른 variate 예측용)
         self.cross_head = nn.Linear(d_model, patch_size)
 
-        # 8. Horizon Embedding (random horizon next-patch prediction)
+        # 9. Horizon Embedding (random horizon next-patch prediction)
         self.max_horizon = max_horizon
         self.horizon_embed = nn.Embedding(max_horizon, d_model)
 
-        # 9. Contrastive Projection Head (SimCLR-style 2-layer MLP)
+        # 10. Contrastive Projection Head (SimCLR-style 2-layer MLP)
         self.contrastive_proj_dim = contrastive_proj_dim
         if contrastive_proj_dim > 0:
             self.contrastive_proj = nn.Sequential(
@@ -165,44 +190,72 @@ class BiosignalFoundationModel(nn.Module):
                 nn.Linear(d_model, contrastive_proj_dim),
             )
 
+        # 11. EEG Spectral Tokenizer + Heads
+        self.eeg_spectral_tokenizer = SpectralTokenizer(
+            patch_size=patch_size,
+            n_fft=eeg_spectral_n_fft,
+            hop_length=eeg_spectral_hop,
+        )
+        spectral_dim = self.eeg_spectral_tokenizer.output_dim
+
+        # EEG 전용 Masked Reconstruction Head: d_model → spectral_dim
+        self.eeg_recon_head = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, spectral_dim),
+        )
+
+        # EEG 전용 Next-Pred Head: d_model → spectral_dim
+        self.eeg_next_head = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, spectral_dim),
+        )
+
     @classmethod
     def from_config(cls, config: ModelConfig) -> BiosignalFoundationModel:
         """ModelConfig로부터 모델 인스턴스를 생성한다."""
-        kwargs = {f.name: getattr(config, f.name) for f in fields(config)}
+        import inspect
+        valid_params = set(inspect.signature(cls.__init__).parameters.keys()) - {"self"}
+        kwargs = {
+            f.name: getattr(config, f.name)
+            for f in fields(config)
+            if f.name in valid_params
+        }
         return cls(**kwargs)
 
-    def forward(
+    # ── Encode Pipeline ────────────────────────────────────────────
+
+    def _encode(
         self,
         batch: PackedBatch,
-        task: str = "masked",  # "masked" 또는 "next_pred"
-        horizon: int = 1,
+        task: str = "masked",
     ) -> dict[str, torch.Tensor]:
-        """전체 forward 파이프라인.
+        """공통 인코딩 파이프라인: Scaler → Patchify → Project → SpatialEmbed → LocScale → Encoder.
 
         Parameters
         ----------
         batch:
-            PackCollate(patch_size=...)로 생성된 PackedBatch.
+            PackCollate로 생성된 PackedBatch.
         task:
-            ``"masked"``: 양방향 attention → reconstruction head.
-            ``"next_pred"``: causal attention → next-patch prediction head.
-        horizon:
-            Next-patch prediction의 예측 거리 (패치 단위). 기본 1.
-            ``horizon=H``이면 i번째 위치에서 i+H번째 패치를 예측한다.
+            ``"masked"``: 양방향 attention.
+            ``"next_pred"``: causal attention.
+            ``"both"``: 양방향 + causal 동시 (encoder 2회 호출, DDP single forward 호환).
 
         Returns
         -------
         dict with keys:
-            ``encoded``: ``(B, N, d_model)`` — 인코딩된 패치 표현.
-            ``reconstructed``: ``(B, N, patch_size)`` — task="masked"일 때만 존재.
-            ``cross_pred``: ``(B, N, patch_size)`` — task="masked"일 때만 존재 (cross-modal 예측).
-            ``next_pred``: ``(B, N, patch_size)`` — task="next_pred"일 때만 존재.
-            ``loc``: ``(B, L, 1)`` — per-variate 위치 (정규화 역변환용).
+            ``encoded``: ``(B, N, d_model)`` — 양방향 인코딩된 패치 표현 (task="both"/"masked").
+            ``encoded_causal``: ``(B, N, d_model)`` — causal 인코딩 (task="both"일 때만).
+            ``patches``: ``(B, N, patch_size)`` — raw patches.
+            ``patch_signal_types``: ``(B, N)`` — 패치별 signal type.
+            ``patch_spatial_ids``: ``(B, N)`` — 패치별 spatial ID.
+            ``loc``: ``(B, L, 1)`` — per-variate 위치.
             ``scale``: ``(B, L, 1)`` — per-variate 스케일.
             ``patch_mask``: ``(B, N)`` — 유효 패치 마스크.
             ``patch_sample_id``: ``(B, N)`` — 패치별 sample_id.
             ``patch_variate_id``: ``(B, N)`` — 패치별 variate_id.
-            ``time_id``: ``(B, N)`` — 패치별 시간 인덱스 (cross-modal 페어링용).
+            ``time_id``: ``(B, N)`` — 패치별 시간 인덱스.
         """
         # 1. Scaler: point-level 정규화
         values = batch.values.unsqueeze(-1)  # (B, L, 1)
@@ -241,27 +294,25 @@ class BiosignalFoundationModel(nn.Module):
         embedded = self.patch_embed.project(patches, patch_signal_types)
         # embedded: (B, N, d_model)
 
-        # 5. Spatial Positional Encoding (Dual Embedding) — 패딩 보호
+        # 패딩 마스크 (p_vid==0은 패딩 토큰)
+        valid_token = (p_vid > 0).unsqueeze(-1)  # (B, N, 1)
+
+        # 5. Spatial Positional Encoding (Dual Embedding)
         if self.use_spatial_embed and patch_signal_types is not None:
             sig_emb = self.signal_type_embed(patch_signal_types)  # (B, N, d_model)
             spa_emb = self.spatial_id_embed(patch_spatial_ids)  # (B, N, d_model)
-
-            # 패딩 토큰(p_vid==0)에는 임베딩을 더하지 않는다
-            valid_mask = (p_vid > 0).unsqueeze(-1)  # (B, N, 1)
-            embedded = embedded + (sig_emb + spa_emb) * valid_mask
+            embedded = embedded + (sig_emb + spa_emb) * valid_token
 
         # 6. Loc/Scale Dual Injection — 절대 레벨 정보 보존
         N = embedded.shape[1]
         stride = self.patch_embed.stride
-        # loc/scale는 variate 내 동일 → 각 패치 시작점에서 샘플링
         patch_starts = torch.arange(N, device=device) * stride  # (N,)
         patch_starts = patch_starts.clamp(max=loc.shape[1] - 1)
         patch_loc = loc[:, patch_starts, :]      # (B, N, 1)
         patch_scale = scale[:, patch_starts, :]  # (B, N, 1)
         loc_emb = self.loc_proj(patch_loc)      # (B, N, d_model)
         scale_emb = self.scale_proj(patch_scale)  # (B, N, d_model)
-        valid_mask_ls = (p_vid > 0).unsqueeze(-1)  # (B, N, 1)
-        embedded = embedded + (loc_emb + scale_emb) * valid_mask_ls
+        embedded = embedded + (loc_emb + scale_emb) * valid_token
 
         # 7. Base Attention Mask: 같은 sample 내에서만 attend + 유효 패치만
         base_attn_mask = (
@@ -270,29 +321,11 @@ class BiosignalFoundationModel(nn.Module):
             & patch_mask.unsqueeze(-1)
         )  # (B, N, N)
 
-        # 5. Task에 따른 Masking 스위치
-        if task == "next_pred":
-            N = base_attn_mask.shape[-1]
-            causal_tri = torch.tril(
-                torch.ones(N, N, dtype=torch.bool, device=embedded.device)
-            )
-            final_attn_mask = base_attn_mask & causal_tri.unsqueeze(0)  # (B, N, N)
-        else:
-            # "masked" 또는 "both": bidirectional attention
-            final_attn_mask = base_attn_mask
-
-        # 6. Transformer Encoder (task에 맞는 mask 적용)
-        encoded = self.encoder(
-            embedded,
-            attn_mask=final_attn_mask,
-            var_id=p_vid,
-            time_id=time_id,
-        )
-        # encoded: (B, N, d_model)
-
-        # 7. Task Head 라우팅
-        out_dict: dict[str, torch.Tensor] = {
-            "encoded": encoded,
+        # 8. Task에 따른 Masking 스위치 + Transformer Encoder
+        result: dict[str, torch.Tensor] = {
+            "patches": patches,
+            "patch_signal_types": patch_signal_types,
+            "patch_spatial_ids": patch_spatial_ids,
             "loc": loc,
             "scale": scale,
             "patch_mask": patch_mask,
@@ -301,19 +334,113 @@ class BiosignalFoundationModel(nn.Module):
             "time_id": time_id,
         }
 
+        encoder_kwargs = dict(var_id=p_vid, time_id=time_id)
+        use_causal = task in ("next_pred", "both")
+
+        # causal mask (next_pred, both에서 공유)
+        if use_causal:
+            causal_tri = torch.tril(
+                torch.ones(N, N, dtype=torch.bool, device=device)
+            )
+            causal_mask = base_attn_mask & causal_tri.unsqueeze(0)  # (B, N, N)
+
+        if task == "both":
+            # bidirectional + causal 동시 (DDP single forward 호환)
+            result["encoded"] = self.encoder(
+                embedded.clone(), attn_mask=base_attn_mask, **encoder_kwargs,
+            )
+            result["encoded_causal"] = self.encoder(
+                embedded.clone(), attn_mask=causal_mask, **encoder_kwargs,
+            )
+        elif task == "next_pred":
+            result["encoded"] = self.encoder(
+                embedded, attn_mask=causal_mask, **encoder_kwargs,
+            )
+        else:  # "masked"
+            result["encoded"] = self.encoder(
+                embedded, attn_mask=base_attn_mask, **encoder_kwargs,
+            )
+
+        return result
+
+    # ── Forward ────────────────────────────────────────────────────
+
+    def forward(
+        self,
+        batch: PackedBatch,
+        task: str = "masked",  # "masked" 또는 "next_pred"
+        horizon: int = 1,
+    ) -> dict[str, torch.Tensor]:
+        """전체 forward 파이프라인.
+
+        Parameters
+        ----------
+        batch:
+            PackCollate(patch_size=...)로 생성된 PackedBatch.
+        task:
+            ``"masked"``: 양방향 attention → reconstruction head.
+            ``"next_pred"``: causal attention → next-patch prediction head.
+        horizon:
+            Next-patch prediction의 예측 거리 (패치 단위). 기본 1.
+
+        Returns
+        -------
+        dict with keys:
+            ``encoded``: ``(B, N, d_model)`` — 인코딩된 패치 표현.
+            ``reconstructed``: ``(B, N, patch_size)`` — task="masked"일 때.
+            ``cross_pred``: ``(B, N, patch_size)`` — task="masked"일 때 (cross-modal 예측).
+            ``next_pred``: ``(B, N, patch_size)`` — task="next_pred"일 때.
+            ``patches``: ``(B, N, patch_size)`` — raw patches.
+            ``patch_signal_types``: ``(B, N)`` — 패치별 signal type.
+            ``loc``: ``(B, L, 1)`` — per-variate 위치.
+            ``scale``: ``(B, L, 1)`` — per-variate 스케일.
+            ``patch_mask``: ``(B, N)`` — 유효 패치 마스크.
+            ``patch_sample_id``: ``(B, N)`` — 패치별 sample_id.
+            ``patch_variate_id``: ``(B, N)`` — 패치별 variate_id.
+            ``time_id``: ``(B, N)`` — 패치별 시간 인덱스.
+        """
+        enc = self._encode(batch, task=task)
+
+        encoded = enc["encoded"]  # bidirectional (or sole encoding for single-task)
+        patch_signal_types = enc["patch_signal_types"]  # (B, N) or None
+
+        out_dict: dict[str, torch.Tensor] = {
+            "encoded": encoded,
+            "patches": enc["patches"],
+            "patch_signal_types": patch_signal_types,
+            "loc": enc["loc"],
+            "scale": enc["scale"],
+            "patch_mask": enc["patch_mask"],
+            "patch_sample_id": enc["patch_sample_id"],
+            "patch_variate_id": enc["patch_variate_id"],
+            "time_id": enc["time_id"],
+        }
+
+        # ── Masked Reconstruction ──
         if task in ("masked", "both"):
             out_dict["reconstructed"] = self.head(encoded)  # (B, N, patch_size)
             out_dict["cross_pred"] = self.cross_head(encoded)  # (B, N, patch_size)
             if self.contrastive_proj_dim > 0:
                 out_dict["contrastive_z"] = self.contrastive_proj(encoded)  # (B, N, proj_dim)
+            if patch_signal_types is not None:
+                out_dict["eeg_reconstructed"] = self.eeg_recon_head(encoded)  # (B, N, spectral_dim)
 
+        # ── Next-Patch Prediction ──
         if task in ("next_pred", "both"):
-            # Horizon conditioning: encoded에 horizon embedding 더함
+            encoded_for_next = enc.get("encoded_causal", encoded)  # (B, N, d_model)
             h_emb = self.horizon_embed(
-                torch.tensor(horizon - 1, device=encoded.device)
+                torch.tensor(horizon - 1, device=encoded_for_next.device)
             )  # (d_model,)
-            encoded_h = encoded + h_emb.unsqueeze(0).unsqueeze(0)  # (B, N, d_model)
+            encoded_h = encoded_for_next + h_emb.unsqueeze(0).unsqueeze(0)  # (B, N, d_model)
             out_dict["next_pred"] = self.next_head(encoded_h)  # (B, N, patch_size)
+            if patch_signal_types is not None:
+                out_dict["eeg_next_pred"] = self.eeg_next_head(encoded_h)  # (B, N, spectral_dim)
+
+        # ── EEG Spectral Target ──
+        if patch_signal_types is not None:
+            out_dict["eeg_mask"] = (patch_signal_types == EEG_SIGNAL_TYPE)  # (B, N)
+            with torch.no_grad():
+                out_dict["eeg_recon_target"] = self.eeg_spectral_tokenizer(enc["patches"]).detach()  # (B, N, spectral_dim)
 
         return out_dict
 
@@ -337,6 +464,7 @@ class BiosignalFoundationModel(nn.Module):
         self.eval()
         out = self.forward(batch, task="masked")
         out.pop("reconstructed", None)
+        out.pop("cross_pred", None)
         return out
 
     @torch.no_grad()
@@ -370,8 +498,6 @@ class BiosignalFoundationModel(nn.Module):
             loc = out["loc"]  # (B, L, 1)
             scale = out["scale"]  # (B, L, 1)
             P = self.patch_size
-            # per-patch loc/scale: scaler는 variate 내 모든 point에 동일 값 부여
-            # → 패치 경계에서 추출하여 (B, N, 1)로 변환
             patch_loc = loc[:, ::P, :]  # (B, N_approx, 1)
             patch_scale = scale[:, ::P, :]  # (B, N_approx, 1)
             N = pred.shape[1]
@@ -405,20 +531,17 @@ class BiosignalFoundationModel(nn.Module):
         Returns
         -------
         torch.Tensor
-            ``(n_steps, B, patch_size)`` generated patches (normalized or denormalized).
+            ``(n_steps, B, patch_size)`` generated patches.
         """
         self.eval()
         P = self.patch_size
 
-        # 첫 forward로 loc/scale 캐시
         out = self.forward(batch, task="next_pred", horizon=1)
         loc = out["loc"]  # (B, L, 1)
         scale = out["scale"]  # (B, L, 1)
-        # per-variate 단일 값 추출 (variate 내 동일)
         cached_loc = loc[:, 0:1, :]  # (B, 1, 1)
         cached_scale = scale[:, 0:1, :]  # (B, 1, 1)
 
-        # 첫 step 예측 추출 — 각 row의 마지막 유효 위치
         generated = []
         pred = out["next_pred"]  # (B, N, patch_size)
         patch_mask = out["patch_mask"]  # (B, N)
@@ -429,7 +552,6 @@ class BiosignalFoundationModel(nn.Module):
         ]  # (B, patch_size)
         generated.append(new_patch)
 
-        # 나머지 step
         for _ in range(n_steps - 1):
             batch = _append_patch_to_batch(batch, new_patch, P)
             out = self.forward(batch, task="next_pred", horizon=1)
@@ -445,7 +567,6 @@ class BiosignalFoundationModel(nn.Module):
         result = torch.stack(generated, dim=0)  # (n_steps, B, patch_size)
 
         if denormalize:
-            # cached_loc/scale: (B, 1, 1) → (1, B, 1) for broadcast
             dl = cached_loc.squeeze(-1).permute(1, 0)  # (1, B)
             ds = cached_scale.squeeze(-1).permute(1, 0)  # (1, B)
             result = result * ds.unsqueeze(-1) + dl.unsqueeze(-1)
@@ -479,16 +600,13 @@ def _append_patch_to_batch(
     B, L = batch.values.shape
     device = batch.values.device
 
-    # 각 row의 유효 길이 (sample_id > 0인 마지막 위치 + 1)
     valid_mask = batch.sample_id > 0  # (B, L)
-    # 유효한 위치가 있는 경우의 끝 위치 계산
     valid_lengths = valid_mask.sum(dim=-1)  # (B,)
 
     new_end = valid_lengths + patch_size  # (B,)
     max_new_end = new_end.max().item()
 
     if max_new_end > L:
-        # 우측 패딩 확장
         pad_size = max_new_end - L
         batch = PackedBatch(
             values=torch.cat(
@@ -509,7 +627,6 @@ def _append_patch_to_batch(
             padded_lengths=batch.padded_lengths,
         )
 
-    # 새 패치를 각 row에 append
     for i in range(B):
         start = valid_lengths[i].item()
         end = start + patch_size
