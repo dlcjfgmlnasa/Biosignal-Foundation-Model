@@ -299,6 +299,7 @@ def main():
         collate_mode=config.collate_mode,
         patch_size=config.model_config.patch_size,
         pin_memory=True,
+        prefetch_factor=4,
         sampler=sampler,
     )
     if rank0:
@@ -336,7 +337,7 @@ def main():
     model.to(device)
 
     if use_ddp:
-        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
 
     if rank0:
         raw_model = model.module if use_ddp else model
