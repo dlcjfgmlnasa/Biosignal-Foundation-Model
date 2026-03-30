@@ -40,7 +40,7 @@ crop_ratio_min: 0.15           # 최소 9초 (60s × 0.15)
 crop_ratio_max: 1.0            # 최대 전체 윈도우 (60s)
 
 # ── 학습 ──
-batch_size: 128                # DDP 2GPU → effective 256
+batch_size: 32                 # collate 빠르게, max_batches로 학습량 보상
 lr: 8.0e-4
 n_epochs: 100
 warmup_epochs: 10              # 10% warmup
@@ -49,7 +49,7 @@ mask_ratio: 0.3                # 30% 패치 마스킹
 gradient_clip: 1.0
 seed: 42
 collate_mode: ci
-max_batches: 2000              # epoch당 2000 batches (~23분/epoch, 전체 ~1.6일)
+max_batches: 8000              # 32 × 8000 = 256K samples/epoch (batch128 × 2000과 동일)
 
 # ── Loss 가중치 (Phase 1: MPM + Next-Pred) ──
 alpha: 1.0                     # masked reconstruction (non-EEG raw + EEG spectral)
