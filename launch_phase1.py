@@ -1,18 +1,13 @@
 #!/usr/bin/env python
 # -*- coding:utf-8 -*-
 from __future__ import annotations
-"""Phase 1 DDP launcher (V1/V2 자동 선택).
+"""Phase 1 DDP launcher.
 
-torchrun은 -m (module) 실행을 지원하지 않으므로,
-이 스크립트를 통해 train.v{1,2}_1_channel_independency를 실행한다.
-
-Usage (V1, 기본):
+Usage (단일 GPU):
     python launch_phase1.py --device cuda:0 ...
-    torchrun --nproc_per_node=2 launch_phase1.py ...
 
-Usage (V2):
-    python launch_phase1.py --model_version v2 --device cuda:0 ...
-    torchrun --nproc_per_node=2 launch_phase1.py --model_version v2 ...
+Usage (멀티 GPU):
+    torchrun --nproc_per_node=2 launch_phase1.py ...
 """
 import runpy
 import sys
@@ -20,12 +15,4 @@ import sys
 if "" not in sys.path:
     sys.path.insert(0, "")
 
-# --model_version 인자 추출 (argparse에 전달되기 전에 빼냄)
-version = "v1"
-if "--model_version" in sys.argv:
-    idx = sys.argv.index("--model_version")
-    version = sys.argv[idx + 1]
-    del sys.argv[idx:idx + 2]
-
-module = f"train.{version}_1_channel_independency"
-runpy.run_module(module, run_name="__main__")
+runpy.run_module("train.1_channel_independency", run_name="__main__")
