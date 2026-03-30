@@ -66,7 +66,7 @@ class TrainConfig:
     beta: float = 0.0   # next-patch prediction
     gamma: float = 0.0  # cross-modal (beta 내부 가중)
     delta: float = 0.0  # cross-modal contrastive
-    eeg_loss_weight: float = 0.05  # V2 EEG embedding reconstruction weight
+    # EEG spectral loss는 alpha/beta와 동일 weight 적용 (별도 weight 불필요)
     aux_loss_weight: float = 0.01  # MoE load balancing auxiliary loss
     contrastive_temperature: float = 0.07
     learnable_temperature: bool = True
@@ -357,8 +357,8 @@ def train_one_epoch(
                     ) * (1.0 / H)  # horizon weight (V1 next-pred와 동일)
 
             # ── 최종 total loss ──
-            eeg_total = eeg_loss + eeg_next_loss
-            loss = losses["total"] + config.eeg_loss_weight * eeg_total + config.aux_loss_weight * aux_loss
+            # EEG도 alpha/beta와 동일 weight 적용 (spectral target이 per-patch 정규화되어 스케일 동일)
+            loss = losses["total"] + config.alpha * eeg_loss + config.beta * eeg_next_loss + config.aux_loss_weight * aux_loss
 
         # NaN/Inf 감지
         if not torch.isfinite(loss):
@@ -435,8 +435,6 @@ def train_one_epoch(
                 parts.append(f"cross: {losses['cross_modal_loss'].item():.6f}")
             if losses['contrastive_loss'].item() > 0:
                 parts.append(f"contrastive: {losses['contrastive_loss'].item():.6f}")
-            if eeg_loss.item() > 0:
-                parts.append(f"eeg: {eeg_loss.item():.6f}")
             if aux_loss.item() > 0:
                 parts.append(f"aux: {aux_loss.item():.6f}")
             parts.append(f"grad_norm: {grad_norm:.4f}")
@@ -594,8 +592,7 @@ def validate(
                         eeg_recon_target[:, H:][eeg_next_valid],
                     ) * (1.0 / H)
 
-            eeg_total = eeg_loss + eeg_next_loss
-            total_loss = losses["total"] + config.eeg_loss_weight * eeg_total + config.aux_loss_weight * aux_loss
+            total_loss = losses["total"] + config.alpha * eeg_loss + config.beta * eeg_next_loss + config.aux_loss_weight * aux_loss
 
         if not torch.isfinite(total_loss):
             continue

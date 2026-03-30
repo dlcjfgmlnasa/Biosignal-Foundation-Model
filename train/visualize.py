@@ -122,11 +122,15 @@ def _plot_figure_grid(
     mode: str,  # "masked" or "next_pred"
     horizon: int = 1,
     next_pred_ratio: float = 0.3,
+    eeg_spectral: list[dict] | None = None,  # [{"pred": (F,T), "target": (F,T)}, ...]
 ) -> Path:
-    """행=신호 타입, 열=샘플로 grid figure를 그려 저장한다."""
+    """행=신호 타입, 열=샘플로 grid figure를 그려 저장한다. EEG spectral 행 포함."""
     types = sorted(grid.keys())
     n_rows = len(types)
     n_cols = max(len(v) for v in grid.values()) if grid else 1
+    has_eeg_spec = eeg_spectral is not None and len(eeg_spectral) > 0
+    if has_eeg_spec:
+        n_rows += 1  # EEG spectral 행 추가
     if n_rows == 0:
         return output_dir / f"empty_epoch{epoch:03d}.png"
 
@@ -210,6 +214,30 @@ def _plot_figure_grid(
         Patch(facecolor=highlight_color, alpha=0.12, label=highlight_label),
     ]
     axes[0, 0].legend(handles=legend_elements, loc="upper right", fontsize=7)
+
+    # ── EEG Spectral 행 (마지막 행) ──
+    if has_eeg_spec:
+        eeg_row = n_rows - 1
+        n_spec = min(len(eeg_spectral), n_cols)
+        for col in range(n_cols):
+            ax = axes[eeg_row, col]
+            if col >= n_spec:
+                ax.axis("off")
+                continue
+            ex = eeg_spectral[col]
+            # 좌우 분할: 왼쪽=target, 오른쪽=pred
+            combined = np.concatenate([ex["target"], ex["pred"]], axis=1)  # (F, T*2)
+            im = ax.imshow(combined, aspect="auto", origin="lower",
+                           cmap="viridis", interpolation="nearest")
+            n_t = ex["target"].shape[1]
+            ax.axvline(n_t - 0.5, color="white", linewidth=1.5, linestyle="--")
+            ax.set_title("Original | Predicted", fontsize=8, loc="right")
+            if col == 0:
+                spec_label = "EEG (spectral recon)" if mode == "masked" else "EEG (spectral pred)"
+                ax.set_ylabel(spec_label, fontsize=10)
+            ax.tick_params(labelsize=7)
+            if eeg_row == n_rows - 1:
+                ax.set_xlabel("Freq × Time", fontsize=8)
 
     if mode == "masked":
         title = f"Masked Reconstruction — Epoch {epoch}"
@@ -478,7 +506,75 @@ def _process_next_pred_batch(
     return candidates
 
 
-# ── EEG Spectral Visualization (V2) ──────────────────────────
+# ── EEG Spectral Data Collection ─────────────────────────────
+
+
+def _collect_eeg_spectral(
+    model: BiosignalFoundationModel,
+    batches: list[PackedBatch],
+    mask_ratio: float,
+    device: torch.device | None,
+    mode: str = "masked",  # "masked" or "next_pred"
+    horizon: int = 1,
+    max_examples: int = 3,
+) -> list[dict] | None:
+    """EEG spectral 비교 데이터를 수집한다. _plot_figure_grid의 eeg_spectral 인자로 전달."""
+    from loss.masked_mse_loss import create_patch_mask as _create_mask
+
+    if not (hasattr(model, "eeg_spectral_tokenizer") and model.eeg_spectral_tokenizer is not None):
+        return None
+
+    n_freq = model.eeg_spectral_tokenizer.n_freq_bins
+    n_frames = model.eeg_spectral_tokenizer.n_frames
+    examples: list[dict] = []
+
+    for batch in batches:
+        if device is not None:
+            _batch_to_device(batch, device)
+
+        out = model(batch, task="both", horizon=horizon)
+        eeg_mask = out.get("eeg_mask")
+        eeg_target = out.get("eeg_recon_target")
+        if eeg_mask is None or eeg_target is None:
+            continue
+
+        patch_mask = out["patch_mask"]
+        p_sid = out["patch_sample_id"]
+        p_vid = out["patch_variate_id"]
+        B, N = eeg_mask.shape
+
+        if mode == "masked":
+            eeg_pred = out.get("eeg_reconstructed")
+            if eeg_pred is None:
+                continue
+            pred_mask = _create_mask(patch_mask, mask_ratio=mask_ratio)
+            for b in range(B):
+                indices = (pred_mask[b] & eeg_mask[b]).nonzero(as_tuple=True)[0]
+                for idx in indices[:2]:
+                    examples.append({
+                        "pred": eeg_pred[b, idx].detach().cpu().numpy().reshape(n_freq, n_frames),
+                        "target": eeg_target[b, idx].detach().cpu().numpy().reshape(n_freq, n_frames),
+                    })
+                    if len(examples) >= max_examples:
+                        return examples
+        else:  # next_pred
+            eeg_next = out.get("eeg_next_pred")
+            if eeg_next is None:
+                continue
+            for b in range(B):
+                for i in range(N - horizon):
+                    if (eeg_mask[b, i] and eeg_mask[b, i + horizon]
+                            and patch_mask[b, i] and patch_mask[b, i + horizon]
+                            and p_sid[b, i] == p_sid[b, i + horizon]
+                            and p_vid[b, i] == p_vid[b, i + horizon]):
+                        examples.append({
+                            "pred": eeg_next[b, i].detach().cpu().numpy().reshape(n_freq, n_frames),
+                            "target": eeg_target[b, i + horizon].detach().cpu().numpy().reshape(n_freq, n_frames),
+                        })
+                        if len(examples) >= max_examples:
+                            return examples
+
+    return examples if examples else None
 
 
 def _save_eeg_spectral_figure(
@@ -489,89 +585,115 @@ def _save_eeg_spectral_figure(
     mask_ratio: float,
     device: torch.device | None,
     max_examples: int = 4,
+    horizon: int = 1,
 ) -> Path | None:
-    """V2 EEG spectral reconstruction 시각화.
+    """EEG spectral reconstruction + next-pred 시각화.
 
-    마스킹된 EEG 패치의 원본 spectrogram vs 예측 spectrogram을 비교한다.
-    V2 모델이 아니면 None을 반환한다.
+    마스킹된 EEG 패치의 원본 vs 예측 spectrogram, 그리고
+    next-pred의 원본 vs 예측 spectrogram을 비교한다.
     """
     from loss.masked_mse_loss import create_patch_mask as _create_mask
 
-    examples: list[dict] = []
+    if not (hasattr(model, "eeg_spectral_tokenizer") and model.eeg_spectral_tokenizer is not None):
+        return None
+
+    n_freq = model.eeg_spectral_tokenizer.n_freq_bins
+    n_frames = model.eeg_spectral_tokenizer.n_frames
+
+    recon_examples: list[dict] = []
+    next_examples: list[dict] = []
 
     for batch in batches:
         if device is not None:
             _batch_to_device(batch, device)
 
-        out = model(batch, task="masked")
+        out = model(batch, task="both", horizon=horizon)
 
-        # V2 spectral 출력이 있는지 확인
-        eeg_mask = out.get("eeg_mask")           # (B, N)
-        eeg_recon = out.get("eeg_reconstructed")  # (B, N, spec_dim)
-        eeg_target = out.get("eeg_recon_target")  # (B, N, spec_dim)
-        if eeg_mask is None or eeg_recon is None or eeg_target is None:
+        eeg_mask = out.get("eeg_mask")            # (B, N)
+        eeg_recon = out.get("eeg_reconstructed")   # (B, N, spec_dim)
+        eeg_next = out.get("eeg_next_pred")        # (B, N, spec_dim)
+        eeg_target = out.get("eeg_recon_target")   # (B, N, spec_dim)
+        if eeg_mask is None or eeg_target is None:
             continue
 
         patch_mask = out["patch_mask"]
+        p_sid = out["patch_sample_id"]
+        p_vid = out["patch_variate_id"]
         pred_mask = _create_mask(patch_mask, mask_ratio=mask_ratio)
-
-        # SpectralTokenizer 정보
-        if hasattr(model, "eeg_spectral_tokenizer") and model.eeg_spectral_tokenizer is not None:
-            n_freq = model.eeg_spectral_tokenizer.n_freq_bins
-            n_frames = model.eeg_spectral_tokenizer.n_frames
-        else:
-            continue
 
         B, N = eeg_mask.shape
         for b in range(B):
-            masked_eeg = pred_mask[b] & eeg_mask[b]  # (N,)
-            if not masked_eeg.any():
-                continue
+            # Masked reconstruction examples
+            if eeg_recon is not None and len(recon_examples) < max_examples:
+                masked_eeg = pred_mask[b] & eeg_mask[b]
+                indices = masked_eeg.nonzero(as_tuple=True)[0]
+                for idx in indices[:2]:
+                    recon_examples.append({
+                        "pred": eeg_recon[b, idx].detach().cpu().numpy().reshape(n_freq, n_frames),
+                        "target": eeg_target[b, idx].detach().cpu().numpy().reshape(n_freq, n_frames),
+                    })
+                    if len(recon_examples) >= max_examples:
+                        break
 
-            indices = masked_eeg.nonzero(as_tuple=True)[0]
-            for idx in indices[:2]:  # 패치 2개까지
-                pred_spec = eeg_recon[b, idx].detach().cpu().numpy().reshape(n_freq, n_frames)
-                target_spec = eeg_target[b, idx].detach().cpu().numpy().reshape(n_freq, n_frames)
-                examples.append({"pred": pred_spec, "target": target_spec})
-                if len(examples) >= max_examples:
-                    break
-            if len(examples) >= max_examples:
-                break
-        if len(examples) >= max_examples:
+            # Next-pred examples
+            if eeg_next is not None and len(next_examples) < max_examples:
+                for i in range(N - horizon):
+                    if (eeg_mask[b, i] and eeg_mask[b, i + horizon]
+                            and patch_mask[b, i] and patch_mask[b, i + horizon]
+                            and p_sid[b, i] == p_sid[b, i + horizon]
+                            and p_vid[b, i] == p_vid[b, i + horizon]):
+                        next_examples.append({
+                            "pred": eeg_next[b, i].detach().cpu().numpy().reshape(n_freq, n_frames),
+                            "target": eeg_target[b, i + horizon].detach().cpu().numpy().reshape(n_freq, n_frames),
+                        })
+                        if len(next_examples) >= max_examples:
+                            break
+
+        if len(recon_examples) >= max_examples and len(next_examples) >= max_examples:
             break
 
-    if not examples:
+    if not recon_examples and not next_examples:
         return None
 
-    # Plot
-    n = len(examples)
-    fig, axes = plt.subplots(n, 2, figsize=(10, 3 * n), squeeze=False)
-    fig.suptitle(f"EEG Spectral Reconstruction — Epoch {epoch}", fontsize=13, y=1.01)
+    # ── Plot ──
+    sections = []
+    if recon_examples:
+        sections.append(("Masked Reconstruction", recon_examples))
+    if next_examples:
+        sections.append((f"Next-Pred (H={horizon})", next_examples))
 
-    sr = 100.0
-    freq_labels = np.arange(n_freq) * (sr / (2 * (n_freq - 1)))  # Hz
+    total_rows = sum(len(exs) for _, exs in sections)
+    fig, axes = plt.subplots(total_rows, 2, figsize=(10, 3 * total_rows), squeeze=False)
+    fig.suptitle(f"EEG Spectral — Epoch {epoch}", fontsize=13, y=1.01)
 
-    for row in range(n):
-        ex = examples[row]
+    row = 0
+    for section_name, examples in sections:
+        for i, ex in enumerate(examples):
+            # Target
+            ax = axes[row, 0]
+            im = ax.imshow(ex["target"], aspect="auto", origin="lower",
+                           cmap="viridis", interpolation="nearest")
+            ax.set_ylabel("Freq bin", fontsize=8)
+            if i == 0:
+                ax.set_title(f"Original — {section_name}", fontsize=9)
+            else:
+                ax.set_title("Original", fontsize=9)
+            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
-        # Target spectrogram
-        ax = axes[row, 0]
-        im = ax.imshow(ex["target"], aspect="auto", origin="lower",
-                       cmap="viridis", interpolation="nearest")
-        ax.set_title("Original Spectrogram", fontsize=9)
-        ax.set_ylabel("Freq bin")
-        if row == n - 1:
-            ax.set_xlabel("Time frame")
-        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            # Predicted
+            ax = axes[row, 1]
+            im = ax.imshow(ex["pred"], aspect="auto", origin="lower",
+                           cmap="viridis", interpolation="nearest")
+            if i == 0:
+                ax.set_title(f"Predicted — {section_name}", fontsize=9)
+            else:
+                ax.set_title("Predicted", fontsize=9)
+            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
-        # Predicted spectrogram
-        ax = axes[row, 1]
-        im = ax.imshow(ex["pred"], aspect="auto", origin="lower",
-                       cmap="viridis", interpolation="nearest")
-        ax.set_title("Predicted Spectrogram", fontsize=9)
-        if row == n - 1:
-            ax.set_xlabel("Time frame")
-        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            if row == total_rows - 1:
+                axes[row, 0].set_xlabel("Time frame")
+                axes[row, 1].set_xlabel("Time frame")
+            row += 1
 
     plt.tight_layout()
     path = output_dir / f"eeg_spectral_epoch{epoch:03d}.png"
@@ -621,13 +743,14 @@ def save_reconstruction_figure(
         model.train()
         return output_dir / f"recon_epoch{epoch:03d}.png"
 
+    # EEG spectral recon 데이터 수집
+    eeg_spec = _collect_eeg_spectral(model, batches, mask_ratio, device, mode="masked")
+
     path = _plot_figure_grid(
         grid, epoch, output_dir,
         max_duration_s, sampling_rate, mode="masked",
+        eeg_spectral=eeg_spec,
     )
-
-    # V2: EEG spectral reconstruction 별도 시각화
-    _save_eeg_spectral_figure(model, batches, epoch, output_dir, mask_ratio, device)
 
     model.train()
     return path
@@ -669,9 +792,13 @@ def save_next_pred_figure(
         model.train()
         return output_dir / f"next_pred_epoch{epoch:03d}.png"
 
+    # EEG spectral next-pred 데이터 수집
+    eeg_spec = _collect_eeg_spectral(model, batches, 0.15, device, mode="next_pred", horizon=horizon)
+
     path = _plot_figure_grid(
         grid, epoch, output_dir,
         max_duration_s, sampling_rate, mode="next_pred", horizon=horizon,
+        eeg_spectral=eeg_spec,
     )
     model.train()
     return path

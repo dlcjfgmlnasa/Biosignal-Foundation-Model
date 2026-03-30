@@ -114,7 +114,6 @@ def parse_args() -> argparse.Namespace:
     g.add_argument("--beta", type=float, default=0.3, help="Next-patch prediction weight")
     g.add_argument("--gamma", type=float, default=1.0, help="Cross-modal loss weight")
     g.add_argument("--delta", type=float, default=0.1, help="Contrastive loss weight")
-    g.add_argument("--eeg_loss_weight", type=float, default=0.05, help="V2 EEG embedding reconstruction weight")
     g.add_argument("--contrastive_proj_dim", type=int, default=128,
                    help="Contrastive projection head dim (0=disabled)")
     g.add_argument("--contrastive_temperature", type=float, default=0.07)
@@ -193,7 +192,6 @@ def main():
         beta=args.beta,
         gamma=args.gamma,
         delta=args.delta,
-        eeg_loss_weight=args.eeg_loss_weight,
         contrastive_temperature=args.contrastive_temperature,
 
         # Phase 2: variate-level 마스킹

@@ -1,9 +1,8 @@
-# Phase 1: Channel-Independent Pre-training — Base (d=256, L=12)
+# Phase 1: Channel-Independent Pre-training — Base (~10M params)
 # ──────────────────────────────────────────────────────────────
 # Server: 2xL4 24GB, 8vCPU, 96GB RAM
-#
-# Usage (단일 GPU):
-#   python -m train.1_channel_independency --config configs/phase1_base.yaml
+# Dataset: VitalDB ~6,000 subjects, ~6M windows (60s each)
+# Estimated: ~2,000 batches/epoch × 100 epochs ≈ 200K steps (~1.6일)
 #
 # Usage (2-GPU DDP):
 #   torchrun --nproc_per_node=2 -m train.1_channel_independency \
@@ -12,68 +11,69 @@
 # Smoke test:
 #   python -m train.1_channel_independency --config configs/phase1_base.yaml --dry-run
 
-# ── 모델 (Base: d=256, L=12) ──
+# ── 모델 (Base: d=256, L=12, ~10M params) ──
 model_config:
   d_model: 256
   num_layers: 12
-  patch_size: 100
-  stride: null
-  num_heads: 8            # head_dim = 256/8 = 32
-  num_groups: null         # MHA (= num_heads)
+  patch_size: 100            # 100Hz × 1초 = 100 samples/patch
+  stride: null               # non-overlapping (= patch_size)
+  num_heads: 8               # head_dim = 256/8 = 32
+  num_groups: null            # MHA (= num_heads)
   use_glu: true
-  use_moe: false           # Phase 1 CI에서는 off
+  use_moe: false              # Phase 1 CI에서는 off
   use_rope: true
   use_var_attn_bias: true
   use_spatial_embed: true
   dropout_p: 0.1
-  max_horizon: 1           # curriculum: H=1로 시작 → 수렴 후 3으로 증가
-  use_cnn_stem: false
-  contrastive_proj_dim: 0  # Phase 1에서는 비활성
+  max_horizon: 1              # H=1로 시작, 수렴 후 3→5 증가
+  use_cnn_stem: true
+  contrastive_proj_dim: 0     # Phase 1에서는 비활성
 
 # ── 데이터 ──
 data_dir: ../updown/datasets/vitaldb
 signal_types: [0, 1, 2, 3, 4, 5, 6]  # ECG, ABP, EEG, PPG, CVP, CO2, AWP
-max_subjects: null
-window_seconds: 60.0       # 60초 윈도우 (60 patches)
+max_subjects: null             # 전체 ~6,000 subjects
+window_seconds: 60.0           # 60초 윈도우 (60 patches)
 max_length: 50000
 cache_size: 16
-crop_ratio_min: 0.15      # 최소 9초 (60s × 0.15)
-crop_ratio_max: 1.0       # 최대 전체 윈도우 (60s)
+crop_ratio_min: 0.15           # 최소 9초 (60s × 0.15)
+crop_ratio_max: 1.0            # 최대 전체 윈도우 (60s)
 
 # ── 학습 ──
-batch_size: 32             # OOM 방지 (d=256, L=12), 안정 확인 후 64로 증가 가능
+batch_size: 128                # DDP 2GPU → effective 256
 lr: 8.0e-4
 n_epochs: 100
-warmup_epochs: 10          # 10% warmup
-min_lr_ratio: 0.1          # 최종 LR = 8e-5
-mask_ratio: 0.3            # 보수적 시작, ablation 대상 (0.15/0.3/0.4)
+warmup_epochs: 10              # 10% warmup
+min_lr_ratio: 0.1              # 최종 LR = 8e-5
+mask_ratio: 0.3                # 30% 패치 마스킹
 gradient_clip: 1.0
 seed: 42
 collate_mode: ci
+max_batches: 2000              # epoch당 2000 batches (~23분/epoch, 전체 ~1.6일)
 
 # ── Loss 가중치 (Phase 1: MPM + Next-Pred) ──
-alpha: 1.0                 # masked reconstruction
-beta: 0.3                  # next-pred (보수적 시작, 모니터링 후 0.5로 증가 가능)
-gamma: 0.0                 # cross-modal (Phase 2에서 활성)
-delta: 0.0                 # contrastive (Phase 2에서 활성)
-eeg_loss_weight: 0.05
+alpha: 1.0                     # masked reconstruction (non-EEG raw + EEG spectral)
+beta: 0.3                      # next-pred (non-EEG raw + EEG spectral)
+gamma: 0.0                     # cross-modal (Phase 2에서 활성)
+delta: 0.0                     # contrastive (Phase 2에서 활성)
 aux_loss_weight: 0.01
 contrastive_temperature: 0.07
 learnable_temperature: true
 
 # ── Masking ──
-variate_mask_prob: 0.0     # Phase 1은 비활성
+variate_mask_prob: 0.0         # Phase 1은 비활성 (Phase 2에서 0.3)
 
 # ── Mixed Precision ──
-use_amp: true              # L4 FP16 tensor cores
+use_amp: true                  # L4 FP16 tensor cores
 
 # ── Validation & Early Stopping ──
-val_ratio: 0.05            # subject 단위 5% validation
-patience: 15               # early stopping patience
+val_ratio: 0.05                # subject 단위 5% validation
+patience: 15                   # early stopping patience
 
 # ── 시스템 ──
 device: auto
-num_workers: 4             # 8vCPU → 4 workers
+num_workers: 4                 # 8vCPU → 4 workers
 output_dir: outputs/phase1_base
 checkpoint_every: 10
+viz_every: 1
 exp_name: phase1_base_d256_L12
