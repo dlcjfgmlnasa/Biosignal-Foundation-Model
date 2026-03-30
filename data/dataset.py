@@ -85,6 +85,7 @@ class BiosignalDataset(Dataset[BiosignalSample]):
         cache_size: int = 8,
         use_mmap: bool = True,
         crop_ratio_range: tuple[float, float] | None = None,
+        preload: bool = False,
     ) -> None:
         super().__init__()
         self.max_length = max_length
@@ -94,9 +95,21 @@ class BiosignalDataset(Dataset[BiosignalSample]):
         self._manifest = list(manifest)
         self._use_mmap = use_mmap
         self._cache_size = cache_size
+        self._preload = preload
 
-        # LRU 캐시를 인스턴스별로 생성 (lru_cache는 함수 레벨이므로 래핑)
-        self._load_recording = lru_cache(maxsize=cache_size)(self._load_recording_impl)
+        # 프리로드: 모든 레코딩을 RAM에 미리 로드
+        if preload:
+            print(f"  [preload] Loading {len(self._manifest)} recordings into RAM...")
+            self._preloaded: dict[int, torch.Tensor] = {}
+            for i, entry in enumerate(self._manifest):
+                self._preloaded[i] = self._load_recording_impl(i)
+                if (i + 1) % 10000 == 0:
+                    print(f"  [preload] {i + 1}/{len(self._manifest)} loaded")
+            print(f"  [preload] Done. {len(self._preloaded)} recordings in RAM.")
+            self._load_recording = self._preloaded.__getitem__
+        else:
+            # LRU 캐시를 인스턴스별로 생성 (lru_cache는 함수 레벨이므로 래핑)
+            self._load_recording = lru_cache(maxsize=cache_size)(self._load_recording_impl)
 
         # 레코딩별 window/stride (샘플 단위로 변환)
         self._window_lengths_per_rec: list[int | None] = []
@@ -133,15 +146,19 @@ class BiosignalDataset(Dataset[BiosignalSample]):
     def __getstate__(self) -> dict:
         """Pickle 직렬화: lru_cache wrapper는 pickle 불가이므로 제외."""
         state = self.__dict__.copy()
-        del state["_load_recording"]
+        if not self._preload:
+            del state["_load_recording"]
         return state
 
     def __setstate__(self, state: dict) -> None:
-        """Pickle 역직렬화: Worker에서 새 lru_cache를 생성."""
+        """Pickle 역직렬화: Worker에서 캐시를 복원."""
         self.__dict__.update(state)
-        self._load_recording = lru_cache(maxsize=self._cache_size)(
-            self._load_recording_impl
-        )
+        if self._preload:
+            self._load_recording = self._preloaded.__getitem__
+        else:
+            self._load_recording = lru_cache(maxsize=self._cache_size)(
+                self._load_recording_impl
+            )
 
     def __len__(self) -> int:
         return self._rec_offsets[-1]
