@@ -90,6 +90,12 @@ def convert_subject(subject_dir: Path) -> int:
     return n_converted
 
 
+def _convert_worker(sd: Path) -> tuple[str, int]:
+    """multiprocessing worker."""
+    n = convert_subject(sd)
+    return sd.name, n
+
+
 def main():
     parser = argparse.ArgumentParser(description="Zarr → HDF5 변환")
     parser.add_argument("--data_dir", type=str, required=True,
@@ -106,12 +112,8 @@ def main():
     if args.workers > 1:
         from multiprocessing import Pool
 
-        def _worker(sd: Path) -> tuple[str, int]:
-            n = convert_subject(sd)
-            return sd.name, n
-
         with Pool(processes=args.workers) as pool:
-            results = pool.map(_worker, subject_dirs)
+            results = pool.map(_convert_worker, subject_dirs)
 
         total = 0
         for name, n in results:
