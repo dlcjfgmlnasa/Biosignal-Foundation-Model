@@ -34,7 +34,7 @@ data_dir: ../updown/datasets/vitaldb
 signal_types: [0, 1, 2, 3, 4, 5, 6]  # ECG, ABP, EEG, PPG, CVP, CO2, AWP
 max_subjects: null             # 전체 ~6,000 subjects
 window_seconds: 60.0           # 60초 윈도우 (60 patches)
-max_length: 50000
+max_length: 8000              # CI: 60초 윈도우(6000) + patch 정렬 여유
 cache_size: 16
 crop_ratio_min: 0.15           # 최소 9초 (60s × 0.15)
 crop_ratio_max: 1.0            # 최대 전체 윈도우 (60s)
