@@ -137,6 +137,12 @@ class BiosignalDataset(Dataset[BiosignalSample]):
         self, rec_idx: int
     ) -> torch.Tensor:  # (channels, time)
         path = self._manifest[rec_idx].path
+        if "#" in path:
+            # HDF5: "subject.h5#dataset_name"
+            import h5py
+            h5_path, ds_name = path.split("#", 1)
+            with h5py.File(h5_path, "r") as hf:
+                return torch.from_numpy(hf[ds_name][:]).float()
         if path.endswith(".zarr"):
             import zarr
             arr = zarr.open(path, mode="r")

@@ -168,9 +168,16 @@ def load_manifest_from_processed(
             for rec in session["recordings"]:
                 if signal_types is not None and rec["signal_type"] not in signal_types:
                     continue
+                # HDF5: "subject.h5#dataset" → subject_dir/subject.h5#dataset
+                file_ref = rec["file"]
+                if "#" in file_ref:
+                    h5_file, ds_name = file_ref.split("#", 1)
+                    full_path = str(subject_dir / h5_file) + "#" + ds_name
+                else:
+                    full_path = str(subject_dir / file_ref)
                 entries.append(
                     RecordingManifest(
-                        path=str(subject_dir / rec["file"]),
+                        path=full_path,
                         n_channels=rec["n_channels"],
                         n_timesteps=rec["n_timesteps"],
                         sampling_rate=rec["sampling_rate"],
