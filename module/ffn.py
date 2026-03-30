@@ -207,10 +207,10 @@ class MoEFeedForward(nn.Module):
         tokens_per_expert = one_hot.sum(dim=0)  # (E,)
         f = tokens_per_expert / (num_tokens * self.num_experts_per_token)  # (E,)
         # P_i: 각 expert의 평균 gate 확률
-        P = gate_probs.mean(dim=0)  # (E,)
+        probs = gate_probs.mean(dim=0)  # (E,)
 
         if self.training:
-            self.aux_loss = self.num_experts * (f * P).sum()
+            self.aux_loss = self.num_experts * (f * probs).sum()
         else:
             self.aux_loss = None
 

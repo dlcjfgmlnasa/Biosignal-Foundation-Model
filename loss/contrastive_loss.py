@@ -58,7 +58,7 @@ class CrossModalContrastiveLoss(nn.Module):
 
         단일 variate만 존재하는 batch row는 positive pair가 없으므로 스킵한다.
         """
-        B, N, D = z.shape
+        b, n, d = z.shape
 
         # L2 normalize
         z = F.normalize(z, dim=-1)
@@ -74,14 +74,14 @@ class CrossModalContrastiveLoss(nn.Module):
         valid_pair = valid.unsqueeze(-1) & valid.unsqueeze(-2)  # (B, N, N)
 
         # Positive mask: same (sample_id, time_id), different variate_id
-        K = time_id.max() + 1  # 0-dim 텐서 (CUDA sync 없음)
-        group_key = patch_sample_id * K + time_id  # (B, N)
+        k = time_id.max() + 1  # 0-dim 텐서 (CUDA sync 없음)
+        group_key = patch_sample_id * k + time_id  # (B, N)
         same_group = group_key.unsqueeze(-1) == group_key.unsqueeze(-2)  # (B, N, N)
         diff_var = patch_variate_id.unsqueeze(-1) != patch_variate_id.unsqueeze(-2)  # (B, N, N)
         pos_mask = same_group & diff_var & valid_pair  # (B, N, N)
 
         # Self-mask (diagonal 제외)
-        self_mask = torch.eye(N, dtype=torch.bool, device=z.device).unsqueeze(0)  # (1, N, N)
+        self_mask = torch.eye(n, dtype=torch.bool, device=z.device).unsqueeze(0)  # (1, N, N)
 
         # has_pos: positive pair가 있는 유효 anchor
         has_pos = pos_mask.any(dim=-1) & valid  # (B, N)

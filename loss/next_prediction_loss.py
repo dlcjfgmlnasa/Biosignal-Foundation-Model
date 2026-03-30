@@ -128,11 +128,11 @@ class NextPredictionLoss(nn.Module):
         다른 그룹 간 (ECG↔CO2, ECG↔EEG 등)은 차단된다.
         """
         # group_key: (batch, sample_id, time_id)가 같은 패치를 그룹핑
-        B, N = time_id.shape
-        K = time_id.max() + 1          # 0-dim 텐서 (CUDA sync 없음)
-        S = patch_sample_id.max() + 1  # 0-dim 텐서 (CUDA sync 없음)
-        batch_idx = torch.arange(B, device=time_id.device).unsqueeze(-1)  # (B, 1)
-        group_key = batch_idx * (S * K) + patch_sample_id * K + time_id  # (B, N)
+        b, n = time_id.shape
+        k = time_id.max() + 1          # 0-dim 텐서 (CUDA sync 없음)
+        s = patch_sample_id.max() + 1  # 0-dim 텐서 (CUDA sync 없음)
+        batch_idx = torch.arange(b, device=time_id.device).unsqueeze(-1)  # (B, 1)
+        group_key = batch_idx * (s * k) + patch_sample_id * k + time_id  # (B, N)
 
         # (B, N, N) pairwise 비교
         same_group = group_key.unsqueeze(-1) == group_key.unsqueeze(-2)

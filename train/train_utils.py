@@ -257,15 +257,15 @@ def train_one_epoch(
         batch.variate_id = batch.variate_id.to(device)
 
         # ── Forward (single call: task="both" for DDP compatibility) ──
-        H = 1
+        h = 1
         if enable_next:
-            H = random.randint(1, config.model_config.max_horizon)
+            h = random.randint(1, config.model_config.max_horizon)
 
         with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
             raw_model = model.module if isinstance(model, DDP) else model
             task = "both" if enable_next else "masked"
 
-            out = model(batch, task=task, horizon=H)
+            out = model(batch, task=task, horizon=h)
 
             reconstructed = out["reconstructed"]  # (B, N, patch_size)
             cross_pred = out["cross_pred"]        # (B, N, patch_size)
@@ -293,11 +293,11 @@ def train_one_epoch(
             )
 
             # 원본 패치 추출 (정규화된 값)
-            P = raw_model.patch_size
+            p = raw_model.patch_size
             normalized = ((batch.values.unsqueeze(-1) - out["loc"]) / out["scale"]).squeeze(-1)
-            B, L = normalized.shape
-            N = L // P
-            original_patches = normalized.reshape(B, N, P)  # (B, N, P)
+            b, l = normalized.shape
+            n = l // p
+            original_patches = normalized.reshape(b, n, p)  # (B, N, P)
 
             # ── EEG 패치를 제외한 non-EEG pred_mask ──
             if eeg_mask is not None:
@@ -320,44 +320,41 @@ def train_one_epoch(
                 patch_mask=non_eeg_patch_mask,
                 patch_sample_id=out["patch_sample_id"],
                 patch_variate_id=out["patch_variate_id"],
-                horizon=H,
+                horizon=h,
                 cross_pred=cross_pred if config.gamma > 0 else None,
                 time_id=time_id if needs_time_id else None,
                 contrastive_z=contrastive_z if config.delta > 0 else None,
                 patch_signal_types=out.get("patch_signal_types"),
             )
 
-            # ── EEG 전용 masked reconstruction loss ──
+            # ── EEG spectral loss (masked recon + next-pred) ──
             eeg_loss = reconstructed.new_tensor(0.0)
-            if eeg_mask is not None and eeg_reconstructed is not None:
-                eeg_pred_mask = pred_mask & eeg_mask  # (B, N)
-                if eeg_pred_mask.any():
-                    eeg_loss = torch.nn.functional.mse_loss(
-                        eeg_reconstructed[eeg_pred_mask],   # (M, spectral_dim)
-                        eeg_recon_target[eeg_pred_mask],    # (M, spectral_dim)
-                    )
-
-            # ── EEG 전용 next-pred loss (spectral) ──
-            eeg_next_pred = out.get("eeg_next_pred")  # (B, N, spectral_dim) or None
             eeg_next_loss = reconstructed.new_tensor(0.0)
-            if eeg_mask is not None and eeg_next_pred is not None and eeg_recon_target is not None:
-                # same-variate, same-sample, horizon shift 조건
-                p_sid = out["patch_sample_id"]
-                p_vid = out["patch_variate_id"]
-                eeg_next_valid = (
-                    eeg_mask[:, :-H] & eeg_mask[:, H:]
-                    & patch_mask[:, :-H] & patch_mask[:, H:]
-                    & (p_sid[:, :-H] == p_sid[:, H:])
-                    & (p_vid[:, :-H] == p_vid[:, H:])
-                )  # (B, N-H)
-                if eeg_next_valid.any():
-                    eeg_next_loss = torch.nn.functional.mse_loss(
-                        eeg_next_pred[:, :-H][eeg_next_valid],       # (M, spectral_dim)
-                        eeg_recon_target[:, H:][eeg_next_valid],     # (M, spectral_dim)
-                    ) * (1.0 / H)  # horizon weight (V1 next-pred와 동일)
+            if eeg_mask is not None and eeg_recon_target is not None:
+                if eeg_reconstructed is not None:
+                    eeg_pred_mask = pred_mask & eeg_mask
+                    if eeg_pred_mask.any():
+                        eeg_loss = torch.nn.functional.mse_loss(
+                            eeg_reconstructed[eeg_pred_mask],
+                            eeg_recon_target[eeg_pred_mask],
+                        )
 
-            # ── 최종 total loss ──
-            # EEG도 alpha/beta와 동일 weight 적용 (spectral target이 per-patch 정규화되어 스케일 동일)
+                eeg_next_pred = out.get("eeg_next_pred")
+                if eeg_next_pred is not None:
+                    p_sid = out["patch_sample_id"]
+                    p_vid = out["patch_variate_id"]
+                    eeg_next_valid = (
+                        eeg_mask[:, :-h] & eeg_mask[:, h:]
+                        & patch_mask[:, :-h] & patch_mask[:, h:]
+                        & (p_sid[:, :-h] == p_sid[:, h:])
+                        & (p_vid[:, :-h] == p_vid[:, h:])
+                    )
+                    if eeg_next_valid.any():
+                        eeg_next_loss = torch.nn.functional.mse_loss(
+                            eeg_next_pred[:, :-h][eeg_next_valid],
+                            eeg_recon_target[:, h:][eeg_next_valid],
+                        ) * (1.0 / h)
+
             loss = losses["total"] + config.alpha * eeg_loss + config.beta * eeg_next_loss + config.aux_loss_weight * aux_loss
 
         # NaN/Inf 감지
@@ -500,13 +497,13 @@ def validate(
         batch.sample_id = batch.sample_id.to(device)
         batch.variate_id = batch.variate_id.to(device)
 
-        H = 1
+        h = 1
         if enable_next:
-            H = random.randint(1, config.model_config.max_horizon)
+            h = random.randint(1, config.model_config.max_horizon)
 
         with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
             task = "both" if enable_next else "masked"
-            out = raw_model(batch, task=task, horizon=H)
+            out = raw_model(batch, task=task, horizon=h)
 
             reconstructed = out["reconstructed"]
             cross_pred = out["cross_pred"]
@@ -532,11 +529,11 @@ def validate(
                 variate_mask_prob=config.variate_mask_prob,
             )
 
-            P = raw_model.patch_size
+            p = raw_model.patch_size
             normalized = ((batch.values.unsqueeze(-1) - out["loc"]) / out["scale"]).squeeze(-1)
-            B, L = normalized.shape
-            N = L // P
-            original_patches = normalized.reshape(B, N, P)
+            b, l = normalized.shape
+            n = l // p
+            original_patches = normalized.reshape(b, n, p)
 
             # EEG 패치 제외
             if eeg_mask is not None:
@@ -557,40 +554,42 @@ def validate(
                 patch_mask=non_eeg_patch_mask,
                 patch_sample_id=out["patch_sample_id"],
                 patch_variate_id=out["patch_variate_id"],
-                horizon=H,
+                horizon=h,
                 cross_pred=cross_pred if config.gamma > 0 else None,
                 time_id=time_id if needs_time_id else None,
                 contrastive_z=contrastive_z if config.delta > 0 else None,
                 patch_signal_types=out.get("patch_signal_types"),
             )
 
-            # EEG 전용 masked reconstruction loss
+            # ── EEG spectral loss (masked recon + next-pred) ──
             eeg_loss = reconstructed.new_tensor(0.0)
-            if eeg_mask is not None and eeg_reconstructed is not None:
-                eeg_pred_mask = pred_mask & eeg_mask
-                if eeg_pred_mask.any():
-                    eeg_loss = torch.nn.functional.mse_loss(
-                        eeg_reconstructed[eeg_pred_mask],
-                        eeg_recon_target[eeg_pred_mask],
-                    )
-
-            # EEG 전용 next-pred loss (spectral)
-            eeg_next_pred = out.get("eeg_next_pred")
             eeg_next_loss = reconstructed.new_tensor(0.0)
-            if eeg_mask is not None and eeg_next_pred is not None and eeg_recon_target is not None:
-                p_sid = out["patch_sample_id"]
-                p_vid = out["patch_variate_id"]
-                eeg_next_valid = (
-                    eeg_mask[:, :-H] & eeg_mask[:, H:]
-                    & patch_mask[:, :-H] & patch_mask[:, H:]
-                    & (p_sid[:, :-H] == p_sid[:, H:])
-                    & (p_vid[:, :-H] == p_vid[:, H:])
-                )
-                if eeg_next_valid.any():
-                    eeg_next_loss = torch.nn.functional.mse_loss(
-                        eeg_next_pred[:, :-H][eeg_next_valid],
-                        eeg_recon_target[:, H:][eeg_next_valid],
-                    ) * (1.0 / H)
+            if eeg_mask is not None and eeg_recon_target is not None:
+                # Masked reconstruction
+                if eeg_reconstructed is not None:
+                    eeg_pred_mask = pred_mask & eeg_mask
+                    if eeg_pred_mask.any():
+                        eeg_loss = torch.nn.functional.mse_loss(
+                            eeg_reconstructed[eeg_pred_mask],
+                            eeg_recon_target[eeg_pred_mask],
+                        )
+
+                # Next-pred
+                eeg_next_pred = out.get("eeg_next_pred")
+                if eeg_next_pred is not None:
+                    p_sid = out["patch_sample_id"]
+                    p_vid = out["patch_variate_id"]
+                    eeg_next_valid = (
+                        eeg_mask[:, :-h] & eeg_mask[:, h:]
+                        & patch_mask[:, :-h] & patch_mask[:, h:]
+                        & (p_sid[:, :-h] == p_sid[:, h:])
+                        & (p_vid[:, :-h] == p_vid[:, h:])
+                    )
+                    if eeg_next_valid.any():
+                        eeg_next_loss = torch.nn.functional.mse_loss(
+                            eeg_next_pred[:, :-h][eeg_next_valid],
+                            eeg_recon_target[:, h:][eeg_next_valid],
+                        ) * (1.0 / h)
 
             total_loss = losses["total"] + config.alpha * eeg_loss + config.beta * eeg_next_loss + config.aux_loss_weight * aux_loss
 

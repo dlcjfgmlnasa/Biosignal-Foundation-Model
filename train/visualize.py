@@ -52,7 +52,7 @@ def _build_signal_map(
     p_sid: torch.Tensor,  # (B, N) patch_sample_id
     p_vid: torch.Tensor,  # (B, N) patch_variate_id
     patch_mask: torch.Tensor,  # (B, N)
-    B: int,
+    b: int,
 ) -> dict[tuple[int, int, int], int]:
     """(row, sample_id, variate_id) → signal_type 매핑을 반환한다."""
     has_signal_types = hasattr(batch, "signal_types") and batch.signal_types is not None
@@ -61,13 +61,13 @@ def _build_signal_map(
         return mapping
 
     gvi = 0
-    for b in range(B):
-        valid = patch_mask[b]
+    for bi in range(b):
+        valid = patch_mask[bi]
         if not valid.any():
             continue
 
-        sid_valid = p_sid[b, valid]
-        vid_valid = p_vid[b, valid]
+        sid_valid = p_sid[bi, valid]
+        vid_valid = p_vid[bi, valid]
         seen: set[tuple[int, int]] = set()
         ordered_pairs: list[tuple[int, int]] = []
         for i in range(len(sid_valid)):
@@ -78,7 +78,7 @@ def _build_signal_map(
 
         for sid, vid in ordered_pairs:
             if gvi < len(batch.signal_types):
-                mapping[(b, sid, vid)] = batch.signal_types[gvi].item()
+                mapping[(bi, sid, vid)] = batch.signal_types[gvi].item()
             gvi += 1
 
     return mapping
@@ -134,8 +134,8 @@ def _plot_figure_grid(
     if n_rows == 0:
         return output_dir / f"empty_epoch{epoch:03d}.png"
 
-    P = next(iter(grid.values()))[0].patch_size
-    max_patches = max(1, int(max_duration_s * sampling_rate / P))
+    p = next(iter(grid.values()))[0].patch_size
+    max_patches = max(1, int(max_duration_s * sampling_rate / p))
 
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(8 * n_cols, 3 * n_rows), squeeze=False)
 
@@ -186,8 +186,8 @@ def _plot_figure_grid(
 
             n_pred = 0
             for patch_idx in range(n_show):
-                start = patch_idx * P
-                end = start + P
+                start = patch_idx * p
+                end = start + p
                 patch_pred = pred_wave[start:end]
                 if not np.isnan(patch_pred[0]):
                     ax.axvspan(start / sampling_rate, end / sampling_rate,
@@ -199,7 +199,7 @@ def _plot_figure_grid(
             if col == 0:
                 ax.set_ylabel(cand.signal_name, fontsize=10)
 
-            duration_shown = n_show * P / sampling_rate
+            duration_shown = n_show * p / sampling_rate
             ax.set_title(
                 f"{n_pred}/{n_show} patches | {duration_shown:.0f}s",
                 fontsize=8, loc="right",
@@ -273,20 +273,20 @@ def _extract_patches_and_scales(
         patch_scale: (B, N)
         N: 패치 수
     """
-    P = model.patch_size
+    p = model.patch_size
     loc = out["loc"]      # (B, L, 1)
     scale = out["scale"]  # (B, L, 1)
-    B, L = batch.values.shape[0], batch.values.shape[1]
-    N = L // P
-    original_patches = batch.values[:, :N * P].reshape(B, N, P)
+    b, l = batch.values.shape[0], batch.values.shape[1]
+    n = l // p
+    original_patches = batch.values[:, :n * p].reshape(b, n, p)
 
     stride = model.patch_embed.stride
-    patch_starts = torch.arange(N, device=loc.device) * stride
+    patch_starts = torch.arange(n, device=loc.device) * stride
     patch_starts = patch_starts.clamp(max=loc.shape[1] - 1)
     patch_loc = loc[:, patch_starts, 0]      # (B, N)
     patch_scale = scale[:, patch_starts, 0]  # (B, N)
 
-    return original_patches, patch_loc, patch_scale, N
+    return original_patches, patch_loc, patch_scale, n
 
 
 def _extract_candidates(
@@ -297,24 +297,24 @@ def _extract_candidates(
     patch_scale: torch.Tensor,       # (B, N)
     pred_tensor: torch.Tensor,       # (B, N, P) — reconstructed or next_pred
     build_pred_fn,                   # (seg_orig, seg_pred_denorm, seg_indices, ...) -> pred array
-    P: int,
+    patch_size: int,
 ) -> list[RowCandidate]:
     """(sample_id, variate_id) 단위로 RowCandidate를 추출한다."""
     patch_mask = out["patch_mask"]   # (B, N)
     p_sid = out["patch_sample_id"]   # (B, N)
     p_vid = out["patch_variate_id"]  # (B, N)
-    B = original_patches.shape[0]
+    batch_size = original_patches.shape[0]
 
-    sig_map = _build_signal_map(batch, p_sid, p_vid, patch_mask, B)
+    sig_map = _build_signal_map(batch, p_sid, p_vid, patch_mask, batch_size)
     is_v2 = "eeg_mask" in out or "eeg_reconstructed" in out
 
     candidates: list[RowCandidate] = []
-    for b in range(B):
-        valid = patch_mask[b]
+    for bi in range(batch_size):
+        valid = patch_mask[bi]
         if not valid.any():
             continue
 
-        combo = p_sid[b] * 10000 + p_vid[b]
+        combo = p_sid[bi] * 10000 + p_vid[bi]
         unique_combos = combo[valid].unique().tolist()
         for c in unique_combos:
             sid = int(c) // 10000
@@ -325,19 +325,19 @@ def _extract_candidates(
             if n_seg == 0:
                 continue
 
-            seg_orig = original_patches[b, seg_indices].cpu().numpy()
+            seg_orig = original_patches[bi, seg_indices].cpu().numpy()
 
             # denormalize
-            seg_pred_norm = pred_tensor[b, seg_indices]
-            seg_loc = patch_loc[b, seg_indices].unsqueeze(-1)
-            seg_scale = patch_scale[b, seg_indices].unsqueeze(-1)
+            seg_pred_norm = pred_tensor[bi, seg_indices]
+            seg_loc = patch_loc[bi, seg_indices].unsqueeze(-1)
+            seg_scale = patch_scale[bi, seg_indices].unsqueeze(-1)
             seg_pred_denorm = (seg_pred_norm * seg_scale + seg_loc).cpu().numpy()
 
             pred = build_pred_fn(seg_orig, seg_pred_denorm, seg_indices, n_seg)
             if pred is None:
                 continue
 
-            sig_type = sig_map.get((b, sid, vid), -1)
+            sig_type = sig_map.get((bi, sid, vid), -1)
             if is_v2 and sig_type == 2:
                 continue
             sig_name = SIGNAL_TYPE_NAMES.get(sig_type, "?")
@@ -348,7 +348,7 @@ def _extract_candidates(
                 signal_type=sig_type,
                 signal_name=sig_name,
                 n_valid=n_seg,
-                patch_size=P,
+                patch_size=patch_size,
             ))
 
     return candidates
@@ -368,8 +368,8 @@ def _process_recon_batch(
         _batch_to_device(batch, device)
 
     out = model(batch, task="masked")
-    original_patches, patch_loc, patch_scale, N = _extract_patches_and_scales(model, batch, out)
-    P = model.patch_size
+    original_patches, patch_loc, patch_scale, n = _extract_patches_and_scales(model, batch, out)
+    p = model.patch_size
 
     pred_mask = create_patch_mask(out["patch_mask"], mask_ratio=mask_ratio)
 
@@ -383,22 +383,22 @@ def _process_recon_batch(
     patch_mask = out["patch_mask"]
     p_sid = out["patch_sample_id"]
     p_vid = out["patch_variate_id"]
-    B = original_patches.shape[0]
+    batch_size = original_patches.shape[0]
 
-    sig_map = _build_signal_map(batch, p_sid, p_vid, patch_mask, B)
+    sig_map = _build_signal_map(batch, p_sid, p_vid, patch_mask, batch_size)
     is_v2 = "eeg_mask" in out or "eeg_reconstructed" in out
 
     reconstructed = out["reconstructed"]
     pred_mask_full = create_patch_mask(patch_mask, mask_ratio=mask_ratio)
 
     candidates: list[RowCandidate] = []
-    for b in range(B):
-        valid = patch_mask[b]
+    for bi in range(batch_size):
+        valid = patch_mask[bi]
         if not valid.any():
             continue
-        masked = pred_mask_full[b] & valid
+        masked = pred_mask_full[bi] & valid
 
-        combo = p_sid[b] * 10000 + p_vid[b]
+        combo = p_sid[bi] * 10000 + p_vid[bi]
         unique_combos = combo[valid].unique().tolist()
         for c in unique_combos:
             sid = int(c) // 10000
@@ -409,18 +409,18 @@ def _process_recon_batch(
                 continue
 
             seg_indices = seg_mask.nonzero(as_tuple=True)[0]
-            seg_orig = original_patches[b, seg_indices].cpu().numpy()
+            seg_orig = original_patches[bi, seg_indices].cpu().numpy()
             seg_masked = masked[seg_indices].cpu().numpy()
 
-            seg_recon_norm = reconstructed[b, seg_indices]
-            seg_loc = patch_loc[b, seg_indices].unsqueeze(-1)
-            seg_scale = patch_scale[b, seg_indices].unsqueeze(-1)
+            seg_recon_norm = reconstructed[bi, seg_indices]
+            seg_loc = patch_loc[bi, seg_indices].unsqueeze(-1)
+            seg_scale = patch_scale[bi, seg_indices].unsqueeze(-1)
             seg_recon = (seg_recon_norm * seg_scale + seg_loc).cpu().numpy()
 
             pred = np.full_like(seg_orig, np.nan)
             pred[seg_masked] = seg_recon[seg_masked]
 
-            sig_type = sig_map.get((b, sid, vid), -1)
+            sig_type = sig_map.get((bi, sid, vid), -1)
             if is_v2 and sig_type == 2:
                 continue
             sig_name = SIGNAL_TYPE_NAMES.get(sig_type, "?")
@@ -431,7 +431,7 @@ def _process_recon_batch(
                 signal_type=sig_type,
                 signal_name=sig_name,
                 n_valid=n_seg,
-                patch_size=P,
+                patch_size=p,
             ))
 
     return candidates
@@ -451,25 +451,25 @@ def _process_next_pred_batch(
         _batch_to_device(batch, device)
 
     out = model(batch, task="next_pred", horizon=horizon)
-    original_patches, patch_loc, patch_scale, N = _extract_patches_and_scales(model, batch, out)
-    P = model.patch_size
+    original_patches, patch_loc, patch_scale, n = _extract_patches_and_scales(model, batch, out)
+    p = model.patch_size
 
     next_pred = out["next_pred"]
     patch_mask = out["patch_mask"]
     p_sid = out["patch_sample_id"]
     p_vid = out["patch_variate_id"]
-    B = original_patches.shape[0]
+    batch_size = original_patches.shape[0]
 
-    sig_map = _build_signal_map(batch, p_sid, p_vid, patch_mask, B)
+    sig_map = _build_signal_map(batch, p_sid, p_vid, patch_mask, batch_size)
     is_v2 = "eeg_mask" in out or "eeg_reconstructed" in out
 
     candidates: list[RowCandidate] = []
-    for b in range(B):
-        valid = patch_mask[b]
+    for bi in range(batch_size):
+        valid = patch_mask[bi]
         if not valid.any():
             continue
 
-        combo = p_sid[b] * 10000 + p_vid[b]
+        combo = p_sid[bi] * 10000 + p_vid[bi]
         unique_combos = combo[valid].unique().tolist()
         for c in unique_combos:
             sid = int(c) // 10000
@@ -480,16 +480,16 @@ def _process_next_pred_batch(
             if n_seg <= horizon:
                 continue
 
-            seg_orig = original_patches[b, seg_indices].cpu().numpy()
+            seg_orig = original_patches[bi, seg_indices].cpu().numpy()
 
-            seg_next_norm = next_pred[b, seg_indices]
-            seg_loc = patch_loc[b, seg_indices].unsqueeze(-1)
-            seg_scale = patch_scale[b, seg_indices].unsqueeze(-1)
+            seg_next_norm = next_pred[bi, seg_indices]
+            seg_loc = patch_loc[bi, seg_indices].unsqueeze(-1)
+            seg_scale = patch_scale[bi, seg_indices].unsqueeze(-1)
             seg_next = (seg_next_norm * seg_scale + seg_loc).cpu().numpy()
-            pred = np.full((n_seg, P), np.nan)
+            pred = np.full((n_seg, p), np.nan)
             pred[horizon:n_seg] = seg_next[:n_seg - horizon]
 
-            sig_type = sig_map.get((b, sid, vid), -1)
+            sig_type = sig_map.get((bi, sid, vid), -1)
             if is_v2 and sig_type == 2:
                 continue
             sig_name = SIGNAL_TYPE_NAMES.get(sig_type, "?")
@@ -500,7 +500,7 @@ def _process_next_pred_batch(
                 signal_type=sig_type,
                 signal_name=sig_name,
                 n_valid=n_seg,
-                patch_size=P,
+                patch_size=p,
             ))
 
     return candidates
@@ -541,19 +541,19 @@ def _collect_eeg_spectral(
         patch_mask = out["patch_mask"]
         p_sid = out["patch_sample_id"]
         p_vid = out["patch_variate_id"]
-        B, N = eeg_mask.shape
+        batch_size, n_patches = eeg_mask.shape
 
         if mode == "masked":
             eeg_pred = out.get("eeg_reconstructed")
             if eeg_pred is None:
                 continue
             pred_mask = _create_mask(patch_mask, mask_ratio=mask_ratio)
-            for b in range(B):
-                indices = (pred_mask[b] & eeg_mask[b]).nonzero(as_tuple=True)[0]
+            for bi in range(batch_size):
+                indices = (pred_mask[bi] & eeg_mask[bi]).nonzero(as_tuple=True)[0]
                 for idx in indices[:2]:
                     examples.append({
-                        "pred": eeg_pred[b, idx].detach().cpu().numpy().reshape(n_freq, n_frames),
-                        "target": eeg_target[b, idx].detach().cpu().numpy().reshape(n_freq, n_frames),
+                        "pred": eeg_pred[bi, idx].detach().cpu().numpy().reshape(n_freq, n_frames),
+                        "target": eeg_target[bi, idx].detach().cpu().numpy().reshape(n_freq, n_frames),
                     })
                     if len(examples) >= max_examples:
                         return examples
@@ -561,15 +561,15 @@ def _collect_eeg_spectral(
             eeg_next = out.get("eeg_next_pred")
             if eeg_next is None:
                 continue
-            for b in range(B):
-                for i in range(N - horizon):
-                    if (eeg_mask[b, i] and eeg_mask[b, i + horizon]
-                            and patch_mask[b, i] and patch_mask[b, i + horizon]
-                            and p_sid[b, i] == p_sid[b, i + horizon]
-                            and p_vid[b, i] == p_vid[b, i + horizon]):
+            for bi in range(batch_size):
+                for i in range(n_patches - horizon):
+                    if (eeg_mask[bi, i] and eeg_mask[bi, i + horizon]
+                            and patch_mask[bi, i] and patch_mask[bi, i + horizon]
+                            and p_sid[bi, i] == p_sid[bi, i + horizon]
+                            and p_vid[bi, i] == p_vid[bi, i + horizon]):
                         examples.append({
-                            "pred": eeg_next[b, i].detach().cpu().numpy().reshape(n_freq, n_frames),
-                            "target": eeg_target[b, i + horizon].detach().cpu().numpy().reshape(n_freq, n_frames),
+                            "pred": eeg_next[bi, i].detach().cpu().numpy().reshape(n_freq, n_frames),
+                            "target": eeg_target[bi, i + horizon].detach().cpu().numpy().reshape(n_freq, n_frames),
                         })
                         if len(examples) >= max_examples:
                             return examples
@@ -621,30 +621,30 @@ def _save_eeg_spectral_figure(
         p_vid = out["patch_variate_id"]
         pred_mask = _create_mask(patch_mask, mask_ratio=mask_ratio)
 
-        B, N = eeg_mask.shape
-        for b in range(B):
+        batch_size, n_patches = eeg_mask.shape
+        for bi in range(batch_size):
             # Masked reconstruction examples
             if eeg_recon is not None and len(recon_examples) < max_examples:
-                masked_eeg = pred_mask[b] & eeg_mask[b]
+                masked_eeg = pred_mask[bi] & eeg_mask[bi]
                 indices = masked_eeg.nonzero(as_tuple=True)[0]
                 for idx in indices[:2]:
                     recon_examples.append({
-                        "pred": eeg_recon[b, idx].detach().cpu().numpy().reshape(n_freq, n_frames),
-                        "target": eeg_target[b, idx].detach().cpu().numpy().reshape(n_freq, n_frames),
+                        "pred": eeg_recon[bi, idx].detach().cpu().numpy().reshape(n_freq, n_frames),
+                        "target": eeg_target[bi, idx].detach().cpu().numpy().reshape(n_freq, n_frames),
                     })
                     if len(recon_examples) >= max_examples:
                         break
 
             # Next-pred examples
             if eeg_next is not None and len(next_examples) < max_examples:
-                for i in range(N - horizon):
-                    if (eeg_mask[b, i] and eeg_mask[b, i + horizon]
-                            and patch_mask[b, i] and patch_mask[b, i + horizon]
-                            and p_sid[b, i] == p_sid[b, i + horizon]
-                            and p_vid[b, i] == p_vid[b, i + horizon]):
+                for i in range(n_patches - horizon):
+                    if (eeg_mask[bi, i] and eeg_mask[bi, i + horizon]
+                            and patch_mask[bi, i] and patch_mask[bi, i + horizon]
+                            and p_sid[bi, i] == p_sid[bi, i + horizon]
+                            and p_vid[bi, i] == p_vid[bi, i + horizon]):
                         next_examples.append({
-                            "pred": eeg_next[b, i].detach().cpu().numpy().reshape(n_freq, n_frames),
-                            "target": eeg_target[b, i + horizon].detach().cpu().numpy().reshape(n_freq, n_frames),
+                            "pred": eeg_next[bi, i].detach().cpu().numpy().reshape(n_freq, n_frames),
+                            "target": eeg_target[bi, i + horizon].detach().cpu().numpy().reshape(n_freq, n_frames),
                         })
                         if len(next_examples) >= max_examples:
                             break

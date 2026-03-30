@@ -58,13 +58,13 @@ def create_patch_mask(
     torch.Tensor
         (B, N) bool. True=마스킹 대상.
     """
-    B, N = patch_mask.shape
+    b, n = patch_mask.shape
     device = patch_mask.device
 
-    pred_mask = torch.zeros(B, N, dtype=torch.bool, device=device)
+    pred_mask = torch.zeros(b, n, dtype=torch.bool, device=device)
 
-    for b in range(B):
-        valid_idx = patch_mask[b].nonzero(as_tuple=True)[0]  # 유효 패치 인덱스
+    for bi in range(b):
+        valid_idx = patch_mask[bi].nonzero(as_tuple=True)[0]  # 유효 패치 인덱스
         if len(valid_idx) == 0:
             continue
 
@@ -75,19 +75,19 @@ def create_patch_mask(
             and torch.rand(1).item() < variate_mask_prob
         ):
             # 유효 패치의 variate_id에서 0 제외 (패딩)
-            valid_var_ids = patch_variate_id[b, valid_idx]
+            valid_var_ids = patch_variate_id[bi, valid_idx]
             unique_vars = valid_var_ids[valid_var_ids > 0].unique()
             if len(unique_vars) > 1:
                 # 랜덤 variate 선택 → 해당 variate 전체 마스킹
                 chosen_var = unique_vars[torch.randint(len(unique_vars), (1,)).item()]
-                var_mask = (patch_variate_id[b] == chosen_var)
-                pred_mask[b] = var_mask & patch_mask[b]
+                var_mask = (patch_variate_id[bi] == chosen_var)
+                pred_mask[bi] = var_mask & patch_mask[bi]
                 continue
 
         # 랜덤 패치 마스킹 (기본 / Phase 1)
         n_valid = len(valid_idx)
         n_mask = max(1, int(n_valid * mask_ratio))
         perm = torch.randperm(n_valid, device=device)[:n_mask]
-        pred_mask[b, valid_idx[perm]] = True
+        pred_mask[bi, valid_idx[perm]] = True
 
     return pred_mask

@@ -73,10 +73,10 @@ class SpectralTokenizer(nn.Module):
         """
         orig_shape = patches.shape
         if patches.ndim == 3:
-            B, N, P = patches.shape
-            patches = patches.reshape(B * N, P)
+            b, n, p = patches.shape
+            patches = patches.reshape(b * n, p)
         else:
-            B, N = None, None
+            b, n = None, None
 
         # STFT: (M, P) → (M, n_freq, n_frames) complex
         spec = torch.stft(
@@ -102,7 +102,7 @@ class SpectralTokenizer(nn.Module):
         std = output.std(dim=-1, keepdim=True).clamp(min=1e-8)  # (M, 1)
         output = (output - mean) / std
 
-        if B is not None:
-            output = output.reshape(B, N, -1)  # (B, N, output_dim)
+        if b is not None:
+            output = output.reshape(b, n, -1)  # (B, N, output_dim)
 
         return output

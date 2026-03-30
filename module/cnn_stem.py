@@ -142,12 +142,12 @@ class ModalityCNNStem(nn.Module):
         torch.Tensor
             ``(B, N, d_model)`` — modality-specific embeddings.
         """
-        B, N, P = patches.shape
+        b, n, p = patches.shape
         device = patches.device
         dtype = patches.dtype
 
-        flat_patches = patches.reshape(B * N, P)          # (B*N, P)
-        flat_types = signal_types.reshape(B * N)           # (B*N,)
+        flat_patches = patches.reshape(b * n, p)          # (B*N, P)
+        flat_types = signal_types.reshape(b * n)           # (B*N,)
         flat_output: torch.Tensor | None = None
 
         for t, stem in enumerate(self.stems):
@@ -156,11 +156,11 @@ class ModalityCNNStem(nn.Module):
             embedded = stem(selected)                      # (M_t, d_model) — batch=0이면 no-op
             if flat_output is None:
                 flat_output = torch.zeros(
-                    B * N, self.d_model, device=device, dtype=embedded.dtype,
+                    b * n, self.d_model, device=device, dtype=embedded.dtype,
                 )
             flat_output[mask] = embedded
 
         if flat_output is None:
-            flat_output = torch.zeros(B * N, self.d_model, device=device, dtype=dtype)
+            flat_output = torch.zeros(b * n, self.d_model, device=device, dtype=dtype)
 
-        return flat_output.reshape(B, N, self.d_model)    # (B, N, d_model)
+        return flat_output.reshape(b, n, self.d_model)    # (B, N, d_model)

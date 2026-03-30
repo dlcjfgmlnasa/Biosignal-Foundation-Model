@@ -272,7 +272,7 @@ class BiosignalFoundationModel(nn.Module):
         )
         # patches: (B, N, patch_size)
 
-        B = patches.shape[0]
+        b = patches.shape[0]
         device = patches.device
 
         # 3. global_var_idx 계산 — CNN stem과 dual embedding 모두에서 재사용
@@ -281,8 +281,8 @@ class BiosignalFoundationModel(nn.Module):
 
         if hasattr(batch, "spatial_ids") and batch.spatial_ids is not None:
             per_row_max_var = p_vid.max(dim=-1).values  # (B,)
-            var_offsets = torch.zeros(B, dtype=torch.long, device=device)
-            if B > 1:
+            var_offsets = torch.zeros(b, dtype=torch.long, device=device)
+            if b > 1:
                 var_offsets[1:] = per_row_max_var[:-1].cumsum(dim=0)
             global_var_idx = var_offsets.unsqueeze(-1) + (p_vid - 1)  # (B, N)
             global_var_idx = global_var_idx.clamp(min=0)
@@ -304,9 +304,9 @@ class BiosignalFoundationModel(nn.Module):
             embedded = embedded + (sig_emb + spa_emb) * valid_token
 
         # 6. Loc/Scale Dual Injection — 절대 레벨 정보 보존
-        N = embedded.shape[1]
+        n = embedded.shape[1]
         stride = self.patch_embed.stride
-        patch_starts = torch.arange(N, device=device) * stride  # (N,)
+        patch_starts = torch.arange(n, device=device) * stride  # (N,)
         patch_starts = patch_starts.clamp(max=loc.shape[1] - 1)
         patch_loc = loc[:, patch_starts, :]      # (B, N, 1)
         patch_scale = scale[:, patch_starts, :]  # (B, N, 1)
@@ -319,7 +319,7 @@ class BiosignalFoundationModel(nn.Module):
             (p_sid.unsqueeze(-1) == p_sid.unsqueeze(-2))
             & patch_mask.unsqueeze(-2)
             & patch_mask.unsqueeze(-1)
-        )  # (B, N, N)
+        )  # (B, N, n)
 
         # 8. Task에 따른 Masking 스위치 + Transformer Encoder
         result: dict[str, torch.Tensor] = {
@@ -340,7 +340,7 @@ class BiosignalFoundationModel(nn.Module):
         # causal mask (next_pred, both에서 공유)
         if use_causal:
             causal_tri = torch.tril(
-                torch.ones(N, N, dtype=torch.bool, device=device)
+                torch.ones(n, n, dtype=torch.bool, device=device)
             )
             causal_mask = base_attn_mask & causal_tri.unsqueeze(0)  # (B, N, N)
 
@@ -438,9 +438,11 @@ class BiosignalFoundationModel(nn.Module):
 
         # ── EEG Spectral Target ──
         if patch_signal_types is not None:
-            out_dict["eeg_mask"] = (patch_signal_types == EEG_SIGNAL_TYPE)  # (B, N)
-            with torch.no_grad():
-                out_dict["eeg_recon_target"] = self.eeg_spectral_tokenizer(enc["patches"]).detach()  # (B, N, spectral_dim)
+            eeg_mask = (patch_signal_types == EEG_SIGNAL_TYPE)  # (B, N)
+            out_dict["eeg_mask"] = eeg_mask
+            if eeg_mask.any():
+                with torch.no_grad():
+                    out_dict["eeg_recon_target"] = self.eeg_spectral_tokenizer(enc["patches"]).detach()  # (B, N, spectral_dim)
 
         return out_dict
 
@@ -497,12 +499,12 @@ class BiosignalFoundationModel(nn.Module):
         if denormalize:
             loc = out["loc"]  # (B, L, 1)
             scale = out["scale"]  # (B, L, 1)
-            P = self.patch_size
-            patch_loc = loc[:, ::P, :]  # (B, N_approx, 1)
-            patch_scale = scale[:, ::P, :]  # (B, N_approx, 1)
-            N = pred.shape[1]
-            patch_loc = patch_loc[:, :N, :]  # (B, N, 1)
-            patch_scale = patch_scale[:, :N, :]  # (B, N, 1)
+            p = self.patch_size
+            patch_loc = loc[:, ::p, :]  # (B, N_approx, 1)
+            patch_scale = scale[:, ::p, :]  # (B, N_approx, 1)
+            n = pred.shape[1]
+            patch_loc = patch_loc[:, :n, :]  # (B, N, 1)
+            patch_scale = patch_scale[:, :n, :]  # (B, N, 1)
             pred = pred * patch_scale + patch_loc
 
         return pred
@@ -534,7 +536,7 @@ class BiosignalFoundationModel(nn.Module):
             ``(n_steps, B, patch_size)`` generated patches.
         """
         self.eval()
-        P = self.patch_size
+        p = self.patch_size
 
         out = self.forward(batch, task="next_pred", horizon=1)
         loc = out["loc"]  # (B, L, 1)
@@ -553,7 +555,7 @@ class BiosignalFoundationModel(nn.Module):
         generated.append(new_patch)
 
         for _ in range(n_steps - 1):
-            batch = _append_patch_to_batch(batch, new_patch, P)
+            batch = _append_patch_to_batch(batch, new_patch, p)
             out = self.forward(batch, task="next_pred", horizon=1)
             pred = out["next_pred"]
             patch_mask = out["patch_mask"]
@@ -597,7 +599,7 @@ def _append_patch_to_batch(
     PackedBatch
         새 패치가 append된 PackedBatch.
     """
-    B, L = batch.values.shape
+    b, l = batch.values.shape
     device = batch.values.device
 
     valid_mask = batch.sample_id > 0  # (B, L)
@@ -606,18 +608,18 @@ def _append_patch_to_batch(
     new_end = valid_lengths + patch_size  # (B,)
     max_new_end = new_end.max().item()
 
-    if max_new_end > L:
-        pad_size = max_new_end - L
+    if max_new_end > l:
+        pad_size = max_new_end - l
         batch = PackedBatch(
             values=torch.cat(
-                [batch.values, torch.zeros(B, pad_size, device=device)], dim=-1
+                [batch.values, torch.zeros(b, pad_size, device=device)], dim=-1
             ),
             sample_id=torch.cat(
-                [batch.sample_id, torch.zeros(B, pad_size, dtype=torch.long, device=device)],
+                [batch.sample_id, torch.zeros(b, pad_size, dtype=torch.long, device=device)],
                 dim=-1,
             ),
             variate_id=torch.cat(
-                [batch.variate_id, torch.zeros(B, pad_size, dtype=torch.long, device=device)],
+                [batch.variate_id, torch.zeros(b, pad_size, dtype=torch.long, device=device)],
                 dim=-1,
             ),
             lengths=batch.lengths,
@@ -627,7 +629,7 @@ def _append_patch_to_batch(
             padded_lengths=batch.padded_lengths,
         )
 
-    for i in range(B):
+    for i in range(b):
         start = valid_lengths[i].item()
         end = start + patch_size
         batch.values[i, start:end] = new_patch[i]

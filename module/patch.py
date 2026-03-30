@@ -68,9 +68,9 @@ class PatchEmbedding(nn.Module):
         torch.Tensor,  # (batch, num_patches) bool — patch_mask (True=유효)
     ]:
         """패치 추출 + 메타데이터 (projection 미적용)."""
-        P = self.patch_size
-        S = self.stride
-        if S == P:
+        p = self.patch_size
+        s = self.stride
+        if s == p:
             return self._patchify_non_overlapping(values, sample_id, variate_id)
         else:
             return self._patchify_overlapping(values, sample_id, variate_id)
@@ -112,19 +112,19 @@ class PatchEmbedding(nn.Module):
         sample_id: torch.Tensor,  # (batch, max_length) long
         variate_id: torch.Tensor,  # (batch, max_length) long
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        P = self.patch_size
-        B, L = values.shape
-        assert L % P == 0, (
-            f"max_length({L})가 patch_size({P})의 배수가 아닙니다. "
-            f"PackCollate(patch_size={P})를 사용하세요."
+        p = self.patch_size
+        b, l = values.shape
+        assert l % p == 0, (
+            f"max_length({l})가 patch_size({p})의 배수가 아닙니다. "
+            f"PackCollate(patch_size={p})를 사용하세요."
         )
-        N = L // P
+        n = l // p
 
-        patches = values.reshape(B, N, P)  # (B, N, P)
+        patches = values.reshape(b, n, p)  # (B, N, P)
 
         # 메타데이터 다운샘플
-        patch_sample_id = sample_id[:, ::P]  # (B, N)
-        patch_variate_id = variate_id[:, ::P]  # (B, N)
+        patch_sample_id = sample_id[:, ::p]  # (B, N)
+        patch_variate_id = variate_id[:, ::p]  # (B, N)
         patch_mask = patch_sample_id != 0  # (B, N)
 
         # time_id
@@ -139,29 +139,29 @@ class PatchEmbedding(nn.Module):
         sample_id: torch.Tensor,  # (batch, max_length) long
         variate_id: torch.Tensor,  # (batch, max_length) long
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        P = self.patch_size
-        S = self.stride
-        B, L = values.shape
-        assert L >= P, (
-            f"max_length({L})가 patch_size({P})보다 작습니다."
+        p = self.patch_size
+        s = self.stride
+        b, l = values.shape
+        assert l >= p, (
+            f"max_length({l})가 patch_size({p})보다 작습니다."
         )
-        assert (L - P) % S == 0, (
-            f"(max_length({L}) - patch_size({P})) % stride({S}) != 0. "
-            f"PackCollate(patch_size={P}, stride={S})를 사용하세요."
+        assert (l - p) % s == 0, (
+            f"(max_length({l}) - patch_size({p})) % stride({s}) != 0. "
+            f"PackCollate(patch_size={p}, stride={s})를 사용하세요."
         )
-        N = (L - P) // S + 1
+        n = (l - p) // s + 1
 
-        patches = values.unfold(-1, P, S)  # (B, N, P)
+        patches = values.unfold(-1, p, s)  # (B, N, P)
 
         # unfold로 패치 유효성 검사
-        sid_unfold = sample_id.unfold(-1, P, S)  # (B, N, P)
-        vid_unfold = variate_id.unfold(-1, P, S)  # (B, N, P)
+        sid_unfold = sample_id.unfold(-1, p, s)  # (B, N, P)
+        vid_unfold = variate_id.unfold(-1, p, s)  # (B, N, P)
 
         # 각 패치 첫 위치의 메타데이터
         patch_sample_id = sid_unfold[:, :, 0]  # (B, N)
         patch_variate_id = vid_unfold[:, :, 0]  # (B, N)
 
-        # 패치 유효 조건: P개 위치 모두 동일 (sid, vid) & sid != 0
+        # 패치 유효 조건: p개 위치 모두 동일 (sid, vid) & sid != 0
         sid_ok = (sid_unfold == sid_unfold[:, :, :1]).all(dim=-1)  # (B, N)
         vid_ok = (vid_unfold == vid_unfold[:, :, :1]).all(dim=-1)  # (B, N)
         patch_mask = sid_ok & vid_ok & (patch_sample_id != 0)  # (B, N)
@@ -182,18 +182,18 @@ class PatchEmbedding(nn.Module):
         (sample_id, variate_id) 조합이 같은 연속 패치들에 대해
         0부터 시작하는 순차 인덱스를 부여한다.
         """
-        B, N = sample_id.shape
+        b, n = sample_id.shape
         device = sample_id.device
 
         # 고유 variate 키: sample_id와 variate_id를 조합
         combined = sample_id * (variate_id.max() + 1) + variate_id  # (B, N)
 
         # 경계 감지: combined가 이전과 다르면 새 variate 시작
-        boundary = torch.ones(B, N, dtype=torch.bool, device=device)
+        boundary = torch.ones(b, n, dtype=torch.bool, device=device)
         boundary[:, 1:] = combined[:, 1:] != combined[:, :-1]
 
         # arange와 cummax로 각 위치의 그룹 시작 인덱스 계산
-        arange = torch.arange(N, device=device).unsqueeze(0).expand(B, -1)  # (B, N)
+        arange = torch.arange(n, device=device).unsqueeze(0).expand(b, -1)  # (B, N)
         boundary_pos = torch.where(boundary, arange, torch.zeros_like(arange))
         group_start, _ = boundary_pos.cummax(dim=-1)  # (B, N)
 
