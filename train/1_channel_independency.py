@@ -366,11 +366,21 @@ def main():
     viz_batches: list | None = None
     viz_dir = None
     if rank0 and viz_every > 0 and val_dataloader is not None:
+        # 모든 signal type이 포함될 때까지 배치 수집 (최대 100 배치)
         viz_iter = iter(val_dataloader)
         viz_batches = []
-        for _ in range(min(10, len(val_dataloader))):
+        seen_types: set[int] = set()
+        all_types = set(config.signal_types) if hasattr(config, "signal_types") else set()
+        max_viz_batches = min(100, len(val_dataloader))
+        for _ in range(max_viz_batches):
             try:
-                viz_batches.append(next(viz_iter))
+                b = next(viz_iter)
+                viz_batches.append(b)
+                for j in range(len(b.signal_types)):
+                    seen_types.add(int(b.signal_types[j]))
+                # 모든 signal type이 커버되면 중단
+                if all_types and seen_types >= all_types:
+                    break
             except StopIteration:
                 break
         del viz_iter
