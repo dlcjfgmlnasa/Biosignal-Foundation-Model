@@ -90,6 +90,9 @@ class TrainConfig:
     # 실험 관리
     exp_name: str = ""  # 실험 이름 (비어있으면 output_dir 그대로 사용)
 
+    # 시각화
+    viz_every: int = 5  # N 에폭마다 시각화 저장 (0=비활성)
+
     # 실행 제한
     max_batches: int = 0  # >0이면 에폭당 최대 배치 수 제한
     dry_run: bool = False  # True면 1 batch만 실행 후 종료

@@ -356,7 +356,10 @@ def main():
         print(f"AMP enabled (GradScaler)")
 
     # ── 시각화용 배치 캐시 (rank 0만) ──
-    viz_every = args.viz_every
+    viz_every = getattr(args, "viz_every", 5)
+    # YAML config에서 viz_every가 설정되어 있으면 우선 사용
+    if hasattr(config, "viz_every") and config.viz_every is not None:
+        viz_every = config.viz_every
     viz_batches: list | None = None
     viz_dir = None
     if rank0 and viz_every > 0 and val_dataloader is not None:
