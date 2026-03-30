@@ -401,8 +401,7 @@ def main():
             f"masked: {losses['masked_loss']:.6f} | "
             f"next: {losses['next_loss']:.6f} | "
             f"cross: {losses['cross_modal_loss']:.6f} | "
-            f"contrastive: {losses['contrastive_loss']:.6f} | "
-            f"eeg: {losses['eeg_loss']:.6f}"
+            f"contrastive: {losses['contrastive_loss']:.6f}"
         )
         if val_losses is not None:
             line += f" | val: {val_losses['total']:.6f}"

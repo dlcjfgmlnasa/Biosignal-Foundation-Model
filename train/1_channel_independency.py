@@ -425,8 +425,7 @@ def main():
                 f"Epoch {epoch:3d} | "
                 f"train: {losses['total']:.6f} | "
                 f"masked: {losses['masked_loss']:.6f} | "
-                f"next: {losses['next_loss']:.6f} | "
-                f"eeg: {losses['eeg_loss']:.6f}"
+                f"next: {losses['next_loss']:.6f}"
             )
             if val_losses is not None:
                 line += f" | val: {val_losses['total']:.6f}"
