@@ -45,6 +45,7 @@ from .train_utils import (
     set_seed,
     setup_ddp,
     split_manifest_by_subject,
+    get_max_horizon,
     train_one_epoch,
     validate,
 )
@@ -405,12 +406,24 @@ def main():
         print(f"\nStarting training: {config.n_epochs} epochs")
         print(f"  alpha={config.alpha}, beta={config.beta}, gamma={config.gamma}")
         print(f"  max_horizon={config.model_config.max_horizon}, mask_ratio={config.mask_ratio}")
+        if config.model_config.max_horizon > 1:
+            n = config.n_epochs
+            print(f"  horizon_curriculum: epoch 0~{int(n*0.4)-1}→H=1, "
+                  f"{int(n*0.4)}~{int(n*0.7)-1}→H≤{max(1,-(-config.model_config.max_horizon*3//5))}, "
+                  f"{int(n*0.7)}~{n-1}→H≤{config.model_config.max_horizon}")
         print(f"  warmup_epochs={config.warmup_epochs}")
         if val_dataloader is not None:
             print(f"  val_ratio={config.val_ratio}, patience={config.patience}")
         print(f"{'='*60}")
 
+    prev_max_h = None
     for epoch in range(config.n_epochs):
+        # Horizon curriculum 로깅
+        cur_max_h = get_max_horizon(config, epoch)
+        if rank0 and cur_max_h != prev_max_h:
+            print(f"  [Horizon] epoch {epoch}: max_horizon {prev_max_h} -> {cur_max_h}")
+            prev_max_h = cur_max_h
+
         # DDP: sampler 에폭 설정 (셔플링 동기화)
         if sampler is not None:
             sampler.set_epoch(epoch)
@@ -432,6 +445,7 @@ def main():
             val_losses = validate(
                 model, val_dataloader, criterion,
                 config=config, device=device, phase_name="Phase1_CI",
+                epoch=epoch,
             )
         epoch_sec = time.time() - epoch_start
 

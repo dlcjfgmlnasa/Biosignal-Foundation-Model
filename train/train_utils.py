@@ -73,6 +73,9 @@ class TrainConfig:
 
     # Masking 전략
     variate_mask_prob: float = 0.0  # Phase 2: variate-level 마스킹 확률
+    block_mask: bool = False       # True면 연속 블록 단위 마스킹
+    block_size_min: int = 3        # 블록 최소 크기 (패치 수, 즉 초)
+    block_size_max: int = 8        # 블록 최대 크기 (패치 수, 즉 초)
 
     # 시스템
     device: str = "auto"  # "auto", "cuda", "cpu"
@@ -230,6 +233,29 @@ def split_manifest_by_subject(
 # ── 학습 루프 ───────────────────────────────────────────────────
 
 
+def get_max_horizon(config: TrainConfig, epoch: int) -> int:
+    """현재 epoch에 해당하는 max_horizon을 반환한다.
+
+    max_horizon <= 1이면 항상 1 반환 (curriculum 비활성).
+    max_horizon > 1이면 n_epochs를 3등분하여 자동 curriculum:
+      → 전반 40%: H=1, 중반 30%: H=ceil(max_horizon*0.6), 후반 30%: H=max_horizon
+    """
+    max_h = config.model_config.max_horizon
+    if max_h <= 1:
+        return 1
+
+    n = config.n_epochs
+    phase1_end = int(n * 0.4)   # 40%
+    phase2_end = int(n * 0.7)   # 70%
+
+    if epoch < phase1_end:
+        return 1
+    elif epoch < phase2_end:
+        return max(1, -(-max_h * 3 // 5))  # ceil(max_h * 0.6)
+    else:
+        return max_h
+
+
 def train_one_epoch(
     model: nn.Module,
     dataloader,
@@ -273,7 +299,7 @@ def train_one_epoch(
         # ── Forward (single call: task="both" for DDP compatibility) ──
         h = 1
         if enable_next:
-            h = random.randint(1, config.model_config.max_horizon)
+            h = random.randint(1, get_max_horizon(config, epoch))
 
         with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
             raw_model = model.module if isinstance(model, DDP) else model
@@ -298,12 +324,15 @@ def train_one_epoch(
                 if hasattr(layer.ffn, "aux_loss") and layer.ffn.aux_loss is not None:
                     aux_loss = aux_loss + layer.ffn.aux_loss
 
-            # 패치 단위 마스킹 (variate-level 마스킹 지원)
+            # 패치 단위 마스킹 (block / variate-level 마스킹 지원)
             pred_mask = create_patch_mask(
                 patch_mask,
                 mask_ratio=config.mask_ratio,
                 patch_variate_id=out["patch_variate_id"] if config.variate_mask_prob > 0 else None,
                 variate_mask_prob=config.variate_mask_prob,
+                block_mask=config.block_mask,
+                block_size_min=config.block_size_min,
+                block_size_max=config.block_size_max,
             )
 
             # 원본 패치 추출 (정규화된 값)
@@ -483,6 +512,7 @@ def validate(
     config: TrainConfig,
     device: torch.device,
     phase_name: str,
+    epoch: int = 0,
 ) -> dict[str, float]:
     """Validation 루프. train_one_epoch()과 동일한 loss 계산, backward 없이.
 
@@ -513,7 +543,7 @@ def validate(
 
         h = 1
         if enable_next:
-            h = random.randint(1, config.model_config.max_horizon)
+            h = random.randint(1, get_max_horizon(config, epoch))
 
         with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
             task = "both" if enable_next else "masked"
@@ -541,6 +571,9 @@ def validate(
                 mask_ratio=config.mask_ratio,
                 patch_variate_id=out["patch_variate_id"] if config.variate_mask_prob > 0 else None,
                 variate_mask_prob=config.variate_mask_prob,
+                block_mask=config.block_mask,
+                block_size_min=config.block_size_min,
+                block_size_max=config.block_size_max,
             )
 
             p = raw_model.patch_size

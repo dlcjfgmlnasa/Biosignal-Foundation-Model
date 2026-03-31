@@ -396,6 +396,7 @@ def main():
             val_losses = validate(
                 model, val_dataloader, criterion,
                 config=config, device=device, phase_name="Phase2_AV",
+                epoch=epoch,
             )
         epoch_sec = time.time() - epoch_start
 

@@ -38,6 +38,9 @@ def create_patch_mask(
     mask_ratio: float = 0.15,
     patch_variate_id: torch.Tensor | None = None,  # (B, N)
     variate_mask_prob: float = 0.0,    # Phase 2: 전체 variate 마스킹 확률
+    block_mask: bool = False,          # True면 연속 블록 마스킹
+    block_size_min: int = 3,           # 블록 최소 크기 (패치 수)
+    block_size_max: int = 8,           # 블록 최대 크기 (패치 수)
 ) -> torch.Tensor:  # (B, N) bool — 마스킹 대상 (True=마스킹)
     """패치 마스킹 생성.
 
@@ -52,6 +55,13 @@ def create_patch_mask(
     variate_mask_prob:
         variate-level 마스킹 확률. 0이면 비활성 (Phase 1 동작).
         > 0이면 해당 확률로 랜덤 variate를 선택하여 모든 패치를 마스킹.
+    block_mask:
+        True이면 연속 블록 단위로 마스킹. 보간 기반 복원을 방지하여
+        장기 시간적 의존성 학습을 강제한다.
+    block_size_min:
+        블록 최소 크기 (패치 수). 기본 3 (3초).
+    block_size_max:
+        블록 최대 크기 (패치 수). 기본 8 (8초).
 
     Returns
     -------
@@ -74,20 +84,74 @@ def create_patch_mask(
             and patch_variate_id is not None
             and torch.rand(1).item() < variate_mask_prob
         ):
-            # 유효 패치의 variate_id에서 0 제외 (패딩)
             valid_var_ids = patch_variate_id[bi, valid_idx]
             unique_vars = valid_var_ids[valid_var_ids > 0].unique()
             if len(unique_vars) > 1:
-                # 랜덤 variate 선택 → 해당 variate 전체 마스킹
                 chosen_var = unique_vars[torch.randint(len(unique_vars), (1,)).item()]
                 var_mask = (patch_variate_id[bi] == chosen_var)
                 pred_mask[bi] = var_mask & patch_mask[bi]
                 continue
 
-        # 랜덤 패치 마스킹 (기본 / Phase 1)
         n_valid = len(valid_idx)
         n_mask = max(1, int(n_valid * mask_ratio))
-        perm = torch.randperm(n_valid, device=device)[:n_mask]
-        pred_mask[bi, valid_idx[perm]] = True
+
+        if block_mask and n_valid >= block_size_min:
+            # ── Block Masking ──
+            # variate별로 연속 구간을 찾아 블록 단위로 마스킹
+            masked_count = 0
+            # valid_idx는 정렬되어 있으므로 연속 구간(run) 추출
+            runs = _find_contiguous_runs(valid_idx)
+            # 랜덤 순서로 run을 순회하며 블록 배치
+            run_order = torch.randperm(len(runs)).tolist()
+            while masked_count < n_mask:
+                placed = False
+                for ri in run_order:
+                    run_start, run_len = runs[ri]
+                    if run_len < block_size_min:
+                        continue
+                    bs = torch.randint(block_size_min, min(block_size_max, run_len) + 1, (1,)).item()
+                    bs = min(bs, n_mask - masked_count)  # 초과 방지
+                    if bs < 1:
+                        break
+                    max_start = run_len - bs
+                    offset = torch.randint(0, max_start + 1, (1,)).item()
+                    start_idx = run_start + offset
+                    pred_mask[bi, start_idx:start_idx + bs] = True
+                    masked_count += bs
+                    placed = True
+                if not placed:
+                    break
+            # 목표 미달 시 랜덤으로 나머지 채움
+            if masked_count < n_mask:
+                remaining = valid_idx[~pred_mask[bi, valid_idx]]
+                if len(remaining) > 0:
+                    extra = min(n_mask - masked_count, len(remaining))
+                    perm = torch.randperm(len(remaining), device=device)[:extra]
+                    pred_mask[bi, remaining[perm]] = True
+        else:
+            # ── Random Masking (기본) ──
+            perm = torch.randperm(n_valid, device=device)[:n_mask]
+            pred_mask[bi, valid_idx[perm]] = True
 
     return pred_mask
+
+
+def _find_contiguous_runs(
+    indices: torch.Tensor,  # (K,) sorted 인덱스
+) -> list[tuple[int, int]]:
+    """정렬된 인덱스에서 연속 구간 (start, length) 리스트를 반환한다."""
+    if len(indices) == 0:
+        return []
+    runs: list[tuple[int, int]] = []
+    start = indices[0].item()
+    prev = start
+    for i in range(1, len(indices)):
+        cur = indices[i].item()
+        if cur == prev + 1:
+            prev = cur
+        else:
+            runs.append((start, prev - start + 1))
+            start = cur
+            prev = cur
+    runs.append((start, prev - start + 1))
+    return runs
