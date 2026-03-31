@@ -7,6 +7,7 @@ Phase 1 (CI): 같은 variate 내 시간 예측 (dynamics).
 Phase 2 (Any-variate): 같은 variate 시간 예측 + cross-modal 예측 (causality).
 """
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from data.spatial_map import MECHANISM_GROUP
@@ -101,9 +102,10 @@ class NextPredictionLoss(nn.Module):
         n_valid = valid.float().sum()
         if n_valid > 0:
             horizon_weight = 1.0 / horizon
-            loss = (
-                (pred_next[valid] - target_next[valid]) ** 2
-            ).mean() * horizon_weight
+            loss = F.huber_loss(
+                pred_next[valid], target_next[valid],
+                reduction="mean", delta=1.0,
+            ) * horizon_weight
         else:
             loss = next_pred.new_tensor(0.0)
         return loss
@@ -160,6 +162,6 @@ class NextPredictionLoss(nn.Module):
 
         pred_p = cross_pred[b_idx, i_idx]          # (K, P)
         target_p = original_patches[b_idx, j_idx]  # (K, P)
-        loss = ((pred_p - target_p) ** 2).mean()
+        loss = F.huber_loss(pred_p, target_p, reduction="mean", delta=1.0)
 
         return loss

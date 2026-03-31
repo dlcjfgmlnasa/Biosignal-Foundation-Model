@@ -7,14 +7,18 @@ Phase 1 (CI): 랜덤 패치 마스킹 → 같은 variate 내 형태학 복원.
 Phase 2 (Any-variate): variate-level 마스킹 → 다른 모달리티로부터 복원 (Virtual Sensing).
 """
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 
 class MaskedPatchLoss(nn.Module):
-    """마스킹된 패치 위치만 MSE를 계산하는 손실 함수.
+    """마스킹된 패치 위치만 Huber Loss를 계산하는 손실 함수.
 
-    pred_mask=True인 패치에 대해 (reconstructed - original)^2 평균을 반환한다.
+    pred_mask=True인 패치에 대해 Huber Loss(delta=1.0) 평균을 반환한다.
     마스킹된 위치가 없으면 0을 반환한다.
+
+    Huber Loss는 작은 오차에는 MSE, 큰 오차에는 L1로 전환하여
+    ECG QRS spike 등 outlier의 과도한 gradient를 완화한다.
     """
 
     def forward(
@@ -25,9 +29,12 @@ class MaskedPatchLoss(nn.Module):
     ) -> torch.Tensor:  # scalar
         n_masked = pred_mask.float().sum()
         if n_masked > 0:
-            loss = (
-                (reconstructed[pred_mask] - original_patches[pred_mask]) ** 2
-            ).mean()
+            loss = F.huber_loss(
+                reconstructed[pred_mask],
+                original_patches[pred_mask],
+                reduction="mean",
+                delta=1.0,
+            )
         else:
             loss = reconstructed.new_tensor(0.0)
         return loss
