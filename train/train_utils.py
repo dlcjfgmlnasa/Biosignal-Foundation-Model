@@ -98,6 +98,7 @@ class TrainConfig:
 
     # 실행 제한
     max_batches: int = 0  # >0이면 에폭당 최대 배치 수 제한
+    val_max_batches: int = 500  # validation 최대 배치 수
     dry_run: bool = False  # True면 1 batch만 실행 후 종료
 
     # ── YAML 직렬화 ──────────────────────────────────────────
@@ -618,7 +619,8 @@ def validate(
         epoch_aux += aux_loss
         n_batches += 1
 
-        if config.max_batches > 0 and n_batches >= config.max_batches:
+        val_limit = config.val_max_batches if config.val_max_batches > 0 else config.max_batches
+        if val_limit > 0 and n_batches >= val_limit:
             break
 
     model.train()
