@@ -14,6 +14,7 @@ import torch
 from torch import nn
 
 from data.collate import PackedBatch
+from loss.masked_mse_loss import create_patch_mask
 from model._config import ModelConfig
 from module.cnn_stem import ModalityCNNStem
 from module.packed_scaler import PackedStdScaler, PackedScaler
@@ -190,7 +191,10 @@ class BiosignalFoundationModel(nn.Module):
                 nn.Linear(d_model, contrastive_proj_dim),
             )
 
-        # 11. EEG Spectral Tokenizer + Heads
+        # 11. Learnable [MASK] Token
+        self.mask_token = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+
+        # 12. EEG Spectral Tokenizer + Heads
         self.eeg_spectral_tokenizer = SpectralTokenizer(
             patch_size=patch_size,
             n_fft=eeg_spectral_n_fft,
@@ -230,6 +234,11 @@ class BiosignalFoundationModel(nn.Module):
         self,
         batch: PackedBatch,
         task: str = "masked",
+        mask_ratio: float = 0.0,
+        block_mask: bool = False,
+        block_size_min: int = 3,
+        block_size_max: int = 8,
+        variate_mask_prob: float = 0.0,
     ) -> dict[str, torch.Tensor]:
         """공통 인코딩 파이프라인: Scaler → Patchify → Project → SpatialEmbed → LocScale → Encoder.
 
@@ -314,14 +323,26 @@ class BiosignalFoundationModel(nn.Module):
         scale_emb = self.scale_proj(patch_scale)  # (B, N, d_model)
         embedded = embedded + (loc_emb + scale_emb) * valid_token
 
-        # 7. Base Attention Mask: 같은 sample 내에서만 attend + 유효 패치만
+        # 7. [MASK] Token — 마스킹된 패치의 content를 learnable token으로 교체
+        pred_mask: torch.Tensor | None = None
+        if mask_ratio > 0 and task in ("masked", "both"):
+            pred_mask = create_patch_mask(
+                patch_mask, mask_ratio=mask_ratio,
+                patch_variate_id=p_vid if variate_mask_prob > 0 else None,
+                variate_mask_prob=variate_mask_prob,
+                block_mask=block_mask,
+                block_size_min=block_size_min,
+                block_size_max=block_size_max,
+            )
+
+        # 8. Base Attention Mask: 같은 sample 내에서만 attend + 유효 패치만
         base_attn_mask = (
             (p_sid.unsqueeze(-1) == p_sid.unsqueeze(-2))
             & patch_mask.unsqueeze(-2)
             & patch_mask.unsqueeze(-1)
         )  # (B, N, n)
 
-        # 8. Task에 따른 Masking 스위치 + Transformer Encoder
+        # 9. Task에 따른 Masking 스위치 + Transformer Encoder
         result: dict[str, torch.Tensor] = {
             "patches": patches,
             "patch_signal_types": patch_signal_types,
@@ -332,6 +353,7 @@ class BiosignalFoundationModel(nn.Module):
             "patch_sample_id": p_sid,
             "patch_variate_id": p_vid,
             "time_id": time_id,
+            "pred_mask": pred_mask,
         }
 
         encoder_kwargs = dict(var_id=p_vid, time_id=time_id)
@@ -345,10 +367,16 @@ class BiosignalFoundationModel(nn.Module):
             causal_mask = base_attn_mask & causal_tri.unsqueeze(0)  # (B, N, N)
 
         if task == "both":
-            # bidirectional + causal 동시 (DDP single forward 호환)
+            # bidirectional: [MASK] 토큰 적용 → 마스킹된 패치 정보 차단
+            embedded_bi = embedded.clone()
+            if pred_mask is not None:
+                mask_expanded = pred_mask.unsqueeze(-1)  # (B, N, 1)
+                mask_token_expanded = self.mask_token.expand_as(embedded_bi)
+                embedded_bi = torch.where(mask_expanded, mask_token_expanded, embedded_bi)
             result["encoded"] = self.encoder(
-                embedded.clone(), attn_mask=base_attn_mask, **encoder_kwargs,
+                embedded_bi, attn_mask=base_attn_mask, **encoder_kwargs,
             )
+            # causal: [MASK] 불필요 — causal attention이 미래 정보 차단
             result["encoded_causal"] = self.encoder(
                 embedded.clone(), attn_mask=causal_mask, **encoder_kwargs,
             )
@@ -357,6 +385,10 @@ class BiosignalFoundationModel(nn.Module):
                 embedded, attn_mask=causal_mask, **encoder_kwargs,
             )
         else:  # "masked"
+            if pred_mask is not None:
+                mask_expanded = pred_mask.unsqueeze(-1)
+                mask_token_expanded = self.mask_token.expand_as(embedded)
+                embedded = torch.where(mask_expanded, mask_token_expanded, embedded)
             result["encoded"] = self.encoder(
                 embedded, attn_mask=base_attn_mask, **encoder_kwargs,
             )
@@ -370,6 +402,11 @@ class BiosignalFoundationModel(nn.Module):
         batch: PackedBatch,
         task: str = "masked",  # "masked" 또는 "next_pred"
         horizon: int = 1,
+        mask_ratio: float = 0.0,
+        block_mask: bool = False,
+        block_size_min: int = 3,
+        block_size_max: int = 8,
+        variate_mask_prob: float = 0.0,
     ) -> dict[str, torch.Tensor]:
         """전체 forward 파이프라인.
 
@@ -399,7 +436,12 @@ class BiosignalFoundationModel(nn.Module):
             ``patch_variate_id``: ``(B, N)`` — 패치별 variate_id.
             ``time_id``: ``(B, N)`` — 패치별 시간 인덱스.
         """
-        enc = self._encode(batch, task=task)
+        enc = self._encode(
+            batch, task=task,
+            mask_ratio=mask_ratio, block_mask=block_mask,
+            block_size_min=block_size_min, block_size_max=block_size_max,
+            variate_mask_prob=variate_mask_prob,
+        )
 
         encoded = enc["encoded"]  # bidirectional (or sole encoding for single-task)
         patch_signal_types = enc["patch_signal_types"]  # (B, N) or None
@@ -414,6 +456,7 @@ class BiosignalFoundationModel(nn.Module):
             "patch_sample_id": enc["patch_sample_id"],
             "patch_variate_id": enc["patch_variate_id"],
             "time_id": enc["time_id"],
+            "pred_mask": enc["pred_mask"],
         }
 
         # ── Masked Reconstruction ──

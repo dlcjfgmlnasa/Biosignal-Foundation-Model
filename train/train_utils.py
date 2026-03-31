@@ -25,7 +25,7 @@ from torch.optim.lr_scheduler import LambdaLR
 
 from data import RecordingManifest
 from loss.criterion import CombinedLoss
-from loss.masked_mse_loss import create_patch_mask
+from loss.masked_mse_loss import create_patch_mask  # noqa: F401 — downstream에서 re-import 가능
 from model.checkpoint import save_checkpoint
 from model import ModelConfig
 
@@ -305,13 +305,21 @@ def train_one_epoch(
             raw_model = model.module if isinstance(model, DDP) else model
             task = "both" if enable_next else "masked"
 
-            out = model(batch, task=task, horizon=h)
+            out = model(
+                batch, task=task, horizon=h,
+                mask_ratio=config.mask_ratio,
+                block_mask=config.block_mask,
+                block_size_min=config.block_size_min,
+                block_size_max=config.block_size_max,
+                variate_mask_prob=config.variate_mask_prob,
+            )
 
             reconstructed = out["reconstructed"]  # (B, N, patch_size)
             cross_pred = out["cross_pred"]        # (B, N, patch_size)
             patch_mask = out["patch_mask"]        # (B, N) bool
             time_id = out["time_id"]              # (B, N)
             next_pred = out.get("next_pred")      # (B, N, patch_size) or None
+            pred_mask = out["pred_mask"]          # (B, N) bool — 모델 내부에서 생성
 
             # V2 전용 출력
             eeg_reconstructed = out.get("eeg_reconstructed")  # (B, N, d_model) or None
@@ -323,17 +331,6 @@ def train_one_epoch(
             for layer in raw_model.encoder.layers:
                 if hasattr(layer.ffn, "aux_loss") and layer.ffn.aux_loss is not None:
                     aux_loss = aux_loss + layer.ffn.aux_loss
-
-            # 패치 단위 마스킹 (block / variate-level 마스킹 지원)
-            pred_mask = create_patch_mask(
-                patch_mask,
-                mask_ratio=config.mask_ratio,
-                patch_variate_id=out["patch_variate_id"] if config.variate_mask_prob > 0 else None,
-                variate_mask_prob=config.variate_mask_prob,
-                block_mask=config.block_mask,
-                block_size_min=config.block_size_min,
-                block_size_max=config.block_size_max,
-            )
 
             # 원본 패치 추출 (정규화된 값)
             p = raw_model.patch_size
@@ -547,13 +544,21 @@ def validate(
 
         with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
             task = "both" if enable_next else "masked"
-            out = raw_model(batch, task=task, horizon=h)
+            out = raw_model(
+                batch, task=task, horizon=h,
+                mask_ratio=config.mask_ratio,
+                block_mask=config.block_mask,
+                block_size_min=config.block_size_min,
+                block_size_max=config.block_size_max,
+                variate_mask_prob=config.variate_mask_prob,
+            )
 
             reconstructed = out["reconstructed"]
             cross_pred = out["cross_pred"]
             patch_mask = out["patch_mask"]
             time_id = out["time_id"]
             next_pred = out.get("next_pred")
+            pred_mask = out["pred_mask"]  # 모델 내부에서 생성
 
             # V2 전용 출력
             eeg_reconstructed = out.get("eeg_reconstructed")
@@ -565,16 +570,6 @@ def validate(
             for layer in raw_model.encoder.layers:
                 if hasattr(layer.ffn, "aux_loss") and layer.ffn.aux_loss is not None:
                     aux_loss += layer.ffn.aux_loss.item()
-
-            pred_mask = create_patch_mask(
-                patch_mask,
-                mask_ratio=config.mask_ratio,
-                patch_variate_id=out["patch_variate_id"] if config.variate_mask_prob > 0 else None,
-                variate_mask_prob=config.variate_mask_prob,
-                block_mask=config.block_mask,
-                block_size_min=config.block_size_min,
-                block_size_max=config.block_size_max,
-            )
 
             p = raw_model.patch_size
             normalized = ((batch.values.unsqueeze(-1) - out["loc"]) / out["scale"]).squeeze(-1)

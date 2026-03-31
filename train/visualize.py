@@ -367,11 +367,11 @@ def _process_recon_batch(
     if device is not None:
         _batch_to_device(batch, device)
 
-    out = model(batch, task="masked")
+    out = model(batch, task="masked", mask_ratio=mask_ratio)
     original_patches, patch_loc, patch_scale, n = _extract_patches_and_scales(model, batch, out)
     p = model.patch_size
 
-    pred_mask = create_patch_mask(out["patch_mask"], mask_ratio=mask_ratio)
+    pred_mask = out["pred_mask"]
 
     def build_pred(seg_orig, seg_pred_denorm, seg_indices, n_seg):
         seg_masked = pred_mask[0][seg_indices].cpu().numpy()  # noqa — closure captures b
@@ -389,7 +389,7 @@ def _process_recon_batch(
     is_v2 = "eeg_mask" in out or "eeg_reconstructed" in out
 
     reconstructed = out["reconstructed"]
-    pred_mask_full = create_patch_mask(patch_mask, mask_ratio=mask_ratio)
+    pred_mask_full = out["pred_mask"]
 
     candidates: list[RowCandidate] = []
     for bi in range(batch_size):
@@ -519,8 +519,6 @@ def _collect_eeg_spectral(
     max_examples: int = 3,
 ) -> list[dict] | None:
     """EEG spectral 비교 데이터를 수집한다. _plot_figure_grid의 eeg_spectral 인자로 전달."""
-    from loss.masked_mse_loss import create_patch_mask as _create_mask
-
     if not (hasattr(model, "eeg_spectral_tokenizer") and model.eeg_spectral_tokenizer is not None):
         return None
 
@@ -532,7 +530,7 @@ def _collect_eeg_spectral(
         if device is not None:
             _batch_to_device(batch, device)
 
-        out = model(batch, task="both", horizon=horizon)
+        out = model(batch, task="both", horizon=horizon, mask_ratio=mask_ratio)
         eeg_mask = out.get("eeg_mask")
         eeg_target = out.get("eeg_recon_target")
         if eeg_mask is None or eeg_target is None:
@@ -547,7 +545,7 @@ def _collect_eeg_spectral(
             eeg_pred = out.get("eeg_reconstructed")
             if eeg_pred is None:
                 continue
-            pred_mask = _create_mask(patch_mask, mask_ratio=mask_ratio)
+            pred_mask = out["pred_mask"]
             for bi in range(batch_size):
                 indices = (pred_mask[bi] & eeg_mask[bi]).nonzero(as_tuple=True)[0]
                 for idx in indices[:2]:
@@ -592,8 +590,6 @@ def _save_eeg_spectral_figure(
     마스킹된 EEG 패치의 원본 vs 예측 spectrogram, 그리고
     next-pred의 원본 vs 예측 spectrogram을 비교한다.
     """
-    from loss.masked_mse_loss import create_patch_mask as _create_mask
-
     if not (hasattr(model, "eeg_spectral_tokenizer") and model.eeg_spectral_tokenizer is not None):
         return None
 
@@ -607,7 +603,7 @@ def _save_eeg_spectral_figure(
         if device is not None:
             _batch_to_device(batch, device)
 
-        out = model(batch, task="both", horizon=horizon)
+        out = model(batch, task="both", horizon=horizon, mask_ratio=mask_ratio)
 
         eeg_mask = out.get("eeg_mask")            # (B, N)
         eeg_recon = out.get("eeg_reconstructed")   # (B, N, spec_dim)
@@ -619,7 +615,7 @@ def _save_eeg_spectral_figure(
         patch_mask = out["patch_mask"]
         p_sid = out["patch_sample_id"]
         p_vid = out["patch_variate_id"]
-        pred_mask = _create_mask(patch_mask, mask_ratio=mask_ratio)
+        pred_mask = out["pred_mask"]
 
         batch_size, n_patches = eeg_mask.shape
         for bi in range(batch_size):
