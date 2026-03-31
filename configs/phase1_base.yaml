@@ -68,6 +68,7 @@ use_amp: true                  # L4 FP16 tensor cores
 
 # ── Validation & Early Stopping ──
 val_ratio: 0.05                # subject 단위 5% validation
+val_max_batches: 500           # validation 최대 배치 수
 patience: 15                   # early stopping patience
 
 # ── 시스템 ──
