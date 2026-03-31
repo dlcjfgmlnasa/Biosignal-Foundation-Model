@@ -86,12 +86,14 @@ class BiosignalDataset(Dataset[BiosignalSample]):
         use_mmap: bool = True,
         crop_ratio_range: tuple[float, float] | None = None,
         preload: bool = False,
+        patch_size: int | None = None,
     ) -> None:
         super().__init__()
         self.max_length = max_length
         self.window_seconds = window_seconds
         self.stride_seconds = stride_seconds
         self.crop_ratio_range = crop_ratio_range  # e.g. (0.5, 1.0)
+        self._patch_size = patch_size  # crop 시 patch 배수 정렬용
         self._manifest = list(manifest)
         self._use_mmap = use_mmap
         self._cache_size = cache_size
@@ -189,11 +191,14 @@ class BiosignalDataset(Dataset[BiosignalSample]):
             if self.max_length is not None:
                 values = values[: self.max_length]
 
-        # Random crop: 윈도우 내에서 랜덤 비율로 잘라냄
+        # Random crop: 윈도우 내에서 랜덤 비율로 잘라냄 (patch_size 배수 정렬)
         if self.crop_ratio_range is not None and len(values) > 0:
             lo, hi = self.crop_ratio_range
             ratio = random.uniform(lo, hi)
             crop_len = max(1, int(len(values) * ratio))
+            # patch_size 배수로 정렬 — 마지막 패치의 zero-padding 방지
+            if hasattr(self, '_patch_size') and self._patch_size is not None:
+                crop_len = max(self._patch_size, (crop_len // self._patch_size) * self._patch_size)
             if crop_len < len(values):
                 start = random.randint(0, len(values) - crop_len)
                 values = values[start : start + crop_len]

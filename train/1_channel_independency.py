@@ -280,6 +280,7 @@ def main():
         cache_size=config.cache_size,
         crop_ratio_range=crop_range,
         preload=config.preload,
+        patch_size=config.model_config.patch_size,
     )
     if rank0:
         print(f"Train dataset: {len(dataset)} windows")
@@ -313,6 +314,7 @@ def main():
             window_seconds=config.window_seconds,
             cache_size=config.cache_size,
             preload=config.preload,
+            patch_size=config.model_config.patch_size,
         )
         val_sampler = None
         if use_ddp:
