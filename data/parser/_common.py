@@ -184,6 +184,37 @@ def save_recording(tensor: torch.Tensor, out_path: str) -> None:
     torch.save(tensor.to(torch.float32), out_path)
 
 
+def save_recording_h5(
+    data: np.ndarray,
+    h5_path: str | Path,
+    dataset_name: str,
+) -> None:
+    """(C, T) float32 배열을 HDF5 파일의 dataset으로 저장한다.
+
+    subject당 단일 HDF5 파일에 여러 recording을 dataset으로 추가한다.
+    이미 파일이 있으면 append, 없으면 생성.
+
+    Parameters
+    ----------
+    data:
+        (n_channels, n_timesteps) float32 배열.
+    h5_path:
+        HDF5 파일 경로 (.h5).
+    dataset_name:
+        HDF5 내 dataset 이름 (e.g., "VDB_0001_S0_ecg_1_seg0").
+    """
+    import h5py
+
+    with h5py.File(str(h5_path), "a") as hf:  # "a" = append mode
+        if dataset_name in hf:
+            del hf[dataset_name]  # 이미 존재하면 덮어쓰기
+        hf.create_dataset(
+            dataset_name, data=data.astype(np.float16),
+            compression="gzip", compression_opts=4,
+            chunks=(data.shape[0], min(data.shape[1], 100_000)),
+        )
+
+
 def save_recording_zarr(
     data: np.ndarray,
     out_path: str | Path,

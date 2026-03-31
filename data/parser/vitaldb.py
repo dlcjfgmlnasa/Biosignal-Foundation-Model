@@ -35,6 +35,7 @@ import numpy as np
 from data.parser._common import (
     domain_quality_check,
     resample_to_target,
+    save_recording_h5,
     save_recording_zarr,
     segment_quality_score,
 )
@@ -566,12 +567,13 @@ def process_vital(
                 if duration_s < min_duration_s:
                     continue
 
-                fname = f"{session_id}_{stype_key}_{spatial_id}_seg{seg_idx}_{group_idx}.zarr"
-                save_recording_zarr(channel_data, subj_out / fname)
+                ds_name = f"{session_id}_{stype_key}_{spatial_id}_seg{seg_idx}_{group_idx}"
+                h5_path = subj_out / f"{subject_id}.h5"
+                save_recording_h5(channel_data, h5_path, ds_name)
 
                 rec = {
                     "signal_type": signal_type,
-                    "file": fname,
+                    "file": f"{subject_id}.h5#{ds_name}",
                     "n_channels": 1,
                     "sampling_rate": TARGET_SR,
                     "n_timesteps": channel_data.shape[1],
