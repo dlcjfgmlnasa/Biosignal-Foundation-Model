@@ -49,7 +49,7 @@ mask_ratio: 0.3                # 30% 패치 마스킹
 gradient_clip: 1.0
 seed: 42
 collate_mode: ci
-max_batches: 8000              # 32 × 8000 = 256K samples/epoch (batch128 × 2000과 동일)
+max_batches: 2000              # 256 × 2000 = 512K samples/epoch (전체의 8.5%, 100ep → ~8.5회)
 
 # ── Loss 가중치 (Phase 1: MPM + Next-Pred) ──
 alpha: 1.0                     # masked reconstruction (non-EEG raw + EEG spectral)
