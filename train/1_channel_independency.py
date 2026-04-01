@@ -372,9 +372,12 @@ def main():
         state = load_checkpoint(args.resume, raw_model_for_load, optimizer=optimizer, device=device)
         start_epoch = state.get("epoch", 0) + 1
         best_loss = state.get("loss", float("inf"))
-        # scheduler를 resume epoch까지 진행
-        for _ in range(start_epoch):
-            scheduler.step()
+        # scheduler를 resume epoch까지 진행 (warning 억제)
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            for _ in range(start_epoch):
+                scheduler.step()
         if rank0:
             print(f"Resumed from {args.resume} (epoch {state.get('epoch', '?')}, loss {best_loss:.6f})")
             print(f"  Continuing from epoch {start_epoch}, LR={optimizer.param_groups[0]['lr']:.6e}")
