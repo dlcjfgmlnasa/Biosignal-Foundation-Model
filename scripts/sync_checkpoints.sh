@@ -9,7 +9,7 @@ SRC="${1:?Usage: $0 <SRC> <DST> [INTERVAL]}"
 DST="${2:?Usage: $0 <SRC> <DST> [INTERVAL]}"
 INTERVAL="${3:-60}"
 
-mkdir -p "$DST"
+mkdir -p "$DST/checkpoints" "$DST/figures/recon" "$DST/figures/next_pred"
 
 echo "[sync] Started: $SRC -> $DST (every ${INTERVAL}s)"
 
