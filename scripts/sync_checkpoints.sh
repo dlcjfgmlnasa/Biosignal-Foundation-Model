@@ -17,8 +17,10 @@ while true; do
     # 1. 전체 복사
     cp -ru "$SRC/." "$DST/"
 
-    # 2. 로컬 checkpoint 삭제 (복사 완료 후)
+    # 2. 로컬 정리 (복사 완료 후)
     rm -f "$SRC"/checkpoints/checkpoint_*.pt 2>/dev/null
+    rm -f "$SRC"/figures/recon/*.png 2>/dev/null
+    rm -f "$SRC"/figures/next_pred/*.png 2>/dev/null
 
     echo "[sync] $(date '+%H:%M:%S') synced. Local disk: $(df -h . | tail -1 | awk '{print $4}') free"
     sleep $INTERVAL
