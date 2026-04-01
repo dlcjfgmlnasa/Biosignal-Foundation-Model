@@ -1,13 +1,17 @@
 #!/bin/bash
 # 로컬 디스크의 checkpoint를 네트워크 마운트로 주기적으로 동기화
-# Usage: bash scripts/sync_checkpoints.sh &
+# Usage: bash scripts/sync_checkpoints.sh <SRC> <DST> [INTERVAL]
 #
-# 10분마다 best checkpoint + training_log.csv를 복사하고,
+# 주기적으로 best checkpoint + training_log.csv를 복사하고,
 # 로컬의 오래된 non-best checkpoint를 삭제하여 디스크 공간 확보
+#
+# 예시:
+#   bash scripts/sync_checkpoints.sh outputs/phase1/base_1min_d256_L12 ../updown/outputs/phase1/base_1min_d256_L12
+#   bash scripts/sync_checkpoints.sh outputs/phase1/base_1min_d256_L12 ../updown/outputs/phase1/base_1min_d256_L12 120
 
-SRC="outputs/phase1/base_1min_d256_L12"
-DST="../updown/outputs/phase1/base_1min_d256_L12"
-INTERVAL=600  # 10분
+SRC="${1:?Usage: $0 <SRC> <DST> [INTERVAL]}"
+DST="${2:?Usage: $0 <SRC> <DST> [INTERVAL]}"
+INTERVAL="${3:-60}"
 
 mkdir -p "$DST/checkpoints"
 mkdir -p "$DST/figures/recon"
