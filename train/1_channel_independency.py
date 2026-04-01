@@ -49,6 +49,7 @@ from .train_utils import (
     train_one_epoch,
     validate,
 )
+from model.checkpoint import load_checkpoint
 from .visualize import save_reconstruction_figure, save_next_pred_figure
 
 
@@ -60,6 +61,8 @@ def parse_args() -> argparse.Namespace:
                    help="YAML config file path. CLI args override YAML values.")
     p.add_argument("--dry-run", action="store_true",
                    help="1 batch만 실행 후 종료 (OOM/NaN 검증용)")
+    p.add_argument("--resume", type=str, default=None,
+                   help="학습 재개할 checkpoint 경로 (.pt)")
 
     # Model
     g = p.add_argument_group("Model")
@@ -361,6 +364,21 @@ def main():
     if rank0 and scaler is not None:
         print(f"AMP enabled (GradScaler)")
 
+    # ── Resume from checkpoint ──
+    start_epoch = 0
+    best_loss = float("inf")
+    if args.resume:
+        raw_model_for_load = model.module if use_ddp else model
+        state = load_checkpoint(args.resume, raw_model_for_load, optimizer=optimizer, device=device)
+        start_epoch = state.get("epoch", 0) + 1
+        best_loss = state.get("loss", float("inf"))
+        # scheduler를 resume epoch까지 진행
+        for _ in range(start_epoch):
+            scheduler.step()
+        if rank0:
+            print(f"Resumed from {args.resume} (epoch {state.get('epoch', '?')}, loss {best_loss:.6f})")
+            print(f"  Continuing from epoch {start_epoch}, LR={optimizer.param_groups[0]['lr']:.6e}")
+
     # ── 시각화용 배치 캐시 (rank 0만) ──
     viz_every = getattr(args, "viz_every", 5)
     # YAML config에서 viz_every가 설정되어 있으면 우선 사용
@@ -401,7 +419,8 @@ def main():
               f"  ({len(viz_batches)} batches, {n_types} signal types)")
 
     # ── 학습 루프 ──
-    best_loss = float("inf")
+    if not args.resume:
+        best_loss = float("inf")
     early_stopper = EarlyStopping(patience=config.patience) if config.patience > 0 else None
     csv_logger = CSVLogger(output_dir / "training_log.csv") if rank0 else None
     if rank0:
@@ -419,7 +438,7 @@ def main():
         print(f"{'='*60}")
 
     prev_max_h = None
-    for epoch in range(config.n_epochs):
+    for epoch in range(start_epoch, config.n_epochs):
         # Horizon curriculum 로깅
         cur_max_h = get_max_horizon(config, epoch)
         if rank0 and cur_max_h != prev_max_h:
