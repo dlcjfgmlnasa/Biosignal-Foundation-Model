@@ -96,11 +96,9 @@ class SpectralTokenizer(nn.Module):
         # Flatten frequency × time → single vector
         output = log_mag.reshape(patches.shape[0], -1)  # (M, output_dim)
 
-        # Per-patch 정규화: zero mean, unit variance
-        # raw 패치가 Z-score 정규화되어 MSE ~1.0이므로, spectral도 동일 스케일로 맞춤
-        mean = output.mean(dim=-1, keepdim=True)  # (M, 1)
-        std = output.std(dim=-1, keepdim=True).clamp(min=1e-8)  # (M, 1)
-        output = (output - mean) / std
+        # log1p 변환만 적용 (per-patch z-score 제거)
+        # per-patch 정규화는 패치 간 절대적 스펙트럼 에너지 차이를 제거하여
+        # 마취 깊이 변화 등 임상적으로 중요한 정보를 손실시킴
 
         if b is not None:
             output = output.reshape(b, n, -1)  # (B, N, output_dim)
