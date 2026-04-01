@@ -24,24 +24,24 @@ class SpectralTokenizer(nn.Module):
         64 at 100Hz → 해상도 ~1.56Hz, 주파수 빈 33개 (0~50Hz).
     hop_length:
         STFT hop 크기. 시간 프레임 수 = floor((patch_size - n_fft) / hop_length) + 1.
-        16 at patch_size=100 → 3 프레임.
+        8 at patch_size=100 → 5 프레임.
 
     출력 차원: ``(n_fft // 2 + 1) * n_frames``.
-    기본값(n_fft=64, hop=16, patch=100): 33 * 3 = **99**.
+    기본값(n_fft=64, hop=8, patch=100): 33 * 5 = **165**.
 
     Usage::
 
         tokenizer = SpectralTokenizer(patch_size=100)
         patches = torch.randn(32, 100)   # (M, P)
-        target = tokenizer(patches)       # (M, 99)
-        print(tokenizer.output_dim)       # 99
+        target = tokenizer(patches)       # (M, 165)
+        print(tokenizer.output_dim)       # 165
     """
 
     def __init__(
         self,
         patch_size: int = 100,
         n_fft: int = 64,
-        hop_length: int = 16,
+        hop_length: int = 8,
     ) -> None:
         super().__init__()
         self.patch_size = patch_size

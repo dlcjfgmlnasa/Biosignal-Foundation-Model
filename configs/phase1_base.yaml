@@ -25,37 +25,39 @@ model_config:
   use_var_attn_bias: true
   use_spatial_embed: true
   dropout_p: 0.1
-  max_horizon: 5              # horizon_schedule이 있으면 무시됨
+  max_horizon: 5              # H=1로 시작, 수렴 후 3→5 증가
   use_cnn_stem: false
   contrastive_proj_dim: 0     # Phase 1에서는 비활성
 
 # ── 데이터 ──
-data_dir: ../updown/datasets/vitaldb
+data_dir: ./datasets/vitaldb_h5
 signal_types: [0, 1, 2, 3, 4, 5, 6]  # ECG, ABP, EEG, PPG, CVP, CO2, AWP
-max_subjects: null             # 전체 ~6,000 subjects
+max_subjects: null              # 전체 ~6,000 subjects
 window_seconds: 60.0           # 60초 윈도우 (60 patches)
-max_length: 8000              # CI: 60초 윈도우(6000) + patch 정렬 여유
+max_length: 8000               # CI: 60초 윈도우(6000) + patch 정렬 여유
 cache_size: 16
 crop_ratio_min: 0.15           # 최소 9초 (60s × 0.15)
 crop_ratio_max: 1.0            # 최대 전체 윈도우 (60s)
 
 # ── 학습 ──
-batch_size: 32                 # collate 빠르게, max_batches로 학습량 보상
+batch_size: 64                 # collate 빠르게, max_batches로 학습량 보상
 lr: 8.0e-4
 n_epochs: 100
 warmup_epochs: 10              # 10% warmup
 min_lr_ratio: 0.1              # 최종 LR = 8e-5
-mask_ratio: 0.3                # 30% 패치 마스킹
+mask_ratio: 0.4                # 40% 패치 마스킹
 gradient_clip: 1.0
 seed: 42
 collate_mode: ci
-max_batches: 2000              # 256 × 2000 = 512K samples/epoch (전체의 8.5%, 100ep → ~8.5회)
+max_batches: 8000              # 256 × 2000 = 512K samples/epoch (전체의 8.5%, 100ep → ~8.5회)
 
 # ── Loss 가중치 (Phase 1: MPM + Next-Pred) ──
 alpha: 1.0                     # masked reconstruction (non-EEG raw + EEG spectral)
 beta: 0.5                      # next-pred (non-EEG raw + EEG spectral)
 gamma: 0.0                     # cross-modal (Phase 2에서 활성)
 delta: 0.0                     # contrastive (Phase 2에서 활성)
+lambda_grad: 0.0               # Gradient Loss (1차 미분 MSE) — baseline 수렴 후 활성
+lambda_spec: 0.0               # Spectral Loss (FFT magnitude MSE) — baseline 수렴 후 활성
 aux_loss_weight: 0.01
 contrastive_temperature: 0.07
 learnable_temperature: true
@@ -77,7 +79,7 @@ patience: 15                   # early stopping patience
 # ── 시스템 ──
 device: auto
 num_workers: 4                 # 8vCPU → 4 workers
-output_dir: outputs/phase1_base
-checkpoint_every: 10
+output_dir: outputs/phase1
+checkpoint_every: 5
 viz_every: 1
-exp_name: phase1_base_d256_L12
+exp_name: base_1min_d256_L12

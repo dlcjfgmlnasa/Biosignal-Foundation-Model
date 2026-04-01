@@ -326,7 +326,9 @@ def main():
     # ── Optimizer & Scheduler (Phase 2는 새 optimizer) ──
     criterion = CombinedLoss(
         alpha=config.alpha, beta=config.beta, gamma=config.gamma,
-        delta=config.delta, contrastive_temperature=config.contrastive_temperature,
+        delta=config.delta, lambda_grad=config.lambda_grad,
+        lambda_spec=config.lambda_spec,
+        contrastive_temperature=config.contrastive_temperature,
         learnable_temperature=config.learnable_temperature,
     )
     optimizer = torch.optim.Adam(

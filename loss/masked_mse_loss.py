@@ -11,26 +11,64 @@ from torch import nn
 
 
 class MaskedPatchLoss(nn.Module):
-    """마스킹된 패치 위치만 MSE를 계산하는 손실 함수.
+    """마스킹된 패치 위치만 MSE + Gradient + Spectral Loss를 계산하는 손실 함수.
 
-    pred_mask=True인 패치에 대해 (reconstructed - original)^2 평균을 반환한다.
+    pred_mask=True인 패치에 대해 복합 loss를 반환한다.
     마스킹된 위치가 없으면 0을 반환한다.
+
+    Parameters
+    ----------
+    lambda_grad:
+        Gradient Loss 가중치. 0이면 비활성.
+    lambda_spec:
+        Spectral Loss 가중치. 0이면 비활성.
     """
+
+    def __init__(
+        self,
+        lambda_grad: float = 0.0,
+        lambda_spec: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.lambda_grad = lambda_grad
+        self.lambda_spec = lambda_spec
 
     def forward(
         self,
         reconstructed: torch.Tensor,     # (B, N, P)
         original_patches: torch.Tensor,  # (B, N, P)
         pred_mask: torch.Tensor,         # (B, N) bool
-    ) -> torch.Tensor:  # scalar
+    ) -> dict[str, torch.Tensor]:
         n_masked = pred_mask.float().sum()
-        if n_masked > 0:
-            loss = (
-                (reconstructed[pred_mask] - original_patches[pred_mask]) ** 2
-            ).mean()
+        if n_masked == 0:
+            zero = reconstructed.new_tensor(0.0)
+            return {"mse": zero, "grad": zero, "spec": zero, "total": zero}
+
+        pred_m = reconstructed[pred_mask]    # (M, P)
+        target_m = original_patches[pred_mask]  # (M, P)
+
+        # ── MSE ──
+        mse = ((pred_m - target_m) ** 2).mean()
+
+        # ── Gradient Loss (1차 미분 MSE) ──
+        if self.lambda_grad > 0:
+            diff_pred = pred_m[:, 1:] - pred_m[:, :-1]      # (M, P-1)
+            diff_target = target_m[:, 1:] - target_m[:, :-1]  # (M, P-1)
+            grad_loss = ((diff_pred - diff_target) ** 2).mean()
         else:
-            loss = reconstructed.new_tensor(0.0)
-        return loss
+            grad_loss = reconstructed.new_tensor(0.0)
+
+        # ── Spectral Loss (FFT magnitude MSE) ──
+        if self.lambda_spec > 0:
+            pred_fft = torch.fft.rfft(pred_m, dim=-1).abs()      # (M, P//2+1)
+            target_fft = torch.fft.rfft(target_m, dim=-1).abs()  # (M, P//2+1)
+            spec_loss = ((torch.log1p(pred_fft) - torch.log1p(target_fft)) ** 2).mean()
+        else:
+            spec_loss = reconstructed.new_tensor(0.0)
+
+        total = mse + self.lambda_grad * grad_loss + self.lambda_spec * spec_loss
+
+        return {"mse": mse, "grad": grad_loss, "spec": spec_loss, "total": total}
 
 
 def create_patch_mask(

@@ -66,7 +66,8 @@ class TrainConfig:
     beta: float = 0.0   # next-patch prediction
     gamma: float = 0.0  # cross-modal (beta 내부 가중)
     delta: float = 0.0  # cross-modal contrastive
-    # EEG spectral loss는 alpha/beta와 동일 weight 적용 (별도 weight 불필요)
+    lambda_grad: float = 0.0  # Gradient Loss 가중치 (1차 미분 MSE)
+    lambda_spec: float = 0.0  # Spectral Loss 가중치 (FFT magnitude MSE)
     aux_loss_weight: float = 0.01  # MoE load balancing auxiliary loss
     contrastive_temperature: float = 0.07
     learnable_temperature: bool = True
@@ -466,6 +467,10 @@ def train_one_epoch(
                 f"total: {loss.item():.6f}",
                 f"masked: {losses['masked_loss'].item():.6f}",
             ]
+            if losses.get('masked_grad', torch.tensor(0.0)).item() > 0:
+                parts.append(f"grad: {losses['masked_grad'].item():.6f}")
+            if losses.get('masked_spec', torch.tensor(0.0)).item() > 0:
+                parts.append(f"spec: {losses['masked_spec'].item():.6f}")
             if losses['next_loss'].item() > 0:
                 parts.append(f"next: {losses['next_loss'].item():.6f}")
             if losses['cross_modal_loss'].item() > 0:

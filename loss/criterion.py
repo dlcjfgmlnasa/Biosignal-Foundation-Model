@@ -36,6 +36,8 @@ class CombinedLoss(nn.Module):
         beta: float = 0.0,
         gamma: float = 0.0,
         delta: float = 0.0,
+        lambda_grad: float = 0.0,
+        lambda_spec: float = 0.0,
         contrastive_temperature: float = 0.07,
         learnable_temperature: bool = True,
     ) -> None:
@@ -44,7 +46,10 @@ class CombinedLoss(nn.Module):
         self.beta = beta
         self.gamma = gamma
         self.delta = delta
-        self.masked_loss_fn = MaskedPatchLoss()
+        self.masked_loss_fn = MaskedPatchLoss(
+            lambda_grad=lambda_grad,
+            lambda_spec=lambda_spec,
+        )
         self.next_loss_fn = NextPredictionLoss(cross_modal_weight=gamma)
         if delta > 0:
             self.contrastive_loss_fn = CrossModalContrastiveLoss(
@@ -67,8 +72,9 @@ class CombinedLoss(nn.Module):
         contrastive_z: torch.Tensor | None = None,  # (B, N, proj_dim) — contrastive 임베딩
         patch_signal_types: torch.Tensor | None = None,  # (B, N) long — mechanism group 필터용
     ) -> dict[str, torch.Tensor]:
-        # ── Masked Reconstruction Loss ──
-        masked_loss = self.masked_loss_fn(reconstructed, original_patches, pred_mask)
+        # ── Masked Reconstruction Loss (MSE + Gradient + Spectral) ──
+        masked_dict = self.masked_loss_fn(reconstructed, original_patches, pred_mask)
+        masked_loss = masked_dict["total"]
 
         # ── Next-Patch Prediction Loss ──
         if self.beta > 0 and next_pred is not None:
@@ -102,6 +108,9 @@ class CombinedLoss(nn.Module):
         return {
             "total": total,
             "masked_loss": masked_loss,
+            "masked_mse": masked_dict["mse"],
+            "masked_grad": masked_dict["grad"],
+            "masked_spec": masked_dict["spec"],
             "next_loss": next_loss,
             "cross_modal_loss": cross_modal_loss,
             "contrastive_loss": contrastive_loss,
