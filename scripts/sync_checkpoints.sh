@@ -34,12 +34,11 @@ while true; do
     [ -n "$latest_recon" ] && cp "$latest_recon" "$DST/figures/recon/"
     [ -n "$latest_np" ] && cp "$latest_np" "$DST/figures/next_pred/"
 
-    # 4. 로컬 디스크 공간 확보: best가 아닌 오래된 checkpoint 삭제
+    # 4. 로컬 디스크 공간 확보: 모든 checkpoint 삭제 (이미 네트워크로 복사 완료)
     for f in "$SRC"/checkpoints/checkpoint_*.pt; do
         [ -f "$f" ] || continue
-        echo "$f" | grep -q "best" && continue
         rm -f "$f"
-        echo "[sync] Removed old checkpoint: $f"
+        echo "[sync] Removed: $(basename $f)"
     done
 
     echo "[sync] $(date '+%H:%M:%S') synced. Local disk: $(df -h . | tail -1 | awk '{print $4}') free"
