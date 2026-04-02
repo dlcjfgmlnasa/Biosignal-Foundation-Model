@@ -1,0 +1,89 @@
+# Phase 1: Gradient + Multi-Resolution STFT Loss 실험
+# ──────────────────────────────────────────────────────────────
+# 단일 FFT spectral loss → Multi-Resolution STFT Loss로 교체.
+# n_fft=[16, 32, 64], hop=n_fft//4로 다중 스케일 시간-주파수 구조 학습.
+# Spectral Convergence + Log-magnitude L1 합산.
+#
+# Usage:
+#   torchrun --nproc_per_node=2 -m train.1_channel_independency \
+#       --config configs/phase1_grad_spec.yaml \
+#       --resume outputs/phase1/grad_d256_L12/best.pt
+#
+# 판단 기준:
+#   1. val_masked_mse가 baseline/grad 대비 악화되지 않아야 함
+#   2. CVP a/c/v wave 등 미세 주파수 성분 개선 여부 확인
+#   3. 초반 5 epoch 로그에서 spec loss 스케일 확인 후 lambda 조절
+
+# ── 모델 (baseline과 동일) ──
+model_config:
+  d_model: 256
+  num_layers: 12
+  patch_size: 100
+  stride: null
+  num_heads: 8
+  num_groups: null
+  use_glu: true
+  use_moe: false
+  use_rope: true
+  use_var_attn_bias: true
+  use_spatial_embed: true
+  dropout_p: 0.1
+  max_horizon: 5
+  use_cnn_stem: false
+  contrastive_proj_dim: 0
+
+# ── 데이터 (baseline과 동일) ──
+data_dir: ./datasets/vitaldb_h5
+signal_types: [0, 1, 2, 3, 4, 5, 6]
+max_subjects: null
+window_seconds: 60.0
+max_length: 8000
+cache_size: 16
+crop_ratio_min: 0.15
+crop_ratio_max: 1.0
+
+# ── 학습 (fine-tune 설정) ──
+batch_size: 64
+lr: 2.0e-4
+n_epochs: 30
+warmup_epochs: 3
+min_lr_ratio: 0.1
+mask_ratio: 0.4
+gradient_clip: 1.0
+seed: 42
+collate_mode: ci
+max_batches: 8000
+
+# ── Loss 가중치 ──
+alpha: 1.0
+beta: 0.5
+gamma: 0.0
+delta: 0.0
+lambda_grad: 0.1               # Gradient Loss — peak 학습 강화
+lambda_spec: 0.1               # Multi-Resolution STFT Loss — 다중 스케일 주파수 보존
+spec_n_ffts: [16, 32, 64]     # STFT window 크기들 (hop = n_fft // 4)
+aux_loss_weight: 0.01
+contrastive_temperature: 0.07
+learnable_temperature: true
+
+# ── Masking ──
+variate_mask_prob: 0.0
+block_mask: true
+block_size_min: 3
+block_size_max: 8
+
+# ── Mixed Precision ──
+use_amp: true
+
+# ── Validation & Early Stopping ──
+val_ratio: 0.05
+val_max_batches: 500
+patience: 15
+
+# ── 시스템 ──
+device: auto
+num_workers: 4
+output_dir: outputs/phase1
+checkpoint_every: 5
+viz_every: 1
+exp_name: grad_spec_d256_L12

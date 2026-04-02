@@ -10,6 +10,58 @@ import torch
 from torch import nn
 
 
+def _multi_resolution_stft_loss(
+    pred: torch.Tensor,    # (M, P)
+    target: torch.Tensor,  # (M, P)
+    n_ffts: tuple[int, ...] = (16, 32, 64),
+) -> torch.Tensor:
+    """Multi-Resolution STFT Loss.
+
+    여러 n_fft 크기로 STFT를 수행하여 시간-주파수 구조를 다중 스케일로 비교한다.
+    각 스케일에서 log-magnitude L1 + spectral convergence를 합산.
+
+    Parameters
+    ----------
+    pred:
+        예측 패치. (M, P).
+    target:
+        원본 패치. (M, P).
+    n_ffts:
+        STFT window 크기들. hop_length = n_fft // 4.
+    """
+    loss = pred.new_tensor(0.0)
+    # cuFFT half precision은 power-of-2만 지원 → float32로 캐스팅
+    pred_f = pred.float()
+    target_f = target.float()
+
+    for n_fft in n_ffts:
+        hop = n_fft // 4
+        window = torch.hann_window(n_fft, device=pred.device)
+        pred_stft = torch.stft(
+            pred_f, n_fft=n_fft, hop_length=hop,
+            win_length=n_fft, window=window,
+            return_complex=True,
+        )  # (M, n_fft//2+1, T)
+        target_stft = torch.stft(
+            target_f, n_fft=n_fft, hop_length=hop,
+            win_length=n_fft, window=window,
+            return_complex=True,
+        )  # (M, n_fft//2+1, T)
+
+        pred_mag = pred_stft.abs()      # (M, F, T)
+        target_mag = target_stft.abs()  # (M, F, T)
+
+        # Spectral Convergence: Frobenius norm ratio
+        sc = torch.norm(target_mag - pred_mag, p="fro") / (torch.norm(target_mag, p="fro") + 1e-8)
+
+        # Log-magnitude L1
+        log_mag = (torch.log1p(pred_mag) - torch.log1p(target_mag)).abs().mean()
+
+        loss = loss + sc + log_mag
+
+    return loss / len(n_ffts)
+
+
 class MaskedPatchLoss(nn.Module):
     """마스킹된 패치 위치만 MSE + Gradient + Spectral Loss를 계산하는 손실 함수.
 
@@ -22,16 +74,20 @@ class MaskedPatchLoss(nn.Module):
         Gradient Loss 가중치. 0이면 비활성.
     lambda_spec:
         Spectral Loss 가중치. 0이면 비활성.
+    spec_n_ffts:
+        Multi-Resolution STFT에 사용할 n_fft 크기들.
     """
 
     def __init__(
         self,
         lambda_grad: float = 0.0,
         lambda_spec: float = 0.0,
+        spec_n_ffts: tuple[int, ...] = (16, 32, 64),
     ) -> None:
         super().__init__()
         self.lambda_grad = lambda_grad
         self.lambda_spec = lambda_spec
+        self.spec_n_ffts = spec_n_ffts
 
     def forward(
         self,
@@ -58,11 +114,9 @@ class MaskedPatchLoss(nn.Module):
         else:
             grad_loss = reconstructed.new_tensor(0.0)
 
-        # ── Spectral Loss (FFT magnitude MSE) ──
+        # ── Multi-Resolution STFT Loss ──
         if self.lambda_spec > 0:
-            pred_fft = torch.fft.rfft(pred_m, dim=-1).abs()      # (M, P//2+1)
-            target_fft = torch.fft.rfft(target_m, dim=-1).abs()  # (M, P//2+1)
-            spec_loss = ((torch.log1p(pred_fft) - torch.log1p(target_fft)) ** 2).mean()
+            spec_loss = _multi_resolution_stft_loss(pred_m, target_m, self.spec_n_ffts)
         else:
             spec_loss = reconstructed.new_tensor(0.0)
 

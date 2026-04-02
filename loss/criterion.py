@@ -38,6 +38,7 @@ class CombinedLoss(nn.Module):
         delta: float = 0.0,
         lambda_grad: float = 0.0,
         lambda_spec: float = 0.0,
+        spec_n_ffts: tuple[int, ...] = (16, 32, 64),
         contrastive_temperature: float = 0.07,
         learnable_temperature: bool = True,
     ) -> None:
@@ -49,6 +50,7 @@ class CombinedLoss(nn.Module):
         self.masked_loss_fn = MaskedPatchLoss(
             lambda_grad=lambda_grad,
             lambda_spec=lambda_spec,
+            spec_n_ffts=spec_n_ffts,
         )
         self.next_loss_fn = NextPredictionLoss(cross_modal_weight=gamma)
         if delta > 0:
