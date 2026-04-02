@@ -10,11 +10,38 @@ import torch
 from torch import nn
 
 
+class ResidualMLP(nn.Module):
+    """Residual MLP block for patch embedding (TimesFM style).
+
+    MLP(1 hidden layer) + skip connection으로 패치를 d_model로 변환한다.
+    MLP가 비선형 feature를 추출하고, skip path가 원본 정보를 보존한다.
+
+    Parameters
+    ----------
+    in_dim:
+        입력 차원 (patch_size).
+    out_dim:
+        출력 차원 (d_model).
+    """
+
+    def __init__(self, in_dim: int, out_dim: int) -> None:
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(in_dim, out_dim),
+            nn.ReLU(),
+            nn.Linear(out_dim, out_dim),
+        )
+        self.skip = nn.Linear(in_dim, out_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # (*, in_dim) → (*, out_dim)
+        return self.mlp(x) + self.skip(x)
+
+
 class PatchEmbedding(nn.Module):
     """패치 임베딩 (non-overlapping 및 overlapping 지원).
 
     PackCollate(patch_size=P, stride=S)로 생성된 PackedBatch를 입력받아,
-    각 variate를 patch_size 단위로 분할하고 선형 투영한다.
+    각 variate를 patch_size 단위로 분할하고 Residual MLP로 투영한다.
 
     Parameters
     ----------
@@ -28,7 +55,7 @@ class PatchEmbedding(nn.Module):
     bias:
         선형 투영의 bias 사용 여부.
     stem:
-        CNN stem 모듈. ``None``이면 선형 투영 사용.
+        CNN stem 모듈. ``None``이면 Residual MLP 사용.
     """
 
     def __init__(
@@ -51,7 +78,7 @@ class PatchEmbedding(nn.Module):
             self.proj = None
         else:
             self.stem = None
-            self.proj = nn.Linear(patch_size, d_model, bias=bias)
+            self.proj = ResidualMLP(patch_size, d_model)
 
     # ── Public API ────────────────────────────────────────────────
 
