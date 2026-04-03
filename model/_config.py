@@ -45,14 +45,6 @@ class ModelConfig:
         글로벌 spatial ID 수.
     max_horizon:
         Next-patch prediction 최대 예측 거리.
-    use_cnn_stem:
-        Modality-specific 1D-CNN stem 사용 여부.
-    stem_hidden_channels:
-        CNN stem 중간 채널 수.
-    stem_num_layers:
-        CNN stem Conv1d 레이어 수.
-    stem_kernel_size:
-        CNN stem 커널 크기.
     """
 
     # Architecture
@@ -80,18 +72,8 @@ class ModelConfig:
     # Task
     max_horizon: int = 1
 
-    # CNN Stem
-    use_cnn_stem: bool = False
-    stem_hidden_channels: int = 64
-    stem_num_layers: int = 3
-    stem_kernel_size: int = 3
-
     # Contrastive
     contrastive_proj_dim: int = 0  # 0=비활성, >0=projection head 출력 차원
-
-    # EEG Spectral Target (V2 전용)
-    eeg_spectral_n_fft: int = 64       # STFT FFT 윈도우 크기 (64 at 100Hz → ~1.56Hz 해상도)
-    eeg_spectral_hop: int = 16         # STFT hop length
 
     def to_dict(self) -> dict:
         """Checkpoint 저장용 직렬화."""

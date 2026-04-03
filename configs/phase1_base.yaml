@@ -26,7 +26,6 @@ model_config:
   use_spatial_embed: true
   dropout_p: 0.1
   max_horizon: 5              # H=1로 시작, 수렴 후 3→5 증가
-  use_cnn_stem: false
   contrastive_proj_dim: 0     # Phase 1에서는 비활성
 
 # ── 데이터 ──

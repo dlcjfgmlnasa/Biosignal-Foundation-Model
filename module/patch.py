@@ -55,8 +55,6 @@ class PatchEmbedding(nn.Module):
         ``stride < patch_size``이면 overlapping. ``patch_size % stride == 0`` 필수.
     bias:
         선형 투영의 bias 사용 여부.
-    stem:
-        CNN stem 모듈. ``None``이면 Residual MLP 사용.
     """
 
     def __init__(
@@ -65,7 +63,6 @@ class PatchEmbedding(nn.Module):
         d_model: int,
         stride: int | None = None,
         bias: bool = True,
-        stem: nn.Module | None = None,
     ) -> None:
         super().__init__()
         self.patch_size = patch_size
@@ -74,12 +71,7 @@ class PatchEmbedding(nn.Module):
         assert patch_size % self.stride == 0, (
             f"patch_size({patch_size})는 stride({self.stride})의 배수여야 합니다."
         )
-        if stem is not None:
-            self.stem = stem
-            self.proj = None
-        else:
-            self.stem = None
-            self.proj = ResidualMLP(patch_size, d_model)
+        self.proj = ResidualMLP(patch_size, d_model)
 
     # ── Public API ────────────────────────────────────────────────
 
@@ -106,11 +98,9 @@ class PatchEmbedding(nn.Module):
     def project(
         self,
         patches: torch.Tensor,  # (batch, num_patches, patch_size)
-        patch_signal_types: torch.Tensor | None = None,  # (batch, num_patches) long
+        patch_signal_types: torch.Tensor | None = None,  # (batch, num_patches) long — unused, kept for API compat
     ) -> torch.Tensor:  # (batch, num_patches, d_model)
-        """Raw patches를 d_model 임베딩으로 투영한다 (linear 또는 CNN stem)."""
-        if self.stem is not None and patch_signal_types is not None:
-            return self.stem(patches, patch_signal_types)
+        """Raw patches를 d_model 임베딩으로 투영한다 (Residual MLP)."""
         return self.proj(patches)
 
     def forward(

@@ -81,10 +81,6 @@ def parse_args() -> argparse.Namespace:
     g.add_argument("--use_var_attn_bias", action=argparse.BooleanOptionalAction, default=True)
     g.add_argument("--dropout_p", type=float, default=0.0)
     g.add_argument("--max_horizon", type=int, default=5)
-    g.add_argument("--use_cnn_stem", action=argparse.BooleanOptionalAction, default=True)
-    g.add_argument("--stem_hidden_channels", type=int, default=64)
-    g.add_argument("--stem_num_layers", type=int, default=3)
-    g.add_argument("--stem_kernel_size", type=int, default=3)
 
     # Data
     g = p.add_argument_group("Data")
@@ -156,10 +152,6 @@ def main():
         use_var_attn_bias=args.use_var_attn_bias,
         dropout_p=args.dropout_p,
         max_horizon=args.max_horizon,
-        use_cnn_stem=args.use_cnn_stem,
-        stem_hidden_channels=args.stem_hidden_channels,
-        stem_num_layers=args.stem_num_layers,
-        stem_kernel_size=args.stem_kernel_size,
         contrastive_proj_dim=args.contrastive_proj_dim,
     )
 

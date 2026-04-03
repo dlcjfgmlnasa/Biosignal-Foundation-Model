@@ -10,7 +10,6 @@ from .packed_scaler import (
     PackedStdScaler,
     PackedAbsMeanScaler,
 )
-from .cnn_stem import Conv1dStem, ModalityCNNStem
 from .patch import PatchEmbedding
 from .transformer import TransformerEncoderLayer, TransformerEncoder
 from .position import (

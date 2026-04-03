@@ -80,7 +80,7 @@ class DownstreamModelWrapper(nn.Module):
         """Encoder 전체 파라미터를 freeze한다 (requires_grad=False).
 
         Freeze 범위: scaler, patch_embed, encoder, signal_type_embed,
-        spatial_id_embed, loc_proj, scale_proj, cnn_stem (V2).
+        spatial_id_embed, loc_proj, scale_proj.
         """
         self.model.requires_grad_(False)
 

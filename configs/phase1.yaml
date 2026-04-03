@@ -18,10 +18,6 @@ model_config:
   use_spatial_embed: true
   dropout_p: 0.0
   max_horizon: 5
-  use_cnn_stem: false
-  stem_hidden_channels: 64
-  stem_num_layers: 3
-  stem_kernel_size: 3
   contrastive_proj_dim: 0
 
 # ── 데이터 ──

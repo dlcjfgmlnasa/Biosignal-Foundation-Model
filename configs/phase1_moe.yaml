@@ -22,7 +22,6 @@ model_config:
   use_spatial_embed: true
   dropout_p: 0.1
   max_horizon: 5
-  use_cnn_stem: false
   contrastive_proj_dim: 0
 
 # ── 데이터 ──

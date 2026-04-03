@@ -2,7 +2,6 @@
 """Biosignal Foundation Model.
 
 Scaler → PatchEmbedding → SpatialEmbedding → TransformerEncoder → Head 파이프라인.
-non-EEG 신호는 raw patch reconstruction, EEG는 spectral target reconstruction.
 """
 from __future__ import annotations
 
@@ -16,15 +15,10 @@ from torch import nn
 from data.collate import PackedBatch
 from loss.masked_mse_loss import create_patch_mask
 from model._config import ModelConfig
-from module.cnn_stem import ModalityCNNStem
 from module.packed_scaler import PackedStdScaler, PackedScaler
 from module.patch import PatchEmbedding
 from module.position import BinaryAttentionBias, QueryKeyProjection, RotaryProjection
-from module.spectral_tokenizer import SpectralTokenizer
 from module.transformer import TransformerEncoder
-
-# EEG signal_type 인덱스
-EEG_SIGNAL_TYPE = 2
 
 
 class BiosignalFoundationModel(nn.Module):
@@ -68,20 +62,8 @@ class BiosignalFoundationModel(nn.Module):
         signal_type + spatial_id 이중 임베딩 사용 여부.
     max_horizon:
         Next-patch prediction 최대 예측 거리.
-    use_cnn_stem:
-        Modality-specific 1D-CNN stem 사용 여부.
-    stem_hidden_channels:
-        CNN stem 중간 채널 수.
-    stem_num_layers:
-        CNN stem Conv1d 레이어 수.
-    stem_kernel_size:
-        CNN stem 커널 크기.
     contrastive_proj_dim:
         Contrastive projection head 출력 차원. 0이면 비활성.
-    eeg_spectral_n_fft:
-        EEG Spectral Tokenizer의 STFT FFT 윈도우 크기.
-    eeg_spectral_hop:
-        EEG Spectral Tokenizer의 STFT hop length.
     """
 
     def __init__(
@@ -104,13 +86,7 @@ class BiosignalFoundationModel(nn.Module):
         num_spatial_ids: int = 12,
         use_spatial_embed: bool = True,
         max_horizon: int = 1,
-        use_cnn_stem: bool = False,
-        stem_hidden_channels: int = 64,
-        stem_num_layers: int = 3,
-        stem_kernel_size: int = 3,
         contrastive_proj_dim: int = 0,
-        eeg_spectral_n_fft: int = 64,
-        eeg_spectral_hop: int = 16,
     ) -> None:
         super().__init__()
         self.d_model = d_model
@@ -120,19 +96,8 @@ class BiosignalFoundationModel(nn.Module):
         self.scaler = scaler or PackedStdScaler()
 
         # 2. Patch Embedding
-        self.use_cnn_stem = use_cnn_stem
-        if use_cnn_stem:
-            stem = ModalityCNNStem(
-                num_signal_types=num_signal_types,
-                d_model=d_model,
-                hidden_channels=stem_hidden_channels,
-                num_layers=stem_num_layers,
-                kernel_size=stem_kernel_size,
-            )
-        else:
-            stem = None
         self.patch_embed = PatchEmbedding(
-            patch_size=patch_size, d_model=d_model, stride=stride, stem=stem,
+            patch_size=patch_size, d_model=d_model, stride=stride,
         )
 
         # 3. Transformer Encoder
@@ -197,28 +162,6 @@ class BiosignalFoundationModel(nn.Module):
 
         # 11. Learnable [MASK] Token
         self.mask_token = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
-
-        # 12. EEG Spectral Tokenizer + Heads
-        self.eeg_spectral_tokenizer = SpectralTokenizer(
-            patch_size=patch_size,
-            n_fft=eeg_spectral_n_fft,
-            hop_length=eeg_spectral_hop,
-        )
-        spectral_dim = self.eeg_spectral_tokenizer.output_dim
-
-        # EEG 전용 Masked Reconstruction Head: d_model → spectral_dim
-        self.eeg_recon_head = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.GELU(),
-            nn.Linear(d_model, spectral_dim),
-        )
-
-        # EEG 전용 Next-Pred Head: d_model → spectral_dim
-        self.eeg_next_head = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.GELU(),
-            nn.Linear(d_model, spectral_dim),
-        )
 
     @classmethod
     def from_config(cls, config: ModelConfig) -> BiosignalFoundationModel:
@@ -469,8 +412,6 @@ class BiosignalFoundationModel(nn.Module):
             out_dict["cross_pred"] = self.cross_head(encoded)  # (B, N, patch_size)
             if self.contrastive_proj_dim > 0:
                 out_dict["contrastive_z"] = self.contrastive_proj(encoded)  # (B, N, proj_dim)
-            if patch_signal_types is not None:
-                out_dict["eeg_reconstructed"] = self.eeg_recon_head(encoded)  # (B, N, spectral_dim)
 
         # ── Next-Patch Prediction ──
         if task in ("next_pred", "both"):
@@ -480,16 +421,6 @@ class BiosignalFoundationModel(nn.Module):
             )  # (d_model,)
             encoded_h = encoded_for_next + h_emb.unsqueeze(0).unsqueeze(0)  # (B, N, d_model)
             out_dict["next_pred"] = self.next_head(encoded_h)  # (B, N, patch_size)
-            if patch_signal_types is not None:
-                out_dict["eeg_next_pred"] = self.eeg_next_head(encoded_h)  # (B, N, spectral_dim)
-
-        # ── EEG Spectral Target ──
-        if patch_signal_types is not None:
-            eeg_mask = (patch_signal_types == EEG_SIGNAL_TYPE)  # (B, N)
-            out_dict["eeg_mask"] = eeg_mask
-            if eeg_mask.any():
-                with torch.no_grad():
-                    out_dict["eeg_recon_target"] = self.eeg_spectral_tokenizer(enc["patches"]).detach()  # (B, N, spectral_dim)
 
         return out_dict
 
