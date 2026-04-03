@@ -354,6 +354,7 @@ def main():
     criterion = CombinedLoss(
         alpha=config.alpha, beta=config.beta, gamma=config.gamma,
         delta=config.delta, peak_alpha=config.peak_alpha,
+        lambda_spec=config.lambda_spec, spec_n_ffts=config.spec_n_ffts,
         contrastive_temperature=config.contrastive_temperature,
         learnable_temperature=config.learnable_temperature,
     ).to(device)

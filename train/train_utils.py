@@ -283,6 +283,7 @@ def train_one_epoch(
     epoch_next = torch.zeros(1, device=device)
     epoch_cross = torch.zeros(1, device=device)
     epoch_contrastive = torch.zeros(1, device=device)
+    epoch_spec = torch.zeros(1, device=device)
     epoch_eeg = torch.zeros(1, device=device)
     epoch_aux = torch.zeros(1, device=device)
     n_batches = 0
@@ -459,6 +460,7 @@ def train_one_epoch(
         epoch_next += losses["next_loss"].detach()
         epoch_cross += losses["cross_modal_loss"].detach()
         epoch_contrastive += losses["contrastive_loss"].detach()
+        epoch_spec += losses["masked_spec"].detach()
         epoch_eeg += eeg_loss.detach()
         epoch_aux += aux_loss.detach()
         n_batches += 1
@@ -500,6 +502,7 @@ def train_one_epoch(
     return {
         "total": (epoch_total / denom).item(),
         "masked_loss": (epoch_masked / denom).item(),
+        "masked_spec": (epoch_spec / denom).item(),
         "next_loss": (epoch_next / denom).item(),
         "cross_modal_loss": (epoch_cross / denom).item(),
         "contrastive_loss": (epoch_contrastive / denom).item(),
@@ -532,6 +535,7 @@ def validate(
     epoch_next = 0.0
     epoch_cross = 0.0
     epoch_contrastive = 0.0
+    epoch_spec = 0.0
     epoch_eeg = 0.0
     epoch_aux = 0.0
     n_batches = 0
@@ -650,6 +654,7 @@ def validate(
         epoch_next += losses["next_loss"].item()
         epoch_cross += losses["cross_modal_loss"].item()
         epoch_contrastive += losses["contrastive_loss"].item()
+        epoch_spec += losses["masked_spec"].item()
         epoch_eeg += eeg_loss.item()
         epoch_aux += aux_loss
         n_batches += 1
@@ -663,6 +668,7 @@ def validate(
     return {
         "total": epoch_total / denom,
         "masked_loss": epoch_masked / denom,
+        "masked_spec": epoch_spec / denom,
         "next_loss": epoch_next / denom,
         "cross_modal_loss": epoch_cross / denom,
         "contrastive_loss": epoch_contrastive / denom,
@@ -716,9 +722,9 @@ class CSVLogger:
     COLUMNS = [
         "epoch", "phase",
         "train_total", "train_masked", "train_next", "train_cross", "train_contrastive",
-        "train_eeg", "train_aux",
+        "train_aux",
         "val_total", "val_masked", "val_next", "val_cross", "val_contrastive",
-        "val_eeg", "val_aux",
+        "val_aux",
         "lr", "epoch_sec",
     ]
 
@@ -746,15 +752,13 @@ class CSVLogger:
             train_losses["next_loss"],
             train_losses["cross_modal_loss"],
             train_losses["contrastive_loss"],
-            train_losses.get("eeg_loss", ""),
-            train_losses.get("aux_loss", ""),
+            train_losses["aux_loss"],
             val_losses["total"] if val_losses else "",
             val_losses["masked_loss"] if val_losses else "",
             val_losses["next_loss"] if val_losses else "",
             val_losses["cross_modal_loss"] if val_losses else "",
             val_losses["contrastive_loss"] if val_losses else "",
-            val_losses.get("eeg_loss", "") if val_losses else "",
-            val_losses.get("aux_loss", "") if val_losses else "",
+            val_losses["aux_loss"] if val_losses else "",
             lr,
             f"{epoch_sec:.1f}",
         ]

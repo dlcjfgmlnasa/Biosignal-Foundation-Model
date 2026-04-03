@@ -50,6 +50,8 @@ class CombinedLoss(nn.Module):
         self.delta = delta
         self.masked_loss_fn = MaskedPatchLoss(
             peak_alpha=peak_alpha,
+            lambda_spec=lambda_spec,
+            spec_n_ffts=spec_n_ffts,
         )
         self.next_loss_fn = NextPredictionLoss(cross_modal_weight=gamma)
         if delta > 0:
@@ -110,6 +112,7 @@ class CombinedLoss(nn.Module):
             "total": total,
             "masked_loss": masked_loss,
             "masked_mse": masked_dict["mse"],
+            "masked_spec": masked_dict["spec"],
             "next_loss": next_loss,
             "cross_modal_loss": cross_modal_loss,
             "contrastive_loss": contrastive_loss,
