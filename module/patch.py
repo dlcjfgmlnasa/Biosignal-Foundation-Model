@@ -26,10 +26,11 @@ class ResidualMLP(nn.Module):
 
     def __init__(self, in_dim: int, out_dim: int) -> None:
         super().__init__()
+        hidden = in_dim * 2
         self.mlp = nn.Sequential(
-            nn.Linear(in_dim, out_dim),
+            nn.Linear(in_dim, hidden),
             nn.ReLU(),
-            nn.Linear(out_dim, out_dim),
+            nn.Linear(hidden, out_dim),
         )
         self.skip = nn.Linear(in_dim, out_dim)
 
