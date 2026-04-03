@@ -160,6 +160,8 @@ class TransformerEncoder(nn.Module):
         shared_var_qk_proj: bool = False,
         shared_time_qk_proj: bool = False,
         d_ff: int | None = None,
+        num_experts: int = 8,
+        num_experts_per_token: int = 2,
     ):
         super().__init__()
         self.use_moe = use_moe
@@ -206,8 +208,8 @@ class TransformerEncoder(nn.Module):
         else:
             get_ffn = partial(
                 MoEFeedForward,
-                num_experts=32,
-                num_experts_per_token=2,
+                num_experts=num_experts,
+                num_experts_per_token=num_experts_per_token,
                 in_dim=d_model,
                 hidden_dim=d_ff,
                 out_dim=None,

@@ -66,6 +66,8 @@ class ModelConfig:
     # Features
     use_glu: bool = True
     use_moe: bool = False
+    num_experts: int = 8
+    num_experts_per_token: int = 2
     use_rope: bool = True
     use_var_attn_bias: bool = True
     use_spatial_embed: bool = True
