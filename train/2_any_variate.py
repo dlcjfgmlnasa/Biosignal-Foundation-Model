@@ -64,6 +64,12 @@ def find_v2_phase1_checkpoint(output_dir: str = "outputs/v2_phase1_ci") -> Path 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Phase 2: Any-Variate Training (V2, Cross-Modal)")
 
+    # Config
+    p.add_argument("--config", type=str, default=None,
+                   help="YAML config file path. CLI args override YAML values.")
+    p.add_argument("--dry-run", action="store_true",
+                   help="1 batch만 실행 후 종료 (OOM/NaN 검증용)")
+
     # Resume
     p.add_argument("--resume", type=str, default=None,
                    help="V2 Phase 1 checkpoint 경로. 미지정 시 outputs/v2_phase1_ci/에서 자동 탐색.")
@@ -140,71 +146,64 @@ def main():
     args = parse_args()
 
     # ── Phase 2 설정 ──
-    model_config = ModelConfig(
-        d_model=args.d_model,
-        num_layers=args.num_layers,
-        patch_size=args.patch_size,
-        num_heads=args.num_heads,
-        num_groups=args.num_groups,
-        use_glu=args.use_glu,
-        use_moe=args.use_moe,
-        use_rope=args.use_rope,
-        use_var_attn_bias=args.use_var_attn_bias,
-        dropout_p=args.dropout_p,
-        max_horizon=args.max_horizon,
-        contrastive_proj_dim=args.contrastive_proj_dim,
-    )
+    if args.config:
+        config = TrainConfig.from_yaml(args.config)
+        # Phase 2 고정값
+        config.collate_mode = "any_variate"
+        # dry-run
+        if args.dry_run:
+            config.max_batches = 1
+            config.n_epochs = 1
+    else:
+        model_config = ModelConfig(
+            d_model=args.d_model,
+            num_layers=args.num_layers,
+            patch_size=args.patch_size,
+            num_heads=args.num_heads,
+            num_groups=args.num_groups,
+            use_glu=args.use_glu,
+            use_moe=args.use_moe,
+            use_rope=args.use_rope,
+            use_var_attn_bias=args.use_var_attn_bias,
+            dropout_p=args.dropout_p,
+            max_horizon=args.max_horizon,
+            contrastive_proj_dim=args.contrastive_proj_dim,
+        )
 
-    config = TrainConfig(
-        model_config=model_config,
-
-        # 데이터
-        data_dir=args.data_dir,
-        signal_types=args.signal_types,
-        max_subjects=args.max_subjects,
-        window_seconds=args.window_seconds,
-        max_length=args.max_length,
-        cache_size=args.cache_size,
-        crop_ratio_min=args.crop_ratio_min,
-        crop_ratio_max=args.crop_ratio_max,
-
-        # 학습
-        batch_size=args.batch_size,
-        lr=args.lr,
-        n_epochs=args.n_epochs,
-        warmup_epochs=args.warmup_epochs,
-        min_lr_ratio=args.min_lr_ratio,
-        mask_ratio=args.mask_ratio,
-        gradient_clip=args.gradient_clip,
-        seed=args.seed,
-        collate_mode="any_variate",
-
-        # Loss
-        alpha=args.alpha,
-        beta=args.beta,
-        gamma=args.gamma,
-        delta=args.delta,
-        contrastive_temperature=args.contrastive_temperature,
-
-        # Phase 2: variate-level 마스킹
-        variate_mask_prob=args.variate_mask_prob,
-
-        # Validation & Early Stopping
-        val_ratio=args.val_ratio,
-        patience=args.patience,
-
-        # Mixed Precision
-        use_amp=args.use_amp,
-
-        # 실험 관리
-        exp_name=args.exp_name,
-
-        # 시스템
-        device=args.device,
-        num_workers=args.num_workers,
-        output_dir=args.output_dir,
-        checkpoint_every=args.checkpoint_every,
-    )
+        config = TrainConfig(
+            model_config=model_config,
+            data_dir=args.data_dir,
+            signal_types=args.signal_types,
+            max_subjects=args.max_subjects,
+            window_seconds=args.window_seconds,
+            max_length=args.max_length,
+            cache_size=args.cache_size,
+            crop_ratio_min=args.crop_ratio_min,
+            crop_ratio_max=args.crop_ratio_max,
+            batch_size=args.batch_size,
+            lr=args.lr,
+            n_epochs=args.n_epochs,
+            warmup_epochs=args.warmup_epochs,
+            min_lr_ratio=args.min_lr_ratio,
+            mask_ratio=args.mask_ratio,
+            gradient_clip=args.gradient_clip,
+            seed=args.seed,
+            collate_mode="any_variate",
+            alpha=args.alpha,
+            beta=args.beta,
+            gamma=args.gamma,
+            delta=args.delta,
+            contrastive_temperature=args.contrastive_temperature,
+            variate_mask_prob=args.variate_mask_prob,
+            val_ratio=args.val_ratio,
+            patience=args.patience,
+            use_amp=args.use_amp,
+            exp_name=args.exp_name,
+            device=args.device,
+            num_workers=args.num_workers,
+            output_dir=args.output_dir,
+            checkpoint_every=args.checkpoint_every,
+        )
 
     set_seed(config.seed)
     device = resolve_device(config.device)

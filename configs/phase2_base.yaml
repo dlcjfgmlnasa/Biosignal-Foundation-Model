@@ -1,0 +1,81 @@
+# Phase 2: Any-Variate Training (Cross-Modal)
+# ──────────────────────────────────────────────────────────────
+# Phase 1 checkpoint를 로드하여 다변량 세션에서 cross-modal 학습 수행.
+# 같은 시간대의 다른 modality 간 예측 + contrastive alignment.
+#
+# Usage:
+#   python -m train.2_any_variate \
+#       --config configs/phase2_base.yaml \
+#       --resume outputs/phase1/base/checkpoints/best.pt
+
+# ── 모델 (Phase 1과 동일해야 함) ──
+model_config:
+  d_model: 256
+  num_layers: 12
+  patch_size: 200
+  stride: null
+  num_heads: 8
+  num_groups: null
+
+  use_glu: true
+  use_moe: false
+  use_rope: true
+  use_var_attn_bias: true
+  use_spatial_embed: true
+  dropout_p: 0.1
+  max_horizon: 3
+  contrastive_proj_dim: 128     # Phase 2: contrastive projection 활성
+
+# ── 데이터 ──
+data_dir: ../updown/datasets/vitaldb_pt
+signal_types: [0, 1, 2, 3, 4, 5, 6]
+max_subjects: null
+window_seconds: 600.0           # Phase 2: 10분 context (장기 cross-modal 패턴)
+max_length: 60000
+cache_size: 16
+crop_ratio_min: 0.025
+crop_ratio_max: 1.0
+
+# ── 학습 ──
+batch_size: 32                  # any_variate는 multi-channel packing → 메모리 더 사용
+lr: 1.0e-4                     # Phase 2: 낮은 LR (fine-tune)
+n_epochs: 50
+warmup_epochs: 5
+min_lr_ratio: 0.1
+mask_ratio: 0.4
+gradient_clip: 1.0
+seed: 42
+collate_mode: any_variate       # Phase 2: 다변량 패킹
+
+# ── Loss 가중치 (Phase 2: 전체 활성) ──
+alpha: 1.0                      # masked reconstruction
+beta: 0.5                       # next-pred (same-variate + cross-modal)
+gamma: 1.0                      # cross-modal prediction (beta 내부 가중)
+delta: 0.1                      # contrastive (InfoNCE)
+lambda_spec: 0.2                # Multi-Resolution STFT Loss
+spec_n_ffts: [32, 64, 128]
+aux_loss_weight: 0.01
+contrastive_temperature: 0.07
+learnable_temperature: true
+
+# ── Masking ──
+variate_mask_prob: 0.3          # Phase 2: 30% 확률로 전체 variate 마스킹 (virtual sensing)
+block_mask: true
+block_size_min: 2
+block_size_max: 4
+
+# ── Mixed Precision ──
+use_amp: true
+
+# ── Validation & Early Stopping ──
+val_ratio: 0.05
+val_max_batches: 500
+patience: 20                    # Phase 2는 수렴이 느릴 수 있음
+
+# ── 시스템 ──
+device: auto
+num_workers: 4
+output_dir: outputs/phase2
+checkpoint_every: 5
+viz_every: 1
+exp_name: base
