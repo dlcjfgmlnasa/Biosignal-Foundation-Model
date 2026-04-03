@@ -99,9 +99,6 @@ class TrainConfig:
     # 시각화
     viz_every: int = 5  # N 에폭마다 시각화 저장 (0=비활성)
 
-    # 데이터 로딩
-    preload: bool = False  # True면 모든 레코딩을 RAM에 미리 로드 (대규모 데이터에서 I/O 병목 해결)
-
     # 실행 제한
     max_batches: int = 0  # >0이면 에폭당 최대 배치 수 제한
     val_max_batches: int = 500  # validation 최대 배치 수
