@@ -63,31 +63,31 @@ def _multi_resolution_stft_loss(
 
 
 class MaskedPatchLoss(nn.Module):
-    """마스킹된 패치 위치만 MSE + Gradient + Spectral Loss를 계산하는 손실 함수.
+    """마스킹된 패치 위치만 Peak-Weighted MSE를 계산하는 손실 함수.
 
-    pred_mask=True인 패치에 대해 복합 loss를 반환한다.
+    진폭이 큰 sample에 자동으로 높은 가중치를 부여하여
+    R-peak, systolic peak 등 임상적으로 중요한 peak 복원을 강화한다.
+    peak_alpha=0이면 일반 MSE와 동일.
+
+    pred_mask=True인 패치에 대해 loss를 반환한다.
     마스킹된 위치가 없으면 0을 반환한다.
 
     Parameters
     ----------
-    lambda_grad:
-        Gradient Loss 가중치. 0이면 비활성.
-    lambda_spec:
-        Spectral Loss 가중치. 0이면 비활성.
-    spec_n_ffts:
-        Multi-Resolution STFT에 사용할 n_fft 크기들.
+    peak_alpha:
+        Peak 가중치 강도. 0이면 일반 MSE. 높을수록 peak에 집중.
     """
 
     def __init__(
         self,
+        peak_alpha: float = 0.0,
+        # 하위 호환: 기존 config에서 전달되는 인자 무시
         lambda_grad: float = 0.0,
         lambda_spec: float = 0.0,
         spec_n_ffts: tuple[int, ...] = (16, 32, 64),
     ) -> None:
         super().__init__()
-        self.lambda_grad = lambda_grad
-        self.lambda_spec = lambda_spec
-        self.spec_n_ffts = spec_n_ffts
+        self.peak_alpha = peak_alpha
 
     def forward(
         self,
@@ -98,31 +98,22 @@ class MaskedPatchLoss(nn.Module):
         n_masked = pred_mask.float().sum()
         if n_masked == 0:
             zero = reconstructed.new_tensor(0.0)
-            return {"mse": zero, "grad": zero, "spec": zero, "total": zero}
+            return {"mse": zero, "total": zero}
 
         pred_m = reconstructed[pred_mask]    # (M, P)
         target_m = original_patches[pred_mask]  # (M, P)
 
-        # ── MSE ──
-        mse = ((pred_m - target_m) ** 2).mean()
-
-        # ── Gradient Loss (1차 미분 MSE) ──
-        if self.lambda_grad > 0:
-            diff_pred = pred_m[:, 1:] - pred_m[:, :-1]      # (M, P-1)
-            diff_target = target_m[:, 1:] - target_m[:, :-1]  # (M, P-1)
-            grad_loss = ((diff_pred - diff_target) ** 2).mean()
+        # ── Peak-Weighted MSE ──
+        if self.peak_alpha > 0:
+            # 패치별 최대 절대값으로 정규화하여 가중치 계산
+            abs_target = target_m.abs()  # (M, P)
+            max_abs = abs_target.amax(dim=-1, keepdim=True).clamp(min=1e-8)  # (M, 1)
+            weight = 1.0 + self.peak_alpha * (abs_target / max_abs)  # (M, P)
+            mse = (weight * (pred_m - target_m) ** 2).mean()
         else:
-            grad_loss = reconstructed.new_tensor(0.0)
+            mse = ((pred_m - target_m) ** 2).mean()
 
-        # ── Multi-Resolution STFT Loss ──
-        if self.lambda_spec > 0:
-            spec_loss = _multi_resolution_stft_loss(pred_m, target_m, self.spec_n_ffts)
-        else:
-            spec_loss = reconstructed.new_tensor(0.0)
-
-        total = mse + self.lambda_grad * grad_loss + self.lambda_spec * spec_loss
-
-        return {"mse": mse, "grad": grad_loss, "spec": spec_loss, "total": total}
+        return {"mse": mse, "total": mse}
 
 
 def create_patch_mask(

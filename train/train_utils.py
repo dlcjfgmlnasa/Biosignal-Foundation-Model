@@ -66,9 +66,10 @@ class TrainConfig:
     beta: float = 0.0   # next-patch prediction
     gamma: float = 0.0  # cross-modal (beta 내부 가중)
     delta: float = 0.0  # cross-modal contrastive
-    lambda_grad: float = 0.0  # Gradient Loss 가중치 (1차 미분 MSE)
-    lambda_spec: float = 0.0  # Spectral Loss 가중치 (Multi-Resolution STFT)
-    spec_n_ffts: tuple[int, ...] = (16, 32, 64)  # MRSTFT window 크기들
+    peak_alpha: float = 0.0  # Peak-Weighted MSE 강도 (0=일반 MSE)
+    lambda_grad: float = 0.0  # Gradient Loss 가중치 (하위 호환)
+    lambda_spec: float = 0.0  # Spectral Loss 가중치 (하위 호환)
+    spec_n_ffts: tuple[int, ...] = (16, 32, 64)  # 하위 호환
     aux_loss_weight: float = 0.01  # MoE load balancing auxiliary loss
     contrastive_temperature: float = 0.07
     learnable_temperature: bool = True
