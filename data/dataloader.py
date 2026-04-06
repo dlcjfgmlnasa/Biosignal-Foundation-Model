@@ -5,7 +5,7 @@ from torch.utils.data import DataLoader, Sampler
 
 from data.collate import PackCollate, PackedBatch
 from data.dataset import BiosignalDataset
-from data.sampler import GroupedBatchSampler
+from data.sampler import GroupedBatchSampler, RecordingLocalitySampler
 
 
 def create_dataloader(

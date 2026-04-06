@@ -23,9 +23,9 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data.distributed import DistributedSampler
 
 from data import BiosignalDataset, create_dataloader
+from data.sampler import RecordingLocalitySampler
 from loss.criterion import CombinedLoss
 from model import BiosignalFoundationModel, ModelConfig
 from .train_utils import (
@@ -279,12 +279,16 @@ def main():
     if rank0:
         print(f"Train dataset: {len(dataset)} windows")
 
-    # DDP: DistributedSampler 사용
-    sampler = None
-    shuffle = True
-    if use_ddp:
-        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=local_rank, shuffle=True)
-        shuffle = False  # sampler가 셔플 담당
+    # Recording-locality sampler: 같은 레코딩의 윈도우를 연속 yield하여
+    # LRU 캐시 히트율을 극대화한다. 네트워크 디스크 I/O 병목 해소.
+    sampler = RecordingLocalitySampler(
+        dataset,
+        num_replicas=world_size if use_ddp else None,
+        rank=local_rank if use_ddp else None,
+        shuffle=True,
+        seed=config.seed,
+    )
+    shuffle = False  # sampler가 셔플 담당
 
     dataloader = create_dataloader(
         dataset,
@@ -309,11 +313,13 @@ def main():
             cache_size=config.cache_size,
                 patch_size=config.model_config.patch_size,
         )
-        val_sampler = None
-        if use_ddp:
-            val_sampler = DistributedSampler(
-                val_dataset, num_replicas=world_size, rank=local_rank, shuffle=False,
-            )
+        val_sampler = RecordingLocalitySampler(
+            val_dataset,
+            num_replicas=world_size if use_ddp else None,
+            rank=local_rank if use_ddp else None,
+            shuffle=False,
+            seed=config.seed,
+        )
         val_dataloader = create_dataloader(
             val_dataset,
             max_length=config.max_length,
