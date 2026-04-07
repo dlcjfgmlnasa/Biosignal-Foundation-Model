@@ -435,23 +435,23 @@ def main() -> None:
 
     # ── 데이터 준비 ──
     if args.dummy:
-        print("[Task 7] Dummy mode: 합성 EEG+BIS 데이터")
+        print("[Task 7] Dummy mode: Synthetic EEG+BIS data")
         all_samples = create_dummy_samples(
             n_samples=100,
             win_samples=int(args.window_sec * TARGET_SR),
         )
     else:
-        print(f"[Task 7] VitalDB BIS+EEG 케이스 {args.n_cases}개 탐색 중...")
+        print(f"[Task 7] VitalDB BIS+EEG cases {args.n_cases}searching...")
         case_ids = find_bis_eeg_cases(n_cases=args.n_cases)
-        print(f"  BIS+EEG 케이스: {len(case_ids)}개")
+        print(f"  BIS+EEG cases: {len(case_ids)}개")
 
         all_samples = load_bis_eeg_windows(
             case_ids, window_sec=args.window_sec, stride_sec=10.0,
         )
-        print(f"  윈도우 추출: {len(all_samples)}개")
+        print(f"  Windows extracted: {len(all_samples)}개")
 
     if len(all_samples) < 10:
-        print("[Task 7] ERROR: 샘플이 너무 적습니다 (최소 10개 필요).")
+        print("[Task 7] ERROR: Not enough samples (min 10 required).")
         return
 
     # Train/Test split (case 단위)
@@ -468,7 +468,7 @@ def main() -> None:
     print(f"  Test:  {len(test_samples)} windows ({len(case_ids_unique) - n_train_cases} cases)")
 
     if not train_samples or not test_samples:
-        print("[Task 7] ERROR: Train 또는 Test 세트가 비어있습니다.")
+        print("[Task 7] ERROR: Train or Test set is empty.")
         return
 
     # BIS 분포 출력
@@ -489,13 +489,13 @@ def main() -> None:
         )
         d_model = wrapper.d_model
         patch_size = wrapper.patch_size
-        print(f"[Task 7] 모델 로드: d_model={d_model}, patch_size={patch_size}")
+        print(f"[Task 7] Model loaded: d_model={d_model}, patch_size={patch_size}")
 
     # ── 학습 & 평가 ──
     device_str = "cpu" if args.dummy or args.checkpoint is None else (
         "cuda" if torch.cuda.is_available() else "cpu"
     )
-    print(f"[Task 7] LinearProbe 학습 시작 (epochs={args.epochs}, lr={args.lr})...")
+    print(f"[Task 7] LinearProbe Training start (epochs={args.epochs}, lr={args.lr})...")
 
     results = train_and_evaluate(
         wrapper, train_samples, test_samples,
