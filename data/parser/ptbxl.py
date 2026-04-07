@@ -232,6 +232,6 @@ def load_ptbxl_split(
     for split_name, (samps, labs) in splits.items():
         from collections import Counter
         dist = Counter(labs)
-        print(f"  {split_name}: {len(samps)} samples — {dict(dist)}")
+        print(f"  {split_name}: {len(samps)} samples - {dict(dist)}")
 
     return splits

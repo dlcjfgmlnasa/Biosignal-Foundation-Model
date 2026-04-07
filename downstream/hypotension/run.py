@@ -9,10 +9,10 @@ Frozen encoder + probe로 ABP 윈도우의 저혈압 여부를 분류한다.
 
 사용법:
     # 단일 윈도우 (기존 동작)
-    python -m downstream.task1_hypotension.run --dummy --n-cases 10
+    python -m downstream.hypotension.run --dummy --n-cases 10
 
     # 다중 윈도우 + prediction horizon
-    python -m downstream.task1_hypotension.run --dummy --n-cases 10 \
+    python -m downstream.hypotension.run --dummy --n-cases 10 \
         --n-context-windows 5 --prediction-horizon-sec 300 --aggregator lstm
 """
 

@@ -11,10 +11,10 @@ VitalDB parser가 reject한 세그먼트를 anomaly 라벨로 역이용.
 Usage
 -----
 # 실제 모델:
-python -m downstream.task6_anomaly.run --checkpoint outputs/phase1_v1/best.pt --signal-type ecg
+python -m downstream.anomaly.run --checkpoint outputs/phase1_v1/best.pt --signal-type ecg
 
 # 더미 테스트:
-python -m downstream.task6_anomaly.run --dummy --signal-type ecg
+python -m downstream.anomaly.run --dummy --signal-type ecg
 """
 from __future__ import annotations
 

@@ -13,15 +13,15 @@ Input 소스: 선택된 signal type의 현재 윈도우
 
 사용법:
     # MIMIC-III, ECG 입력, 5분 후 예측
-    python -m downstream.task1_hypotension.prepare_data \
+    python -m downstream.hypotension.prepare_data \
         --source mimic3 --input-signals ecg --horizon-min 5 --n-cases 5
 
     # VitalDB, ECG+PPG 입력, 10분 후 예측
-    python -m downstream.task1_hypotension.prepare_data \
+    python -m downstream.hypotension.prepare_data \
         --source vitaldb --input-signals ecg ppg --horizon-min 10 --n-cases 10
 
     # MIMIC-III, ABP 입력 (temporal prediction)
-    python -m downstream.task1_hypotension.prepare_data \
+    python -m downstream.hypotension.prepare_data \
         --source mimic3 --input-signals abp --horizon-min 5 --n-cases 5
 """
 
@@ -445,7 +445,7 @@ def prepare_hypotension_forecast(
     window_sec: float = 30.0,
     stride_sec: float = 30.0,
     train_ratio: float = 0.7,
-    out_dir: str = "outputs/downstream/task1",
+    out_dir: str = "outputs/downstream/hypotension",
     manifest_path: str | None = None,
 ) -> Path:
     """Hypotension forecast 데이터를 준비한다.
@@ -560,7 +560,7 @@ def main() -> None:
                         help="Sliding window stride in seconds")
     parser.add_argument("--train-ratio", type=float, default=0.7,
                         help="Train/test split ratio")
-    parser.add_argument("--out-dir", type=str, default="outputs/downstream/task1",
+    parser.add_argument("--out-dir", type=str, default="outputs/downstream/hypotension",
                         help="Output directory")
     parser.add_argument("--manifest", type=str, default=None,
                         help="MIMIC-III manifest JSON path")

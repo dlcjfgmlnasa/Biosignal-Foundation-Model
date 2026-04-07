@@ -124,13 +124,19 @@ def _plot_figure_grid(
     next_pred_ratio: float = 0.3,
     eeg_spectral: list[dict] | None = None,  # [{"pred": (F,T), "target": (F,T)}, ...]
 ) -> Path:
-    """행=신호 타입, 열=샘플로 grid figure를 그려 저장한다. EEG spectral 행 포함."""
+    """행=신호 타입, 열=샘플로 grid figure를 그려 저장한다. EEG PSD 비교 행 포함."""
     types = sorted(grid.keys())
     n_rows = len(types)
     n_cols = max(len(v) for v in grid.values()) if grid else 1
+
+    # EEG spectral tokenizer가 있으면 기존 spectrogram 행 사용
     has_eeg_spec = eeg_spectral is not None and len(eeg_spectral) > 0
+    # spectral tokenizer 없어도 EEG가 grid에 있으면 PSD 비교 행 추가
+    has_eeg_psd = (not has_eeg_spec) and (2 in grid)
     if has_eeg_spec:
-        n_rows += 1  # EEG spectral 행 추가
+        n_rows += 1
+    elif has_eeg_psd:
+        n_rows += 1  # EEG PSD 비교 행 추가
     if n_rows == 0:
         return output_dir / f"empty_epoch{epoch:03d}.png"
 
@@ -239,11 +245,72 @@ def _plot_figure_grid(
             if eeg_row == n_rows - 1:
                 ax.set_xlabel("Freq × Time", fontsize=8)
 
+    # ── EEG PSD 비교 행 (spectral tokenizer 없을 때) ──
+    if has_eeg_psd:
+        eeg_psd_row = n_rows - 1
+        eeg_cands = grid[2]
+        n_eeg = min(len(eeg_cands), n_cols)
+        for col in range(n_cols):
+            ax = axes[eeg_psd_row, col]
+            if col >= n_eeg:
+                ax.axis("off")
+                continue
+
+            cand = eeg_cands[col]
+            n_show = min(cand.n_valid, max_patches)
+            orig_wave = cand.orig_patches[:n_show].reshape(-1)
+
+            # masked/predicted 패치만 추출
+            pred_patches = cand.pred_patches[:n_show]
+            valid_mask = ~np.isnan(pred_patches[:, 0])
+            if valid_mask.any():
+                pred_wave_parts = pred_patches[valid_mask].reshape(-1)
+                orig_wave_parts = cand.orig_patches[:n_show][valid_mask].reshape(-1)
+            else:
+                pred_wave_parts = orig_wave
+                orig_wave_parts = orig_wave
+
+            # PSD 계산 (Welch method)
+            from scipy.signal import welch
+            nperseg = min(256, len(orig_wave_parts) // 2)
+            if nperseg < 16:
+                ax.axis("off")
+                continue
+
+            f_orig, psd_orig = welch(orig_wave_parts, fs=sampling_rate, nperseg=nperseg)
+            f_pred, psd_pred = welch(pred_wave_parts, fs=sampling_rate, nperseg=nperseg)
+
+            # 0.5~45Hz 범위만 표시
+            freq_mask = (f_orig >= 0.5) & (f_orig <= 45)
+            ax.semilogy(f_orig[freq_mask], psd_orig[freq_mask],
+                        color="steelblue", linewidth=1.0, alpha=0.9, label="Original")
+            ax.semilogy(f_pred[freq_mask], psd_pred[freq_mask],
+                        color=pred_color, linewidth=1.0, alpha=0.9, label=pred_label)
+            ax.fill_between(f_orig[freq_mask], psd_orig[freq_mask], psd_pred[freq_mask],
+                            alpha=0.15, color="gray")
+
+            # EEG 대역 표시
+            for band_name, (f_lo, f_hi), clr in [
+                ("delta", (0.5, 4), "#d4e6f1"),
+                ("theta", (4, 8), "#d5f5e3"),
+                ("alpha", (8, 13), "#fdebd0"),
+                ("beta", (13, 30), "#fadbd8"),
+            ]:
+                ax.axvspan(f_lo, f_hi, alpha=0.08, color=clr)
+                ax.text((f_lo + f_hi) / 2, ax.get_ylim()[1] * 0.5,
+                        band_name, fontsize=6, ha="center", alpha=0.5)
+
+            if col == 0:
+                ax.set_ylabel("EEG PSD", fontsize=10)
+                ax.legend(fontsize=6, loc="upper right")
+            ax.set_xlabel("Frequency (Hz)", fontsize=8)
+            ax.tick_params(labelsize=7)
+
     if mode == "masked":
-        title = f"Masked Reconstruction — Epoch {epoch}"
+        title = f"Masked Reconstruction - Epoch {epoch}"
         fname = f"recon_epoch{epoch:03d}.png"
     else:
-        title = f"Next-Patch Prediction (H={horizon}) — Epoch {epoch}"
+        title = f"Next-Patch Prediction (H={horizon}) - Epoch {epoch}"
         fname = f"next_pred_epoch{epoch:03d}.png"
 
     fig.suptitle(title, fontsize=13, y=1.01)
@@ -306,7 +373,8 @@ def _extract_candidates(
     batch_size = original_patches.shape[0]
 
     sig_map = _build_signal_map(batch, p_sid, p_vid, patch_mask, batch_size)
-    is_v2 = "eeg_mask" in out or "eeg_reconstructed" in out
+    # EEG spectral tokenizer가 있어서 별도 spectral 시각화하는 경우에만 waveform에서 EEG 제외
+    has_eeg_spectral_output = "eeg_reconstructed" in out and out["eeg_reconstructed"] is not None
 
     candidates: list[RowCandidate] = []
     for bi in range(batch_size):
@@ -338,7 +406,7 @@ def _extract_candidates(
                 continue
 
             sig_type = sig_map.get((bi, sid, vid), -1)
-            if is_v2 and sig_type == 2:
+            if has_eeg_spectral_output and sig_type == 2:
                 continue
             sig_name = SIGNAL_TYPE_NAMES.get(sig_type, "?")
 
@@ -386,7 +454,8 @@ def _process_recon_batch(
     batch_size = original_patches.shape[0]
 
     sig_map = _build_signal_map(batch, p_sid, p_vid, patch_mask, batch_size)
-    is_v2 = "eeg_mask" in out or "eeg_reconstructed" in out
+    # EEG spectral tokenizer가 있어서 별도 spectral 시각화하는 경우에만 waveform에서 EEG 제외
+    has_eeg_spectral_output = "eeg_reconstructed" in out and out["eeg_reconstructed"] is not None
 
     reconstructed = out["reconstructed"]
     pred_mask_full = out["pred_mask"]
@@ -421,7 +490,7 @@ def _process_recon_batch(
             pred[seg_masked] = seg_recon[seg_masked]
 
             sig_type = sig_map.get((bi, sid, vid), -1)
-            if is_v2 and sig_type == 2:
+            if has_eeg_spectral_output and sig_type == 2:
                 continue
             sig_name = SIGNAL_TYPE_NAMES.get(sig_type, "?")
 
@@ -461,7 +530,8 @@ def _process_next_pred_batch(
     batch_size = original_patches.shape[0]
 
     sig_map = _build_signal_map(batch, p_sid, p_vid, patch_mask, batch_size)
-    is_v2 = "eeg_mask" in out or "eeg_reconstructed" in out
+    # EEG spectral tokenizer가 있어서 별도 spectral 시각화하는 경우에만 waveform에서 EEG 제외
+    has_eeg_spectral_output = "eeg_reconstructed" in out and out["eeg_reconstructed"] is not None
 
     candidates: list[RowCandidate] = []
     for bi in range(batch_size):
@@ -490,7 +560,7 @@ def _process_next_pred_batch(
             pred[horizon:n_seg] = seg_next[:n_seg - horizon]
 
             sig_type = sig_map.get((bi, sid, vid), -1)
-            if is_v2 and sig_type == 2:
+            if has_eeg_spectral_output and sig_type == 2:
                 continue
             sig_name = SIGNAL_TYPE_NAMES.get(sig_type, "?")
 

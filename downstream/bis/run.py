@@ -9,10 +9,10 @@ BIS 범위: 0~100 (0=isoelectric, 40~60=적정 마취, 60~100=각성).
 Usage
 -----
 # 실제 모델:
-python -m downstream.task7_bis.run --checkpoint outputs/phase1_v1/best.pt --n-cases 50
+python -m downstream.bis.run --checkpoint outputs/phase1_v1/best.pt --n-cases 50
 
 # 더미 테스트:
-python -m downstream.task7_bis.run --dummy
+python -m downstream.bis.run --dummy
 """
 from __future__ import annotations
 
