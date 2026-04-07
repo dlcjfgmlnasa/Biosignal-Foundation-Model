@@ -290,8 +290,8 @@ def run_checkpoint_eval(
     stride_sec: float = 15.0,
 ) -> list[AnyToAnyResult]:
     """Evaluate all scenarios with a pretrained checkpoint."""
-    from downstream.common.model_wrapper import DownstreamModelWrapper
-    from downstream.common.data_utils import load_pilot_cases
+    from downstream.model_wrapper import DownstreamModelWrapper
+    from downstream.data_utils import load_pilot_cases
 
     print("=" * 70)
     print(f"Task 8: Any-to-Any Prediction")

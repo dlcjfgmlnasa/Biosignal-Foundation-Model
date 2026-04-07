@@ -40,8 +40,8 @@ from data.collate import PackCollate, PackedBatch
 from data.dataset import BiosignalSample
 from data.spatial_map import get_global_spatial_id
 
-from eval._metrics import compute_auroc, compute_auprc, compute_f1
-from downstream.common.model_wrapper import LinearProbe
+from downstream.metrics import compute_auroc, compute_auprc, compute_f1
+from downstream.model_wrapper import LinearProbe
 
 
 # ── 설정 ──────────────────────────────────────────────────────
@@ -378,7 +378,7 @@ def plot_per_class_auroc(
     plt.close(fig)
 
 
-# ── メイン ────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────
 
 
 def main() -> None:
@@ -413,7 +413,7 @@ def main() -> None:
         model = DummyFeatureExtractor(d_model=128)
         d_model = 128
     elif args.checkpoint:
-        from downstream.common.model_wrapper import DownstreamModelWrapper
+        from downstream.model_wrapper import DownstreamModelWrapper
         print(f"Loading checkpoint: {args.checkpoint}")
         model = DownstreamModelWrapper(args.checkpoint, args.model_version, args.device)
         d_model = model.d_model

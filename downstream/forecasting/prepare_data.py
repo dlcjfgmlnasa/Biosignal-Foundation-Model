@@ -63,7 +63,7 @@ def _load_vitaldb_signal(
     offset_from_end: int = 200,
 ) -> list[dict]:
     """VitalDB에서 단일 signal type 데이터를 로드한다."""
-    from downstream._common.data_utils import load_pilot_cases
+    from downstream.data_utils import load_pilot_cases
 
     cases = load_pilot_cases(
         n_cases=n_cases,

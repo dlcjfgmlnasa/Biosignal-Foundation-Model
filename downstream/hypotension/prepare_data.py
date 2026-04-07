@@ -225,7 +225,7 @@ def _load_vitaldb_aligned_signals(
     offset_from_end: int = 200,
 ) -> list[dict]:
     """VitalDB에서 시간 정렬된 다채널 데이터를 로드한다."""
-    from downstream.common.data_utils import (
+    from downstream.data_utils import (
         load_pilot_cases, PREFERRED_TRACKS,
     )
 

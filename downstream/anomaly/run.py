@@ -65,7 +65,7 @@ def prepare_anomaly_windows(
 
     quality check PASS → label=0 (정상), FAIL → label=1 (이상).
     """
-    from downstream.common.data_utils import (
+    from downstream.data_utils import (
         extract_windows,
         load_pilot_cases,
     )
@@ -246,7 +246,7 @@ def find_optimal_threshold(
     -------
     (best_threshold, best_f1)
     """
-    from eval._metrics import compute_f1
+    from downstream.metrics import compute_f1
 
     scores_arr = np.array(scores)
     labels_arr = np.array(labels)
@@ -428,7 +428,7 @@ def main() -> None:
         wrapper = DummyWrapper(patch_size=patch_size)
         print(f"[Task 6] DummyWrapper 사용 (patch_size={patch_size})")
     else:
-        from downstream.common.model_wrapper import DownstreamModelWrapper
+        from downstream.model_wrapper import DownstreamModelWrapper
         device = "cuda" if torch.cuda.is_available() else "cpu"
         wrapper = DownstreamModelWrapper(
             args.checkpoint, model_version=args.model_version, device=device,
@@ -445,7 +445,7 @@ def main() -> None:
     )
 
     # ── 메트릭 계산 ──
-    from eval._metrics import compute_auroc, compute_auprc, compute_f1
+    from downstream.metrics import compute_auroc, compute_auprc, compute_f1
 
     scores_arr = np.array(scores)
     labels_arr = np.array(labels)
@@ -476,7 +476,7 @@ def main() -> None:
     }
 
     # ── 시각화 ──
-    from eval._viz import plot_roc_curve
+    from downstream.viz import plot_roc_curve
 
     plot_score_distribution(
         scores, labels, best_thresh,

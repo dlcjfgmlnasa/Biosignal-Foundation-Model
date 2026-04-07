@@ -33,7 +33,7 @@ from data.dataset import BiosignalSample
 from data.spatial_map import get_global_spatial_id
 from data.parser.vitaldb import SIGNAL_TYPES
 
-from downstream.common.data_utils import (
+from downstream.data_utils import (
     CaseData,
     LabeledWindow,
     Window,
@@ -44,13 +44,13 @@ from downstream.common.data_utils import (
     split_by_subject,
     TARGET_SR,
 )
-from eval._metrics import (
+from downstream.metrics import (
     compute_auroc,
     compute_auprc,
     compute_sensitivity_specificity,
     plot_roc_curve,
 )
-from downstream.common.model_wrapper import LinearProbe
+from downstream.model_wrapper import LinearProbe
 
 
 # ── 설정 ──────────────────────────────────────────────────────
@@ -462,7 +462,7 @@ def main() -> None:
         model = DummyFeatureExtractor(d_model=128)
         d_model = 128
     elif args.checkpoint:
-        from downstream.common.model_wrapper import DownstreamModelWrapper
+        from downstream.model_wrapper import DownstreamModelWrapper
         print(f"Loading checkpoint: {args.checkpoint}")
         model = DownstreamModelWrapper(args.checkpoint, args.model_version, args.device)
         d_model = model.d_model

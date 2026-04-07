@@ -355,34 +355,6 @@ class BiosignalFoundationModel(nn.Module):
         block_size_max: int = 8,
         variate_mask_prob: float = 0.0,
     ) -> dict[str, torch.Tensor]:
-        """전체 forward 파이프라인.
-
-        Parameters
-        ----------
-        batch:
-            PackCollate(patch_size=...)로 생성된 PackedBatch.
-        task:
-            ``"masked"``: 양방향 attention → reconstruction head.
-            ``"next_pred"``: causal attention → next-patch prediction head.
-        horizon:
-            Next-patch prediction의 예측 거리 (패치 단위). 기본 1.
-
-        Returns
-        -------
-        dict with keys:
-            ``encoded``: ``(B, N, d_model)`` — 인코딩된 패치 표현.
-            ``reconstructed``: ``(B, N, patch_size)`` — task="masked"일 때.
-            ``cross_pred``: ``(B, N, patch_size)`` — task="masked"일 때 (cross-modal 예측).
-            ``next_pred``: ``(B, N, patch_size)`` — task="next_pred"일 때.
-            ``patches``: ``(B, N, patch_size)`` — raw patches.
-            ``patch_signal_types``: ``(B, N)`` — 패치별 signal type.
-            ``loc``: ``(B, L, 1)`` — per-variate 위치.
-            ``scale``: ``(B, L, 1)`` — per-variate 스케일.
-            ``patch_mask``: ``(B, N)`` — 유효 패치 마스크.
-            ``patch_sample_id``: ``(B, N)`` — 패치별 sample_id.
-            ``patch_variate_id``: ``(B, N)`` — 패치별 variate_id.
-            ``time_id``: ``(B, N)`` — 패치별 시간 인덱스.
-        """
         enc = self._encode(
             batch, task=task,
             mask_ratio=mask_ratio, block_mask=block_mask,

@@ -65,7 +65,7 @@ def _load_vitaldb_signals(
     signal_type: str,
     offset_from_end: int = 200,
 ) -> list[dict]:
-    from downstream._common.data_utils import load_pilot_cases
+    from downstream.data_utils import load_pilot_cases
 
     cases = load_pilot_cases(
         n_cases=n_cases,

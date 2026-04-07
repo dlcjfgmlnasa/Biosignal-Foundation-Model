@@ -241,13 +241,13 @@ def train_and_evaluate(
     -------
     dict with keys: mae, mse, rmse, pearson_r, bland_altman, bin_accuracy, n_train, n_test.
     """
-    from eval._metrics import (
+    from downstream.metrics import (
         compute_bland_altman,
         compute_mae,
         compute_mse,
         compute_pearson_r,
     )
-    from downstream.common.model_wrapper import LinearProbe
+    from downstream.model_wrapper import LinearProbe
 
     device_t = torch.device(device)
     d_model = wrapper.d_model
@@ -482,7 +482,7 @@ def main() -> None:
         wrapper = DummyWrapper(d_model=d_model, patch_size=patch_size)
         print(f"[Task 7] DummyWrapper (d_model={d_model}, patch_size={patch_size})")
     else:
-        from downstream.common.model_wrapper import DownstreamModelWrapper
+        from downstream.model_wrapper import DownstreamModelWrapper
         device = "cuda" if torch.cuda.is_available() else "cpu"
         wrapper = DownstreamModelWrapper(
             args.checkpoint, model_version=args.model_version, device=device,
@@ -506,7 +506,7 @@ def main() -> None:
     )
 
     # ── 시각화 ──
-    from eval._viz import plot_bland_altman
+    from downstream.viz import plot_bland_altman
 
     plot_bland_altman(
         results["y_true"], results["y_pred"],

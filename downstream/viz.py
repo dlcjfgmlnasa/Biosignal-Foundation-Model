@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
-from eval._metrics import _binary_auroc, compute_bland_altman
+from downstream.metrics import _binary_auroc, compute_bland_altman
 
 
 def plot_roc_curve(
