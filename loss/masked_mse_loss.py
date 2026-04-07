@@ -224,42 +224,29 @@ def create_patch_mask(
                 masked_count += bs
 
                 # 배치된 블록 영역 + 양옆 1패치 gap을 run에서 제거
-                # → 좌/우 sub-run으로 분할하여 블록 간 연속 방지
                 ri = eligible[pick][0]
                 old_start, old_len = runs[ri]
                 old_end = old_start + old_len
                 new_runs: list[tuple[int, int]] = []
-                # 왼쪽 sub-run (블록 왼쪽 1칸 gap 확보)
-                left_len = start_idx - old_start - 1  # -1: gap
+                # 왼쪽 sub-run (1패치 gap 확보)
+                left_len = start_idx - old_start - 1
                 if left_len > 0:
                     new_runs.append((old_start, left_len))
-                # 오른쪽 sub-run (블록 오른쪽 1칸 gap 확보)
-                right_start = start_idx + bs + 1  # +1: gap
+                # 오른쪽 sub-run (1패치 gap 확보)
+                right_start = start_idx + bs + 1
                 right_len = old_end - right_start
                 if right_len > 0:
                     new_runs.append((right_start, right_len))
-                # 기존 run을 교체
+                # 기존 run을 교체 (block_size_min 미만 run도 보존 — eligible 필터가 걸러줌)
                 runs = runs[:ri] + new_runs + runs[ri + 1:]
 
-            # 목표 미달 시 랜덤으로 나머지 채움 (마스킹 인접 패치 제외)
+            # 목표 미달 시 랜덤으로 나머지 채움
             if masked_count < n_mask:
                 remaining = valid_idx[~pred_mask[bi, valid_idx]]
                 if len(remaining) > 0:
-                    # 기존 마스킹 패치 양옆 1칸은 제외하여 연속 확장 방지
-                    masked_idx = pred_mask[bi].nonzero(as_tuple=True)[0]
-                    neighbor = set()
-                    for mi in masked_idx:
-                        neighbor.add(mi.item() - 1)
-                        neighbor.add(mi.item() + 1)
-                    non_adjacent = torch.tensor(
-                        [r.item() for r in remaining if r.item() not in neighbor],
-                        device=device,
-                    )
-                    # non-adjacent가 부족하면 remaining 전체에서 채움
-                    pool = non_adjacent if len(non_adjacent) > 0 else remaining
-                    extra = min(n_mask - masked_count, len(pool))
-                    perm = torch.randperm(len(pool), device=device)[:extra]
-                    pred_mask[bi, pool[perm]] = True
+                    extra = min(n_mask - masked_count, len(remaining))
+                    perm = torch.randperm(len(remaining), device=device)[:extra]
+                    pred_mask[bi, remaining[perm]] = True
         else:
             # ── Random Masking (기본) ──
             perm = torch.randperm(n_valid, device=device)[:n_mask]
