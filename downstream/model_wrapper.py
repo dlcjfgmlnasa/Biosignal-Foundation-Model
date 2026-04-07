@@ -168,11 +168,11 @@ class DownstreamModelWrapper(nn.Module):
         # 원본 패치 추출 (정규화된 값)
         normalized = (
             (batch.values.unsqueeze(-1) - out["loc"]) / out["scale"]
-        ).squeeze(-1)  # (B, L)
-        B, L = normalized.shape
-        P = self.patch_size
-        N = L // P
-        original_patches = normalized.reshape(B, N, P)  # (B, N, P)
+        ).squeeze(-1)  # (b, l)
+        b, l = normalized.shape
+        p = self.patch_size
+        n = l // p
+        original_patches = normalized.reshape(b, n, p)  # (b, n, p)
 
         mask = mask.to(self.device)
         if not mask.any():
