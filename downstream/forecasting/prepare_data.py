@@ -4,25 +4,18 @@
 임의 신호의 과거 waveform으로 미래 waveform을 예측하는 task.
 model.generate() (autoregressive) API를 평가한다.
 
-지원 신호: ecg, abp, ppg, eeg, co2, awp, cvp (모두 가능)
-데이터 소스: VitalDB, MIMIC-III
+지원 신호: ecg, abp, ppg (MIMIC-III 가용 신호)
+데이터 소스: MIMIC-III Waveform (external)
 
 사용법:
-    # VitalDB ECG forecasting (5 cases)
-    python -m downstream.forecasting.prepare_data \
-        --source vitaldb --signal-type ecg --n-cases 5
+    # ECG forecasting (5 cases)
+    python -m downstream.forecasting.prepare_data --signal-type ecg --n-cases 5
 
-    # VitalDB 모든 신호 (개별 .pt 생성)
-    python -m downstream.forecasting.prepare_data \
-        --source vitaldb --signal-type all --n-cases 10
-
-    # MIMIC-III ABP forecasting
-    python -m downstream.forecasting.prepare_data \
-        --source mimic3 --signal-type abp --n-cases 5
+    # ABP forecasting
+    python -m downstream.forecasting.prepare_data --signal-type abp --n-cases 5
 
     # 시각화 포함
-    python -m downstream.forecasting.prepare_data \
-        --source vitaldb --signal-type ecg --n-cases 5 --visualize
+    python -m downstream.forecasting.prepare_data --signal-type ecg --n-cases 5 --visualize
 """
 
 from __future__ import annotations
@@ -52,37 +45,6 @@ class ForecastSample:
     signal_type: str
     case_id: str
     win_start_sec: float
-
-
-# ---- VitalDB 로더 ----
-
-
-def _load_vitaldb_signal(
-    n_cases: int,
-    signal_type: str,
-    offset_from_end: int = 200,
-) -> list[dict]:
-    """VitalDB에서 단일 signal type 데이터를 로드한다."""
-    from downstream.data_utils import load_pilot_cases
-
-    cases = load_pilot_cases(
-        n_cases=n_cases,
-        offset_from_end=offset_from_end,
-        signal_types=[signal_type],
-    )
-
-    results = []
-    for c in cases:
-        if signal_type in c.tracks:
-            sig = c.tracks[signal_type]
-            if len(sig) >= int(60 * TARGET_SR):
-                results.append({
-                    "case_id": f"vitaldb_{c.case_id}",
-                    "signal": sig,
-                })
-
-    print(f"  Loaded {len(results)} cases with {signal_type.upper()}")
-    return results
 
 
 # ---- MIMIC-III 로더 ----
@@ -286,7 +248,7 @@ def _visualize(
 
 
 def prepare_forecasting(
-    source: str = "vitaldb",
+    source: str = "mimic3",
     signal_type: str = "ecg",
     n_cases: int = 10,
     context_sec: float = 30.0,
@@ -312,9 +274,6 @@ def prepare_forecasting(
 
         # 1. 데이터 로드
         print(f"\n[1/4] Loading {stype.upper()} data...")
-        if source == "vitaldb":
-            cases = _load_vitaldb_signal(n_cases, stype)
-        elif source == "mimic3":
             cases = _load_mimic3_signal(n_cases, stype)
         else:
             print(f"ERROR: Unknown source '{source}'", file=sys.stderr)
@@ -375,8 +334,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Vital Sign Forecasting - Data Preparation",
     )
-    parser.add_argument("--source", type=str, default="vitaldb",
-                        choices=["vitaldb", "mimic3"])
+    parser.add_argument("--source", type=str, default="mimic3",
+                        choices=["mimic3"])
     parser.add_argument("--signal-type", type=str, default="ecg",
                         choices=ALL_SIGNAL_TYPES + ["all"],
                         help="Signal type to forecast ('all' for all types)")
