@@ -633,8 +633,11 @@ class CSVLogger:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if not self.path.exists():
-            with open(self.path, "w", newline="", encoding="utf-8") as f:
-                csv.writer(f).writerow(self.COLUMNS)
+            try:
+                with open(self.path, "w", newline="", encoding="utf-8") as f:
+                    csv.writer(f).writerow(self.COLUMNS)
+            except OSError:
+                pass  # 첫 log() 호출 시 write fallback에서 처리
 
     def log(
         self,
@@ -663,8 +666,17 @@ class CSVLogger:
             lr,
             f"{epoch_sec:.1f}",
         ]
-        with open(self.path, "a", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow(row)
+        try:
+            with open(self.path, "a", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow(row)
+        except OSError:
+            # 네트워크 파일시스템에서 append 미지원 시 read+write 우회
+            existing = self.path.read_text(encoding="utf-8") if self.path.exists() else ""
+            import io
+            buf = io.StringIO()
+            csv.writer(buf).writerow(row)
+            with open(self.path, "w", newline="", encoding="utf-8") as f:
+                f.write(existing + buf.getvalue())
 
 
 # ── 유틸리티 ────────────────────────────────────────────────────
