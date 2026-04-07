@@ -398,7 +398,7 @@ def main() -> None:
 
     # ── 데이터 준비 ──
     if args.dummy:
-        print(f"[Task 6] Dummy mode: {args.signal_type} 합성 데이터")
+        print(f"[Task 6] Dummy mode: {args.signal_type} Synthetic data")
         windows = create_dummy_windows(
             n_normal=40, n_anomaly=20,
             win_samples=int(args.window_sec * TARGET_SR),
@@ -437,7 +437,7 @@ def main() -> None:
         print(f"[Task 6] 모델 로드: {args.model_version}, patch_size={patch_size}")
 
     # ── Anomaly Scoring ──
-    print(f"[Task 6] Anomaly score 계산 중 ({len(windows)} windows)...")
+    print(f"[Task 6] Computing anomaly scores ({len(windows)} windows)...")
     scores = compute_anomaly_scores(
         wrapper, windows,
         patch_size=patch_size,
