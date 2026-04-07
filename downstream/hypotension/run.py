@@ -48,8 +48,8 @@ from downstream.metrics import (
     compute_auroc,
     compute_auprc,
     compute_sensitivity_specificity,
-    plot_roc_curve,
 )
+from downstream.viz import plot_roc_curve
 from downstream.model_wrapper import LinearProbe
 
 
@@ -440,6 +440,8 @@ def main() -> None:
     parser.add_argument("--out-dir", type=str, default=".")
     parser.add_argument("--dummy", action="store_true")
     parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--data-path", type=str, default=None,
+                        help="Prepared .pt file from prepare_data.py (skips VitalDB loading)")
     # Multi-window args
     parser.add_argument("--n-context-windows", type=int, default=1,
                         help="과거 context 윈도우 수 (1=단일 윈도우, >1=다중)")
@@ -478,78 +480,55 @@ def main() -> None:
     print(f"Mode: {mode_str}")
 
     # ── 데이터 로드 ──
-    print(f"\nLoading {args.n_cases} pilot cases (ABP)...")
-    cases = load_pilot_cases(n_cases=args.n_cases, offset_from_end=200, signal_types=["abp"])
-    if not cases:
-        print("No cases loaded.", file=sys.stderr)
-        sys.exit(1)
+    if args.data_path and Path(args.data_path).exists():
+        # Prepared .pt 파일에서 로드 (prepare_data.py로 생성)
+        print(f"\nLoading prepared data: {args.data_path}")
+        data = torch.load(args.data_path, weights_only=False)
+        meta = data.get("metadata", {})
+        print(f"  Task: {meta.get('task', '?')}, Source: {meta.get('source', '?')}")
+        print(f"  Input signals: {meta.get('input_signals', '?')}")
+        print(f"  Horizon: {meta.get('horizon_sec', 0)/60:.0f}min, Window: {meta.get('window_sec', '?')}s")
 
-    train_cases, test_cases = split_by_subject(cases, train_ratio=args.train_ratio)
-    print(f"Split: {len(train_cases)} train, {len(test_cases)} test cases")
+        # train/test signals + labels 추출
+        train_data = data["train"]
+        test_data = data["test"]
 
-    if multi_mode:
-        # ── 다중 윈도우 모드 ──
-        def _extract_multi(case_list):
-            all_samples = []
-            for case in case_list:
-                mw = create_multiwindow_samples(
-                    case, n_context=args.n_context_windows,
-                    window_sec=args.window_sec, stride_sec=args.stride_sec,
-                    horizon_sec=args.prediction_horizon_sec,
-                )
-                all_samples.extend(mw)
-            return all_samples
-
-        train_mw = _extract_multi(train_cases)
-        test_mw = _extract_multi(test_cases)
-
-        n_pos_train = sum(1 for s in train_mw if s.label == 1)
-        n_pos_test = sum(1 for s in test_mw if s.label == 1)
-        print(f"Train: {len(train_mw)} samples ({n_pos_train} hypo, {n_pos_train / max(len(train_mw), 1) * 100:.1f}%)")
-        print(f"Test:  {len(test_mw)} samples ({n_pos_test} hypo, {n_pos_test / max(len(test_mw), 1) * 100:.1f}%)")
-
-        if not train_mw or not test_mw:
-            print("Insufficient multi-window data.", file=sys.stderr)
+        # signals에서 첫 번째 signal type의 텐서 사용
+        input_keys = list(train_data["signals"].keys())
+        if not input_keys:
+            print("ERROR: No signals in prepared data.", file=sys.stderr)
             sys.exit(1)
 
-        train_batches = _make_multi_batches(train_mw, args.batch_size, args.patch_size, max_length)
-        test_batches = _make_multi_batches(test_mw, args.batch_size, args.patch_size, max_length)
+        # 각 signal을 LabeledWindow로 변환
+        def _pt_to_labeled(split_data):
+            labeled = []
+            sig_key = input_keys[0]
+            signals_t = split_data["signals"][sig_key]  # (N, win_samples)
+            labels_t = split_data["labels"]              # (N,)
+            label_values_t = split_data["label_values"]  # (N,)
+            for i in range(len(labels_t)):
+                labeled.append(LabeledWindow(
+                    signal=signals_t[i].numpy(),
+                    signal_type=sig_key,
+                    case_id=split_data["case_ids"][i] if "case_ids" in split_data else 0,
+                    label=int(labels_t[i].item()),
+                    label_value=float(label_values_t[i].item()),
+                ))
+            return labeled
 
-        # Probe 선택
-        if args.aggregator == "concat":
-            probe = ConcatProbe(d_model, args.n_context_windows, n_classes=1)
-        elif args.aggregator == "lstm":
-            probe = LSTMProbe(d_model, hidden_dim=64, n_classes=1)
-        elif args.aggregator == "mean":
-            probe = MeanProbe(d_model, n_classes=1)
-
-        print(f"\nTraining {args.aggregator} probe (d_model={d_model}, n_ctx={args.n_context_windows})...")
-        train_losses = train_probe_multi(model, probe, train_batches, args.epochs, args.lr, device)
-
-        print("\nEvaluating...")
-        metrics = evaluate_probe_multi(model, probe, test_batches, device)
-
-    else:
-        # ── 단일 윈도우 모드 (기존) ──
-        def _extract_labeled(case_list):
-            windows = []
-            for case in case_list:
-                wins = extract_windows(case, "abp", args.window_sec, args.stride_sec)
-                windows.extend(apply_pipeline(wins))
-            return create_labeled_dataset_hypotension(windows)
-
-        train_labeled = _extract_labeled(train_cases)
-        test_labeled = _extract_labeled(test_cases)
+        train_labeled = _pt_to_labeled(train_data)
+        test_labeled = _pt_to_labeled(test_data)
 
         n_pos_train = sum(1 for lw in train_labeled if lw.label == 1)
         n_pos_test = sum(1 for lw in test_labeled if lw.label == 1)
-        print(f"Train: {len(train_labeled)} windows ({n_pos_train} hypo, {n_pos_train / max(len(train_labeled), 1) * 100:.1f}%)")
-        print(f"Test:  {len(test_labeled)} windows ({n_pos_test} hypo, {n_pos_test / max(len(test_labeled), 1) * 100:.1f}%)")
+        print(f"  Train: {len(train_labeled)} samples ({n_pos_train} hypo, {n_pos_train / max(len(train_labeled), 1) * 100:.1f}%)")
+        print(f"  Test:  {len(test_labeled)} samples ({n_pos_test} hypo, {n_pos_test / max(len(test_labeled), 1) * 100:.1f}%)")
 
         if not train_labeled or not test_labeled:
             print("Insufficient data.", file=sys.stderr)
             sys.exit(1)
 
+        max_length = len(train_labeled[0].signal)
         train_batches = _make_single_batches(train_labeled, args.batch_size, args.patch_size, max_length)
         test_batches = _make_single_batches(test_labeled, args.batch_size, args.patch_size, max_length)
 
@@ -559,6 +538,90 @@ def main() -> None:
 
         print("\nEvaluating...")
         metrics = evaluate_probe_single(model, probe, test_batches, device)
+
+    else:
+        # ── VitalDB live loading ──
+        print(f"\nLoading {args.n_cases} pilot cases (ABP)...")
+        cases = load_pilot_cases(n_cases=args.n_cases, offset_from_end=200, signal_types=["abp"])
+        if not cases:
+            print("No cases loaded.", file=sys.stderr)
+            sys.exit(1)
+
+        train_cases, test_cases = split_by_subject(cases, train_ratio=args.train_ratio)
+        print(f"Split: {len(train_cases)} train, {len(test_cases)} test cases")
+
+        if multi_mode:
+            # ── 다중 윈도우 모드 ──
+            def _extract_multi(case_list):
+                all_samples = []
+                for case in case_list:
+                    mw = create_multiwindow_samples(
+                        case, n_context=args.n_context_windows,
+                        window_sec=args.window_sec, stride_sec=args.stride_sec,
+                        horizon_sec=args.prediction_horizon_sec,
+                    )
+                    all_samples.extend(mw)
+                return all_samples
+
+            train_mw = _extract_multi(train_cases)
+            test_mw = _extract_multi(test_cases)
+
+            n_pos_train = sum(1 for s in train_mw if s.label == 1)
+            n_pos_test = sum(1 for s in test_mw if s.label == 1)
+            print(f"Train: {len(train_mw)} samples ({n_pos_train} hypo, {n_pos_train / max(len(train_mw), 1) * 100:.1f}%)")
+            print(f"Test:  {len(test_mw)} samples ({n_pos_test} hypo, {n_pos_test / max(len(test_mw), 1) * 100:.1f}%)")
+
+            if not train_mw or not test_mw:
+                print("Insufficient multi-window data.", file=sys.stderr)
+                sys.exit(1)
+
+            train_batches = _make_multi_batches(train_mw, args.batch_size, args.patch_size, max_length)
+            test_batches = _make_multi_batches(test_mw, args.batch_size, args.patch_size, max_length)
+
+            # Probe 선택
+            if args.aggregator == "concat":
+                probe = ConcatProbe(d_model, args.n_context_windows, n_classes=1)
+            elif args.aggregator == "lstm":
+                probe = LSTMProbe(d_model, hidden_dim=64, n_classes=1)
+            elif args.aggregator == "mean":
+                probe = MeanProbe(d_model, n_classes=1)
+
+            print(f"\nTraining {args.aggregator} probe (d_model={d_model}, n_ctx={args.n_context_windows})...")
+            train_losses = train_probe_multi(model, probe, train_batches, args.epochs, args.lr, device)
+
+            print("\nEvaluating...")
+            metrics = evaluate_probe_multi(model, probe, test_batches, device)
+
+        else:
+            # ── 단일 윈도우 모드 ──
+            def _extract_labeled(case_list):
+                windows = []
+                for case in case_list:
+                    wins = extract_windows(case, "abp", args.window_sec, args.stride_sec)
+                    windows.extend(apply_pipeline(wins))
+                return create_labeled_dataset_hypotension(windows)
+
+            train_labeled = _extract_labeled(train_cases)
+            test_labeled = _extract_labeled(test_cases)
+
+            n_pos_train = sum(1 for lw in train_labeled if lw.label == 1)
+            n_pos_test = sum(1 for lw in test_labeled if lw.label == 1)
+            print(f"Train: {len(train_labeled)} windows ({n_pos_train} hypo, {n_pos_train / max(len(train_labeled), 1) * 100:.1f}%)")
+            print(f"Test:  {len(test_labeled)} windows ({n_pos_test} hypo, {n_pos_test / max(len(test_labeled), 1) * 100:.1f}%)")
+
+            if not train_labeled or not test_labeled:
+                print("Insufficient data.", file=sys.stderr)
+                sys.exit(1)
+
+            train_batches = _make_single_batches(train_labeled, args.batch_size, args.patch_size, max_length)
+            test_batches = _make_single_batches(test_labeled, args.batch_size, args.patch_size, max_length)
+
+            probe = LinearProbe(d_model, n_classes=1)
+            print(f"\nTraining LinearProbe (d_model={d_model})...")
+            train_losses = train_probe_single(model, probe, train_batches, args.epochs, args.lr, device)
+
+            print("\nEvaluating...")
+            metrics = evaluate_probe_single(model, probe, test_batches, device)
 
     # ── 결과 출력 ──
     y_true = metrics.pop("y_true")
