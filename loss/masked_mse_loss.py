@@ -68,6 +68,72 @@ def _multi_resolution_stft_loss(
     return loss / len(valid_ffts)
 
 
+def compute_peak_weighted_mse(
+    pred: torch.Tensor,    # (M, P)
+    target: torch.Tensor,  # (M, P)
+    peak_alpha: float = 0.0,
+) -> torch.Tensor:
+    """Peak-Weighted MSE 계산.
+
+    진폭이 큰 sample에 자동으로 높은 가중치를 부여하여
+    R-peak, systolic peak 등 임상적으로 중요한 peak 복원을 강화한다.
+    peak_alpha=0이면 일반 MSE와 동일.
+
+    Parameters
+    ----------
+    pred:
+        예측 패치. ``(M, P)``.
+    target:
+        원본 패치. ``(M, P)``.
+    peak_alpha:
+        Peak 가중치 강도. 0이면 일반 MSE.
+    """
+    if peak_alpha > 0:
+        abs_target = target.abs()  # (M, P)
+        max_abs = abs_target.amax(dim=-1, keepdim=True).clamp(min=1e-8)  # (M, 1)
+        weight = 1.0 + peak_alpha * (abs_target / max_abs)  # (M, P)
+        return (weight * (pred - target) ** 2).mean()
+    return ((pred - target) ** 2).mean()
+
+
+def compute_patch_loss(
+    pred: torch.Tensor,    # (M, P)
+    target: torch.Tensor,  # (M, P)
+    peak_alpha: float = 0.0,
+    lambda_spec: float = 0.0,
+    spec_n_ffts: tuple[int, ...] = (16, 32, 64),
+) -> dict[str, torch.Tensor]:
+    """Peak-Weighted MSE + Multi-Resolution STFT Loss 계산.
+
+    Parameters
+    ----------
+    pred:
+        예측 패치. ``(M, P)``.
+    target:
+        원본 패치. ``(M, P)``.
+    peak_alpha:
+        Peak 가중치 강도. 0이면 일반 MSE.
+    lambda_spec:
+        STFT loss 가중치. 0이면 비활성.
+    spec_n_ffts:
+        STFT window 크기들.
+
+    Returns
+    -------
+    dict with keys: ``mse``, ``spec``, ``total``.
+    """
+    mse = compute_peak_weighted_mse(pred, target, peak_alpha)
+
+    if lambda_spec > 0:
+        spec_loss = _multi_resolution_stft_loss(pred, target, spec_n_ffts)
+        total = mse + lambda_spec * spec_loss
+    else:
+        spec_loss = mse.new_tensor(0.0)
+        total = mse
+
+    return {"mse": mse, "spec": spec_loss, "total": total}
+
+
 class MaskedPatchLoss(nn.Module):
     """마스킹된 패치 위치만 Peak-Weighted MSE를 계산하는 손실 함수.
 
@@ -110,25 +176,12 @@ class MaskedPatchLoss(nn.Module):
         pred_m = reconstructed[pred_mask]    # (M, P)
         target_m = original_patches[pred_mask]  # (M, P)
 
-        # ── Peak-Weighted MSE ──
-        if self.peak_alpha > 0:
-            # 패치별 최대 절대값으로 정규화하여 가중치 계산
-            abs_target = target_m.abs()  # (M, P)
-            max_abs = abs_target.amax(dim=-1, keepdim=True).clamp(min=1e-8)  # (M, 1)
-            weight = 1.0 + self.peak_alpha * (abs_target / max_abs)  # (M, P)
-            mse = (weight * (pred_m - target_m) ** 2).mean()
-        else:
-            mse = ((pred_m - target_m) ** 2).mean()
-
-        # ── Multi-Resolution STFT Loss ──
-        if self.lambda_spec > 0:
-            spec_loss = _multi_resolution_stft_loss(pred_m, target_m, self.spec_n_ffts)
-            total = mse + self.lambda_spec * spec_loss
-        else:
-            spec_loss = mse.new_tensor(0.0)
-            total = mse
-
-        return {"mse": mse, "spec": spec_loss, "total": total}
+        return compute_patch_loss(
+            pred_m, target_m,
+            peak_alpha=self.peak_alpha,
+            lambda_spec=self.lambda_spec,
+            spec_n_ffts=self.spec_n_ffts,
+        )
 
 
 def create_patch_mask(

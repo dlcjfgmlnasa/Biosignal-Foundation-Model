@@ -10,6 +10,7 @@ import torch
 from torch import nn
 
 from data.spatial_map import MECHANISM_GROUP
+from loss.masked_mse_loss import compute_patch_loss
 
 
 # signal_type → mechanism_group 변환용 lookup tensor (최대 signal_type + 1 크기)
@@ -26,11 +27,26 @@ class NextPredictionLoss(nn.Module):
     ----------
     cross_modal_weight:
         γ 가중치. 0이면 cross-modal loss 비활성 (Phase 1 동작).
+    peak_alpha:
+        Peak 가중치 강도. 0이면 일반 MSE.
+    lambda_spec:
+        Multi-Resolution STFT loss 가중치. 0이면 비활성.
+    spec_n_ffts:
+        STFT window 크기들.
     """
 
-    def __init__(self, cross_modal_weight: float = 0.0) -> None:
+    def __init__(
+        self,
+        cross_modal_weight: float = 0.0,
+        peak_alpha: float = 0.0,
+        lambda_spec: float = 0.0,
+        spec_n_ffts: tuple[int, ...] = (16, 32, 64),
+    ) -> None:
         super().__init__()
         self.cross_modal_weight = cross_modal_weight
+        self.peak_alpha = peak_alpha
+        self.lambda_spec = lambda_spec
+        self.spec_n_ffts = spec_n_ffts
 
     def forward(
         self,
@@ -53,7 +69,7 @@ class NextPredictionLoss(nn.Module):
             ``cross_modal_loss``: cross-modal prediction MSE (0 if disabled).
         """
         # ── Same-variate next-patch loss ──
-        next_loss = self._same_variate_loss(
+        next_dict = self._same_variate_loss(
             next_pred, original_patches, patch_mask,
             patch_sample_id, patch_variate_id, horizon,
         )
@@ -64,17 +80,18 @@ class NextPredictionLoss(nn.Module):
             and cross_pred is not None
             and time_id is not None
         ):
-            cross_modal_loss = self._cross_modal_loss(
+            cross_dict = self._cross_modal_loss(
                 cross_pred, original_patches, patch_mask,
                 patch_sample_id, patch_variate_id, time_id,
                 patch_signal_types,
             )
-            cross_modal_loss = self.cross_modal_weight * cross_modal_loss
+            cross_modal_loss = self.cross_modal_weight * cross_dict["total"]
         else:
             cross_modal_loss = next_pred.new_tensor(0.0)
 
         return {
-            "next_loss": next_loss,
+            "next_loss": next_dict["total"],
+            "next_spec": next_dict["spec"],
             "cross_modal_loss": cross_modal_loss,
         }
 
@@ -86,8 +103,13 @@ class NextPredictionLoss(nn.Module):
         patch_sample_id: torch.Tensor,   # (B, N) long
         patch_variate_id: torch.Tensor,  # (B, N) long
         horizon: int,
-    ) -> torch.Tensor:
-        """Same-variate next-patch prediction loss (기존 CombinedLoss 로직)."""
+    ) -> dict[str, torch.Tensor]:
+        """Same-variate next-patch prediction loss.
+
+        Returns
+        -------
+        dict with keys: ``mse``, ``spec``, ``total``.
+        """
         target_next = original_patches[:, horizon:, :]   # (B, N-H, P)
         pred_next = next_pred[:, :-horizon, :]            # (B, N-H, P)
 
@@ -101,12 +123,20 @@ class NextPredictionLoss(nn.Module):
         n_valid = valid.float().sum()
         if n_valid > 0:
             horizon_weight = 1.0 / horizon
-            loss = (
-                (pred_next[valid] - target_next[valid]) ** 2
-            ).mean() * horizon_weight
-        else:
-            loss = next_pred.new_tensor(0.0)
-        return loss
+            loss_dict = compute_patch_loss(
+                pred_next[valid], target_next[valid],
+                peak_alpha=self.peak_alpha,
+                lambda_spec=self.lambda_spec,
+                spec_n_ffts=self.spec_n_ffts,
+            )
+            return {
+                "mse": loss_dict["mse"] * horizon_weight,
+                "spec": loss_dict["spec"] * horizon_weight,
+                "total": loss_dict["total"] * horizon_weight,
+            }
+
+        zero = next_pred.new_tensor(0.0)
+        return {"mse": zero, "spec": zero, "total": zero}
 
     def _cross_modal_loss(
         self,
@@ -117,7 +147,7 @@ class NextPredictionLoss(nn.Module):
         patch_variate_id: torch.Tensor,   # (B, N) long
         time_id: torch.Tensor,            # (B, N) long
         patch_signal_types: torch.Tensor | None = None,  # (B, N) long
-    ) -> torch.Tensor:
+    ) -> dict[str, torch.Tensor]:
         """Cross-modal prediction loss.
 
         같은 (sample_id, time_id)에서 서로 다른 variate_id를 가진 패치 쌍을 매칭하고,
@@ -156,10 +186,15 @@ class NextPredictionLoss(nn.Module):
         b_idx, i_idx, j_idx = torch.where(cross_mask)
 
         if len(b_idx) == 0:
-            return cross_pred.new_tensor(0.0)
+            zero = cross_pred.new_tensor(0.0)
+            return {"mse": zero, "spec": zero, "total": zero}
 
         pred_p = cross_pred[b_idx, i_idx]          # (K, P)
         target_p = original_patches[b_idx, j_idx]  # (K, P)
-        loss = ((pred_p - target_p) ** 2).mean()
 
-        return loss
+        return compute_patch_loss(
+            pred_p, target_p,
+            peak_alpha=self.peak_alpha,
+            lambda_spec=self.lambda_spec,
+            spec_n_ffts=self.spec_n_ffts,
+        )

@@ -53,7 +53,12 @@ class CombinedLoss(nn.Module):
             lambda_spec=lambda_spec,
             spec_n_ffts=spec_n_ffts,
         )
-        self.next_loss_fn = NextPredictionLoss(cross_modal_weight=gamma)
+        self.next_loss_fn = NextPredictionLoss(
+            cross_modal_weight=gamma,
+            peak_alpha=peak_alpha,
+            lambda_spec=lambda_spec,
+            spec_n_ffts=spec_n_ffts,
+        )
         if delta > 0:
             self.contrastive_loss_fn = CrossModalContrastiveLoss(
                 temperature=contrastive_temperature,
@@ -88,9 +93,11 @@ class CombinedLoss(nn.Module):
                 horizon=horizon,
             )
             next_loss = next_dict["next_loss"]
+            next_spec = next_dict["next_spec"]
             cross_modal_loss = next_dict["cross_modal_loss"]
         else:
             next_loss = reconstructed.new_tensor(0.0)
+            next_spec = reconstructed.new_tensor(0.0)
             cross_modal_loss = reconstructed.new_tensor(0.0)
 
         # ── Cross-Modal Contrastive Loss ──
@@ -114,6 +121,7 @@ class CombinedLoss(nn.Module):
             "masked_mse": masked_dict["mse"],
             "masked_spec": masked_dict["spec"],
             "next_loss": next_loss,
+            "next_spec": next_spec,
             "cross_modal_loss": cross_modal_loss,
             "contrastive_loss": contrastive_loss,
         }
