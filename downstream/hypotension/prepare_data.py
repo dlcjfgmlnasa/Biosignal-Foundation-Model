@@ -58,19 +58,21 @@ class ForecastSample:
 def _parse_pt_filename(name: str) -> dict | None:
     """파일명에서 메타데이터를 추출한다.
 
-    형식: {session_id}_{signal_type}_{spatial_id}_seg{i}_{j}.pt
+    형식: {subject_id}_S{session}_{signal_name}_{spatial_id}_seg{i}_{j}.pt
+    예: VDB_0239_S0_abp_1_seg0_0.pt
     """
     m = re.match(
-        r"^(\d+)_(\d+)_(\d+)_seg(\d+)_(\d+)\.pt$", name,
+        r"^(.+?)_S(\d+)_([a-z0-9]+)_(\d+)_seg(\d+)_(\d+)\.pt$", name,
     )
     if m is None:
         return None
     return {
-        "session_id": int(m.group(1)),
-        "signal_type": int(m.group(2)),
-        "spatial_id": int(m.group(3)),
-        "seg_i": int(m.group(4)),
-        "seg_j": int(m.group(5)),
+        "subject_id": m.group(1),
+        "session_id": int(m.group(2)),
+        "signal_type": m.group(3),  # 문자열: "ecg", "abp", etc.
+        "spatial_id": int(m.group(4)),
+        "seg_i": int(m.group(5)),
+        "seg_j": int(m.group(6)),
     }
 
 
@@ -99,11 +101,6 @@ def _load_local_pt_aligned_signals(
         return []
 
     required_types = set(input_signals) | {"abp"}
-    required_type_ints = set()
-    str_to_int = {v: k for k, v in SIGNAL_TYPE_MAP.items()}
-    for st in required_types:
-        if st in str_to_int:
-            required_type_ints.add(str_to_int[st])
 
     subject_dirs = sorted([d for d in root.iterdir() if d.is_dir()])
     if max_subjects is not None:
@@ -116,8 +113,8 @@ def _load_local_pt_aligned_signals(
         subject_id = subj_dir.name
 
         # 이 subject의 모든 .pt 파일 파싱
-        file_map: dict[tuple[int, int, int], dict[int, Path]] = {}
-        # key: (session_id, seg_i, seg_j) → {signal_type: path}
+        file_map: dict[tuple[int, int, int], dict[str, Path]] = {}
+        # key: (session_id, seg_i, seg_j) → {signal_type_str: path}
 
         for pt_file in subj_dir.glob("*.pt"):
             meta = _parse_pt_filename(pt_file.name)
@@ -131,17 +128,14 @@ def _load_local_pt_aligned_signals(
         # 필요한 모든 signal type이 있는 세그먼트 찾기
         for seg_key, type_paths in file_map.items():
             available_types = set(type_paths.keys())
-            if not required_type_ints.issubset(available_types):
+            if not required_types.issubset(available_types):
                 continue
 
-            # 로드 및 시간 정렬 확인
+            # 로드
             signals: dict[str, np.ndarray] = {}
-            valid = True
-            for stype_int in required_type_ints:
-                t = torch.load(type_paths[stype_int], weights_only=True)  # (1, T)
-                arr = t.squeeze(0).numpy()  # (T,)
-                stype_str = SIGNAL_TYPE_MAP[stype_int]
-                signals[stype_str] = arr
+            for stype_str in required_types:
+                t = torch.load(type_paths[stype_str], weights_only=True)  # (1, T)
+                signals[stype_str] = t.squeeze(0).numpy()  # (T,)
 
             # 모든 채널을 동일 길이로 자르기
             min_len = min(len(s) for s in signals.values())
