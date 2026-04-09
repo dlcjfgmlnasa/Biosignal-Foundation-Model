@@ -56,26 +56,6 @@ def _autocorrelation_peak(
     return float(np.max(autocorr[min_lag:max_lag + 1]))
 
 
-def _respiratory_band_power(
-    segment: np.ndarray,
-    sr: float,
-    lo: float = 0.1,
-    hi: float = 0.5,
-) -> float:
-    """호흡 대역(0.1~0.5Hz) 파워 비율을 반환한다."""
-    n = len(segment)
-    fft_vals = np.fft.rfft(segment - np.mean(segment))
-    power = np.abs(fft_vals) ** 2
-    freqs = np.fft.rfftfreq(n, d=1.0 / sr)
-
-    total_power = float(power.sum())
-    if total_power < 1e-10:
-        return 0.0
-
-    resp_mask = (freqs >= lo) & (freqs <= hi)
-    resp_power = float(power[resp_mask].sum())
-    return resp_power / total_power
-
 
 # ── ECG ───────────────────────────────────────────────────────
 
@@ -418,7 +398,7 @@ def cvp_quality_check(
     _fail = {
         "hr": 0.0, "n_peaks": 0, "regularity": 1.0,
         "flatline_ratio": 1.0, "autocorr_peak": 0.0,
-        "resp_power_ratio": 0.0, "pass": False,
+        "pass": False,
     }
 
     if len(segment) < int(sr * 2):
@@ -467,8 +447,6 @@ def cvp_quality_check(
     max_lag_s = 60.0 / min_hr
     autocorr_peak = _autocorrelation_peak(segment, sr, min_lag_s, max_lag_s)
 
-    resp_power_ratio = _respiratory_band_power(segment, sr)
-
     passed = (
         hr_valid
         and regularity < regularity_threshold
@@ -481,7 +459,6 @@ def cvp_quality_check(
         "regularity": round(regularity, 4),
         "flatline_ratio": round(flatline_ratio, 4),
         "autocorr_peak": round(autocorr_peak, 4),
-        "resp_power_ratio": round(resp_power_ratio, 4),
         "pass": passed,
     }
 

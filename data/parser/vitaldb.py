@@ -651,6 +651,18 @@ def main() -> None:
         "--workers", type=int, default=1,
         help="병렬 처리 worker 수 (기본 1=순차 처리)",
     )
+    parser.add_argument(
+        "--test-ratio", type=float, default=0.0,
+        help="Test split 비율 (0.0~1.0). 0이면 분할 없이 전체 --out으로. 예: 0.2이면 20%% test.",
+    )
+    parser.add_argument(
+        "--test-out", default=None,
+        help="Test split 출력 디렉토리. --test-ratio > 0일 때 필수.",
+    )
+    parser.add_argument(
+        "--split-seed", type=int, default=42,
+        help="Train/test 분할 랜덤 시드 (기본 42)",
+    )
     args = parser.parse_args()
 
     raw_dir = Path(args.raw)
@@ -684,56 +696,109 @@ def main() -> None:
         print("ERROR: --out 경로를 지정하세요.", file=sys.stderr)
         sys.exit(1)
 
+    # ── Train/Test split 설정 ──
+    test_ratio = args.test_ratio
+    if test_ratio > 0:
+        if args.test_out is None:
+            print("ERROR: --test-ratio > 0이면 --test-out을 지정하세요.", file=sys.stderr)
+            sys.exit(1)
+        import random
+        random.seed(args.split_seed)
+        indices = list(range(len(vital_files)))
+        random.shuffle(indices)
+        n_test = max(1, int(len(vital_files) * test_ratio))
+        test_indices = set(indices[:n_test])
+        train_indices = set(indices[n_test:])
+        test_out_dir = Path(args.test_out)
+        test_out_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Train/Test split: {len(train_indices)} train, {len(test_indices)} test (seed={args.split_seed})\n")
+    else:
+        test_indices = set()
+        train_indices = set(range(len(vital_files)))
+        test_out_dir = None
+
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # manifest.jsonl 기존 항목 로드
-    jsonl_path = out_dir / "manifest.jsonl"
-    existing_subjects: set[str] = set()
-    if jsonl_path.exists():
-        with open(jsonl_path, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    existing_subjects.add(json.loads(line)["subject_id"])
+    def _load_existing(directory: Path) -> set[str]:
+        jp = directory / "manifest.jsonl"
+        subjects: set[str] = set()
+        if jp.exists():
+            with open(jp, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        subjects.add(json.loads(line)["subject_id"])
+        return subjects
+
+    existing_train = _load_existing(out_dir)
+    existing_test = _load_existing(test_out_dir) if test_out_dir else set()
 
     sig_filter = set(args.signal_types) if args.signal_types else None
     min_dur = args.min_duration
 
-    n_processed = 0
+    n_train, n_test = 0, 0
+
+    def _append_manifest(directory: Path, subject_id: str) -> None:
+        jp = directory / "manifest.jsonl"
+        prev = ""
+        if jp.exists():
+            prev = jp.read_text(encoding="utf-8")
+        new_line = json.dumps(
+            {"subject_id": subject_id, "manifest": f"{subject_id}/manifest.json"},
+            ensure_ascii=False,
+        ) + "\n"
+        jp.write_text(prev + new_line, encoding="utf-8")
+
+    def _handle_result(result, file_idx: int) -> None:
+        nonlocal n_train, n_test
+        if result is None:
+            return
+        subject_id, session_id, recordings = result
+        if not recordings:
+            return
+
+        if file_idx in test_indices:
+            if subject_id not in existing_test:
+                _append_manifest(test_out_dir, subject_id)
+                existing_test.add(subject_id)
+            n_test += 1
+        else:
+            if subject_id not in existing_train:
+                _append_manifest(out_dir, subject_id)
+                existing_train.add(subject_id)
+            n_train += 1
 
     if args.workers > 1:
         from multiprocessing import Pool
         from functools import partial
 
-        _worker = partial(
-            _process_one_worker,
-            out_dir=out_dir, min_duration_s=min_dur, signal_types=sig_filter,
-        )
         print(f"병렬 처리: {args.workers} workers\n")
+
+        # 파일별로 출력 디렉토리 결정하여 worker에 전달
+        tasks = []
+        for i, vf_path in enumerate(vital_files):
+            target_dir = test_out_dir if i in test_indices else out_dir
+            tasks.append((vf_path, target_dir))
+
+        def _worker_split(task_tuple):
+            vf_path, target = task_tuple
+            return _process_one_worker(
+                vf_path, out_dir=target, min_duration_s=min_dur,
+                signal_types=sig_filter,
+            )
+
         with Pool(processes=args.workers) as pool:
-            for result in pool.imap_unordered(_worker, vital_files):
-                if result is None:
-                    continue
-                subject_id, session_id, recordings = result
-                if not recordings:
-                    continue
-                if subject_id not in existing_subjects:
-                    prev = ""
-                    if jsonl_path.exists():
-                        prev = jsonl_path.read_text(encoding="utf-8")
-                    new_line = json.dumps(
-                        {"subject_id": subject_id, "manifest": f"{subject_id}/manifest.json"},
-                        ensure_ascii=False,
-                    ) + "\n"
-                    jsonl_path.write_text(prev + new_line, encoding="utf-8")
-                    existing_subjects.add(subject_id)
-                n_processed += 1
+            for i, result in enumerate(pool.imap(_worker_split, tasks)):
+                _handle_result(result, i)
     else:
-        for vf_path in vital_files:
-            print(f"[{vf_path.name}]")
+        for i, vf_path in enumerate(vital_files):
+            target_dir = test_out_dir if i in test_indices else out_dir
+            split_tag = "[TEST]" if i in test_indices else "[TRAIN]"
+            print(f"{split_tag} [{vf_path.name}]")
             result = _process_one_worker(
-                vf_path, out_dir=out_dir, min_duration_s=min_dur,
+                vf_path, out_dir=target_dir, min_duration_s=min_dur,
                 signal_types=sig_filter,
             )
             if result is None:
@@ -742,22 +807,14 @@ def main() -> None:
             if not recordings:
                 print(f"    [SKIP] 유효 레코딩 없음")
                 continue
-            if subject_id not in existing_subjects:
-                prev = ""
-                if jsonl_path.exists():
-                    prev = jsonl_path.read_text(encoding="utf-8")
-                new_line = json.dumps(
-                    {"subject_id": subject_id, "manifest": f"{subject_id}/manifest.json"},
-                    ensure_ascii=False,
-                ) + "\n"
-                jsonl_path.write_text(prev + new_line, encoding="utf-8")
-                existing_subjects.add(subject_id)
-            n_processed += 1
+            _handle_result(result, i)
 
-    print(
-        f"\n완료: {n_processed}명 처리 → {out_dir}"
-        f"\n인덱스: {jsonl_path}"
-    )
+    print(f"\n완료: train {n_train}명 → {out_dir}")
+    if test_out_dir:
+        print(f"       test {n_test}명 → {test_out_dir}")
+    print(f"인덱스: {out_dir / 'manifest.jsonl'}")
+    if test_out_dir:
+        print(f"        {test_out_dir / 'manifest.jsonl'}")
 
 
 if __name__ == "__main__":

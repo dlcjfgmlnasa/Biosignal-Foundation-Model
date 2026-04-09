@@ -1,35 +1,29 @@
 # -*- coding:utf-8 -*-
 """Task 1: Hypotension Prediction - 데이터 준비 스크립트.
 
-미래 5~15분 후 MAP<65 예측을 위한 (input_window, future_label) 쌍 생성.
+미래 5~15분 후 MAP<65 (≥1분 지속) 예측을 위한 (input_window, future_label) 쌍 생성.
 4가지 입력 모드: abp, ecg, ppg, ecg_ppg
 
 Label 소스: 항상 ABP (미래 구간의 MAP)
 Input 소스: 선택된 signal type의 현재 윈도우
 
-데이터 소스:
-  - MIMIC-III Waveform (외부 평가용)
-  - VitalDB (내부 평가용)
+데이터 소스: 로컬 전처리된 .pt 파일 (vitaldb_pt_test/)
 
 사용법:
-    # MIMIC-III, ECG 입력, 5분 후 예측
+    # ABP 입력, 5분 후 예측
     python -m downstream.hypotension.prepare_data \
-        --source mimic3 --input-signals ecg --horizon-min 5 --n-cases 5
+        --data-dir vitaldb_pt_test --input-signals abp --horizon-min 5
 
-    # VitalDB, ECG+PPG 입력, 10분 후 예측
+    # ECG+PPG 입력, 10분 후 예측
     python -m downstream.hypotension.prepare_data \
-        --source vitaldb --input-signals ecg ppg --horizon-min 10 --n-cases 10
-
-    # MIMIC-III, ABP 입력 (temporal prediction)
-    python -m downstream.hypotension.prepare_data \
-        --source mimic3 --input-signals abp --horizon-min 5 --n-cases 5
+        --data-dir vitaldb_pt_test --input-signals ecg ppg --horizon-min 10
 """
 
 from __future__ import annotations
 
 import argparse
+import re
 import sys
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -37,6 +31,11 @@ import numpy as np
 import torch
 
 TARGET_SR: float = 100.0
+
+# signal_type 정수 → 문자열 매핑
+SIGNAL_TYPE_MAP: dict[int, str] = {
+    0: "ecg", 1: "abp", 2: "eeg", 3: "ppg", 4: "cvp", 5: "co2", 6: "awp",
+}
 
 
 # ---- 데이터 구조 ----
@@ -53,214 +52,133 @@ class ForecastSample:
     horizon_sec: float                     # prediction horizon (초)
 
 
-# ---- MIMIC-III 로더 ----
+# ---- 로컬 .pt 로더 ----
 
 
-def _load_mimic3_aligned_signals(
-    n_cases: int,
+def _parse_pt_filename(name: str) -> dict | None:
+    """파일명에서 메타데이터를 추출한다.
+
+    형식: {session_id}_{signal_type}_{spatial_id}_seg{i}_{j}.pt
+    """
+    m = re.match(
+        r"^(\d+)_(\d+)_(\d+)_seg(\d+)_(\d+)\.pt$", name,
+    )
+    if m is None:
+        return None
+    return {
+        "session_id": int(m.group(1)),
+        "signal_type": int(m.group(2)),
+        "spatial_id": int(m.group(3)),
+        "seg_i": int(m.group(4)),
+        "seg_j": int(m.group(5)),
+    }
+
+
+def _load_local_pt_aligned_signals(
+    data_dir: str,
     input_signals: list[str],
     min_duration_sec: float = 1200.0,
-    manifest_path: str | None = None,
-    out_dir: str = "outputs/downstream/mimic3",
+    max_subjects: int | None = None,
 ) -> list[dict]:
-    """MIMIC-III에서 시간 정렬된 다채널 데이터를 로드한다.
+    """로컬 .pt 디렉토리에서 시간 정렬된 다채널 데이터를 로드한다.
 
     Parameters
     ----------
-    min_duration_sec : 최소 유효 신호 길이 (초). window + horizon 이상이어야 함.
+    data_dir : vitaldb_pt_test/ 경로.
+    input_signals : 입력으로 사용할 signal types (예: ["ecg", "ppg"]).
+    min_duration_sec : 최소 유효 신호 길이 (초).
+    max_subjects : 최대 subject 수. None이면 전체.
 
-    Returns: list of {"case_id": str, "signals": {"abp": array, "ecg": array, ...}}
+    Returns
+    -------
+    list of {"case_id": str, "patient_id": str, "signals": {"abp": array, ...}}
     """
-    import wfdb
-    from data.parser.mimic3_waveform import (
-        PN_DB, ABP_CHANNEL_NAMES, ECG_CHANNEL_NAMES, PPG_CHANNEL_NAMES,
-        scan_abp_records, load_manifest, _apply_pipeline,
-        MIMIC3_NATIVE_SR,
-    )
-
-    # 필요한 채널 결정 (ABP는 라벨용으로 항상 필요)
-    required_types = set(input_signals) | {"abp"}
-
-    # manifest 로드 또는 스캔
-    manifest_file = Path(out_dir) / "mimic3_abp_manifest.json"
-    if manifest_path and Path(manifest_path).exists():
-        records = load_manifest(manifest_path)
-    elif manifest_file.exists():
-        records = load_manifest(str(manifest_file))
-    else:
-        print(f"  Scanning for ABP records...")
-        records = scan_abp_records(
-            max_records=n_cases * 5,
-            save_path=str(manifest_file),
-        )
-
-    # 필요 채널이 모두 있는 레코드 필터링
-    filtered = []
-    for r in records:
-        has_all = True
-        if "ecg" in required_types and not r.has_ecg:
-            has_all = False
-        if "ppg" in required_types and not r.has_ppg:
-            has_all = False
-        if has_all:
-            filtered.append(r)
-
-    if not filtered:
-        print(f"  WARNING: No records with all required signals {required_types}")
-        print(f"  Available: {len(records)} ABP records, "
-              f"{sum(1 for r in records if r.has_ecg)} with ECG, "
-              f"{sum(1 for r in records if r.has_ppg)} with PPG")
+    root = Path(data_dir)
+    if not root.is_dir():
+        print(f"  ERROR: Data directory not found: {root}")
         return []
 
-    filtered = filtered[:n_cases]
-    print(f"  Found {len(filtered)} records with {required_types}")
+    required_types = set(input_signals) | {"abp"}
+    required_type_ints = set()
+    str_to_int = {v: k for k, v in SIGNAL_TYPE_MAP.items()}
+    for st in required_types:
+        if st in str_to_int:
+            required_type_ints.add(str_to_int[st])
 
-    # 각 레코드에서 시간 정렬된 다채널 데이터 추출
-    cases = []
-    for i, info in enumerate(filtered):
-        print(f"  [{i+1}/{len(filtered)}] {info.record_name}...", end=" ")
-        t0 = time.time()
+    subject_dirs = sorted([d for d in root.iterdir() if d.is_dir()])
+    if max_subjects is not None:
+        subject_dirs = subject_dirs[:max_subjects]
 
-        try:
-            hdr = wfdb.rdheader(info.record_name, pn_dir=info.pn_dir)
-        except Exception as e:
-            print(f"SKIP (header error: {e})")
-            continue
+    print(f"  Scanning {len(subject_dirs)} subjects in {root}...")
+    cases: list[dict] = []
 
-        if not hasattr(hdr, "seg_name") or not hdr.seg_name:
-            print("SKIP (no segments)")
-            continue
+    for subj_dir in subject_dirs:
+        subject_id = subj_dir.name
 
-        # 채널 매핑
-        ch_map = {"abp": info.abp_channel}
-        if "ecg" in required_types and info.ecg_channel:
-            ch_map["ecg"] = info.ecg_channel
-        if "ppg" in required_types and info.ppg_channel:
-            ch_map["ppg"] = info.ppg_channel
+        # 이 subject의 모든 .pt 파일 파싱
+        file_map: dict[tuple[int, int, int], dict[int, Path]] = {}
+        # key: (session_id, seg_i, seg_j) → {signal_type: path}
 
-        # 모든 채널이 동시에 존재하는 가장 긴 세그먼트 찾기
-        best_seg = None
-        best_len = 0
+        for pt_file in subj_dir.glob("*.pt"):
+            meta = _parse_pt_filename(pt_file.name)
+            if meta is None:
+                continue
+            seg_key = (meta["session_id"], meta["seg_i"], meta["seg_j"])
+            if seg_key not in file_map:
+                file_map[seg_key] = {}
+            file_map[seg_key][meta["signal_type"]] = pt_file
 
-        for seg_name, seg_len in zip(hdr.seg_name, hdr.seg_len):
-            if seg_name == "~" or seg_name.endswith("_layout") or seg_len <= 0:
+        # 필요한 모든 signal type이 있는 세그먼트 찾기
+        for seg_key, type_paths in file_map.items():
+            available_types = set(type_paths.keys())
+            if not required_type_ints.issubset(available_types):
                 continue
 
-            try:
-                seg_hdr = wfdb.rdheader(seg_name, pn_dir=info.pn_dir)
-                if seg_hdr.sig_name is None:
-                    continue
+            # 로드 및 시간 정렬 확인
+            signals: dict[str, np.ndarray] = {}
+            valid = True
+            for stype_int in required_type_ints:
+                t = torch.load(type_paths[stype_int], weights_only=True)  # (1, T)
+                arr = t.squeeze(0).numpy()  # (T,)
+                stype_str = SIGNAL_TYPE_MAP[stype_int]
+                signals[stype_str] = arr
 
-                # 모든 필요 채널이 이 세그먼트에 있는지 확인
-                all_present = all(
-                    ch_name in seg_hdr.sig_name
-                    for ch_name in ch_map.values()
-                )
-                if all_present and seg_len > best_len:
-                    best_seg = seg_name
-                    best_len = seg_len
-            except Exception:
+            # 모든 채널을 동일 길이로 자르기
+            min_len = min(len(s) for s in signals.values())
+            if min_len < int(min_duration_sec * TARGET_SR):
                 continue
 
-        if best_seg is None or best_len < int(min_duration_sec * MIMIC3_NATIVE_SR):
-            # 최소 20분 이상 필요 (input + horizon)
-            print(f"SKIP (no aligned segment >= {min_duration_sec/60:.0f}min)")
-            continue
+            signals = {k: v[:min_len] for k, v in signals.items()}
+            session_id, seg_i, seg_j = seg_key
 
-        # 가장 긴 정렬 세그먼트 로드
-        try:
-            seg = wfdb.rdrecord(best_seg, pn_dir=info.pn_dir)
-        except Exception as e:
-            print(f"SKIP (read error: {e})")
-            continue
+            cases.append({
+                "case_id": f"{subject_id}_s{session_id}_seg{seg_i}_{seg_j}",
+                "patient_id": subject_id,
+                "signals": signals,
+            })
 
-        if seg.p_signal is None:
-            print("SKIP (no signal)")
-            continue
-
-        # 각 채널 추출 + 전처리
-        signals = {}
-        valid = True
-        for stype, ch_name in ch_map.items():
-            if ch_name not in seg.sig_name:
-                valid = False
-                break
-            ch_idx = seg.sig_name.index(ch_name)
-            raw = seg.p_signal[:, ch_idx].astype(np.float64)
-
-            processed = _apply_pipeline(raw, stype, MIMIC3_NATIVE_SR)
-            if processed is None or len(processed) < int(min_duration_sec * TARGET_SR):
-                valid = False
-                break
-            signals[stype] = processed
-
-        if not valid or "abp" not in signals:
-            print(f"SKIP (preprocessing failed)")
-            continue
-
-        # 모든 채널을 동일 길이로 자르기 (전처리 후 길이가 약간 다를 수 있음)
-        min_len = min(len(s) for s in signals.values())
-        signals = {k: v[:min_len] for k, v in signals.items()}
-
-        elapsed = time.time() - t0
-        dur_min = min_len / TARGET_SR / 60
-        print(f"OK ({dur_min:.1f}min, {len(signals)} channels) [{elapsed:.1f}s]")
-
-        cases.append({
-            "case_id": info.record_name,
-            "patient_id": info.patient_id,
-            "signals": signals,
-        })
-
-    return cases
-
-
-# ---- VitalDB 로더 ----
-
-
-def _load_vitaldb_aligned_signals(
-    n_cases: int,
-    input_signals: list[str],
-    min_duration_sec: float = 1200.0,
-    offset_from_end: int = 200,
-) -> list[dict]:
-    """VitalDB에서 시간 정렬된 다채널 데이터를 로드한다."""
-    from downstream.data_utils import (
-        load_pilot_cases, PREFERRED_TRACKS,
-    )
-
-    required_types = list(set(input_signals) | {"abp"})
-    print(f"  Loading {n_cases} VitalDB cases (signals={required_types})...")
-
-    raw_cases = load_pilot_cases(
-        n_cases=n_cases,
-        offset_from_end=offset_from_end,
-        signal_types=required_types,
-    )
-
-    cases = []
-    for rc in raw_cases:
-        # 모든 필요 채널이 있는지 확인
-        if not all(st in rc.tracks for st in required_types):
-            continue
-
-        # 동일 길이로 자르기
-        min_len = min(len(rc.tracks[st]) for st in required_types)
-        if min_len < int(min_duration_sec * TARGET_SR):  # 최소 20분
-            continue
-
-        signals = {st: rc.tracks[st][:min_len] for st in required_types}
-        cases.append({
-            "case_id": f"vitaldb_{rc.case_id}",
-            "patient_id": str(rc.case_id),
-            "signals": signals,
-        })
-
-    print(f"  Loaded {len(cases)} cases with all required signals")
+    print(f"  Loaded {len(cases)} aligned segments with {required_types}")
     return cases
 
 
 # ---- 윈도우 추출 + 라벨링 ----
+
+
+def _has_sustained_hypotension(
+    future_maps: list[float],
+    threshold: float,
+    min_consecutive: int,
+) -> bool:
+    """연속 min_consecutive개 이상 윈도우에서 MAP < threshold인지 확인한다."""
+    consecutive = 0
+    for m in future_maps:
+        if m < threshold:
+            consecutive += 1
+            if consecutive >= min_consecutive:
+                return True
+        else:
+            consecutive = 0
+    return False
 
 
 def extract_forecast_samples(
@@ -270,6 +188,7 @@ def extract_forecast_samples(
     stride_sec: float = 30.0,
     horizon_sec: float = 300.0,
     map_threshold: float = 65.0,
+    sustained_sec: float = 60.0,
 ) -> list[ForecastSample]:
     """시간 정렬된 다채널 데이터에서 (input, future_label) 쌍을 추출한다.
 
@@ -281,6 +200,7 @@ def extract_forecast_samples(
     stride_sec : 슬라이드 보폭 (초).
     horizon_sec : prediction horizon (초). 미래 이 구간 내 MAP<65 발생 여부.
     map_threshold : MAP 미만이면 hypotension.
+    sustained_sec : MAP<threshold가 이 시간 이상 지속되어야 positive.
 
     Returns
     -------
@@ -289,6 +209,12 @@ def extract_forecast_samples(
     win_samples = int(window_sec * TARGET_SR)
     stride_samples = int(stride_sec * TARGET_SR)
     horizon_samples = int(horizon_sec * TARGET_SR)
+
+    # MAP 계산 윈도우: 10초
+    map_win_sec = 10.0
+    map_win = int(map_win_sec * TARGET_SR)
+    # 1분 지속 = 6개 연속 10초 윈도우
+    min_consecutive = max(1, int(sustained_sec / map_win_sec))
 
     # 전체 필요 길이: input window + horizon
     total_needed = win_samples + horizon_samples
@@ -318,9 +244,8 @@ def extract_forecast_samples(
             future_end = future_start + horizon_samples
             future_abp = abp[future_start:future_end]
 
-            # 미래 구간의 MAP (10초 윈도우별 평균의 최솟값)
-            map_win = int(10 * TARGET_SR)
-            future_maps = []
+            # 미래 구간의 MAP (10초 윈도우별 평균)
+            future_maps: list[float] = []
             for j in range(0, len(future_abp) - map_win + 1, map_win):
                 w = future_abp[j:j + map_win]
                 if not np.isnan(w).any():
@@ -329,9 +254,13 @@ def extract_forecast_samples(
             if not future_maps:
                 continue
 
-            # 미래 구간에서 MAP<65가 한 번이라도 발생하면 positive
+            # ≥1분 지속 MAP<65 여부 확인
+            label = 1 if _has_sustained_hypotension(
+                future_maps, map_threshold, min_consecutive,
+            ) else 0
+
+            # label_value: 미래 MAP의 최솟값 (참고용)
             min_future_map = min(future_maps)
-            label = 1 if min_future_map < map_threshold else 0
 
             samples.append(ForecastSample(
                 input_signals=input_dict,
@@ -354,7 +283,6 @@ def save_dataset(
     input_signals: list[str],
     horizon_sec: float,
     window_sec: float,
-    source: str,
     out_dir: str,
 ) -> Path:
     """ForecastSample 리스트를 .pt로 저장한다."""
@@ -388,12 +316,13 @@ def save_dataset(
         "test": _to_tensors(test_samples),
         "metadata": {
             "task": "hypotension_forecast",
-            "source": source,
+            "source": "vitaldb_pt",
             "input_signals": input_signals,
             "horizon_sec": horizon_sec,
             "window_sec": window_sec,
             "sampling_rate": TARGET_SR,
             "map_threshold": 65.0,
+            "sustained_sec": 60.0,
             "n_train": len(train_samples),
             "n_test": len(test_samples),
         },
@@ -401,7 +330,7 @@ def save_dataset(
 
     mode_str = "_".join(input_signals)
     horizon_min = int(horizon_sec / 60)
-    filename = f"task1_hypotension_{source}_{mode_str}_h{horizon_min}min.pt"
+    filename = f"task1_hypotension_{mode_str}_h{horizon_min}min.pt"
     save_path = out_path / filename
     torch.save(save_dict, save_path)
 
@@ -438,29 +367,27 @@ def print_stats(
 
 
 def prepare_hypotension_forecast(
-    source: str = "mimic3",
+    data_dir: str,
     input_signals: list[str] | None = None,
-    n_cases: int = 5,
+    max_subjects: int | None = None,
     horizon_min: float = 5.0,
     window_sec: float = 30.0,
     stride_sec: float = 30.0,
     train_ratio: float = 0.7,
     out_dir: str = "outputs/downstream/hypotension",
-    manifest_path: str | None = None,
 ) -> Path:
     """Hypotension forecast 데이터를 준비한다.
 
     Parameters
     ----------
-    source : "mimic3" 또는 "vitaldb".
+    data_dir : 로컬 .pt 데이터 디렉토리 (vitaldb_pt_test/).
     input_signals : 입력 signal types. None이면 ["abp"].
-    n_cases : 로드할 케이스 수.
+    max_subjects : 최대 subject 수. None이면 전체.
     horizon_min : prediction horizon (분).
     window_sec : 입력 윈도우 길이 (초).
     stride_sec : 슬라이드 보폭 (초).
     train_ratio : train/test 분할 비율.
     out_dir : 저장 디렉토리.
-    manifest_path : MIMIC-III manifest 경로.
     """
     if input_signals is None:
         input_signals = ["abp"]
@@ -472,27 +399,19 @@ def prepare_hypotension_forecast(
 
     print(f"{'='*60}")
     print(f"  Task 1: Hypotension Forecast")
-    print(f"  Source:  {source}")
+    print(f"  Data:    {data_dir}")
     print(f"  Input:   {mode_str}")
     print(f"  Horizon: {horizon_min} min")
     print(f"  Window:  {window_sec}s, Stride: {stride_sec}s")
+    print(f"  Label:   MAP<65 sustained >=1min")
     print(f"  Min duration: {min_duration_sec/60:.1f} min")
     print(f"{'='*60}")
 
     # 1. 데이터 로드
     print(f"\n[1/4] Loading aligned multi-channel data...")
-    if source == "mimic3":
-        cases = _load_mimic3_aligned_signals(
-            n_cases, input_signals, min_duration_sec, manifest_path,
-            out_dir=str(Path(out_dir).parent / "mimic3"),
-        )
-    elif source == "vitaldb":
-        cases = _load_vitaldb_aligned_signals(
-            n_cases, input_signals, min_duration_sec,
-        )
-    else:
-        print(f"ERROR: Unknown source '{source}'", file=sys.stderr)
-        sys.exit(1)
+    cases = _load_local_pt_aligned_signals(
+        data_dir, input_signals, min_duration_sec, max_subjects,
+    )
 
     if not cases:
         print("ERROR: No valid cases loaded.", file=sys.stderr)
@@ -512,7 +431,7 @@ def prepare_hypotension_forecast(
     print(f"  Test:  {len(test_cases)} cases ({len(patient_ids) - len(train_patients)} patients)")
 
     # 3. 윈도우 추출 + 라벨링
-    print(f"\n[3/4] Extracting forecast samples (horizon={horizon_min}min)...")
+    print(f"\n[3/4] Extracting forecast samples (horizon={horizon_min}min, sustained>=1min)...")
     train_samples = extract_forecast_samples(
         train_cases, input_signals, window_sec, stride_sec, horizon_sec,
     )
@@ -531,7 +450,7 @@ def prepare_hypotension_forecast(
     print(f"\n[4/4] Saving...")
     save_path = save_dataset(
         train_samples, test_samples,
-        input_signals, horizon_sec, window_sec, source, out_dir,
+        input_signals, horizon_sec, window_sec, out_dir,
     )
 
     print(f"\n{'='*60}")
@@ -544,14 +463,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Task 1: Hypotension Forecast - Data Preparation",
     )
-    parser.add_argument("--source", type=str, default="mimic3",
-                        choices=["mimic3", "vitaldb"],
-                        help="Data source")
+    parser.add_argument("--data-dir", type=str, required=True,
+                        help="Local .pt data directory (e.g. vitaldb_pt_test/)")
     parser.add_argument("--input-signals", nargs="+", default=["abp"],
                         choices=["abp", "ecg", "ppg"],
                         help="Input signal types (label always from ABP)")
-    parser.add_argument("--n-cases", type=int, default=5,
-                        help="Number of cases to load")
+    parser.add_argument("--max-subjects", type=int, default=None,
+                        help="Max number of subjects to load (None=all)")
     parser.add_argument("--horizon-min", type=float, default=5.0,
                         help="Prediction horizon in minutes")
     parser.add_argument("--window-sec", type=float, default=30.0,
@@ -562,20 +480,17 @@ def main() -> None:
                         help="Train/test split ratio")
     parser.add_argument("--out-dir", type=str, default="outputs/downstream/hypotension",
                         help="Output directory")
-    parser.add_argument("--manifest", type=str, default=None,
-                        help="MIMIC-III manifest JSON path")
     args = parser.parse_args()
 
     prepare_hypotension_forecast(
-        source=args.source,
+        data_dir=args.data_dir,
         input_signals=args.input_signals,
-        n_cases=args.n_cases,
+        max_subjects=args.max_subjects,
         horizon_min=args.horizon_min,
         window_sec=args.window_sec,
         stride_sec=args.stride_sec,
         train_ratio=args.train_ratio,
         out_dir=args.out_dir,
-        manifest_path=args.manifest,
     )
 
 
