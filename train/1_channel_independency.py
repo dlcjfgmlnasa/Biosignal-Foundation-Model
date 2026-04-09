@@ -495,6 +495,9 @@ def main():
                     viz_model, viz_batches, epoch=epoch,
                     output_dir=viz_recon_dir, mask_ratio=config.mask_ratio,
                     device=device,
+                    block_mask=config.block_mask,
+                    block_size_min=config.block_size_min,
+                    block_size_max=config.block_size_max,
                 )
                 print(f"  -> Reconstruction figure saved: {fig_path}")
                 np_path = save_next_pred_figure(

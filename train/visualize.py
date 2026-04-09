@@ -430,12 +430,16 @@ def _process_recon_batch(
     batch: PackedBatch,
     mask_ratio: float,
     device: torch.device | None,
+    block_mask: bool = False,
+    block_size_min: int = 3,
+    block_size_max: int = 8,
 ) -> list[RowCandidate]:
     """Masked reconstruction 후보를 추출한다."""
     if device is not None:
         _batch_to_device(batch, device)
 
-    out = model(batch, task="masked", mask_ratio=mask_ratio)
+    out = model(batch, task="masked", mask_ratio=mask_ratio,
+                block_mask=block_mask, block_size_min=block_size_min, block_size_max=block_size_max)
     original_patches, patch_loc, patch_scale, n = _extract_patches_and_scales(model, batch, out)
     p = model.patch_size
 
@@ -783,6 +787,9 @@ def save_reconstruction_figure(
     max_duration_s: float = 60.0,
     sampling_rate: float = 100.0,
     device: torch.device | None = None,
+    block_mask: bool = False,
+    block_size_min: int = 3,
+    block_size_max: int = 8,
 ) -> Path:
     """마스킹된 패치의 원본 vs 복원 비교 figure를 저장한다.
 
@@ -801,7 +808,10 @@ def save_reconstruction_figure(
 
     all_candidates: list[RowCandidate] = []
     for b in batches:
-        all_candidates.extend(_process_recon_batch(model, b, mask_ratio, device))
+        all_candidates.extend(_process_recon_batch(
+            model, b, mask_ratio, device,
+            block_mask=block_mask, block_size_min=block_size_min, block_size_max=block_size_max,
+        ))
 
     grid = _select_diverse_grid(all_candidates, samples_per_type=samples_per_type)
 
