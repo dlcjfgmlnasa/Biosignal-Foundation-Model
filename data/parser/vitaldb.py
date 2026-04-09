@@ -95,6 +95,10 @@ SIGNAL_CONFIGS: dict[str, SignalConfig] = {
     # CO2/AWP: lowpass — 느린 호흡 신호, DC 보존
     "co2": SignalConfig(valid_range=(0.0, 100.0),      filter_type="lowpass",  filter_freq=(0.0, 5.0),   max_high_freq_ratio=1.0, max_flatline_ratio=0.3, min_amplitude=5.0, quality_window_s=15.0),
     "awp": SignalConfig(valid_range=(-20.0, 80.0),     filter_type="lowpass",  filter_freq=(0.0, 20.0),  max_high_freq_ratio=1.0, min_amplitude=2.0, quality_window_s=15.0),
+    # PAP: 폐동맥압 — ABP와 유사한 동맥 압력 파형 (체순환보다 낮은 압력)
+    "pap": SignalConfig(valid_range=(5.0, 80.0),       filter_type="lowpass",  filter_freq=(0.0, 15.0),  max_high_freq_ratio=0.5, max_flatline_ratio=0.3, min_amplitude=5.0, spike_detection=True, spike_threshold_std=6.0, median_kernel=5),
+    # ICP: 두개내압 — 저압 맥동 파형, CVP와 유사한 특성
+    "icp": SignalConfig(valid_range=(-10.0, 80.0),     filter_type="lowpass",  filter_freq=(0.0, 10.0),  max_high_freq_ratio=0.5, max_flatline_ratio=0.3, min_amplitude=1.0, spike_detection=True, spike_threshold_std=8.0),
 }
 
 
@@ -131,10 +135,23 @@ TRACK_MAP: dict[str, tuple[str, int]] = {
     # AWP (6) — Primus 62.5Hz, hPa
     "Primus/AWP": ("awp", 0),       # Airway pressure (공식)
     "Solar8000/AWP": ("awp", 0),    # Airway pressure — Solar8000 대체 (비공식)
+    # PAP (7) — 500Hz, mmHg (K-MIMIC ICU)
+    "SNUADC/PAP": ("pap", 0),       # Pulmonary arterial pressure
+    "SNUADCM/PAP": ("pap", 0),      # K-MIMIC ICU
+    # ICP (8) — 500Hz, mmHg (K-MIMIC ICU)
+    "SNUADC/ICP": ("icp", 0),       # Intracranial pressure
+    "SNUADCM/ICP": ("icp", 0),      # K-MIMIC ICU
+    # ── K-MIMIC (SNUADCM) 트랙 매핑 ──
+    "SNUADCM/ECG_II": ("ecg", 1),   # Lead II
+    "SNUADCM/ECG_V5": ("ecg", 2),   # Lead V5
+    "SNUADCM/ART": ("abp", 1),      # Radial artery
+    "SNUADCM/PLETH": ("ppg", 1),    # Finger
+    "SNUADCM/CVP": ("cvp", 0),      # Central venous pressure
 }
 
 SIGNAL_TYPES: dict[str, int] = {
     "ecg": 0, "abp": 1, "eeg": 2, "ppg": 3, "cvp": 4, "co2": 5, "awp": 6,
+    "pap": 7, "icp": 8,
 }
 
 

@@ -50,6 +50,14 @@ SPATIAL_MAP: dict[int, dict[str, int]] = {
     6: {
         "Unknown": 0,
     },
+    # PAP/Pulmonary Arterial Pressure (signal_type=7) — K-MIMIC: SNUADCM/PAP
+    7: {
+        "Unknown": 0,
+    },
+    # ICP/Intracranial Pressure (signal_type=8) — K-MIMIC: SNUADCM/ICP
+    8: {
+        "Unknown": 0,
+    },
 }
 
 # signal_type별 offset (누적 합)
@@ -86,18 +94,20 @@ def get_global_spatial_id(signal_type: int, local_id: int) -> int:
 # Cross-Modal MSE reconstruction은 같은 mechanism group 내에서만 허용.
 # Contrastive (InfoNCE)는 전체 허용 (그룹 무관).
 #
-# Cardiovascular (0): ECG, ABP, PPG, CVP — 심혈관계, 유사 파형/주기
-# Neural (1): EEG — 대뇌 피질, 다른 그룹과 파형 형태 상이
+# Cardiovascular (0): ECG, ABP, PPG, CVP, PAP, ICP — 심혈관계, 심박 주기 동기화
+# Neural (1): EEG — 대뇌 피질, 사전학습에서 제외
 # Respiratory (2): CO2, AWP — 호흡계, 환기 동기화
 
 MECHANISM_GROUP: dict[int, int] = {
     0: 0,  # ECG → Cardiovascular
     1: 0,  # ABP → Cardiovascular
-    2: 1,  # EEG → Neural
+    2: 1,  # EEG → Neural (사전학습 제외)
     3: 0,  # PPG → Cardiovascular
     4: 0,  # CVP → Cardiovascular
     5: 2,  # CO2 → Respiratory
     6: 2,  # AWP → Respiratory
+    7: 0,  # PAP → Cardiovascular
+    8: 0,  # ICP → Cardiovascular
 }
 
 MECHANISM_GROUP_NAMES: dict[int, str] = {
@@ -125,4 +135,8 @@ CHANNEL_NAME_TO_SPATIAL: dict[str, tuple[int, int]] = {
     "CO2": (5, 0),
     # AWP
     "AWP": (6, 0),
+    # PAP
+    "PAP": (7, 0),
+    # ICP
+    "ICP": (8, 0),
 }

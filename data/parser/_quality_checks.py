@@ -463,6 +463,37 @@ def cvp_quality_check(
     }
 
 
+# ── PAP ──────────────────────────────────────────────────────
+
+
+def pap_quality_check(
+    segment: np.ndarray,
+    sr: float = 100.0,
+    min_hr: float = 30.0,
+    max_hr: float = 200.0,
+    regularity_threshold: float = 0.5,
+    min_autocorr: float = 0.10,
+) -> dict:
+    """PAP 세그먼트의 pulse peak regularity 기반 품질 검사. ABP와 동일 로직."""
+    return abp_quality_check(segment, sr, min_hr, max_hr, regularity_threshold, min_autocorr)
+
+
+# ── ICP ──────────────────────────────────────────────────────
+
+
+def icp_quality_check(
+    segment: np.ndarray,
+    sr: float = 100.0,
+    min_hr: float = 30.0,
+    max_hr: float = 200.0,
+    regularity_threshold: float = 0.7,
+    max_flatline_ratio: float = 0.3,
+    min_autocorr: float = 0.15,
+) -> dict:
+    """ICP 세그먼트의 맥동 기반 품질 검사. CVP와 동일 로직."""
+    return cvp_quality_check(segment, sr, min_hr, max_hr, regularity_threshold, max_flatline_ratio, min_autocorr)
+
+
 # ── Dispatcher ────────────────────────────────────────────────
 
 
@@ -474,6 +505,8 @@ DOMAIN_QUALITY_CHECKS: dict[str, callable] = {
     "cvp": cvp_quality_check,
     "co2": co2_quality_check,
     "awp": awp_quality_check,
+    "pap": pap_quality_check,
+    "icp": icp_quality_check,
 }
 
 
