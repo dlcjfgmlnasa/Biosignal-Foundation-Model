@@ -619,6 +619,20 @@ def _process_one_worker(
         return None
 
 
+# multiprocessing용 모듈 레벨 worker (pickle 가능)
+_mp_min_dur: float = 60.0
+_mp_sig_filter: set[int] | None = None
+
+
+def _worker_split(task_tuple: tuple) -> tuple | None:
+    """병렬 처리용 worker. (vf_path, out_dir) 튜플을 받아 처리한다."""
+    vf_path, target_dir = task_tuple
+    return _process_one_worker(
+        vf_path, out_dir=target_dir, min_duration_s=_mp_min_dur,
+        signal_types=_mp_sig_filter,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="VitalDB (.vital) → datasets/processed/ zarr 변환"
@@ -776,18 +790,16 @@ def main() -> None:
 
         print(f"병렬 처리: {args.workers} workers\n")
 
+        # 모듈 레벨 변수 설정 (worker가 참조)
+        global _mp_min_dur, _mp_sig_filter
+        _mp_min_dur = min_dur
+        _mp_sig_filter = sig_filter
+
         # 파일별로 출력 디렉토리 결정하여 worker에 전달
         tasks = []
         for i, vf_path in enumerate(vital_files):
             target_dir = test_out_dir if i in test_indices else out_dir
             tasks.append((vf_path, target_dir))
-
-        def _worker_split(task_tuple):
-            vf_path, target = task_tuple
-            return _process_one_worker(
-                vf_path, out_dir=target, min_duration_s=min_dur,
-                signal_types=sig_filter,
-            )
 
         with Pool(processes=args.workers) as pool:
             for i, result in enumerate(pool.imap(_worker_split, tasks)):
