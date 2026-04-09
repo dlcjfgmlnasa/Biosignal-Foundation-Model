@@ -1,9 +1,10 @@
 # -*- coding:utf-8 -*-
-"""VitalDB (.vital) → datasets/processed/ 변환 스크립트.
+"""VitalDB (.vital) → .pt 변환 스크립트.
 
 VitalDB(https://vitaldb.net)의 수술 중 모니터링 데이터를 파싱하여
-zarr 압축 포맷으로 저장한다. 신호별 physiological range check와
-bandpass filtering을 적용하고, 모든 유효 세그먼트를 개별 zarr로 저장한다.
+.pt (float32 텐서, 100Hz) 포맷으로 저장한다. 신호별 physiological range check와
+bandpass filtering을 적용하고, 모든 유효 세그먼트를 개별 .pt로 저장한다.
+--test-ratio 옵션으로 patient 단위 train/test 분할을 지원한다.
 
 신호 타입 매핑:
   ECG(0), ABP(1), EEG(2), PPG(3), CVP(4), CO2(5), AWP(6)
@@ -635,7 +636,7 @@ def _worker_split(task_tuple: tuple) -> tuple | None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="VitalDB (.vital) → datasets/processed/ zarr 변환"
+        description="VitalDB (.vital) → .pt 변환 (100Hz 리샘플링, train/test 분할 지원)"
     )
     parser.add_argument(
         "--raw", required=True,
