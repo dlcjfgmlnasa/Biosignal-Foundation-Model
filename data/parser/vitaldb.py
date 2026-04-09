@@ -681,9 +681,10 @@ def main() -> None:
     args = parser.parse_args()
 
     raw_dir = Path(args.raw)
-    vital_files = sorted(raw_dir.glob("*.vital"))
+    # 재귀 검색: 중첩 디렉토리 구조 지원 (K-MIMIC-MORTAL 등)
+    vital_files = sorted(raw_dir.glob("**/*.vital"))
     if not vital_files:
-        print(f"ERROR: {raw_dir}에 .vital 파일이 없습니다.", file=sys.stderr)
+        print(f"ERROR: {raw_dir} 하위에 .vital 파일이 없습니다.", file=sys.stderr)
         sys.exit(1)
 
     if args.max_files is not None:
