@@ -82,8 +82,8 @@ class BiosignalFoundationModel(nn.Module):
         use_var_attn_bias: bool = True,
         scaler: PackedScaler | None = None,
         dropout_p: float = 0.0,
-        num_signal_types: int = 9,   # ECG(0),ABP(1),EEG(2),PPG(3),CVP(4),CO2(5),AWP(6),PAP(7),ICP(8)
-        num_spatial_ids: int = 14,  # 9 signal types × 가변 spatial IDs
+        num_signal_types: int = 8,   # ECG(0),ABP(1),PPG(2),CVP(3),CO2(4),AWP(5),PAP(6),ICP(7)
+        num_spatial_ids: int = 13,  # TOTAL_SPATIAL_IDS (8 types × 가변 spatial IDs)
         use_spatial_embed: bool = True,
         max_horizon: int = 1,
         contrastive_proj_dim: int = 0,

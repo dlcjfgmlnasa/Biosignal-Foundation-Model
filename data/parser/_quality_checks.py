@@ -340,46 +340,6 @@ def awp_quality_check(
     }
 
 
-# ── EEG ───────────────────────────────────────────────────────
-
-
-def eeg_quality_check(
-    segment: np.ndarray,
-    sr: float = 100.0,
-    min_band_ratio: float = 0.1,
-) -> dict:
-    """EEG 세그먼트의 주파수 대역 파워 비율 기반 품질 검사."""
-    if len(segment) < int(sr * 2):
-        return {"band_ratio": 0.0, "pass": False}
-
-    n = len(segment)
-    fft_vals = np.fft.rfft(segment)
-    power = np.abs(fft_vals) ** 2
-    freqs = np.fft.rfftfreq(n, d=1.0 / sr)
-
-    total_power = float(power.sum())
-    if total_power < 1e-10:
-        return {"band_ratio": 0.0, "pass": False}
-
-    band_mask = (freqs >= 1.0) & (freqs <= 30.0)
-    band_power = float(power[band_mask].sum())
-    band_ratio = band_power / total_power
-
-    power_norm = power / total_power
-    power_norm = power_norm[power_norm > 1e-12]
-    entropy = float(-np.sum(power_norm * np.log(power_norm)))
-    max_entropy = np.log(len(power))
-    norm_entropy = entropy / max_entropy if max_entropy > 0 else 0
-
-    passed = band_ratio >= min_band_ratio and 0.3 <= norm_entropy <= 0.95
-
-    return {
-        "band_ratio": round(band_ratio, 4),
-        "entropy": round(norm_entropy, 4),
-        "pass": passed,
-    }
-
-
 # ── CVP ───────────────────────────────────────────────────────
 
 
@@ -499,7 +459,6 @@ def icp_quality_check(
 
 DOMAIN_QUALITY_CHECKS: dict[str, callable] = {
     "ecg": ecg_quality_check,
-    "eeg": eeg_quality_check,
     "abp": abp_quality_check,
     "ppg": ppg_quality_check,
     "cvp": cvp_quality_check,

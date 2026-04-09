@@ -6,56 +6,51 @@ signal_type(대분류) + spatial_id(소분류) 이중 인코딩 체계.
 
 로컬 ID 0은 항상 Unknown(위치 정보 없음)이다.
 
-VitalDB Waveform 기준 (2026-03-27):
-  SNUADC/ECG_II (500Hz, mV), SNUADC/ECG_V5 (500Hz, mV)
-  SNUADC/ART (500Hz, mmHg), SNUADC/FEM (500Hz, mmHg)
-  SNUADC/CVP (500Hz, mmHg)
-  SNUADC/PLETH (500Hz, unitless)
-  Primus/AWP (62.5Hz, hPa), Primus/CO2 (62.5Hz, mmHg)
-  BIS/EEG1_WAV (128Hz, μV), BIS/EEG2_WAV (128Hz, μV)
+지원 신호 (8종):
+  ECG(0), ABP(1), PPG(2), CVP(3), CO2(4), AWP(5), PAP(6), ICP(7)
+
+데이터 소스:
+  VitalDB Open: SNUADC/ (OR, 500Hz) — ECG, ABP, PPG, CVP, CO2, AWP
+  K-MIMIC-MORTAL: SNUADCM/ (ICU, 500Hz) — ECG, ABP, PPG, CVP, PAP, ICP
 """
 
 from __future__ import annotations
 
 # signal_type → {로컬 이름: 로컬 ID}
 SPATIAL_MAP: dict[int, dict[str, int]] = {
-    # ECG (signal_type=0) — VitalDB: ECG_II(Lead II), ECG_V5(Lead V5)
+    # ECG (signal_type=0)
     0: {
         "Unknown": 0,
         "Lead_II": 1, "Lead_V5": 2,
     },
-    # ABP (signal_type=1) — VitalDB: ART(Radial), FEM(Femoral)
+    # ABP (signal_type=1)
     1: {
         "Unknown": 0,
         "Radial": 1, "Femoral": 2,
     },
-    # EEG (signal_type=2) — VitalDB: BIS/EEG1_WAV, BIS/EEG2_WAV (forehead, 위치 구분 없음)
+    # PPG (signal_type=2)
     2: {
-        "Unknown": 0,
-    },
-    # PPG (signal_type=3) — VitalDB: PLETH (Finger)
-    3: {
         "Unknown": 0,
         "Finger": 1,
     },
-    # CVP (signal_type=4) — VitalDB: CVP
+    # CVP (signal_type=3)
+    3: {
+        "Unknown": 0,
+    },
+    # CO2/Capnography (signal_type=4)
     4: {
         "Unknown": 0,
     },
-    # CO2/Capnography (signal_type=5) — VitalDB: Primus/CO2 (Sidestream)
+    # AWP/Airway Pressure (signal_type=5)
     5: {
         "Unknown": 0,
     },
-    # AWP/Airway Pressure (signal_type=6) — VitalDB: Primus/AWP
+    # PAP/Pulmonary Arterial Pressure (signal_type=6)
     6: {
         "Unknown": 0,
     },
-    # PAP/Pulmonary Arterial Pressure (signal_type=7) — K-MIMIC: SNUADCM/PAP
+    # ICP/Intracranial Pressure (signal_type=7)
     7: {
-        "Unknown": 0,
-    },
-    # ICP/Intracranial Pressure (signal_type=8) — K-MIMIC: SNUADCM/ICP
-    8: {
         "Unknown": 0,
     },
 }
@@ -95,48 +90,43 @@ def get_global_spatial_id(signal_type: int, local_id: int) -> int:
 # Contrastive (InfoNCE)는 전체 허용 (그룹 무관).
 #
 # Cardiovascular (0): ECG, ABP, PPG, CVP, PAP, ICP — 심혈관계, 심박 주기 동기화
-# Neural (1): EEG — 대뇌 피질, 사전학습에서 제외
-# Respiratory (2): CO2, AWP — 호흡계, 환기 동기화
+# Respiratory (1): CO2, AWP — 호흡계, 환기 동기화
 
 MECHANISM_GROUP: dict[int, int] = {
     0: 0,  # ECG → Cardiovascular
     1: 0,  # ABP → Cardiovascular
-    2: 1,  # EEG → Neural (사전학습 제외)
-    3: 0,  # PPG → Cardiovascular
-    4: 0,  # CVP → Cardiovascular
-    5: 2,  # CO2 → Respiratory
-    6: 2,  # AWP → Respiratory
-    7: 0,  # PAP → Cardiovascular
-    8: 0,  # ICP → Cardiovascular
+    2: 0,  # PPG → Cardiovascular
+    3: 0,  # CVP → Cardiovascular
+    4: 1,  # CO2 → Respiratory
+    5: 1,  # AWP → Respiratory
+    6: 0,  # PAP → Cardiovascular
+    7: 0,  # ICP → Cardiovascular
 }
 
 MECHANISM_GROUP_NAMES: dict[int, str] = {
     0: "Cardiovascular",
-    1: "Neural",
-    2: "Respiratory",
+    1: "Respiratory",
 }
 
 
 # 채널명 → (signal_type, local_spatial_id) 역매핑
 CHANNEL_NAME_TO_SPATIAL: dict[str, tuple[int, int]] = {
-    # ECG
+    # ECG (0)
     "ECG Lead II": (0, 1), "ECG II": (0, 1), "II": (0, 1),
     "ECG Lead V5": (0, 2), "ECG V5": (0, 2), "V5": (0, 2),
-    # ABP
+    # ABP (1)
     "ABP Radial": (1, 1), "ART": (1, 1),
     "ABP Femoral": (1, 2), "FEM": (1, 2),
-    # EEG
-    "EEG": (2, 0), "BIS EEG": (2, 0),
-    # PPG
-    "PPG": (3, 0), "PLETH": (3, 1), "PPG Finger": (3, 1),
-    # CVP
-    "CVP": (4, 0),
-    # CO2
-    "CO2": (5, 0),
-    # AWP
-    "AWP": (6, 0),
-    # PAP
-    "PAP": (7, 0),
-    # ICP
-    "ICP": (8, 0),
+    # PPG (2)
+    "PPG": (2, 0), "PLETH": (2, 1), "PPG Finger": (2, 1),
+    # CVP (3)
+    "CVP": (3, 0),
+    # CO2 (4)
+    "CO2": (4, 0),
+    # AWP (5)
+    "AWP": (5, 0),
+    # PAP (6)
+    "PAP": (6, 0),
+    # ICP (7)
+    "ICP": (7, 0),
 }

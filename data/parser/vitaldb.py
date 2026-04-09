@@ -7,7 +7,7 @@ bandpass filtering을 적용하고, 모든 유효 세그먼트를 개별 .pt로 
 --test-ratio 옵션으로 patient 단위 train/test 분할을 지원한다.
 
 신호 타입 매핑:
-  ECG(0), ABP(1), EEG(2), PPG(3), CVP(4), CO2(5), AWP(6)
+  ECG(0), ABP(1), PPG(2), CVP(3), CO2(4), AWP(5), PAP(6), ICP(7)
 
 사용법:
   # 트랙 탐색
@@ -83,10 +83,9 @@ class SignalConfig:
 
 
 SIGNAL_CONFIGS: dict[str, SignalConfig] = {
-    # ECG/EEG: bandpass — baseline wander(저주파) + 고주파 노이즈 동시 제거
-    #   notch 60Hz (VitalDB=한국, 60Hz 전원), spike detection 활성
+    # ECG: bandpass — baseline wander(저주파) + 고주파 노이즈 동시 제거
+    #   notch 60Hz (한국, 60Hz 전원), spike detection 활성
     "ecg": SignalConfig(valid_range=(-5.0, 5.0),       filter_type="bandpass", filter_freq=(0.5, 40.0),  max_high_freq_ratio=1.0, min_amplitude=0.3, min_high_freq_ratio=0.05, notch_freq=60.0, spike_detection=True, spike_threshold_std=10.0),
-    "eeg": SignalConfig(valid_range=(-500.0, 500.0),   filter_type="bandpass", filter_freq=(0.5, 45.0),  max_high_freq_ratio=2.0, min_amplitude=2.0, max_amplitude=500.0, notch_freq=60.0, spike_detection=True, spike_threshold_std=10.0),
     # ABP/PPG/CVP: lowpass — DC(절대값) 보존, 고주파 노이즈만 제거
     #   PPG/ABP: median filter로 임펄스 노이즈 제거, spike detection 활성
     "abp": SignalConfig(valid_range=(20.0, 300.0),     filter_type="lowpass",  filter_freq=(0.0, 15.0),  max_high_freq_ratio=0.5, max_flatline_ratio=0.3, min_amplitude=10.0, spike_detection=True, spike_threshold_std=6.0, median_kernel=5),
@@ -109,49 +108,44 @@ SIGNAL_CONFIGS: dict[str, SignalConfig] = {
 # 공식: https://vitaldb.net/dataset/ — Hemodynamic Parameters (W=waveform)
 # 비공식: 일부 파일에 존재하는 대체 장비 트랙 (같은 신호, 다른 소스)
 TRACK_MAP: dict[str, tuple[str, int]] = {
+    # ── VitalDB Open (SNUADC, OR) ──
     # ECG (0) — 500Hz, mV
-    "SNUADC/ECG_II": ("ecg", 1),    # Lead II (공식)
-    "SNUADC/ECG_V5": ("ecg", 2),    # Lead V5 (공식)
+    "SNUADC/ECG_II": ("ecg", 1),    # Lead II
+    "SNUADC/ECG_V5": ("ecg", 2),    # Lead V5
     "SNUADC/ECG_I": ("ecg", 0),     # Lead I (비공식)
     "SNUADC/ECG_III": ("ecg", 0),   # Lead III (비공식)
-    "Solar8000/ECG_II": ("ecg", 1), # Lead II — Solar8000 대체 (비공식)
+    "Solar8000/ECG_II": ("ecg", 1), # Lead II — Solar8000 대체
     # ABP (1) — 500Hz, mmHg
-    "SNUADC/ART": ("abp", 1),       # Radial artery (공식)
-    "SNUADC/FEM": ("abp", 2),       # Femoral artery (공식)
-    # EEG (2) — BIS 128Hz, μV
-    "BIS/EEG1_WAV": ("eeg", 0),     # BIS channel 1 (공식)
-    "BIS/EEG2_WAV": ("eeg", 0),     # BIS channel 2 (공식)
-    "SNUADC/EEG_BIS": ("eeg", 0),   # BIS EEG (비공식)
-    "SNUADC/EEG1": ("eeg", 0),      # EEG ch1 (비공식)
-    "SNUADC/EEG2": ("eeg", 0),      # EEG ch2 (비공식)
-    # PPG (3) — 500Hz, unitless
-    "SNUADC/PLETH": ("ppg", 1),     # Finger (공식)
-    "Solar8000/PLETH": ("ppg", 1),  # Finger — Solar8000 대체 (비공식)
-    # CVP (4) — 500Hz, mmHg
-    "SNUADC/CVP": ("cvp", 0),       # Central venous pressure (공식)
-    # CO2 (5) — Primus 62.5Hz, mmHg
-    "Primus/CO2": ("co2", 0),       # Capnography (공식)
-    "Solar8000/CO2": ("co2", 0),    # Capnography — Solar8000 대체 (비공식)
-    # AWP (6) — Primus 62.5Hz, hPa
-    "Primus/AWP": ("awp", 0),       # Airway pressure (공식)
-    "Solar8000/AWP": ("awp", 0),    # Airway pressure — Solar8000 대체 (비공식)
-    # PAP (7) — 500Hz, mmHg (K-MIMIC ICU)
+    "SNUADC/ART": ("abp", 1),       # Radial artery
+    "SNUADC/FEM": ("abp", 2),       # Femoral artery
+    # PPG (2) — 500Hz, unitless
+    "SNUADC/PLETH": ("ppg", 1),     # Finger
+    "Solar8000/PLETH": ("ppg", 1),  # Finger — Solar8000 대체
+    # CVP (3) — 500Hz, mmHg
+    "SNUADC/CVP": ("cvp", 0),       # Central venous pressure
+    # CO2 (4) — Primus 62.5Hz, mmHg
+    "Primus/CO2": ("co2", 0),       # Capnography
+    "Solar8000/CO2": ("co2", 0),    # Capnography — Solar8000 대체
+    # AWP (5) — Primus 62.5Hz, hPa
+    "Primus/AWP": ("awp", 0),       # Airway pressure
+    "Solar8000/AWP": ("awp", 0),    # Airway pressure — Solar8000 대체
+    # PAP (6) — 500Hz, mmHg
     "SNUADC/PAP": ("pap", 0),       # Pulmonary arterial pressure
-    "SNUADCM/PAP": ("pap", 0),      # K-MIMIC ICU
-    # ICP (8) — 500Hz, mmHg (K-MIMIC ICU)
+    # ICP (7) — 500Hz, mmHg
     "SNUADC/ICP": ("icp", 0),       # Intracranial pressure
-    "SNUADCM/ICP": ("icp", 0),      # K-MIMIC ICU
-    # ── K-MIMIC (SNUADCM) 트랙 매핑 ──
+    # ── K-MIMIC-MORTAL (SNUADCM, ICU) ──
     "SNUADCM/ECG_II": ("ecg", 1),   # Lead II
     "SNUADCM/ECG_V5": ("ecg", 2),   # Lead V5
     "SNUADCM/ART": ("abp", 1),      # Radial artery
     "SNUADCM/PLETH": ("ppg", 1),    # Finger
     "SNUADCM/CVP": ("cvp", 0),      # Central venous pressure
+    "SNUADCM/PAP": ("pap", 0),      # Pulmonary arterial pressure
+    "SNUADCM/ICP": ("icp", 0),      # Intracranial pressure
 }
 
 SIGNAL_TYPES: dict[str, int] = {
-    "ecg": 0, "abp": 1, "eeg": 2, "ppg": 3, "cvp": 4, "co2": 5, "awp": 6,
-    "pap": 7, "icp": 8,
+    "ecg": 0, "abp": 1, "ppg": 2, "cvp": 3, "co2": 4, "awp": 5,
+    "pap": 6, "icp": 7,
 }
 
 

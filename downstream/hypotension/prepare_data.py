@@ -34,7 +34,7 @@ TARGET_SR: float = 100.0
 
 # signal_type 정수 → 문자열 매핑
 SIGNAL_TYPE_MAP: dict[int, str] = {
-    0: "ecg", 1: "abp", 2: "eeg", 3: "ppg", 4: "cvp", 5: "co2", 6: "awp",
+    0: "ecg", 1: "abp", 2: "ppg", 3: "cvp", 4: "co2", 5: "awp", 6: "pap", 7: "icp",
 }
 
 
