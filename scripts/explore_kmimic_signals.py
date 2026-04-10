@@ -356,9 +356,42 @@ def visualize_all_tracks(vital_files: list[Path], out_dir: str,
     print(f"\n전체 {plotted}개 파일 시각화 완료")
 
 
+def visualize_single_file(file_path: str, track_name: str, out_dir: str) -> None:
+    """.vital 파일 하나를 직접 지정하여 시각화."""
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    vf = Path(file_path)
+    if not vf.exists():
+        print(f"ERROR: {vf} not found")
+        return
+
+    track_info = TRACK_MAP.get(track_name)
+    if track_info is None:
+        print(f"WARNING: {track_name} not in TRACK_MAP")
+        stype_key = track_name.split("/")[-1].lower()
+    else:
+        stype_key = track_info[0]
+
+    native_sr = NATIVE_SR.get(stype_key, 500.0)
+
+    print(f"Loading {vf.name} — {track_name} ({stype_key}, {native_sr}Hz)")
+    arr = load_track_raw(vf, track_name, native_sr)
+    if arr is None:
+        print("  No valid data")
+        return
+
+    result = apply_pipeline_steps(arr, stype_key, native_sr)
+    title = f"{vf.name} — {track_name} ({stype_key.upper()})"
+    fname = f"{stype_key}_{vf.stem}.png"
+    plot_pipeline(result, title, str(out_path / fname))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="K-MIMIC 신호 탐색/전처리 파이프라인 시각화")
-    parser.add_argument("--raw", required=True, help="K-MIMIC .vital 디렉토리")
+    parser.add_argument("--raw", default=None, help="K-MIMIC .vital 디렉토리 (탐색 모드)")
+    parser.add_argument("--file", default=None, help=".vital 파일 직접 지정")
+    parser.add_argument("--track", default=None, help="트랙명 (--file 사용 시, 예: SNUADCM/PAP)")
     parser.add_argument("--signal", type=str, default=None,
                         help="탐색할 신호 (PAP, ICP, ECG_II, ART, PLETH, CVP)")
     parser.add_argument("--all-tracks", action="store_true",
@@ -371,14 +404,22 @@ def main() -> None:
                         help="출력 디렉토리")
     args = parser.parse_args()
 
-    vital_files = find_vital_files(args.raw, args.n_search)
-
-    if args.all_tracks:
-        visualize_all_tracks(vital_files, args.out_dir, max_files=args.max_plots)
-    elif args.signal:
-        search_and_visualize(vital_files, args.signal, args.out_dir, args.max_plots)
+    if args.file:
+        track = args.track or f"SNUADCM/{args.signal}" if args.signal else args.track
+        if not track:
+            print("--file 사용 시 --track 또는 --signal을 지정하세요")
+            return
+        visualize_single_file(args.file, track, args.out_dir)
+    elif args.raw:
+        vital_files = find_vital_files(args.raw, args.n_search)
+        if args.all_tracks:
+            visualize_all_tracks(vital_files, args.out_dir, max_files=args.max_plots)
+        elif args.signal:
+            search_and_visualize(vital_files, args.signal, args.out_dir, args.max_plots)
+        else:
+            print("--signal 또는 --all-tracks를 지정하세요")
     else:
-        print("--signal 또는 --all-tracks를 지정하세요")
+        print("--raw 또는 --file을 지정하세요")
 
 
 if __name__ == "__main__":
