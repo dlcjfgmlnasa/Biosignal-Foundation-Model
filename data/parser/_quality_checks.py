@@ -431,10 +431,10 @@ def pap_quality_check(
     sr: float = 100.0,
     min_hr: float = 30.0,
     max_hr: float = 200.0,
-    regularity_threshold: float = 0.5,
+    regularity_threshold: float = 0.7,
     min_autocorr: float = 0.10,
 ) -> dict:
-    """PAP 세그먼트의 pulse peak regularity 기반 품질 검사. ABP와 동일 로직."""
+    """PAP 세그먼트의 pulse peak regularity 기반 품질 검사."""
     return abp_quality_check(segment, sr, min_hr, max_hr, regularity_threshold, min_autocorr)
 
 
