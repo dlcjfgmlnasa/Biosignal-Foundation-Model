@@ -60,7 +60,6 @@ class SignalConfig:
     high_freq_ratio 근거 (실측 + 시각 검증, 2026-03-26):
         ECG: QRS spike → 정상도 ~0.4, P99=1.97 → 3.0
         ABP: 매우 부드러운 파형, P99=0.03 → 0.5, valid_range 하한 20mmHg
-        EEG: alpha/beta 고주파 → 합성 clean=0.38 → 2.0
         PPG: 부드러운 파형, hf>0.05부터 노이즈 → 0.05 (시각 검증)
         CVP: 저주파, 합성 clean=0.0004 → 0.5
         CO2: 느린 capnogram, flatline 구간 → hf=1.0, flatline=0.3
@@ -73,7 +72,7 @@ class SignalConfig:
     max_clip_ratio: float = 0.1              # 10% 이상 clipping이면 불량
     max_high_freq_ratio: float = 2.0         # 기본값; 신호별로 아래에서 재정의
     min_amplitude: float = 0.0               # 최소 peak-to-peak 진폭 (0=비활성)
-    max_amplitude: float = 0.0               # 최대 peak-to-peak 진폭 (0=비활성, EEG artifact용)
+    max_amplitude: float = 0.0               # 최대 peak-to-peak 진폭 (0=비활성)
     min_high_freq_ratio: float = 0.0         # 최소 hf ratio (0=비활성, ECG용: QRS 없으면 불량)
     notch_freq: float | None = None          # 50 또는 60Hz notch filter (None=비활성)
     spike_detection: bool = False            # 스파이크/아티팩트 검출 적용 여부
@@ -275,7 +274,7 @@ def _apply_filter(data: np.ndarray, cfg: SignalConfig, sr: float) -> np.ndarray:
 
 def _detect_electrocautery(data: np.ndarray, sr: float, threshold_std: float = 10.0,
                            blank_ms: float = 100.0) -> tuple[np.ndarray, int]:
-    """전기소작기 아티팩트 구간을 NaN으로 마킹한다. (ECG/EEG용)
+    """전기소작기 아티팩트 구간을 NaN으로 마킹한다. (ECG 등 spike detection 활성 신호용)
 
     급격한 진폭 변화(미분의 절대값)가 threshold_std배 이상인 구간을
     전후 blank_ms만큼 확장하여 NaN 처리한다.
@@ -671,7 +670,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--signal-types", type=int, nargs="+", default=None,
-        help="파싱할 signal type IDs (0=ECG,1=ABP,2=EEG,3=PPG,4=CVP,5=CO2,6=AWP). 미지정 시 전부.",
+        help="파싱할 signal type IDs (0=ECG,1=ABP,2=PPG,3=CVP,4=CO2,5=AWP,6=PAP,7=ICP). 미지정 시 전부.",
     )
     parser.add_argument(
         "--workers", type=int, default=1,

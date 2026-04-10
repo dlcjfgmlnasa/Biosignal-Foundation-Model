@@ -155,7 +155,7 @@ class NextPredictionLoss(nn.Module):
 
         ``patch_signal_types``가 주어지면, 같은 mechanism group 내의 쌍만
         매칭한다 (Cardiovascular↔Cardiovascular, Respiratory↔Respiratory).
-        다른 그룹 간 (ECG↔CO2, ECG↔EEG 등)은 차단된다.
+        다른 그룹 간 (ECG↔CO2 등)은 차단된다.
         """
         # group_key: (batch, sample_id, time_id)가 같은 패치를 그룹핑
         b, n = time_id.shape

@@ -467,7 +467,7 @@ def main() -> None:
                         help="Data source")
     parser.add_argument("--signal-types", nargs="+",
                         default=["ecg", "abp", "ppg", "cvp"],
-                        choices=["ecg", "abp", "ppg", "cvp", "eeg", "co2", "awp"],
+                        choices=["ecg", "abp", "ppg", "cvp", "co2", "awp", "pap", "icp"],
                         help="Signal types to extract")
     parser.add_argument("--n-cases", type=int, default=10,
                         help="Number of cases to load")

@@ -55,7 +55,7 @@ class BiosignalFoundationModel(nn.Module):
     dropout_p:
         드롭아웃 확률.
     num_signal_types:
-        신호 타입 수 (ecg=0, abp=1, eeg=2, ppg=3, cvp=4, co2=5, awp=6).
+        신호 타입 수 (ecg=0, abp=1, ppg=2, cvp=3, co2=4, awp=5, pap=6, icp=7).
     num_spatial_ids:
         글로벌 spatial ID 수.
     use_spatial_embed:

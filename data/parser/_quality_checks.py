@@ -1,6 +1,6 @@
 """신호별 Domain-specific 품질 검사.
 
-7종 생체신호(ECG, EEG, ABP, PPG, CVP, CO2, AWP) 각각의 생리학적 특성에 맞는
+생체신호(ECG, ABP, PPG, CVP, CO2, AWP, PAP, ICP) 각각의 생리학적 특성에 맞는
 품질 검사를 제공한다. 파서(_common.py)의 segment_quality_score와 함께 사용된다.
 """
 from __future__ import annotations
@@ -475,7 +475,7 @@ def domain_quality_check(stype_key: str, segment: np.ndarray, sr: float = 100.0)
     Parameters
     ----------
     stype_key:
-        신호 타입 키 ("ecg", "eeg", "abp", "ppg", "cvp", "co2", "awp").
+        신호 타입 키 ("ecg", "abp", "ppg", "cvp", "co2", "awp", "pap", "icp").
         미등록 타입은 항상 {"pass": True}를 반환한다.
     segment:
         (n_timesteps,) 1D 배열.

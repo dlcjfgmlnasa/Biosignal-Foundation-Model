@@ -48,7 +48,6 @@ PREFERRED_TRACKS: dict[str, list[str]] = {
     "abp": ["SNUADC/ART", "SNUADC/FEM"],
     "ppg": ["SNUADC/PLETH", "Solar8000/PLETH"],
     "cvp": ["SNUADC/CVP"],
-    "eeg": ["BIS/EEG1_WAV", "BIS/EEG2_WAV"],
     "co2": ["Primus/CO2", "Solar8000/CO2"],
     "awp": ["Primus/AWP", "Solar8000/AWP"],
 }
@@ -56,7 +55,7 @@ PREFERRED_TRACKS: dict[str, list[str]] = {
 # 트랙별 native sampling rate (Hz)
 NATIVE_SR: dict[str, float] = {
     "ecg": 500.0, "abp": 500.0, "ppg": 500.0,
-    "cvp": 500.0, "eeg": 128.0, "co2": 62.5, "awp": 62.5,
+    "cvp": 500.0, "co2": 62.5, "awp": 62.5,
 }
 
 

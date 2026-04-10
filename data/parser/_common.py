@@ -165,7 +165,6 @@ from data.parser._quality_checks import (  # noqa: F401, E402
     co2_quality_check,
     cvp_quality_check,
     ecg_quality_check,
-    eeg_quality_check,
     ppg_quality_check,
     domain_quality_check,
 )

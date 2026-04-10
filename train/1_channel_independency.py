@@ -4,7 +4,7 @@ from __future__ import annotations
 """Phase 1: Channel-Independent 사전학습.
 
 collate_mode="ci"로 각 채널을 독립적으로 학습한다.
-EEG는 spectral target으로 복원, 나머지 신호는 raw patch MSE로 복원.
+모든 신호를 raw patch MSE로 복원.
 
 Usage (단일 GPU)
 -----
@@ -81,8 +81,8 @@ def parse_args() -> argparse.Namespace:
     # Data
     g = p.add_argument_group("Data")
     g.add_argument("--data_dir", type=str, default="datasets/processed")
-    g.add_argument("--signal_types", type=int, nargs="+", default=[0, 1, 2, 3, 4, 5, 6],
-                   help="Signal type IDs (0=ECG, 1=ABP, 2=EEG, 3=PPG, 4=CVP, 5=CO2, 6=AWP)")
+    g.add_argument("--signal_types", type=int, nargs="+", default=[0, 1, 2, 3, 4, 5],
+                   help="Signal type IDs (0=ECG, 1=ABP, 2=PPG, 3=CVP, 4=CO2, 5=AWP, 6=PAP, 7=ICP)")
     g.add_argument("--max_subjects", type=int, default=None)
     g.add_argument("--window_seconds", type=float, default=30.0)
     g.add_argument("--max_length", type=int, default=50000)

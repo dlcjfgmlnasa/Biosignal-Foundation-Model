@@ -31,7 +31,7 @@ import torch
 
 TARGET_SR: float = 100.0
 
-ALL_SIGNAL_TYPES = ["ecg", "abp", "ppg", "eeg", "co2", "awp", "cvp"]
+ALL_SIGNAL_TYPES = ["ecg", "abp", "ppg", "co2", "awp", "cvp"]
 
 
 # ---- 데이터 구조 ----

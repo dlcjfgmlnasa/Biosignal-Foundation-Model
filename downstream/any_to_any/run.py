@@ -27,7 +27,7 @@ from data.dataset import BiosignalSample
 
 # signal_type_key -> signal_type_id
 SIGNAL_TYPE_IDS: dict[str, int] = {
-    "ecg": 0, "abp": 1, "eeg": 2, "ppg": 3, "cvp": 4, "co2": 5, "awp": 6,
+    "ecg": 0, "abp": 1, "ppg": 2, "cvp": 3, "co2": 4, "awp": 5, "pap": 6, "icp": 7,
 }
 
 # Mechanism groups for analysis
@@ -36,9 +36,10 @@ MECHANISM_GROUPS: dict[str, str] = {
     "abp": "cardiovascular",
     "ppg": "cardiovascular",
     "cvp": "cardiovascular",
-    "eeg": "neurological",
     "co2": "respiratory",
     "awp": "respiratory",
+    "pap": "cardiovascular",
+    "icp": "neurological",
 }
 
 
@@ -67,7 +68,7 @@ def get_default_scenarios() -> list[Scenario]:
         # 3-to-1: Rich input
         Scenario("ECG+PPG+CVP->ABP", ["ecg", "ppg", "cvp"], "abp", "intra", 3),
         # Inter-group (baseline - expect low performance)
-        Scenario("ECG->EEG",    ["ecg"],             "eeg", "inter", 1),
+        Scenario("ECG->CO2",    ["ecg"],             "co2", "inter", 1),
     ]
     return scenarios
 
@@ -215,7 +216,7 @@ def _pearson_r(x: torch.Tensor, y: torch.Tensor) -> float:
 
 _SYNTH_FREQS: dict[str, float] = {
     "ecg": 1.2, "abp": 1.1, "ppg": 1.0, "cvp": 0.9,
-    "eeg": 10.0, "co2": 0.25, "awp": 0.3,
+    "co2": 0.25, "awp": 0.3, "pap": 1.0, "icp": 0.15,
 }
 
 

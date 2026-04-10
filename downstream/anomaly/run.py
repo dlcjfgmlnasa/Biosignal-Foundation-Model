@@ -35,7 +35,7 @@ from data.spatial_map import get_global_spatial_id
 TARGET_SR = 100.0
 
 SIGNAL_TYPE_INDEX: dict[str, int] = {
-    "ecg": 0, "abp": 1, "eeg": 2, "ppg": 3, "cvp": 4, "co2": 5, "awp": 6,
+    "ecg": 0, "abp": 1, "ppg": 2, "cvp": 3, "co2": 4, "awp": 5, "pap": 6, "icp": 7,
 }
 
 
