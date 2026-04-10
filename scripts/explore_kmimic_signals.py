@@ -243,6 +243,41 @@ def plot_pipeline(result: dict, title: str, out_path: str, show_seconds: float =
         alpha = 0.2 if qc["pass"] else 0.3
         axes[3].axvspan(t_start, t_end, alpha=alpha, color=color)
 
+    # Fail 윈도우에 실패 이유 표시
+    for qc in qc_results:
+        if qc["pass"] or qc["start"] >= n_show_resamp:
+            continue
+        t_mid = (qc["start"] + qc_window / 2) / TARGET_SR
+        # 실패 이유 분석
+        reasons = []
+        b = qc["basic"]
+        if not b["pass"]:
+            if b.get("flatline_ratio", 0) >= cfg.max_flatline_ratio:
+                reasons.append(f"flat={b['flatline_ratio']:.2f}")
+            if b.get("clip_ratio", 0) >= cfg.max_clip_ratio:
+                reasons.append(f"clip={b['clip_ratio']:.2f}")
+            if b.get("high_freq_ratio", 0) >= cfg.max_high_freq_ratio:
+                reasons.append(f"hf={b['high_freq_ratio']:.2f}")
+            if cfg.min_amplitude > 0 and b.get("amplitude", 999) < cfg.min_amplitude:
+                reasons.append(f"amp={b.get('amplitude', 0):.1f}<{cfg.min_amplitude}")
+            if cfg.min_high_freq_ratio > 0 and b.get("high_freq_ratio", 1) < cfg.min_high_freq_ratio:
+                reasons.append(f"hf_low={b.get('high_freq_ratio', 0):.3f}")
+            if not reasons:
+                reasons.append("basic_fail")
+        d = qc.get("domain", {})
+        if b["pass"] and not d.get("pass", True):
+            if "hr" in d and d["hr"] > 0:
+                reasons.append(f"hr={d['hr']:.0f}")
+            if "regularity" in d:
+                reasons.append(f"reg={d['regularity']:.2f}")
+            if "autocorr_peak" in d:
+                reasons.append(f"ac={d['autocorr_peak']:.2f}")
+            if not reasons:
+                reasons.append("domain_fail")
+        reason_str = ", ".join(reasons) if reasons else "?"
+        axes[3].text(t_mid, axes[3].get_ylim()[0], reason_str,
+                     fontsize=5, ha="center", va="bottom", color="red", rotation=45)
+
     legend_elements = [
         Patch(facecolor="#2ecc71", alpha=0.3, label="QC Pass"),
         Patch(facecolor="#e74c3c", alpha=0.3, label="QC Fail"),
@@ -250,6 +285,16 @@ def plot_pipeline(result: dict, title: str, out_path: str, show_seconds: float =
     axes[3].legend(handles=legend_elements, loc="upper right", fontsize=7)
     axes[3].set_title(f"④ QC Results — {result['qc_summary']}", fontsize=9)
     axes[3].set_xlabel("Time (s)")
+
+    # Fail 윈도우 상세 로그 출력
+    fail_windows = [qc for qc in qc_results if not qc["pass"]]
+    if fail_windows:
+        print(f"  QC Fail 상세 ({len(fail_windows)}개):")
+        for qc in fail_windows[:10]:
+            t_s = qc["start"] / TARGET_SR
+            b = qc["basic"]
+            d = qc.get("domain", {})
+            print(f"    {t_s:.1f}s: basic={b} domain={d}")
 
     for ax in axes:
         ax.tick_params(labelsize=7)
