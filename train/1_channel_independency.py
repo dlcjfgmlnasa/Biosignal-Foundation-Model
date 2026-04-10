@@ -440,10 +440,19 @@ def main():
 
     prev_max_h = None
     for epoch in range(start_epoch, config.n_epochs):
-        # Horizon curriculum 로깅
+        # Horizon curriculum 로깅 + embed 복사
         cur_max_h = get_max_horizon(config, epoch)
-        if rank0 and cur_max_h != prev_max_h:
-            print(f"  [Horizon] epoch {epoch}: max_horizon {prev_max_h} -> {cur_max_h}")
+        if cur_max_h != prev_max_h:
+            if rank0:
+                print(f"  [Horizon] epoch {epoch}: max_horizon {prev_max_h} -> {cur_max_h}")
+            # 새 horizon embed를 이전 최고 horizon embed로 초기화
+            if prev_max_h is not None and cur_max_h > prev_max_h:
+                raw = model.module if use_ddp else model
+                with torch.no_grad():
+                    for h in range(prev_max_h, cur_max_h):
+                        raw.horizon_embed.weight.data[h] = raw.horizon_embed.weight.data[prev_max_h - 1].clone()
+                        if rank0:
+                            print(f"    → horizon_embed[{h}] initialized from embed[{prev_max_h - 1}]")
             prev_max_h = cur_max_h
 
         # DDP: sampler 에폭 설정 (셔플링 동기화)
