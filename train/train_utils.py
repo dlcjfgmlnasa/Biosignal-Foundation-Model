@@ -74,6 +74,9 @@ class TrainConfig:
     contrastive_temperature: float = 0.07
     learnable_temperature: bool = True
 
+    # Horizon
+    horizon_curriculum: bool = True  # False면 항상 h=1 고정 (max_horizon 무시)
+
     # Masking 전략
     variate_mask_prob: float = 0.0  # Phase 2: variate-level 마스킹 확률
     block_mask: bool = False       # True면 연속 블록 단위 마스킹
@@ -236,10 +239,14 @@ def split_manifest_by_subject(
 def get_max_horizon(config: TrainConfig, epoch: int) -> int:
     """현재 epoch에 해당하는 max_horizon을 반환한다.
 
+    horizon_curriculum=False이면 항상 1 반환.
     max_horizon <= 1이면 항상 1 반환 (curriculum 비활성).
     max_horizon > 1이면 n_epochs를 3등분하여 자동 curriculum:
       → 전반 40%: H=1, 중반 30%: H=ceil(max_horizon*0.6), 후반 30%: H=max_horizon
     """
+    if not config.horizon_curriculum:
+        return 1
+
     max_h = config.model_config.max_horizon
     if max_h <= 1:
         return 1
