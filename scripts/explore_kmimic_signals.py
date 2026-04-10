@@ -1,23 +1,22 @@
-"""K-MIMIC-MORTAL 신호 탐색 및 시각화 스크립트.
+"""K-MIMIC-MORTAL 신호 탐색 및 전처리 파이프라인 시각화.
 
-.vital 파일에서 PAP/ICP 등 신호를 찾아 raw waveform을 시각화한다.
-서버에서 실행하여 신호 특성을 육안으로 확인한다.
+.vital 파일에서 신호를 찾아 raw → filtered → QC 결과를 시각화한다.
 
 사용법:
-    # PAP 신호 탐색 (랜덤 50개 파일에서 검색)
+    # PAP 신호 탐색 (전처리 파이프라인 포함)
     python scripts/explore_kmimic_signals.py \
         --raw ../datasets/K-MIMIC-MORTAL/1.0.0/VITALDB \
-        --signal PAP --n-search 50
+        --signal PAP --n-search 100
 
     # ICP 신호 탐색
     python scripts/explore_kmimic_signals.py \
         --raw ../datasets/K-MIMIC-MORTAL/1.0.0/VITALDB \
-        --signal ICP --n-search 50
+        --signal ICP --n-search 100
 
-    # 특정 파일에서 모든 SNUADCM 트랙 시각화
+    # 전체 SNUADCM 트랙 시각화
     python scripts/explore_kmimic_signals.py \
         --raw ../datasets/K-MIMIC-MORTAL/1.0.0/VITALDB \
-        --all-tracks --n-search 10
+        --all-tracks --n-search 50
 """
 
 import argparse
@@ -27,11 +26,36 @@ from pathlib import Path
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+import matplotlib.pyplot as plt  # noqa: E402
+from matplotlib.patches import Patch  # noqa: E402
+
+from data.parser.vitaldb import (
+    SIGNAL_CONFIGS,
+    TRACK_MAP,
+    TARGET_SR,
+    _apply_filter,
+    _apply_median_filter,
+    _apply_notch_filter,
+    _apply_range_check,
+    _detect_electrocautery,
+    _detect_motion_artifact,
+    _extract_nan_free_segments,
+)
+from data.parser._common import (
+    domain_quality_check,
+    resample_to_target,
+    segment_quality_score,
+)
+
+# 트랙 → native SR
+NATIVE_SR = {
+    "ecg": 500.0, "abp": 500.0, "ppg": 500.0,
+    "cvp": 500.0, "pap": 500.0, "icp": 500.0,
+    "co2": 62.5, "awp": 62.5,
+}
 
 
 def find_vital_files(raw_dir: str, n_search: int) -> list[Path]:
-    """재귀적으로 .vital 파일을 찾아 랜덤 샘플링한다."""
     root = Path(raw_dir)
     all_files = list(root.glob("**/*.vital"))
     print(f"전체 .vital 파일: {len(all_files)}개")
@@ -43,14 +67,12 @@ def find_vital_files(raw_dir: str, n_search: int) -> list[Path]:
 
 
 def discover_tracks(vf_path: Path) -> list[str]:
-    """vital 파일의 트랙 목록을 반환한다."""
     import vitaldb
     vf = vitaldb.VitalFile(str(vf_path))
     return [t["name"] for t in vf.trks.values() if "name" in t]
 
 
-def load_track(vf_path: Path, track_name: str, sr: float = 500.0) -> np.ndarray | None:
-    """vital 파일에서 특정 트랙을 로드한다."""
+def load_track_raw(vf_path: Path, track_name: str, sr: float) -> np.ndarray | None:
     import vitaldb
     data = vitaldb.VitalFile(str(vf_path))
     vals = data.to_numpy([track_name], interval=1.0 / sr)
@@ -63,63 +85,199 @@ def load_track(vf_path: Path, track_name: str, sr: float = 500.0) -> np.ndarray 
     return arr
 
 
-def plot_signal(arr: np.ndarray, sr: float, title: str, out_path: str,
-                max_seconds: float = 30.0) -> None:
-    """신호를 시각화하여 저장한다."""
-    n_samples = min(len(arr), int(max_seconds * sr))
-    # NaN이 아닌 구간 찾기
-    valid = ~np.isnan(arr)
-    if not valid.any():
-        return
+def apply_pipeline_steps(raw: np.ndarray, stype_key: str, native_sr: float) -> dict:
+    """전처리 파이프라인을 단계별로 적용하고 각 단계 결과를 반환한다."""
+    cfg = SIGNAL_CONFIGS.get(stype_key)
+    if cfg is None:
+        return {"error": f"No config for {stype_key}"}
 
-    # 유효 구간 시작점 찾기
-    starts = np.where(valid)[0]
-    if len(starts) == 0:
-        return
+    result = {"raw": raw.copy(), "stype": stype_key, "native_sr": native_sr}
 
-    # 가장 긴 연속 유효 구간 찾기
-    diffs = np.diff(starts)
-    breaks = np.where(diffs > 1)[0]
-    if len(breaks) == 0:
-        seg_start = starts[0]
-        seg_end = starts[-1] + 1
+    # Step 1: Range check
+    data = raw.copy()
+    if cfg.valid_range is not None:
+        data, n_removed = _apply_range_check(data, cfg.valid_range)
+        result["range_check"] = data.copy()
+        result["range_removed"] = int(n_removed)
     else:
-        seg_lengths = []
-        prev = 0
-        for b in breaks:
-            seg_lengths.append((prev, b + 1))
-            prev = b + 1
-        seg_lengths.append((prev, len(starts)))
-        longest = max(seg_lengths, key=lambda x: x[1] - x[0])
-        seg_start = starts[longest[0]]
-        seg_end = starts[longest[1] - 1] + 1
+        result["range_check"] = data.copy()
+        result["range_removed"] = 0
 
-    seg = arr[seg_start:min(seg_start + n_samples, seg_end)]
-    seg = np.nan_to_num(seg, nan=0.0)
-    t = np.arange(len(seg)) / sr
+    # Step 2: Spike detection
+    if cfg.spike_detection:
+        data, spike_mask = _detect_electrocautery(data, native_sr, threshold_std=cfg.spike_threshold_std)
+        result["spike_detect"] = data.copy()
+        result["spike_count"] = int(spike_mask.sum()) if spike_mask is not None else 0
+    else:
+        result["spike_detect"] = data.copy()
+        result["spike_count"] = 0
 
-    fig, ax = plt.subplots(figsize=(14, 3))
-    ax.plot(t, seg, linewidth=0.5, color="steelblue")
-    ax.set_title(title, fontsize=10)
-    ax.set_xlabel("Time (s)")
-    ax.set_ylabel("Amplitude")
+    # Step 2b: PPG motion artifact
+    if stype_key == "ppg":
+        data, motion_mask = _detect_motion_artifact(data, native_sr)
+        result["motion_detect"] = data.copy()
+    else:
+        result["motion_detect"] = data.copy()
 
-    # 통계 표시
-    stats = f"mean={np.nanmean(seg):.1f}, std={np.nanstd(seg):.1f}, min={np.nanmin(seg):.1f}, max={np.nanmax(seg):.1f}"
-    ax.text(0.01, 0.95, stats, transform=ax.transAxes, fontsize=7,
-            va="top", ha="left", bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5))
+    # Step 3: NaN-free segments
+    min_samples = int(60.0 * native_sr)
+    segments = _extract_nan_free_segments(data, min_samples)
+    if not segments:
+        result["error"] = "No valid segments (all NaN)"
+        return result
 
+    segment = max(segments, key=len)
+    result["longest_segment"] = segment.copy()
+    result["n_segments"] = len(segments)
+    result["segment_duration_s"] = len(segment) / native_sr
+
+    # Step 4: Median → Notch → Filter
+    if cfg.median_kernel > 0:
+        segment = _apply_median_filter(segment, kernel_size=cfg.median_kernel)
+    if cfg.notch_freq is not None:
+        segment = _apply_notch_filter(segment, freq=cfg.notch_freq, sr=native_sr)
+    filtered = _apply_filter(segment, cfg, native_sr)
+    result["filtered"] = filtered.copy()
+
+    # Step 5: Resample to 100Hz
+    if native_sr != TARGET_SR:
+        resampled = resample_to_target(filtered, orig_sr=native_sr, target_sr=TARGET_SR)
+    else:
+        resampled = filtered
+    result["resampled"] = resampled.copy()
+
+    # Step 6: Quality check (5초 윈도우)
+    qc_window_s = cfg.quality_window_s
+    qc_window = int(qc_window_s * TARGET_SR)
+    qc_results = []
+    for start in range(0, len(resampled) - qc_window + 1, qc_window):
+        win = resampled[start:start + qc_window]
+        basic = segment_quality_score(
+            win,
+            max_flatline_ratio=cfg.max_flatline_ratio,
+            max_clip_ratio=cfg.max_clip_ratio,
+            max_high_freq_ratio=cfg.max_high_freq_ratio,
+            min_amplitude=cfg.min_amplitude,
+            max_amplitude=cfg.max_amplitude,
+            min_high_freq_ratio=cfg.min_high_freq_ratio,
+        )
+        if basic["pass"]:
+            domain = domain_quality_check(stype_key, win, sr=TARGET_SR)
+            passed = domain["pass"]
+            qc_results.append({"start": start, "basic": basic, "domain": domain, "pass": passed})
+        else:
+            qc_results.append({"start": start, "basic": basic, "domain": {}, "pass": False})
+
+    result["qc_results"] = qc_results
+    n_pass = sum(1 for q in qc_results if q["pass"])
+    n_total = len(qc_results)
+    result["qc_pass_ratio"] = n_pass / n_total if n_total > 0 else 0
+    result["qc_summary"] = f"{n_pass}/{n_total} windows passed ({result['qc_pass_ratio']:.0%})"
+
+    return result
+
+
+def plot_pipeline(result: dict, title: str, out_path: str, show_seconds: float = 30.0) -> None:
+    """전처리 파이프라인 단계별 시각화."""
+    if "error" in result:
+        print(f"  SKIP: {result['error']}")
+        return
+
+    stype = result["stype"]
+    native_sr = result["native_sr"]
+
+    fig, axes = plt.subplots(4, 1, figsize=(16, 12), sharex=False)
+
+    # Row 0: Raw signal
+    raw = result["raw"]
+    n_show_raw = min(len(raw), int(show_seconds * native_sr))
+    valid = ~np.isnan(raw)
+    starts = np.where(valid)[0]
+    if len(starts) > 0:
+        s0 = starts[0]
+        seg = np.nan_to_num(raw[s0:s0 + n_show_raw], nan=0.0)
+        t = np.arange(len(seg)) / native_sr
+        axes[0].plot(t, seg, linewidth=0.5, color="steelblue")
+        stats = f"mean={np.nanmean(seg):.1f} | std={np.nanstd(seg):.1f} | range=[{np.nanmin(seg):.1f}, {np.nanmax(seg):.1f}]"
+        axes[0].set_title(f"① Raw ({native_sr:.0f}Hz) — {stats}", fontsize=9)
+        axes[0].text(0.01, 0.92, f"range_removed={result['range_removed']} | spikes={result['spike_count']}",
+                     transform=axes[0].transAxes, fontsize=7, va="top",
+                     bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5))
+
+    # Row 1: Filtered (at native SR)
+    filtered = result["filtered"]
+    n_show_filt = min(len(filtered), int(show_seconds * native_sr))
+    seg_f = filtered[:n_show_filt]
+    t_f = np.arange(len(seg_f)) / native_sr
+    axes[1].plot(t_f, seg_f, linewidth=0.5, color="darkorange")
+    cfg = SIGNAL_CONFIGS[stype]
+    filter_info = f"{cfg.filter_type} {cfg.filter_freq}"
+    if cfg.notch_freq:
+        filter_info += f" | notch={cfg.notch_freq}Hz"
+    if cfg.median_kernel > 0:
+        filter_info += f" | median_k={cfg.median_kernel}"
+    stats_f = f"mean={np.mean(seg_f):.1f} | std={np.std(seg_f):.1f} | range=[{np.min(seg_f):.1f}, {np.max(seg_f):.1f}]"
+    axes[1].set_title(f"② Filtered — {filter_info} — {stats_f}", fontsize=9)
+
+    # Row 2: Resampled (100Hz)
+    resampled = result["resampled"]
+    n_show_resamp = min(len(resampled), int(show_seconds * TARGET_SR))
+    seg_r = resampled[:n_show_resamp]
+    t_r = np.arange(len(seg_r)) / TARGET_SR
+    axes[2].plot(t_r, seg_r, linewidth=0.5, color="seagreen")
+    axes[2].set_title(f"③ Resampled ({TARGET_SR:.0f}Hz) — {len(resampled)/TARGET_SR:.0f}s total", fontsize=9)
+
+    # Row 3: QC results overlay
+    qc_results = result["qc_results"]
+    qc_window = int(cfg.quality_window_s * TARGET_SR)
+    axes[3].plot(t_r, seg_r, linewidth=0.5, color="gray", alpha=0.5)
+
+    for qc in qc_results:
+        start = qc["start"]
+        end = start + qc_window
+        if start >= n_show_resamp:
+            continue
+        t_start = start / TARGET_SR
+        t_end = min(end, n_show_resamp) / TARGET_SR
+        color = "#2ecc71" if qc["pass"] else "#e74c3c"
+        alpha = 0.2 if qc["pass"] else 0.3
+        axes[3].axvspan(t_start, t_end, alpha=alpha, color=color)
+
+    legend_elements = [
+        Patch(facecolor="#2ecc71", alpha=0.3, label="QC Pass"),
+        Patch(facecolor="#e74c3c", alpha=0.3, label="QC Fail"),
+    ]
+    axes[3].legend(handles=legend_elements, loc="upper right", fontsize=7)
+    axes[3].set_title(f"④ QC Results — {result['qc_summary']}", fontsize=9)
+    axes[3].set_xlabel("Time (s)")
+
+    for ax in axes:
+        ax.tick_params(labelsize=7)
+
+    plt.suptitle(title, fontsize=11, y=1.01)
     plt.tight_layout()
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved: {out_path}")
 
 
-def search_and_plot_signal(vital_files: list[Path], target_track: str,
-                           out_dir: str, max_plots: int = 5, sr: float = 500.0) -> None:
-    """target_track이 있는 파일을 찾아 시각화한다."""
+def search_and_visualize(vital_files: list[Path], target_signal: str,
+                          out_dir: str, max_plots: int = 5) -> None:
+    """target_signal을 찾아 전처리 파이프라인 시각화."""
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
+
+    target_track = f"SNUADCM/{target_signal}"
+
+    # TRACK_MAP에서 stype_key 확인
+    track_info = TRACK_MAP.get(target_track)
+    if track_info is None:
+        print(f"WARNING: {target_track} not in TRACK_MAP. 탐색은 진행하지만 전처리 설정이 없을 수 있습니다.")
+        stype_key = target_signal.lower()
+    else:
+        stype_key = track_info[0]
+
+    native_sr = NATIVE_SR.get(stype_key, 500.0)
 
     found = 0
     for i, vf in enumerate(vital_files):
@@ -128,30 +286,32 @@ def search_and_plot_signal(vital_files: list[Path], target_track: str,
         except Exception:
             continue
 
-        matching = [t for t in tracks if target_track in t]
-        if not matching:
+        if target_track not in tracks:
             continue
 
-        for track_name in matching:
-            arr = load_track(vf, track_name, sr)
-            if arr is None:
-                continue
+        print(f"[{i+1}] {vf.name} — {target_track} found")
 
-            found += 1
-            title = f"{vf.name} — {track_name} ({len(arr)/sr:.0f}s)"
-            fname = f"{target_track}_{found:02d}_{vf.stem}.png"
-            plot_signal(arr, sr, title, str(out_path / fname))
+        arr = load_track_raw(vf, target_track, native_sr)
+        if arr is None:
+            print(f"  SKIP: insufficient valid data")
+            continue
 
-            if found >= max_plots:
-                print(f"\n{target_track}: {found}개 시각화 완료")
-                return
+        result = apply_pipeline_steps(arr, stype_key, native_sr)
 
-    print(f"\n{target_track}: {found}개 찾음 (탐색 {len(vital_files)}개 파일)")
+        found += 1
+        title = f"{vf.name} — {target_track} ({stype_key.upper()})"
+        fname = f"{target_signal}_{found:02d}_{vf.stem}.png"
+        plot_pipeline(result, title, str(out_path / fname))
+
+        if found >= max_plots:
+            break
+
+    print(f"\n{target_signal}: {found}개 시각화 완료")
 
 
-def search_and_plot_all_snuadcm(vital_files: list[Path], out_dir: str,
-                                 max_files: int = 3, sr: float = 500.0) -> None:
-    """SNUADCM 트랙이 있는 파일에서 모든 트랙을 시각화한다."""
+def visualize_all_tracks(vital_files: list[Path], out_dir: str,
+                          max_files: int = 3) -> None:
+    """SNUADCM 전체 트랙을 파일별로 시각화."""
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
@@ -166,47 +326,28 @@ def search_and_plot_all_snuadcm(vital_files: list[Path], out_dir: str,
         if not snuadcm_tracks:
             continue
 
-        print(f"\n[{vf.name}] — {len(snuadcm_tracks)} SNUADCM tracks")
+        print(f"\n[{vf.name}] — {len(snuadcm_tracks)} SNUADCM tracks: {snuadcm_tracks}")
 
-        fig, axes = plt.subplots(len(snuadcm_tracks), 1,
-                                  figsize=(14, 2.5 * len(snuadcm_tracks)), squeeze=False)
+        for track_name in snuadcm_tracks:
+            track_info = TRACK_MAP.get(track_name)
+            if track_info is None:
+                print(f"  {track_name}: not in TRACK_MAP, skipping")
+                continue
 
-        for j, track_name in enumerate(snuadcm_tracks):
-            ax = axes[j, 0]
-            arr = load_track(vf, track_name, sr)
+            stype_key = track_info[0]
+            native_sr = NATIVE_SR.get(stype_key, 500.0)
+
+            arr = load_track_raw(vf, track_name, native_sr)
             if arr is None:
-                ax.set_title(f"{track_name} — NO DATA", fontsize=9)
-                ax.axis("off")
+                print(f"  {track_name}: no valid data")
                 continue
 
-            # 30초만 표시
-            n_show = min(len(arr), int(30 * sr))
-            valid = ~np.isnan(arr)
-            starts = np.where(valid)[0]
-            if len(starts) == 0:
-                ax.set_title(f"{track_name} — ALL NaN", fontsize=9)
-                ax.axis("off")
-                continue
+            result = apply_pipeline_steps(arr, stype_key, native_sr)
 
-            seg_start = starts[0]
-            seg = arr[seg_start:seg_start + n_show]
-            seg = np.nan_to_num(seg, nan=0.0)
-            t = np.arange(len(seg)) / sr
-
-            ax.plot(t, seg, linewidth=0.5, color="steelblue")
-            stats = f"mean={np.nanmean(seg):.1f}, std={np.nanstd(seg):.1f}, range=[{np.nanmin(seg):.1f}, {np.nanmax(seg):.1f}]"
-            ax.set_title(f"{track_name} — {stats}", fontsize=9)
-            ax.set_ylabel("Amp", fontsize=8)
-            ax.tick_params(labelsize=7)
-
-        axes[-1, 0].set_xlabel("Time (s)", fontsize=8)
-        plt.suptitle(vf.name, fontsize=11)
-        plt.tight_layout()
-
-        fname = f"all_tracks_{plotted:02d}_{vf.stem}.png"
-        fig.savefig(str(out_path / fname), dpi=150, bbox_inches="tight")
-        plt.close(fig)
-        print(f"  Saved: {fname}")
+            signal_name = track_name.split("/")[-1]
+            title = f"{vf.name} — {track_name} ({stype_key.upper()})"
+            fname = f"all_{plotted:02d}_{vf.stem}_{signal_name}.png"
+            plot_pipeline(result, title, str(out_path / fname))
 
         plotted += 1
         if plotted >= max_files:
@@ -216,13 +357,13 @@ def search_and_plot_all_snuadcm(vital_files: list[Path], out_dir: str,
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="K-MIMIC 신호 탐색/시각화")
+    parser = argparse.ArgumentParser(description="K-MIMIC 신호 탐색/전처리 파이프라인 시각화")
     parser.add_argument("--raw", required=True, help="K-MIMIC .vital 디렉토리")
     parser.add_argument("--signal", type=str, default=None,
                         help="탐색할 신호 (PAP, ICP, ECG_II, ART, PLETH, CVP)")
     parser.add_argument("--all-tracks", action="store_true",
                         help="SNUADCM 전체 트랙 시각화")
-    parser.add_argument("--n-search", type=int, default=50,
+    parser.add_argument("--n-search", type=int, default=100,
                         help="탐색할 파일 수")
     parser.add_argument("--max-plots", type=int, default=5,
                         help="최대 시각화 수")
@@ -233,10 +374,9 @@ def main() -> None:
     vital_files = find_vital_files(args.raw, args.n_search)
 
     if args.all_tracks:
-        search_and_plot_all_snuadcm(vital_files, args.out_dir, max_files=args.max_plots)
+        visualize_all_tracks(vital_files, args.out_dir, max_files=args.max_plots)
     elif args.signal:
-        target = f"SNUADCM/{args.signal}"
-        search_and_plot_signal(vital_files, target, args.out_dir, args.max_plots)
+        search_and_visualize(vital_files, args.signal, args.out_dir, args.max_plots)
     else:
         print("--signal 또는 --all-tracks를 지정하세요")
 
