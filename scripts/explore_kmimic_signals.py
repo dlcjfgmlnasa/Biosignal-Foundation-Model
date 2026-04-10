@@ -105,9 +105,9 @@ def apply_pipeline_steps(raw: np.ndarray, stype_key: str, native_sr: float) -> d
 
     # Step 2: Spike detection
     if cfg.spike_detection:
-        data, spike_mask = _detect_electrocautery(data, native_sr, threshold_std=cfg.spike_threshold_std)
+        data, n_spikes = _detect_electrocautery(data, native_sr, threshold_std=cfg.spike_threshold_std)
         result["spike_detect"] = data.copy()
-        result["spike_count"] = int(spike_mask.sum()) if spike_mask is not None else 0
+        result["spike_count"] = int(n_spikes)
     else:
         result["spike_detect"] = data.copy()
         result["spike_count"] = 0
