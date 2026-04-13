@@ -40,7 +40,7 @@ class TrainConfig:
     model_config: ModelConfig = field(default_factory=ModelConfig)
 
     # 데이터
-    data_dir: str = "datasets/processed"
+    data_dir: str | list[str] = "datasets/processed"
     signal_types: list[int] = field(default_factory=lambda: [0, 1, 2, 3, 4, 5, 6])
     max_subjects: int | None = None
     window_seconds: float = 30.0
@@ -157,13 +157,22 @@ class TrainConfig:
 
 
 def load_manifest_from_processed(
-    data_dir: str | Path,
+    data_dir: str | Path | list[str | Path],
     signal_types: list[int] | None = None,
     max_subjects: int | None = None,
 ) -> list[RecordingManifest]:
-    """processed 디렉토리에서 manifest.json을 읽어 RecordingManifest 목록을 반환한다."""
-    data_dir = Path(data_dir)
-    manifest_files = sorted(data_dir.glob("*/manifest.json"))
+    """processed 디렉토리에서 manifest.json을 읽어 RecordingManifest 목록을 반환한다.
+
+    ``data_dir``이 리스트이면 여러 디렉토리의 manifest를 합산한다.
+    """
+    if isinstance(data_dir, (str, Path)):
+        data_dirs = [Path(data_dir)]
+    else:
+        data_dirs = [Path(d) for d in data_dir]
+
+    manifest_files: list[Path] = []
+    for d in data_dirs:
+        manifest_files.extend(sorted(d.glob("*/manifest.json")))
     if max_subjects is not None:
         manifest_files = manifest_files[:max_subjects]
 
