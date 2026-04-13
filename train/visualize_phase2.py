@@ -17,6 +17,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
 from data.collate import PackedBatch
+from data.spatial_map import CROSS_PRED_ALLOWED_PAIRS
 from model import BiosignalFoundationModel
 
 
@@ -168,10 +169,14 @@ def save_cross_modal_figure(
         empty = output_dir / f"cross_modal_epoch{epoch:03d}.png"
         return empty
 
-    # 그룹별 분리: Cardiovascular / Respiratory
+    # whitelist 쌍만 필터 + 그룹별 분리
+    allowed = {(min(a, b), max(a, b)) for a, b in CROSS_PRED_ALLOWED_PAIRS}
     cardio_pairs = []
     resp_pairs = []
     for p in all_pairs:
+        tp = (min(p["sig_type_a"], p["sig_type_b"]), max(p["sig_type_a"], p["sig_type_b"]))
+        if tp not in allowed:
+            continue
         group_a = MECHANISM_GROUP.get(p["sig_type_a"], -1)
         group_b = MECHANISM_GROUP.get(p["sig_type_b"], -1)
         if group_a == 0 and group_b == 0:
