@@ -302,9 +302,10 @@ def train_one_epoch(
         batch.variate_id = batch.variate_id.to(device)
 
         # ── Forward (single call: task="both" for DDP compatibility) ──
+        # DDP: 모든 rank가 동일한 horizon을 사용해야 gradient sync 일치
         h = 1
         if enable_next:
-            h = random.randint(1, get_max_horizon(config, epoch))
+            h = (n_batches % get_max_horizon(config, epoch)) + 1
 
         with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
             raw_model = model.module if isinstance(model, DDP) else model

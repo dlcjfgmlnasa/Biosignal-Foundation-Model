@@ -377,8 +377,7 @@ def main():
         collate_mode=config.collate_mode,
         patch_size=config.model_config.patch_size,
     )
-    # DDP: DistributedSampler는 create_dataloader 내부에서 자동 생성
-    sampler = getattr(dataloader, "sampler", None)
+    sampler = None  # any_variate 모드: GroupedBatchSampler가 셔플 담당
     if rank0:
         print(f"Train batches per epoch: {len(dataloader)}")
 
