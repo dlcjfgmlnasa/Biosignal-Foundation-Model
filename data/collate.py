@@ -94,8 +94,11 @@ class PackCollate:
         collate_mode: str = "any_variate",
         patch_size: int | None = None,
         stride: int | None = None,
+        slot_size: int = 60000,
     ) -> None:
         self.patch_size = patch_size
+        # cross-modal 그루핑 슬롯 크기 (같은 슬롯 = 같은 sample_id)
+        self._slot_size = slot_size
 
         if patch_size is not None:
             self.stride = stride if stride is not None else patch_size
@@ -116,8 +119,11 @@ class PackCollate:
             if self.collate_mode == "ci":
                 key = (i,)  # 고유 키 → 채널 간 그루핑 없음
             elif s.session_id:
-                # session_id로 그루핑 — sampler가 시간 overlap 보장
-                key = (s.session_id,)
+                # session_id + 시간 슬롯으로 그루핑
+                # 같은 슬롯 내 다른 signal type → 같은 sample_id → cross-modal pair
+                abs_sample = s.start_sample + s.win_start
+                slot = abs_sample // self._slot_size
+                key = (s.session_id, slot)
             else:
                 key = (s.recording_idx, s.win_start)
             groups[key].append(s)

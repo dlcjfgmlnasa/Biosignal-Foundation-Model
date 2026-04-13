@@ -24,11 +24,15 @@ def create_dataloader(
     sampler: Sampler | None = None,
 ) -> DataLoader:
     """PackCollate가 적용된 DataLoader를 생성한다."""
+    # slot_size: cross-modal 그루핑 단위 (같은 슬롯 = 같은 sample_id)
+    slot_size = max_length // 2 if collate_mode == "any_variate" else max_length
+
     collate_fn = PackCollate(
         max_length=max_length,
         collate_mode=collate_mode,
         patch_size=patch_size,
         stride=stride,
+        slot_size=slot_size,
     )
 
     # any_variate 모드: GroupedBatchSampler로 같은 (session, time) 채널들을 같은 배치에 넣기
@@ -37,6 +41,10 @@ def create_dataloader(
 
         rank = dist.get_rank() if dist.is_initialized() else 0
         world_size = dist.get_world_size() if dist.is_initialized() else 1
+        # slot_size: 같은 시간 슬롯의 다른 signal type을 같은 배치에
+        # window_seconds * sr 가 이상적이지만, 여기서는 max_length/2 사용
+        # (max_length에 ~2개 variate 수용 가능하도록)
+        slot_size = max_length // 2
         batch_sampler = GroupedBatchSampler(
             dataset=dataset,
             batch_size=batch_size,
@@ -44,7 +52,7 @@ def create_dataloader(
             drop_last=drop_last,
             rank=rank,
             world_size=world_size,
-            max_length=max_length,
+            slot_size=slot_size,
         )
         return DataLoader(
             dataset,

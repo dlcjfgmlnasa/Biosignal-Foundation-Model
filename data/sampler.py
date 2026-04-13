@@ -16,7 +16,6 @@ import bisect
 import math
 from collections import defaultdict
 from collections.abc import Iterator
-from dataclasses import dataclass
 
 import torch
 from torch.utils.data import Sampler
@@ -161,34 +160,23 @@ class GroupedBatchSampler(Sampler[list[int]]):
         generator: torch.Generator | None = None,
         rank: int = 0,
         world_size: int = 1,
-        max_length: int = 60000,
+        slot_size: int = 60000,
     ) -> None:
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.drop_last = drop_last
         self.rank = rank
         self.world_size = world_size
-        self.max_length = max_length
+        self.slot_size = slot_size
         self.epoch = 0
         # DDP: 모든 rank가 동일한 셔플 순서를 사용하도록 고정 시드 generator
         self.generator = generator or torch.Generator()
         self.generator.manual_seed(42)
 
-        # 그룹 빌딩: 실제 시간 overlap 기반
-        # 같은 session_id 내에서 시간이 겹치는 윈도우들을 하나의 그룹으로 묶는다.
-        # → cross-modal pair가 보장되는 그룹만 생성
-
-        # 1단계: 모든 윈도우의 절대 시간 범위 수집
-        @dataclass
-        class _WindowInfo:
-            idx: int
-            rec_idx: int
-            session_id: str
-            signal_type: int
-            abs_start: int
-            abs_end: int
-
-        windows_by_session: dict[str, list[_WindowInfo]] = defaultdict(list)
+        # 그룹 빌딩: (session_id, time_slot) 기반
+        # collate와 동일한 키 → 같은 그룹이 같은 배치 + 같은 sample_id
+        groups: dict[tuple, list[int]] = defaultdict(list)
+        group_to_rec: dict[tuple, int] = {}
 
         for idx in range(len(dataset)):
             rec_idx = (
@@ -204,65 +192,20 @@ class GroupedBatchSampler(Sampler[list[int]]):
             win_start = win_idx * stride
 
             entry = dataset._manifest[rec_idx]
-            if not entry.session_id:
-                # session_id 없으면 독립 그룹
-                windows_by_session[f"__norec_{idx}"].append(
-                    _WindowInfo(idx, rec_idx, "", entry.signal_type, 0, 0)
-                )
-                continue
 
-            abs_start = entry.start_sample + win_start
-            win_len = dataset._window_lengths_per_rec[rec_idx]
-            if win_len is None:
-                win_len = entry.n_timesteps
-            abs_end = abs_start + min(win_len, entry.n_timesteps - win_start)
+            if entry.session_id:
+                abs_sample = entry.start_sample + win_start
+                slot = abs_sample // slot_size
+                key = (entry.session_id, slot)
+            else:
+                key = (rec_idx, win_start)
 
-            windows_by_session[entry.session_id].append(
-                _WindowInfo(idx, rec_idx, entry.session_id, entry.signal_type, abs_start, abs_end)
-            )
-
-        # 2단계: 세션별로 시간 overlap 그룹 생성
-        groups: dict[int, list[int]] = {}  # group_id → [flat_idx_list]
-        group_to_rec: dict[int, int] = {}
-        group_counter = 0
-
-        for session_id, wins in windows_by_session.items():
-            if not wins[0].session_id:
-                # session_id 없는 독립 윈도우
-                for w in wins:
-                    groups[group_counter] = [w.idx]
-                    group_to_rec[group_counter] = w.rec_idx
-                    group_counter += 1
-                continue
-
-            # abs_start 기준 정렬
-            wins.sort(key=lambda w: w.abs_start)
-
-            # sweep line: 시간이 겹치는 윈도우를 그룹으로 묶기
-            # group_max_end = 그룹 내 가장 늦게 끝나는 윈도우의 abs_end
-            # → 어떤 윈도우라도 새 윈도우와 겹치면 그룹 유지
-            current_group: list[_WindowInfo] = []
-            group_max_end = 0
-
-            for w in wins:
-                if current_group and w.abs_start >= group_max_end:
-                    # 어떤 기존 윈도우와도 겹치지 않음 → 그룹 확정
-                    groups[group_counter] = [cw.idx for cw in current_group]
-                    group_to_rec[group_counter] = current_group[0].rec_idx
-                    group_counter += 1
-                    current_group = []
-                    group_max_end = 0
-
-                current_group.append(w)
-                group_max_end = max(group_max_end, w.abs_end)
-
-            if current_group:
-                groups[group_counter] = [cw.idx for cw in current_group]
-                group_to_rec[group_counter] = current_group[0].rec_idx
-                group_counter += 1
+            groups[key].append(idx)
+            group_to_rec[key] = rec_idx
 
         self._groups: list[list[int]] = list(groups.values())
-        self._group_rec_ids: list[int] = [group_to_rec[k] for k in groups.keys()]
+        keys = list(groups.keys())
+        self._group_rec_ids: list[int] = [group_to_rec[k] for k in keys]
 
     def set_epoch(self, epoch: int) -> None:
         """에폭마다 셔플 시드를 변경한다. DDP에서 모든 rank가 동일 호출 필수."""
