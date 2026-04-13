@@ -44,6 +44,7 @@ def create_dataloader(
             drop_last=drop_last,
             rank=rank,
             world_size=world_size,
+            max_length=max_length,
         )
         return DataLoader(
             dataset,

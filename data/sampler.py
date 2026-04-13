@@ -160,12 +160,14 @@ class GroupedBatchSampler(Sampler[list[int]]):
         generator: torch.Generator | None = None,
         rank: int = 0,
         world_size: int = 1,
+        max_length: int = 60000,
     ) -> None:
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.drop_last = drop_last
         self.rank = rank
         self.world_size = world_size
+        self.max_length = max_length
         self.epoch = 0
         # DDP: 모든 rank가 동일한 셔플 순서를 사용하도록 고정 시드 generator
         self.generator = generator or torch.Generator()
@@ -196,8 +198,7 @@ class GroupedBatchSampler(Sampler[list[int]]):
             # 키 생성 (collate.py와 정확히 동일 — 윈도우 크기 단위 버킷팅)
             if entry.session_id:
                 abs_sample = entry.start_sample + win_start
-                bucket_size = dataset.max_length or 60000
-                bucket = abs_sample // bucket_size
+                bucket = abs_sample // max_length
                 key = (entry.session_id, bucket)
             else:
                 key = (rec_idx, win_start)
