@@ -263,10 +263,8 @@ class BiosignalFoundationModel(nn.Module):
             ):
                 patch_start = batch.start_samples.to(device)[global_var_idx]  # (B, N)
                 abs_time = patch_start + time_id * self.patch_size  # (B, N)
-                # 절대 시간을 coarse bin으로 양자화 (10초 = 1000 samples)
-                # 같은 물리적 시간대의 다른 signal type 패치가 같은 bin에 들어감
-                cross_modal_bin = 1000  # 10초 단위 (100Hz × 10s)
-                abs_time_id = abs_time // cross_modal_bin  # (B, N)
+                # patch_size 단위로 양자화 — 같은 물리적 시간의 패치가 정확히 매칭
+                abs_time_id = abs_time // self.patch_size  # (B, N)
                 abs_time_id[~patch_mask] = 0
 
         # 4. Projection (linear 또는 CNN stem)
