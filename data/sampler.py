@@ -239,25 +239,22 @@ class GroupedBatchSampler(Sampler[list[int]]):
             wins.sort(key=lambda w: w.abs_start)
 
             # sweep line: 시간이 겹치는 윈도우를 그룹으로 묶기
-            # 현재 그룹의 공통 overlap 범위를 추적
+            # group_max_end = 그룹 내 가장 늦게 끝나는 윈도우의 abs_end
+            # → 어떤 윈도우라도 새 윈도우와 겹치면 그룹 유지
             current_group: list[_WindowInfo] = []
-            group_end = 0  # 현재 그룹의 최소 abs_end (overlap 범위)
+            group_max_end = 0
 
             for w in wins:
-                if current_group and w.abs_start >= group_end:
-                    # 현재 윈도우가 그룹과 겹치지 않음 → 그룹 확정
+                if current_group and w.abs_start >= group_max_end:
+                    # 어떤 기존 윈도우와도 겹치지 않음 → 그룹 확정
                     groups[group_counter] = [cw.idx for cw in current_group]
                     group_to_rec[group_counter] = current_group[0].rec_idx
                     group_counter += 1
                     current_group = []
-                    group_end = 0
+                    group_max_end = 0
 
                 current_group.append(w)
-                if group_end == 0:
-                    group_end = w.abs_end
-                else:
-                    # overlap 범위 = 가장 빨리 끝나는 윈도우
-                    group_end = min(group_end, w.abs_end)
+                group_max_end = max(group_max_end, w.abs_end)
 
             if current_group:
                 groups[group_counter] = [cw.idx for cw in current_group]
