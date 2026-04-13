@@ -252,14 +252,21 @@ class BiosignalFoundationModel(nn.Module):
 
             # 절대 시간 기반 abs_time_id 계산 (cross-modal 매칭 전용)
             # time_id(상대적)는 RoPE용으로 유지, abs_time_id는 cross-modal loss용
-            abs_time_id = time_id  # fallback: start_samples 없으면 상대적 time_id 사용
+            #
+            # 같은 sample_id 내에서 절대 시간의 최소값을 빼서
+            # 버킷 내 상대 offset으로 변환 → patch_size 단위 양자화.
+            # → 같은 물리적 시간대의 다른 variate 패치가 동일 abs_time_id를 가짐.
+            abs_time_id = time_id  # fallback
             if (
                 hasattr(batch, "start_samples")
                 and batch.start_samples is not None
             ):
                 patch_start = batch.start_samples.to(device)[global_var_idx]  # (B, N)
                 abs_time = patch_start + time_id * self.patch_size  # (B, N)
-                abs_time_id = abs_time // self.patch_size  # (B, N)
+                # 절대 시간을 coarse bin으로 양자화 (10초 = 1000 samples)
+                # 같은 물리적 시간대의 다른 signal type 패치가 같은 bin에 들어감
+                cross_modal_bin = 1000  # 10초 단위 (100Hz × 10s)
+                abs_time_id = abs_time // cross_modal_bin  # (B, N)
                 abs_time_id[~patch_mask] = 0
 
         # 4. Projection (linear 또는 CNN stem)
