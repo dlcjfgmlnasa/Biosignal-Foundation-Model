@@ -186,11 +186,12 @@ class GroupedBatchSampler(Sampler[list[int]]):
 
             entry = dataset._manifest[rec_idx]
 
-            # 키 생성 (collate.py와 정확히 동일)
+            # 키 생성 (collate.py와 정확히 동일 — 윈도우 크기 단위 버킷팅)
             if entry.session_id:
                 abs_sample = entry.start_sample + win_start
-                physical_time_ms = round(abs_sample / entry.sampling_rate * 1000)
-                key = (entry.session_id, physical_time_ms)
+                bucket_size = dataset.max_length or 60000
+                bucket = abs_sample // bucket_size
+                key = (entry.session_id, bucket)
             else:
                 key = (rec_idx, win_start)
 

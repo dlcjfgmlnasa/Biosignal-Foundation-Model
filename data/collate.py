@@ -115,8 +115,9 @@ class PackCollate:
                 key = (i,)  # 고유 키 → 채널 간 그루핑 없음
             elif s.session_id:
                 abs_sample = s.start_sample + s.win_start
-                physical_time_ms = round(abs_sample / s.sampling_rate * 1000)
-                key = (s.session_id, physical_time_ms)
+                # 윈도우 크기 단위로 버킷팅 — 같은 시간대의 다른 signal type이 묶임
+                bucket = abs_sample // self.max_length
+                key = (s.session_id, bucket)
             else:
                 key = (s.recording_idx, s.win_start)
             groups[key].append(s)
