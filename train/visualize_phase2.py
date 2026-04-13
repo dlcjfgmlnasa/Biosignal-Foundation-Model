@@ -160,20 +160,30 @@ def save_cross_modal_figure(
                 continue
             seen_type_pairs.add(tp)
             all_pairs.append(p)
-            if len(all_pairs) >= max_pairs:
-                break
-        if len(all_pairs) >= max_pairs:
+        if len(all_pairs) >= max_pairs * 2:
             break
-
-    all_pairs = all_pairs[:max_pairs]
 
     if not all_pairs:
         model.train()
         empty = output_dir / f"cross_modal_epoch{epoch:03d}.png"
         return empty
 
-    path = _plot_cross_modal_grid(
-        all_pairs,
+    # 그룹별 분리: Cardiovascular / Respiratory
+    cardio_pairs = []
+    resp_pairs = []
+    for p in all_pairs:
+        group_a = MECHANISM_GROUP.get(p["sig_type_a"], -1)
+        group_b = MECHANISM_GROUP.get(p["sig_type_b"], -1)
+        if group_a == 0 and group_b == 0:
+            if len(cardio_pairs) < max_pairs:
+                cardio_pairs.append(p)
+        elif group_a == 1 and group_b == 1:
+            if len(resp_pairs) < max_pairs:
+                resp_pairs.append(p)
+
+    path = _plot_cross_modal_grouped(
+        cardio_pairs,
+        resp_pairs,
         epoch,
         output_dir,
         max_duration_s,
@@ -328,27 +338,14 @@ def _extract_cross_modal_pairs(
     return pairs
 
 
-def _plot_cross_modal_grid(
+def _plot_pair_rows(
+    axes,
     pairs: list[dict],
-    epoch: int,
-    output_dir: Path,
+    row_offset: int,
     max_duration_s: float,
     sampling_rate: float,
-) -> Path:
-    """Cross-modal 쌍을 시각화한다.
-
-    각 쌍마다 2행: 상단=원본A vs cross_pred(B→A), 하단=원본B vs cross_pred(A→B).
-    원본 전체 파형 위에 cross-modal 예측 전체를 겹쳐 그린다.
-    """
-    n_pairs = len(pairs)
-    n_rows = n_pairs * 2  # 각 쌍마다 2행 (variate A, B)
-    fig, axes = plt.subplots(
-        n_rows,
-        1,
-        figsize=(14, 3 * n_rows),
-        squeeze=False,
-    )
-
+) -> None:
+    """Cross-modal 쌍을 axes에 그린다. 각 쌍마다 2행."""
     for pi, pair in enumerate(pairs):
         p = pair["orig_a"].shape[1]  # patch_size
         max_patches = max(1, int(max_duration_s * sampling_rate / p))
@@ -380,7 +377,7 @@ def _plot_cross_modal_grid(
                 ),
             ]
         ):
-            row_idx = pi * 2 + sub_row
+            row_idx = row_offset + pi * 2 + sub_row
             ax = axes[row_idx, 0]
             orig = pair[key_orig]
             cross = pair[key_cross]
@@ -420,7 +417,7 @@ def _plot_cross_modal_grid(
 
             if sub_row == 0:
                 ax.set_title(
-                    f"{pair['sig_name_a']} ↔ {pair['sig_name_b']}  |  "
+                    f"{pair['sig_name_a']} \u2194 {pair['sig_name_b']}  |  "
                     f"MSE={mse:.4f}  r={corr:.3f}  |  {duration:.0f}s",
                     fontsize=10,
                     loc="left",
@@ -434,10 +431,107 @@ def _plot_cross_modal_grid(
                 )
                 ax.set_xlabel("Time (s)", fontsize=9)
 
-    fig.suptitle(f"Cross-Modal Prediction — Epoch {epoch}", fontsize=13, y=1.01)
+
+def _plot_cross_modal_grouped(
+    cardio_pairs: list[dict],
+    resp_pairs: list[dict],
+    epoch: int,
+    output_dir: Path,
+    max_duration_s: float,
+    sampling_rate: float,
+) -> Path:
+    """Cardiovascular / Respiratory 그룹별로 분리하여 시각화한다.
+
+    상단: Cardiovascular 그룹 (ECG, ABP, PPG, CVP, PAP, ICP)
+    하단: Respiratory 그룹 (CO2, AWP)
+    각 쌍마다 2행 (variate A, variate B).
+    """
+    n_cardio_rows = len(cardio_pairs) * 2
+    n_resp_rows = len(resp_pairs) * 2
+    # 그룹 헤더 행 추가 (있는 그룹만)
+    n_sections = (1 if cardio_pairs else 0) + (1 if resp_pairs else 0)
+    n_rows = n_cardio_rows + n_resp_rows + n_sections
+
+    if n_rows == 0:
+        empty = output_dir / f"cross_modal_epoch{epoch:03d}.png"
+        return empty
+
+    fig, axes = plt.subplots(
+        n_rows,
+        1,
+        figsize=(14, 3 * n_rows),
+        squeeze=False,
+        gridspec_kw={"height_ratios": _build_height_ratios(
+            n_cardio_rows, n_resp_rows, cardio_pairs, resp_pairs
+        )},
+    )
+
+    row = 0
+
+    # ── Cardiovascular section ──
+    if cardio_pairs:
+        ax_header = axes[row, 0]
+        ax_header.set_facecolor(MECHANISM_GROUP_COLORS[0] + "15")
+        ax_header.text(
+            0.5, 0.5,
+            "\u2764 Cardiovascular (ECG, ABP, PPG, CVP, PAP, ICP)",
+            transform=ax_header.transAxes,
+            ha="center", va="center",
+            fontsize=12, fontweight="bold",
+            color=MECHANISM_GROUP_COLORS[0],
+        )
+        ax_header.set_xlim(0, 1)
+        ax_header.set_ylim(0, 1)
+        ax_header.axis("off")
+        row += 1
+
+        _plot_pair_rows(axes, cardio_pairs, row, max_duration_s, sampling_rate)
+        row += n_cardio_rows
+
+    # ── Respiratory section ──
+    if resp_pairs:
+        ax_header = axes[row, 0]
+        ax_header.set_facecolor(MECHANISM_GROUP_COLORS[1] + "15")
+        ax_header.text(
+            0.5, 0.5,
+            "\U0001FAC1 Respiratory (CO2, AWP)",
+            transform=ax_header.transAxes,
+            ha="center", va="center",
+            fontsize=12, fontweight="bold",
+            color=MECHANISM_GROUP_COLORS[1],
+        )
+        ax_header.set_xlim(0, 1)
+        ax_header.set_ylim(0, 1)
+        ax_header.axis("off")
+        row += 1
+
+        _plot_pair_rows(axes, resp_pairs, row, max_duration_s, sampling_rate)
+
+    fig.suptitle(
+        f"Cross-Modal Prediction — Epoch {epoch}  "
+        f"[Cardio: {len(cardio_pairs)} pairs, Resp: {len(resp_pairs)} pairs]",
+        fontsize=13, y=1.01,
+    )
     fig.tight_layout()
 
     path = output_dir / f"cross_modal_epoch{epoch:03d}.png"
     fig.savefig(path, dpi=120, bbox_inches="tight")
     plt.close(fig)
     return path
+
+
+def _build_height_ratios(
+    n_cardio_rows: int,
+    n_resp_rows: int,
+    cardio_pairs: list,
+    resp_pairs: list,
+) -> list[float]:
+    """그룹 헤더(작은 높이)와 데이터 행(표준 높이)의 height_ratios."""
+    ratios: list[float] = []
+    if cardio_pairs:
+        ratios.append(0.3)  # 헤더
+        ratios.extend([1.0] * n_cardio_rows)
+    if resp_pairs:
+        ratios.append(0.3)  # 헤더
+        ratios.extend([1.0] * n_resp_rows)
+    return ratios
