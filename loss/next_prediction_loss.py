@@ -9,7 +9,7 @@ Phase 2 (Any-variate): 같은 variate 시간 예측 + cross-modal 예측 (causal
 import torch
 from torch import nn
 
-from data.spatial_map import MECHANISM_GROUP
+from data.spatial_map import CROSS_PRED_ALLOWED_PAIRS, MECHANISM_GROUP
 from loss.masked_mse_loss import compute_patch_loss
 
 
@@ -18,6 +18,12 @@ _MAX_ST = max(MECHANISM_GROUP.keys()) + 1
 _MECH_GROUP_LUT = torch.zeros(_MAX_ST, dtype=torch.long)
 for _st, _mg in MECHANISM_GROUP.items():
     _MECH_GROUP_LUT[_st] = _mg
+
+# Cross-pred 허용 쌍 lookup tensor (양방향)
+_ALLOWED_PAIR_LUT = torch.zeros(_MAX_ST, _MAX_ST, dtype=torch.bool)
+for _a, _b in CROSS_PRED_ALLOWED_PAIRS:
+    _ALLOWED_PAIR_LUT[_a, _b] = True
+    _ALLOWED_PAIR_LUT[_b, _a] = True
 
 
 class NextPredictionLoss(nn.Module):
@@ -51,8 +57,8 @@ class NextPredictionLoss(nn.Module):
     def forward(
         self,
         next_pred: torch.Tensor,  # (B, N, P) — same-variate 예측
-        cross_pred: torch.Tensor
-        | None,  # (B, N, P) — cross-modal 예측 (cross_head 출력)
+        cross_pred_per_type: torch.Tensor
+        | None,  # (B, N, T, P) — per-target-type cross-modal 예측
         original_patches: torch.Tensor,  # (B, N, P)
         patch_mask: torch.Tensor,  # (B, N) bool
         patch_sample_id: torch.Tensor,  # (B, N) long
@@ -83,11 +89,11 @@ class NextPredictionLoss(nn.Module):
         # ── Cross-modal loss ──
         if (
             self.cross_modal_weight > 0
-            and cross_pred is not None
+            and cross_pred_per_type is not None
             and time_id is not None
         ):
             cross_dict = self._cross_modal_loss(
-                cross_pred,
+                cross_pred_per_type,
                 original_patches,
                 patch_mask,
                 patch_sample_id,
@@ -151,7 +157,7 @@ class NextPredictionLoss(nn.Module):
 
     def _cross_modal_loss(
         self,
-        cross_pred: torch.Tensor,  # (B, N, P)
+        cross_pred_per_type: torch.Tensor,  # (B, N, T, P) — per-target-type prediction
         original_patches: torch.Tensor,  # (B, N, P)
         patch_mask: torch.Tensor,  # (B, N) bool
         patch_sample_id: torch.Tensor,  # (B, N) long
@@ -159,14 +165,13 @@ class NextPredictionLoss(nn.Module):
         time_id: torch.Tensor,  # (B, N) long
         patch_signal_types: torch.Tensor | None = None,  # (B, N) long
     ) -> dict[str, torch.Tensor]:
-        """Cross-modal prediction loss.
+        """Cross-modal prediction loss (target-conditioned).
 
         같은 (sample_id, time_id)에서 서로 다른 variate_id를 가진 패치 쌍을 매칭하고,
-        cross_pred[b, i]가 original_patches[b, j]를 예측하도록 MSE를 계산한다.
+        target의 signal type에 해당하는 cross_pred를 선택하여 MSE를 계산한다.
 
-        ``patch_signal_types``가 주어지면, 같은 mechanism group 내의 쌍만
-        매칭한다 (Cardiovascular↔Cardiovascular, Respiratory↔Respiratory).
-        다른 그룹 간 (ECG↔CO2 등)은 차단된다.
+        ``CROSS_PRED_ALLOWED_PAIRS``에 정의된 생리학적으로 타당한 쌍만 허용.
+        (ECG↔ABP, ECG↔PPG, ABP↔PPG, CO2↔AWP)
         """
         # group_key: (batch, sample_id, time_id)가 같은 패치를 그룹핑
         b, n = time_id.shape
@@ -186,22 +191,23 @@ class NextPredictionLoss(nn.Module):
 
         cross_mask = same_group & diff_variate & both_valid & non_pad  # (B, N, N)
 
-        # Mechanism Group 필터: 같은 생리학적 그룹 내에서만 MSE 허용
+        # Allowed Pair 필터: 생리학적으로 타당한 쌍만 허용
         if patch_signal_types is not None:
-            mech_lut = _MECH_GROUP_LUT.to(patch_signal_types.device)
-            mech_group = mech_lut[patch_signal_types]  # (B, N)
-            same_mechanism = mech_group.unsqueeze(-1) == mech_group.unsqueeze(
-                -2
-            )  # (B, N, N)
-            cross_mask = cross_mask & same_mechanism
+            allowed_lut = _ALLOWED_PAIR_LUT.to(patch_signal_types.device)
+            st_i = patch_signal_types.unsqueeze(-1)  # (B, N, 1)
+            st_j = patch_signal_types.unsqueeze(-2)  # (B, 1, N)
+            allowed = allowed_lut[st_i, st_j]  # (B, N, N)
+            cross_mask = cross_mask & allowed
 
         b_idx, i_idx, j_idx = torch.where(cross_mask)
 
         if len(b_idx) == 0:
-            zero = cross_pred.new_tensor(0.0)
+            zero = cross_pred_per_type.new_tensor(0.0)
             return {"mse": zero, "spec": zero, "total": zero}
 
-        pred_p = cross_pred[b_idx, i_idx]  # (K, P)
+        # Target signal type에 맞는 prediction 선택
+        target_st = patch_signal_types[b_idx, j_idx]  # (K,)
+        pred_p = cross_pred_per_type[b_idx, i_idx, target_st]  # (K, P)
         target_p = original_patches[b_idx, j_idx]  # (K, P)
 
         return compute_patch_loss(

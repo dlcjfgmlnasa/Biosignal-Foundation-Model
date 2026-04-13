@@ -92,6 +92,7 @@ class BiosignalFoundationModel(nn.Module):
         super().__init__()
         self.d_model = d_model
         self.patch_size = patch_size
+        self.num_signal_types = num_signal_types
 
         # 1. Scaler (point-level)
         self.scaler = scaler or PackedStdScaler()
@@ -149,6 +150,7 @@ class BiosignalFoundationModel(nn.Module):
 
         # 8. Cross-Modal Prediction Head (다른 variate 예측용)
         self.cross_head = nn.Linear(d_model, patch_size)
+        self.cross_target_embed = nn.Embedding(num_signal_types, d_model)
 
         # 9. Horizon Embedding (random horizon next-patch prediction)
         self.max_horizon = max_horizon
@@ -415,7 +417,12 @@ class BiosignalFoundationModel(nn.Module):
         # ── Masked Reconstruction ──
         if task in ("masked", "both"):
             out_dict["reconstructed"] = self.head(encoded)  # (B, N, patch_size)
-            out_dict["cross_pred"] = self.cross_head(encoded)  # (B, N, patch_size)
+            # Per-target-type cross-modal prediction
+            cross_pred_per_type = torch.stack([
+                self.cross_head(encoded + self.cross_target_embed.weight[st])
+                for st in range(self.num_signal_types)
+            ], dim=2)  # (B, N, num_signal_types, patch_size)
+            out_dict["cross_pred_per_type"] = cross_pred_per_type
             if self.contrastive_proj_dim > 0:
                 out_dict["contrastive_z"] = self.contrastive_proj(
                     encoded

@@ -111,6 +111,28 @@ MECHANISM_GROUP_NAMES: dict[int, str] = {
 }
 
 
+# ── Cross-Pred Allowed Pairs ──────────────────────────────────
+# Cross-Modal MSE reconstruction에서 허용되는 signal type 쌍.
+# 생리학적으로 waveform 복원이 가능한(인과 관계가 있는) 쌍만 포함.
+# Contrastive (InfoNCE)에는 적용되지 않음 (전체 쌍 허용).
+#
+# ECG↔CVP, ECG↔PAP, ECG↔ICP 등은 정보 단절(전기→유체압력)로 제외.
+# CVP/PAP/ICP는 심박 동기화는 되지만, waveform morphology 복원이 불가능.
+
+CROSS_PRED_ALLOWED_PAIRS: set[tuple[int, int]] = {
+    # Arterial-Cardiac (심박 주기 → 압력파 직접 인과)
+    (0, 1),  # ECG ↔ ABP — cardiac cycle, pulse transit time
+    (0, 2),  # ECG ↔ PPG — cardiac cycle, peripheral pulse
+    (1, 2),  # ABP ↔ PPG — arterial pulse wave (거의 동형)
+    # Right Heart / Central Hemodynamics (우심계 혈역학)
+    (3, 6),  # CVP ↔ PAP — 우심방압 ↔ 폐동맥압, 우심실 전후부하 관계
+    # Cerebral Perfusion (뇌관류)
+    (1, 7),  # ABP ↔ ICP — CPP = MAP - ICP, 뇌자동조절 관계
+    # Respiratory (호흡 역학)
+    (4, 5),  # CO2 ↔ AWP — respiratory mechanics
+}
+
+
 # 채널명 → (signal_type, local_spatial_id) 역매핑
 CHANNEL_NAME_TO_SPATIAL: dict[str, tuple[int, int]] = {
     # ECG (0)

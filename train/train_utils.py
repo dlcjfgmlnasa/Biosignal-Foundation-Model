@@ -323,7 +323,7 @@ def train_one_epoch(
             )
 
             reconstructed = out["reconstructed"]  # (B, N, patch_size)
-            cross_pred = out["cross_pred"]  # (B, N, patch_size)
+            cross_pred_per_type = out.get("cross_pred_per_type")  # (B, N, T, P)
             patch_mask = out["patch_mask"]  # (B, N) bool
             time_id = out["time_id"]  # (B, N)
             next_pred = out.get("next_pred")  # (B, N, patch_size) or None
@@ -358,7 +358,7 @@ def train_one_epoch(
                 patch_sample_id=out["patch_sample_id"],
                 patch_variate_id=out["patch_variate_id"],
                 horizon=h,
-                cross_pred=cross_pred if config.gamma > 0 else None,
+                cross_pred_per_type=cross_pred_per_type if config.gamma > 0 else None,
                 time_id=time_id if needs_time_id else None,
                 contrastive_z=contrastive_z if config.delta > 0 else None,
                 patch_signal_types=out.get("patch_signal_types"),
@@ -541,7 +541,7 @@ def validate(
             )
 
             reconstructed = out["reconstructed"]
-            cross_pred = out["cross_pred"]
+            cross_pred_per_type = out.get("cross_pred_per_type")
             patch_mask = out["patch_mask"]
             time_id = out["time_id"]
             next_pred = out.get("next_pred")
@@ -573,7 +573,7 @@ def validate(
                 patch_sample_id=out["patch_sample_id"],
                 patch_variate_id=out["patch_variate_id"],
                 horizon=h,
-                cross_pred=cross_pred if config.gamma > 0 else None,
+                cross_pred_per_type=cross_pred_per_type if config.gamma > 0 else None,
                 time_id=time_id if needs_time_id else None,
                 contrastive_z=contrastive_z if config.delta > 0 else None,
                 patch_signal_types=out.get("patch_signal_types"),

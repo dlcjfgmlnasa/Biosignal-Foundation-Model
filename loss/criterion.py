@@ -73,7 +73,7 @@ class CombinedLoss(nn.Module):
         patch_sample_id: torch.Tensor,  # (B, N) long — 패치별 sample_id
         patch_variate_id: torch.Tensor,  # (B, N) long — 패치별 variate_id
         horizon: int = 1,
-        cross_pred: torch.Tensor | None = None,  # (B, N, patch_size) — cross-modal 예측
+        cross_pred_per_type: torch.Tensor | None = None,  # (B, N, T, patch_size) — per-target-type cross-modal 예측
         time_id: torch.Tensor | None = None,  # (B, N) long — cross-modal 페어링용
         contrastive_z: torch.Tensor
         | None = None,  # (B, N, proj_dim) — contrastive 임베딩
@@ -88,7 +88,7 @@ class CombinedLoss(nn.Module):
         if self.beta > 0 and next_pred is not None:
             next_dict = self.next_loss_fn(
                 next_pred,
-                cross_pred,
+                cross_pred_per_type,
                 original_patches,
                 patch_mask,
                 patch_sample_id,

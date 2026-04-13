@@ -238,7 +238,7 @@ def _extract_cross_modal_pairs(
     p_sid = out["patch_sample_id"]
     p_vid = out["patch_variate_id"]
     time_id = out["time_id"]
-    cross_pred = out["cross_pred"]
+    cross_pred_per_type = out["cross_pred_per_type"]  # (B, N, T, P)
 
     # denorm helpers
     stride = model.patch_embed.stride
@@ -305,18 +305,21 @@ def _extract_cross_modal_pairs(
                     orig_a = original_patches[bi, idx_a].cpu().numpy()
                     orig_b = original_patches[bi, idx_b].cpu().numpy()
 
-                    cp_a = cross_pred[bi, idx_a]
+                    sig_type_a = sig_map.get((bi, sid, vid_a), -1)
+                    sig_type_b = sig_map.get((bi, sid, vid_b), -1)
+
+                    # target-conditioned cross_pred 선택
+                    # cp_a: A 위치에서 B(target)를 예측 → target type = sig_type_b
+                    cp_a = cross_pred_per_type[bi, idx_a, sig_type_b] if sig_type_b >= 0 else cross_pred_per_type[bi, idx_a, 0]
                     loc_a = patch_loc[bi, idx_a].unsqueeze(-1)
                     scl_a = patch_scale[bi, idx_a].unsqueeze(-1)
                     cpred_a = (cp_a * scl_a + loc_a).detach().cpu().numpy()
 
-                    cp_b = cross_pred[bi, idx_b]
+                    # cp_b: B 위치에서 A(target)를 예측 → target type = sig_type_a
+                    cp_b = cross_pred_per_type[bi, idx_b, sig_type_a] if sig_type_a >= 0 else cross_pred_per_type[bi, idx_b, 0]
                     loc_b = patch_loc[bi, idx_b].unsqueeze(-1)
                     scl_b = patch_scale[bi, idx_b].unsqueeze(-1)
                     cpred_b = (cp_b * scl_b + loc_b).detach().cpu().numpy()
-
-                    sig_type_a = sig_map.get((bi, sid, vid_a), -1)
-                    sig_type_b = sig_map.get((bi, sid, vid_b), -1)
 
                     pairs.append(
                         {
