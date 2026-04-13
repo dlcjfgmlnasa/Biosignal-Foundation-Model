@@ -250,17 +250,17 @@ class BiosignalFoundationModel(nn.Module):
             patch_signal_types = batch.signal_types.to(device)[global_var_idx]  # (B, N)
             patch_spatial_ids = batch.spatial_ids.to(device)[global_var_idx]  # (B, N)
 
-            # 절대 시간 기반 time_id 계산 (cross-modal 정렬용)
+            # 절대 시간 기반 abs_time_id 계산 (cross-modal 매칭 전용)
+            # time_id(상대적)는 RoPE용으로 유지, abs_time_id는 cross-modal loss용
+            abs_time_id = time_id  # fallback: start_samples 없으면 상대적 time_id 사용
             if (
                 hasattr(batch, "start_samples")
                 and batch.start_samples is not None
             ):
                 patch_start = batch.start_samples.to(device)[global_var_idx]  # (B, N)
-                # 각 패치의 절대 시간 = start_sample + variate 내 패치 offset
                 abs_time = patch_start + time_id * self.patch_size  # (B, N)
-                # patch_size 단위로 양자화 → 같은 시간대의 다른 variate가 동일 time_id
-                time_id = abs_time // self.patch_size  # (B, N)
-                time_id[~patch_mask] = 0
+                abs_time_id = abs_time // self.patch_size  # (B, N)
+                abs_time_id[~patch_mask] = 0
 
         # 4. Projection (linear 또는 CNN stem)
         embedded = self.patch_embed.project(patches, patch_signal_types)
@@ -316,11 +316,12 @@ class BiosignalFoundationModel(nn.Module):
             "patch_mask": patch_mask,
             "patch_sample_id": p_sid,
             "patch_variate_id": p_vid,
-            "time_id": time_id,
+            "time_id": time_id,          # 상대적 (RoPE용)
+            "abs_time_id": abs_time_id,  # 절대적 (cross-modal 매칭용)
             "pred_mask": pred_mask,
         }
 
-        encoder_kwargs = dict(var_id=p_vid, time_id=time_id)
+        encoder_kwargs = dict(var_id=p_vid, time_id=time_id)  # RoPE는 상대적 time_id
         use_causal = task in ("next_pred", "both")
 
         # causal mask (next_pred, both에서 공유)
@@ -402,7 +403,7 @@ class BiosignalFoundationModel(nn.Module):
             "patch_mask": enc["patch_mask"],
             "patch_sample_id": enc["patch_sample_id"],
             "patch_variate_id": enc["patch_variate_id"],
-            "time_id": enc["time_id"],
+            "time_id": enc["abs_time_id"],  # cross-modal 매칭용 (절대 시간)
             "pred_mask": enc["pred_mask"],
         }
 
