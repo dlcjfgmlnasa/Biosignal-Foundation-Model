@@ -250,6 +250,18 @@ class BiosignalFoundationModel(nn.Module):
             patch_signal_types = batch.signal_types.to(device)[global_var_idx]  # (B, N)
             patch_spatial_ids = batch.spatial_ids.to(device)[global_var_idx]  # (B, N)
 
+            # 절대 시간 기반 time_id 계산 (cross-modal 정렬용)
+            if (
+                hasattr(batch, "start_samples")
+                and batch.start_samples is not None
+            ):
+                patch_start = batch.start_samples.to(device)[global_var_idx]  # (B, N)
+                # 각 패치의 절대 시간 = start_sample + variate 내 패치 offset
+                abs_time = patch_start + time_id * self.patch_size  # (B, N)
+                # patch_size 단위로 양자화 → 같은 시간대의 다른 variate가 동일 time_id
+                time_id = abs_time // self.patch_size  # (B, N)
+                time_id[~patch_mask] = 0
+
         # 4. Projection (linear 또는 CNN stem)
         embedded = self.patch_embed.project(patches, patch_signal_types)
         # embedded: (B, N, d_model)

@@ -47,6 +47,7 @@ class PackedBatch:
     signal_types: torch.Tensor  # (total_variates,) long
     spatial_ids: torch.Tensor  # (total_variates,) long — 전역 spatial_id
     padded_lengths: torch.Tensor | None = None  # (total_variates,) long
+    start_samples: torch.Tensor | None = None  # (total_variates,) long — 절대 시작 sample
 
 
 # ── 내부 데이터 구조 ────────────────────────────────────────────
@@ -64,6 +65,7 @@ class _PackUnit:
     variate_spatial_ids: list[int]  # per-variate 전역 spatial_id
     variate_lengths: list[int]
     padded_variate_lengths: list[int]
+    variate_start_samples: list[int]
 
 
 class PackCollate:
@@ -134,6 +136,7 @@ class PackCollate:
             variate_spatial_ids: list[int] = []
             variate_lengths: list[int] = []
             padded_variate_lengths: list[int] = []
+            variate_start_samples: list[int] = []
             offset = 0
 
             # [최적화] Concat 전에 미리 길이 확인하여 초과분 제거
@@ -177,6 +180,9 @@ class PackCollate:
                 )
                 variate_lengths.append(seg_len)
                 padded_variate_lengths.append(padded_seg_len)
+                # 절대 시작 sample: recording의 start_sample + window의 win_start
+                abs_start = s.start_sample + s.win_start
+                variate_start_samples.append(abs_start)
                 offset += effective_len
 
             # Concat은 이미 max_length 이하이므로 재정리 불필요
@@ -193,6 +199,7 @@ class PackCollate:
                         variate_spatial_ids=variate_spatial_ids,
                         variate_lengths=variate_lengths,
                         padded_variate_lengths=padded_variate_lengths,
+                        variate_start_samples=variate_start_samples,
                     )
                 )
 
@@ -211,6 +218,7 @@ class PackCollate:
         all_rates: list[float] = []
         all_types: list[int] = []
         all_spatial_ids: list[int] = []
+        all_start_samples: list[int] = []
 
         for row_idx, contents in enumerate(bins):
             row_len = min(
@@ -245,6 +253,7 @@ class PackCollate:
                     all_rates.extend(unit.variate_rates)
                     all_types.extend(unit.variate_types)
                     all_spatial_ids.extend(unit.variate_spatial_ids)
+                    all_start_samples.extend(unit.variate_start_samples)
                 else:
                     # 잘린 unit: 포함된 variate만 수집
                     for var_id, (_ch_idx, start, end) in enumerate(unit.channel_spans):
@@ -259,6 +268,7 @@ class PackCollate:
                             all_rates.append(unit.variate_rates[var_id])
                             all_types.append(unit.variate_types[var_id])
                             all_spatial_ids.append(unit.variate_spatial_ids[var_id])
+                            all_start_samples.append(unit.variate_start_samples[var_id])
 
                 row_offset += actual_seg_len
                 if row_offset >= row_len:
@@ -279,6 +289,7 @@ class PackCollate:
             signal_types=torch.tensor(all_types, dtype=torch.long),
             spatial_ids=torch.tensor(all_spatial_ids, dtype=torch.long),
             padded_lengths=padded_lengths_tensor,
+            start_samples=torch.tensor(all_start_samples, dtype=torch.long),
         )
 
     # ── FFD 패킹 ─────────────────────────────────────────────────
