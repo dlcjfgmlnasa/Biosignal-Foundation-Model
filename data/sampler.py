@@ -164,9 +164,12 @@ class GroupedBatchSampler(Sampler[list[int]]):
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.drop_last = drop_last
-        self.generator = generator
         self.rank = rank
         self.world_size = world_size
+        self.epoch = 0
+        # DDP: 모든 rank가 동일한 셔플 순서를 사용하도록 고정 시드 generator
+        self.generator = generator or torch.Generator()
+        self.generator.manual_seed(42)
 
         # 그룹 빌딩: (session_id, physical_time_ms) → [flat_idx_list]
         # 키 공식은 collate.py lines 82-86과 동일해야 함
@@ -208,8 +211,15 @@ class GroupedBatchSampler(Sampler[list[int]]):
         keys = list(groups.keys())
         self._group_rec_ids: list[int] = [group_to_rec[k] for k in keys]
 
+    def set_epoch(self, epoch: int) -> None:
+        """에폭마다 셔플 시드를 변경한다. DDP에서 모든 rank가 동일 호출 필수."""
+        self.epoch = epoch
+
     def __iter__(self) -> Iterator[list[int]]:
         """배치를 yield한다. 각 배치는 완전한 그룹(들)을 포함한다."""
+        # DDP: 모든 rank가 동일 시드로 셔플 → 동일 배치 리스트 생성
+        self.generator.manual_seed(42 + self.epoch)
+
         # 그룹 순서 결정: recording-locality 보장
         # 레코딩 순서를 셔플한 뒤, 같은 레코딩의 그룹들을 연속 배치
         group_indices = list(range(len(self._groups)))

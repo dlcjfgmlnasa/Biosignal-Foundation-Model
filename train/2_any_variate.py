@@ -522,6 +522,8 @@ def main():
         # DDP: sampler epoch sync
         if sampler is not None:
             sampler.set_epoch(epoch)
+        if hasattr(dataloader, "batch_sampler") and hasattr(dataloader.batch_sampler, "set_epoch"):
+            dataloader.batch_sampler.set_epoch(epoch)
 
         epoch_start = time.time()
         losses = train_one_epoch(
