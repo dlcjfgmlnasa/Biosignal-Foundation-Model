@@ -38,7 +38,7 @@ data_dir: /home/coder/workspace/updown/bio_fm/data/train/vitaldb
 signal_types: [0, 1, 2, 3, 4, 5]  # ECG, ABP, PPG, CVP, CO2, AWP
 max_subjects: null
 window_seconds: 600.0             # 600초 (10분) 윈도우 — 다변량 세션
-max_length: 60000                 # 600s × 100Hz
+max_length: 120000                # 600s × 100Hz × 2 (multi-variate packing)
 cache_size: 16
 crop_ratio_min: 0.01
 crop_ratio_max: 1.0
@@ -58,8 +58,8 @@ max_batches: 4000
 # ── Loss 가중치 (Phase 2: MPM + Next-Pred + Cross-Modal + Contrastive) ──
 alpha: 0.7                     # masked reconstruction (Phase 1 대비 낮춤)
 beta: 0.3                      # next-patch prediction (Phase 1 대비 낮춤)
-gamma: 1.0                     # cross-modal prediction (Phase 2 활성)
-delta: 0.1                     # cross-modal contrastive (InfoNCE)
+gamma: 0.5                     # cross-modal prediction (Phase 2 활성)
+delta: 0.5                     # cross-modal contrastive (InfoNCE)
 peak_alpha: 1.0                # Peak-Weighted MSE
 lambda_spec: 0.2               # Multi-Resolution STFT Loss
 spec_n_ffts: [32, 64, 128]
@@ -69,9 +69,10 @@ learnable_temperature: true
 
 # ── Masking ──
 variate_mask_prob: 0.3         # 30% 확률로 전체 variate 마스킹 (virtual sensing)
+variate_drop_prob: 0.1         # 10% 확률로 variate를 attention에서 완전 제거 (zero-shot용)
 block_mask: true
 block_size_min: 2
-block_size_max: 4
+block_size_max: 3
 
 # ── Mixed Precision ──
 use_amp: true
