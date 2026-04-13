@@ -511,15 +511,18 @@ def process_vital(
         try:
             with open(manifest_path, encoding="utf-8") as f:
                 existing = json.load(f)
-            existing_recs = existing.get("recordings", [])
-            if existing_recs:
+            # sessions[].recordings[] 구조에서 전체 recording 수집
+            all_recs = []
+            for sess in existing.get("sessions", []):
+                all_recs.extend(sess.get("recordings", []))
+            if all_recs:
                 # manifest에 기록된 .pt 파일이 모두 존재하는지 확인
                 all_exist = all(
-                    (subj_out / r["file"]).exists() for r in existing_recs
+                    (subj_out / r["file"]).exists() for r in all_recs
                 )
                 if all_exist:
-                    print(f"    [SKIP] {subject_id}: 이미 파싱됨 ({len(existing_recs)} recordings)")
-                    return subject_id, session_id, existing_recs
+                    print(f"    [SKIP] {subject_id}: 이미 파싱됨 ({len(all_recs)} recordings)")
+                    return subject_id, session_id, all_recs
         except (json.JSONDecodeError, KeyError):
             pass  # manifest 손상 → 재파싱
 
