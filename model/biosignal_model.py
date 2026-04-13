@@ -148,9 +148,11 @@ class BiosignalFoundationModel(nn.Module):
         # 7. Next-Patch Prediction Head
         self.next_head = nn.Linear(d_model, patch_size)
 
-        # 8. Cross-Modal Prediction Head (다른 variate 예측용)
-        self.cross_head = nn.Linear(d_model, patch_size)
-        self.cross_target_embed = nn.Embedding(num_signal_types, d_model)
+        # 8. Cross-Modal Prediction Heads (target signal type별 독립 Linear)
+        self.cross_heads = nn.ModuleDict({
+            str(st): nn.Linear(d_model, patch_size)
+            for st in range(num_signal_types)
+        })
 
         # 9. Horizon Embedding (random horizon next-patch prediction)
         self.max_horizon = max_horizon
@@ -465,9 +467,9 @@ class BiosignalFoundationModel(nn.Module):
         # ── Masked Reconstruction ──
         if task in ("masked", "both"):
             out_dict["reconstructed"] = self.head(encoded)  # (B, N, patch_size)
-            # Per-target-type cross-modal prediction
+            # Per-target-type cross-modal prediction (separate heads)
             cross_pred_per_type = torch.stack([
-                self.cross_head(encoded + self.cross_target_embed.weight[st])
+                self.cross_heads[str(st)](encoded)
                 for st in range(self.num_signal_types)
             ], dim=2)  # (B, N, num_signal_types, patch_size)
             out_dict["cross_pred_per_type"] = cross_pred_per_type
