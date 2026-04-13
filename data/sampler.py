@@ -158,11 +158,15 @@ class GroupedBatchSampler(Sampler[list[int]]):
         shuffle: bool = True,
         drop_last: bool = False,
         generator: torch.Generator | None = None,
+        rank: int = 0,
+        world_size: int = 1,
     ) -> None:
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.drop_last = drop_last
         self.generator = generator
+        self.rank = rank
+        self.world_size = world_size
 
         # 그룹 빌딩: (session_id, physical_time_ms) → [flat_idx_list]
         # 키 공식은 collate.py lines 82-86과 동일해야 함
@@ -229,28 +233,37 @@ class GroupedBatchSampler(Sampler[list[int]]):
                 perm = torch.randperm(len(g_list), generator=self.generator).tolist()
                 group_indices.extend(g_list[p] for p in perm)
 
+        # 전체 배치 리스트 생성
+        all_batches: list[list[int]] = []
         batch: list[int] = []
         for g_idx in group_indices:
             group = self._groups[g_idx]
 
-            # 그룹을 추가하면 batch_size 초과 && 배치가 비어있지 않음
-            # → 먼저 현재 배치를 yield한 뒤 새 배치 시작
             if batch and len(batch) + len(group) > self.batch_size:
-                yield batch
+                all_batches.append(batch)
                 batch = []
 
-            # 그룹 추가
             batch.extend(group)
 
-            # 배치가 batch_size 이상이면 바로 yield
             if len(batch) >= self.batch_size:
-                yield batch
+                all_batches.append(batch)
                 batch = []
 
-        # 마지막 배치 처리
         if batch:
             if not self.drop_last:
-                yield batch
+                all_batches.append(batch)
+
+        # DDP: rank별로 배치 분배 (모든 rank가 동일한 배치 수)
+        if self.world_size > 1:
+            n = len(all_batches)
+            # 모든 rank가 같은 수의 배치를 갖도록 올림 패딩
+            per_rank = -(-n // self.world_size)  # ceil division
+            # 부족분은 앞쪽 배치를 반복하여 패딩
+            while len(all_batches) < per_rank * self.world_size:
+                all_batches.append(all_batches[len(all_batches) % n])
+            all_batches = all_batches[self.rank::self.world_size]
+
+        yield from all_batches
 
     def __len__(self) -> int:
         """배치 개수 (근사치).

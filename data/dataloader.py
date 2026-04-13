@@ -64,11 +64,17 @@ def create_dataloader(
 
     # any_variate 모드: GroupedBatchSampler로 같은 (session, time) 채널들을 같은 배치에 넣기
     if collate_mode == "any_variate":
+        import torch.distributed as dist
+
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
         batch_sampler = GroupedBatchSampler(
             dataset=dataset,
             batch_size=batch_size,
             shuffle=shuffle,
             drop_last=drop_last,
+            rank=rank,
+            world_size=world_size,
         )
         return DataLoader(
             dataset,
