@@ -504,6 +504,25 @@ def process_vital(
 
     subject_id, session_id = _parse_subject_id(vital_path)
     subj_out = out_dir / subject_id
+
+    # ── Skip 체크: 이미 파싱 완료된 subject는 건너뜀 ──
+    manifest_path = subj_out / "manifest.json"
+    if manifest_path.exists():
+        try:
+            with open(manifest_path, encoding="utf-8") as f:
+                existing = json.load(f)
+            existing_recs = existing.get("recordings", [])
+            if existing_recs:
+                # manifest에 기록된 .pt 파일이 모두 존재하는지 확인
+                all_exist = all(
+                    (subj_out / r["file"]).exists() for r in existing_recs
+                )
+                if all_exist:
+                    print(f"    [SKIP] {subject_id}: 이미 파싱됨 ({len(existing_recs)} recordings)")
+                    return subject_id, session_id, existing_recs
+        except (json.JSONDecodeError, KeyError):
+            pass  # manifest 손상 → 재파싱
+
     subj_out.mkdir(parents=True, exist_ok=True)
 
     vf = vitaldb.VitalFile(str(vital_path))
