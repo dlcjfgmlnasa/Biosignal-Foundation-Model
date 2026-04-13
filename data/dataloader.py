@@ -1,7 +1,7 @@
 # -*- coding:utf-8 -*-
 from __future__ import annotations
 
-from torch.utils.data import DataLoader, Sampler
+from torch.utils.data import DataLoader, DistributedSampler, Sampler
 
 from data.collate import PackCollate
 from data.dataset import BiosignalDataset
@@ -54,6 +54,8 @@ def create_dataloader(
         패치 크기. 설정 시 PackCollate가 variate 길이를 patch_size 배수로 정렬.
     stride:
         패치 보폭 (overlapping 시). ``None``이면 ``patch_size``와 동일.
+    sampler:
+        외부 sampler (DDP DistributedSampler 등). 전달 시 shuffle 무시.
     """
     collate_fn = PackCollate(
         max_length=max_length,
@@ -62,19 +64,17 @@ def create_dataloader(
         stride=stride,
     )
 
-    # any_variate 모드: GroupedBatchSampler로 같은 (session, time) 채널들을 같은 배치에 넣기
-    if collate_mode == "any_variate":
-        import torch.distributed as dist
+    import torch.distributed as dist
 
-        rank = dist.get_rank() if dist.is_initialized() else 0
-        world_size = dist.get_world_size() if dist.is_initialized() else 1
+    use_ddp = dist.is_initialized()
+
+    if collate_mode == "any_variate" and not use_ddp:
+        # 단일 GPU: GroupedBatchSampler로 cross-modal 그루핑 보장
         batch_sampler = GroupedBatchSampler(
             dataset=dataset,
             batch_size=batch_size,
             shuffle=shuffle,
             drop_last=drop_last,
-            rank=rank,
-            world_size=world_size,
         )
         return DataLoader(
             dataset,
@@ -85,17 +85,25 @@ def create_dataloader(
             persistent_workers=(persistent_workers and num_workers > 0),
             prefetch_factor=(prefetch_factor if num_workers > 0 else None),
         )
-    else:
-        # CI 모드: 개별 샘플 랜덤 샘플링 (DDP 시 sampler 사용)
-        return DataLoader(
-            dataset,
-            batch_size=batch_size,
-            shuffle=(shuffle and sampler is None),
-            sampler=sampler,
-            num_workers=num_workers,
-            drop_last=drop_last,
-            collate_fn=collate_fn,
-            pin_memory=pin_memory,
-            persistent_workers=(persistent_workers and num_workers > 0),
-            prefetch_factor=(prefetch_factor if num_workers > 0 else None),
+
+    # DDP 또는 CI 모드: DistributedSampler (DDP) 또는 기본 sampler
+    # any_variate + DDP에서는 DistributedSampler로 샘플을 분배하고,
+    # collate가 같은 버킷의 샘플을 자연스럽게 그루핑한다.
+    # 일부 배치에서 cross-modal pair가 줄어들 수 있지만 deadlock 없음.
+    if use_ddp and sampler is None:
+        sampler = DistributedSampler(
+            dataset, shuffle=shuffle, drop_last=drop_last,
         )
+
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=(shuffle and sampler is None),
+        sampler=sampler,
+        num_workers=num_workers,
+        drop_last=drop_last,
+        collate_fn=collate_fn,
+        pin_memory=pin_memory,
+        persistent_workers=(persistent_workers and num_workers > 0),
+        prefetch_factor=(prefetch_factor if num_workers > 0 else None),
+    )

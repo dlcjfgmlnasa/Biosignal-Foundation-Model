@@ -371,13 +371,14 @@ def main():
         dataset,
         max_length=config.max_length,
         batch_size=config.batch_size,
-        shuffle=not use_ddp,
+        shuffle=True,
         num_workers=config.num_workers,
         pin_memory=True,
         collate_mode=config.collate_mode,
         patch_size=config.model_config.patch_size,
     )
-    sampler = None  # any_variate 모드: GroupedBatchSampler가 셔플 담당
+    # DDP: DistributedSampler는 create_dataloader 내부에서 자동 생성
+    sampler = getattr(dataloader, "sampler", None)
     if rank0:
         print(f"Train batches per epoch: {len(dataloader)}")
 
@@ -404,7 +405,7 @@ def main():
 
     # ── DDP wrap ──
     if use_ddp:
-        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True, static_graph=True)
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
 
     raw_model = model.module if use_ddp else model
 
