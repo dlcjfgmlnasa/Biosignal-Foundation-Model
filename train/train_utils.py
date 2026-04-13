@@ -193,6 +193,7 @@ def load_manifest_from_processed(
                         signal_type=rec["signal_type"],
                         session_id=session_id,
                         spatial_ids=rec.get("spatial_ids"),
+                        start_sample=rec.get("start_sample", 0),
                     )
                 )
     return entries

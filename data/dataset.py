@@ -30,6 +30,7 @@ class BiosignalSample:
     signal_type: int
     session_id: str = ""
     spatial_id: int = 0  # 로컬 spatial_id (signal_type 내 채널 위치, 0=Unknown)
+    start_sample: int = 0  # 세션 내 절대 시작 sample (recording 단위)
 
 
 @dataclass
@@ -49,6 +50,7 @@ class RecordingManifest:
     spatial_ids: list[int] | None = (
         None  # per-channel 로컬 spatial_id, len == n_channels
     )
+    start_sample: int = 0  # 세션 내 절대 시작 sample (TARGET_SR 기준)
 
 
 class BiosignalDataset(Dataset[BiosignalSample]):
@@ -212,6 +214,7 @@ class BiosignalDataset(Dataset[BiosignalSample]):
             signal_type=entry.signal_type,
             session_id=entry.session_id,
             spatial_id=spatial_id,
+            start_sample=entry.start_sample,
         )
 
     @classmethod

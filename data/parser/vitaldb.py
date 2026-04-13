@@ -397,10 +397,16 @@ def _detect_electrocautery(
 def _extract_nan_free_segments(
     data: np.ndarray,  # (T,) float
     min_samples: int,
-) -> list[np.ndarray]:
-    """NaN 구간을 제거하고 연속 유효 세그먼트를 반환한다."""
+) -> list[tuple[int, np.ndarray]]:
+    """NaN 구간을 제거하고 연속 유효 세그먼트를 반환한다.
+
+    Returns
+    -------
+    list of (start_sample, segment_array).
+    start_sample은 원본 data에서의 절대 시작 인덱스.
+    """
     valid = ~np.isnan(data)
-    segments: list[np.ndarray] = []
+    segments: list[tuple[int, np.ndarray]] = []
 
     diff = np.diff(valid.astype(np.int8), prepend=0, append=0)
     starts = np.where(diff == 1)[0]
@@ -408,7 +414,7 @@ def _extract_nan_free_segments(
 
     for s, e in zip(starts, ends):
         if e - s >= min_samples:
-            segments.append(data[s:e])
+            segments.append((int(s), data[s:e]))
 
     return segments
 
@@ -596,7 +602,11 @@ def process_vital(
         track_recordings: list[dict] = []
         quality_window_s = cfg.quality_window_s
 
-        for seg_idx, segment in enumerate(segments):
+        for seg_idx, (seg_start_native, segment) in enumerate(segments):
+            # seg_start_native: 원본 SR 기준 절대 시작 sample
+            # → TARGET_SR 기준으로 변환
+            seg_start_target = int(seg_start_native * TARGET_SR / native_sr)
+
             # Median filter → Notch filter → Bandpass/Lowpass 순서
             if cfg.median_kernel > 0:
                 segment = _apply_median_filter(segment, kernel_size=cfg.median_kernel)
@@ -651,8 +661,10 @@ def process_vital(
                 window_results.append((win_idx, win))
 
             # 연속 통과 윈도우를 그룹으로 묶기 (불연속 경계에서 분리)
-            contiguous_groups: list[list[np.ndarray]] = []
+            # 각 그룹: (first_win_idx, [win_data, ...])
+            contiguous_groups: list[tuple[int, list[np.ndarray]]] = []
             current_group: list[np.ndarray] = []
+            current_first_idx = 0
             prev_idx = -2  # 불가능한 초기값
 
             for win_idx, win_data in window_results:
@@ -663,13 +675,14 @@ def process_vital(
                     else:
                         # 새 연속 그룹 시작
                         if current_group:
-                            contiguous_groups.append(current_group)
+                            contiguous_groups.append((current_first_idx, current_group))
                         current_group = [win_data]
+                        current_first_idx = win_idx
                     prev_idx = win_idx
                 # win_data is None (fail) → prev_idx 갱신하지 않음
 
             if current_group:
-                contiguous_groups.append(current_group)
+                contiguous_groups.append((current_first_idx, current_group))
 
             if not contiguous_groups:
                 if n_windows > 0:
@@ -681,8 +694,8 @@ def process_vital(
                 continue
 
             # 각 연속 그룹을 별도 세그먼트로 저장
-            n_good_total = sum(len(g) for g in contiguous_groups)
-            for group_idx, group in enumerate(contiguous_groups):
+            n_good_total = sum(len(g) for _, g in contiguous_groups)
+            for group_idx, (first_win_idx, group) in enumerate(contiguous_groups):
                 clean_segment = np.concatenate(group)
                 channel_data = clean_segment.reshape(1, -1).astype(np.float32)
 
@@ -690,6 +703,10 @@ def process_vital(
                 duration_s = channel_data.shape[1] / TARGET_SR
                 if duration_s < min_duration_s:
                     continue
+
+                # 절대 시작 sample (TARGET_SR 기준)
+                # = segment 시작(원본→TARGET_SR) + 품질 통과 첫 윈도우 offset
+                group_start_sample = seg_start_target + first_win_idx * win_samples
 
                 pt_name = (
                     f"{session_id}_{stype_key}_{spatial_id}_seg{seg_idx}_{group_idx}.pt"
@@ -703,6 +720,7 @@ def process_vital(
                     "sampling_rate": TARGET_SR,
                     "n_timesteps": channel_data.shape[1],
                     "spatial_ids": [spatial_id],
+                    "start_sample": group_start_sample,
                 }
                 track_recordings.append(rec)
                 recordings.append(rec)
@@ -711,7 +729,8 @@ def process_vital(
             pct = n_good_total / n_windows * 100 if n_windows > 0 else 0
             n_groups = len(contiguous_groups)
             total_dur = (
-                sum(np.concatenate(g).shape[0] for g in contiguous_groups) / TARGET_SR
+                sum(np.concatenate(g).shape[0] for _, g in contiguous_groups)
+                / TARGET_SR
             )
             print(
                 f"    saved {stype_key} seg{seg_idx}: {n_groups} contiguous group(s), "

@@ -114,7 +114,8 @@ class PackCollate:
             if self.collate_mode == "ci":
                 key = (i,)  # 고유 키 → 채널 간 그루핑 없음
             elif s.session_id:
-                physical_time_ms = round(s.win_start / s.sampling_rate * 1000)
+                abs_sample = s.start_sample + s.win_start
+                physical_time_ms = round(abs_sample / s.sampling_rate * 1000)
                 key = (s.session_id, physical_time_ms)
             else:
                 key = (s.recording_idx, s.win_start)
