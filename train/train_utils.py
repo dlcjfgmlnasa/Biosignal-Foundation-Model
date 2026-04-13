@@ -77,6 +77,7 @@ class TrainConfig:
 
     # Masking 전략
     variate_mask_prob: float = 0.0  # Phase 2: variate-level 마스킹 확률
+    variate_drop_prob: float = 0.0  # Phase 2: variate를 attention에서 완전 제거 (zero-shot용)
     block_mask: bool = False  # True면 연속 블록 단위 마스킹
     block_size_min: int = 3  # 블록 최소 크기 (패치 수, 즉 초)
     block_size_max: int = 8  # 블록 최대 크기 (패치 수, 즉 초)
@@ -320,6 +321,7 @@ def train_one_epoch(
                 block_size_min=config.block_size_min,
                 block_size_max=config.block_size_max,
                 variate_mask_prob=config.variate_mask_prob,
+                variate_drop_prob=config.variate_drop_prob,
             )
 
             reconstructed = out["reconstructed"]  # (B, N, patch_size)
@@ -538,6 +540,7 @@ def validate(
                 block_size_min=config.block_size_min,
                 block_size_max=config.block_size_max,
                 variate_mask_prob=config.variate_mask_prob,
+                variate_drop_prob=0.0,  # validation에서는 dropout 비활성
             )
 
             reconstructed = out["reconstructed"]

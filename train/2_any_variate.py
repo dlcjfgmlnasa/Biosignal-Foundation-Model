@@ -155,6 +155,12 @@ def parse_args() -> argparse.Namespace:
         help="Variate-level masking probability",
     )
     g.add_argument(
+        "--variate_drop_prob",
+        type=float,
+        default=0.1,
+        help="Complete variate dropout probability (zero-shot cross-modal generation용)",
+    )
+    g.add_argument(
         "--block_mask",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -246,6 +252,7 @@ def main():
             delta=args.delta,
             contrastive_temperature=args.contrastive_temperature,
             variate_mask_prob=args.variate_mask_prob,
+            variate_drop_prob=args.variate_drop_prob,
             block_mask=args.block_mask,
             block_size_min=args.block_size_min,
             block_size_max=args.block_size_max,

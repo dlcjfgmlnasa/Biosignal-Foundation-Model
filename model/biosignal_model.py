@@ -168,6 +168,35 @@ class BiosignalFoundationModel(nn.Module):
         # 11. Learnable [MASK] Token
         self.mask_token = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
 
+    @staticmethod
+    def _sample_variate_drop(
+        p_sid: torch.Tensor,  # (B, N)
+        p_vid: torch.Tensor,  # (B, N)
+        patch_mask: torch.Tensor,  # (B, N)
+        drop_prob: float,
+    ) -> torch.Tensor | None:
+        """Complete Variate Dropout: 행별로 하나의 variate를 attention에서 완전히 제거.
+
+        Returns (B, N) bool mask — True = dropped from attention.
+        다변량(2+ variates)인 행에서만 작동. None if no drop.
+        """
+        b, n = p_vid.shape
+        drop_mask = torch.zeros(b, n, dtype=torch.bool, device=p_vid.device)
+        any_dropped = False
+        for bi in range(b):
+            if torch.rand(1).item() >= drop_prob:
+                continue
+            valid = patch_mask[bi]
+            valid_vids = p_vid[bi][valid]
+            unique_vids = valid_vids[valid_vids > 0].unique()
+            if len(unique_vids) < 2:
+                continue  # 단일 variate → dropout 불가
+            # 랜덤으로 하나 선택
+            chosen = unique_vids[torch.randint(len(unique_vids), (1,))]
+            drop_mask[bi] = (p_vid[bi] == chosen) & valid
+            any_dropped = True
+        return drop_mask if any_dropped else None
+
     @classmethod
     def from_config(cls, config: ModelConfig) -> BiosignalFoundationModel:
         """ModelConfig로부터 모델 인스턴스를 생성한다."""
@@ -192,6 +221,7 @@ class BiosignalFoundationModel(nn.Module):
         block_size_min: int = 3,
         block_size_max: int = 8,
         variate_mask_prob: float = 0.0,
+        variate_drop_prob: float = 0.0,
     ) -> dict[str, torch.Tensor]:
         """공통 인코딩 파이프라인: Scaler → Patchify → Project → SpatialEmbed → LocScale → Encoder.
 
@@ -313,6 +343,22 @@ class BiosignalFoundationModel(nn.Module):
             & patch_mask.unsqueeze(-1)
         )  # (B, N, n)
 
+        # 8.5. Complete Variate Dropout: attention에서 variate를 물리적으로 제거
+        # → 학습 시 "해당 variate 없이 cross-pred" 시나리오를 경험
+        # → zero-shot cross-modal generation의 train-inference gap 해소
+        if variate_drop_prob > 0 and self.training and task in ("masked", "both"):
+            drop_mask = self._sample_variate_drop(
+                p_sid, p_vid, patch_mask, variate_drop_prob
+            )  # (B, N) bool — True = attention에서 제거
+            if drop_mask is not None:
+                keep = ~drop_mask  # (B, N)
+                # attention에서 제거: dropped 토큰은 attend 못하고, attend 받지도 못함
+                base_attn_mask = base_attn_mask & keep.unsqueeze(-1) & keep.unsqueeze(-2)
+                # content를 mask_token으로 교체
+                drop_expanded = drop_mask.unsqueeze(-1)  # (B, N, 1)
+                mask_token_expanded = self.mask_token.expand_as(embedded)
+                embedded = torch.where(drop_expanded, mask_token_expanded, embedded)
+
         # 9. Task에 따른 Masking 스위치 + Transformer Encoder
         result: dict[str, torch.Tensor] = {
             "patches": patches,
@@ -387,6 +433,7 @@ class BiosignalFoundationModel(nn.Module):
         block_size_min: int = 3,
         block_size_max: int = 8,
         variate_mask_prob: float = 0.0,
+        variate_drop_prob: float = 0.0,
     ) -> dict[str, torch.Tensor]:
         enc = self._encode(
             batch,
@@ -396,6 +443,7 @@ class BiosignalFoundationModel(nn.Module):
             block_size_min=block_size_min,
             block_size_max=block_size_max,
             variate_mask_prob=variate_mask_prob,
+            variate_drop_prob=variate_drop_prob,
         )
 
         encoded = enc["encoded"]  # bidirectional (or sole encoding for single-task)
@@ -461,8 +509,61 @@ class BiosignalFoundationModel(nn.Module):
         self.eval()
         out = self.forward(batch, task="masked")
         out.pop("reconstructed", None)
-        out.pop("cross_pred", None)
+        out.pop("cross_pred_per_type", None)
         return out
+
+    @torch.no_grad()
+    def generate_cross_modal(
+        self,
+        batch: PackedBatch,
+        target_signal_type: int,
+        denormalize: bool = True,
+    ) -> dict[str, torch.Tensor]:
+        """Zero-shot cross-modal waveform generation (Virtual Token Injection).
+
+        입력 batch의 source signal로부터 target signal type의 waveform을 생성한다.
+        target variate에 [MASK] 가상 토큰을 주입하여, 학습 시 variate dropout과
+        동일한 상황을 재현한다.
+
+        Parameters
+        ----------
+        batch:
+            Source signal만 포함된 PackedBatch.
+        target_signal_type:
+            생성할 target signal type (0=ECG, 1=ABP, 2=PPG, ...).
+        denormalize:
+            ``True``이면 source의 loc/scale로 denormalize (approximate).
+
+        Returns
+        -------
+        dict with keys:
+            ``waveform``: ``(B, N, patch_size)`` — 생성된 target waveform.
+            ``patch_mask``: ``(B, N)`` — 유효 패치 마스크.
+        """
+        self.eval()
+
+        # Forward (mask_ratio=0 → 마스킹 없이 순수 source 정보만 사용)
+        out = self.forward(batch, task="masked", mask_ratio=0.0)
+
+        cross_pred_per_type = out["cross_pred_per_type"]  # (B, N, T, P)
+        target_pred = cross_pred_per_type[:, :, target_signal_type, :]  # (B, N, P)
+
+        if denormalize:
+            loc = out["loc"]  # (B, L, 1)
+            scale = out["scale"]  # (B, L, 1)
+            p = self.patch_size
+            stride = self.patch_embed.stride
+            n = target_pred.shape[1]
+            patch_starts = torch.arange(n, device=loc.device) * stride
+            patch_starts = patch_starts.clamp(max=loc.shape[1] - 1)
+            patch_loc = loc[:, patch_starts, :]  # (B, N, 1)
+            patch_scale = scale[:, patch_starts, :]  # (B, N, 1)
+            target_pred = target_pred * patch_scale + patch_loc
+
+        return {
+            "waveform": target_pred,
+            "patch_mask": out["patch_mask"],
+        }
 
     @torch.no_grad()
     def forecast(
