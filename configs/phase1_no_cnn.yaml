@@ -51,7 +51,6 @@ alpha: 1.0
 beta: 0.5
 gamma: 0.0
 delta: 0.0
-lambda_grad: 0.1
 lambda_spec: 0.0
 aux_loss_weight: 0.01
 contrastive_temperature: 0.07

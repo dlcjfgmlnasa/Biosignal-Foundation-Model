@@ -36,7 +36,6 @@ class CombinedLoss(nn.Module):
         gamma: float = 0.0,
         delta: float = 0.0,
         peak_alpha: float = 0.0,
-        lambda_grad: float = 0.0,
         lambda_spec: float = 0.0,
         spec_n_ffts: tuple[int, ...] = (16, 32, 64),
         contrastive_temperature: float = 0.07,

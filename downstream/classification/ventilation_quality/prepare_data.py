@@ -10,16 +10,16 @@ VitalDB internal evaluation (pretrain holdout split).
 
 사용법:
     # 소수 테스트
-    python -m downstream.ventilation_quality.prepare_data --n-cases 5
+    python -m downstream.classification.ventilation_quality.prepare_data --n-cases 5
 
     # 시각화 포함
-    python -m downstream.ventilation_quality.prepare_data --n-cases 10 --visualize
+    python -m downstream.classification.ventilation_quality.prepare_data --n-cases 10 --visualize
 
     # CO2 단독 입력
-    python -m downstream.ventilation_quality.prepare_data --input-signals co2
+    python -m downstream.classification.ventilation_quality.prepare_data --input-signals co2
 
     # AWP 단독 입력
-    python -m downstream.ventilation_quality.prepare_data --input-signals awp
+    python -m downstream.classification.ventilation_quality.prepare_data --input-signals awp
 """
 
 from __future__ import annotations

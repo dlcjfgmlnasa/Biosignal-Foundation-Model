@@ -11,12 +11,12 @@ Frozen encoder + probe로 ABP 윈도우의 저혈압 여부를 분류한다.
 
 사용법:
     # Prepared .pt 파일 사용
-    python -m downstream.hypotension.run \
+    python -m downstream.classification.hypotension.run \
         --data-path outputs/downstream/hypotension/task1_hypotension_abp_h5min.pt \
         --dummy
 
     # 로컬 .pt 디렉토리에서 직접 로딩
-    python -m downstream.hypotension.run \
+    python -m downstream.classification.hypotension.run \
         --data-dir vitaldb_pt_test --dummy
 """
 
@@ -39,6 +39,9 @@ from data.parser.vitaldb import SIGNAL_TYPES
 
 from downstream.data_utils import (
     LabeledWindow,
+    extract_windows,
+    apply_pipeline,
+    create_labeled_dataset_hypotension,
 )
 from downstream.metrics import (
     compute_auroc,
@@ -453,9 +456,6 @@ def _compute_metrics(y_true: np.ndarray, y_score: np.ndarray) -> dict:
     }
 
 
-# ── メイン ────────────────────────────────────────────────────
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description="Task 1: Hypotension Prediction")
     parser.add_argument("--checkpoint", type=str, default=None)
@@ -612,7 +612,7 @@ def main() -> None:
 
     elif args.data_dir and Path(args.data_dir).is_dir():
         # ── 로컬 .pt 디렉토리에서 로딩 → prepare_data로 변환 후 사용 ──
-        from downstream.hypotension.prepare_data import (
+        from downstream.classification.hypotension.prepare_data import (
             _load_local_pt_aligned_signals,
             extract_forecast_samples,
         )

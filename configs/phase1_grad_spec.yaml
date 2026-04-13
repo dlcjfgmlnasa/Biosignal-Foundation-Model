@@ -58,7 +58,6 @@ alpha: 1.0
 beta: 0.5
 gamma: 0.0
 delta: 0.0
-lambda_grad: 0.1               # Gradient Loss — peak 학습 강화
 lambda_spec: 0.1               # Multi-Resolution STFT Loss — 다중 스케일 주파수 보존
 spec_n_ffts: [16, 32, 64]     # STFT window 크기들 (hop = n_fft // 4)
 aux_loss_weight: 0.01

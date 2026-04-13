@@ -161,7 +161,6 @@ class MaskedPatchLoss(nn.Module):
     def __init__(
         self,
         peak_alpha: float = 0.0,
-        lambda_grad: float = 0.0,  # deprecated, 무시됨
         lambda_spec: float = 0.0,
         spec_n_ffts: tuple[int, ...] = (16, 32, 64),
     ) -> None:

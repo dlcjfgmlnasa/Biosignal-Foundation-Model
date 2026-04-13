@@ -11,11 +11,11 @@ Input 소스: 선택된 signal type의 현재 윈도우
 
 사용법:
     # ABP 입력, 5분 후 예측
-    python -m downstream.hypotension.prepare_data \
+    python -m downstream.classification.hypotension.prepare_data \
         --data-dir vitaldb_pt_test --input-signals abp --horizon-min 5
 
     # ECG+PPG 입력, 10분 후 예측
-    python -m downstream.hypotension.prepare_data \
+    python -m downstream.classification.hypotension.prepare_data \
         --data-dir vitaldb_pt_test --input-signals ecg ppg --horizon-min 10
 """
 

@@ -66,7 +66,6 @@ class TrainConfig:
     gamma: float = 0.0  # cross-modal (beta 내부 가중)
     delta: float = 0.0  # cross-modal contrastive
     peak_alpha: float = 0.0  # Peak-Weighted MSE 강도 (0=일반 MSE)
-    lambda_grad: float = 0.0  # Gradient Loss 가중치 (하위 호환)
     lambda_spec: float = 0.0  # Spectral Loss 가중치 (하위 호환)
     spec_n_ffts: tuple[int, ...] = (16, 32, 64)  # 하위 호환
     aux_loss_weight: float = 0.01  # MoE load balancing auxiliary loss
@@ -440,9 +439,10 @@ def train_one_epoch(
                 parts.append(f"spec: {losses['masked_spec'].item():.6f}")
             if losses["next_loss"].item() > 0:
                 parts.append(f"next: {losses['next_loss'].item():.6f}")
-            if losses["cross_modal_loss"].item() > 0:
+            is_av = config.collate_mode == "any_variate"
+            if is_av or losses["cross_modal_loss"].item() > 0:
                 parts.append(f"cross: {losses['cross_modal_loss'].item():.6f}")
-            if losses["contrastive_loss"].item() > 0:
+            if is_av or losses["contrastive_loss"].item() > 0:
                 parts.append(f"contrastive: {losses['contrastive_loss'].item():.6f}")
             if aux_loss.item() > 0:
                 parts.append(f"aux: {aux_loss.item():.6f}")

@@ -7,10 +7,10 @@ reconstructed (self-reconstruction head)와 cross_pred (cross-modal head) 모두
 Usage
 -----
 # Dummy test (no checkpoint):
-python -m downstream.any_to_any.run --dummy
+python -m downstream.generation.any_to_any.run --dummy
 
 # Real evaluation:
-python -m downstream.any_to_any.run --checkpoint path/to/best.pt
+python -m downstream.generation.any_to_any.run --checkpoint path/to/best.pt
 """
 
 from __future__ import annotations

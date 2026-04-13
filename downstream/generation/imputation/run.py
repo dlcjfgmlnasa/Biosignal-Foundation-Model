@@ -5,8 +5,8 @@
 Zero-shot (forward(masked) → reconstructed) — 추가 학습 없음.
 
 사용법:
-    python -m downstream.imputation.run --dummy
-    python -m downstream.imputation.run --checkpoint path/to/best.pt \
+    python -m downstream.generation.imputation.run --dummy
+    python -m downstream.generation.imputation.run --checkpoint path/to/best.pt \
         --data-path outputs/downstream/imputation/imputation_vitaldb_ecg.pt
 """
 

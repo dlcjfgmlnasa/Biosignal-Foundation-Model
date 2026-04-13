@@ -612,7 +612,12 @@ def main():
                 block_size_max=config.block_size_max,
                 variate_mask_prob=config.variate_mask_prob,
             )
-            print(f"  -> Cross-modal figure: {cross_path}")
+            if cross_path.exists():
+                print(f"  -> Cross-modal figure: {cross_path}")
+            else:
+                print(
+                    f"  -> Cross-modal figure: SKIP (no multi-variate pairs found in viz batch)"
+                )
 
         # Best model
         if rank0:
