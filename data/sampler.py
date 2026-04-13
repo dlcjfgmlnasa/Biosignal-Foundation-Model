@@ -215,68 +215,121 @@ class GroupedBatchSampler(Sampler[list[int]]):
         """에폭마다 셔플 시드를 변경한다. DDP에서 모든 rank가 동일 호출 필수."""
         self.epoch = epoch
 
-    def __iter__(self) -> Iterator[list[int]]:
-        """배치를 yield한다. 각 배치는 완전한 그룹(들)을 포함한다."""
-        # DDP: 모든 rank가 동일 시드로 셔플 → 동일 배치 리스트 생성
-        self.generator.manual_seed(42 + self.epoch)
+    def _shuffle_groups(self) -> list[int]:
+        """Recording-locality를 보존하면서 그룹 순서를 셔플한다.
 
-        # 그룹 순서 결정: recording-locality 보장
-        # 레코딩 순서를 셔플한 뒤, 같은 레코딩의 그룹들을 연속 배치
+        모든 rank가 동일한 시드 → 동일한 순서를 생성한다.
+        """
         group_indices = list(range(len(self._groups)))
-        if self.shuffle:
-            # 1) 레코딩 순서 셔플
-            unique_recs = sorted(set(self._group_rec_ids))
-            rec_perm = torch.randperm(
-                len(unique_recs), generator=self.generator
-            ).tolist()
-            rec_order = [unique_recs[i] for i in rec_perm]
+        if not self.shuffle:
+            return group_indices
 
-            # 2) 레코딩별 그룹 인덱스 모으기
-            rec_to_groups: dict[int, list[int]] = defaultdict(list)
-            for g_idx, r_id in enumerate(self._group_rec_ids):
-                rec_to_groups[r_id].append(g_idx)
+        unique_recs = sorted(set(self._group_rec_ids))
+        rec_perm = torch.randperm(
+            len(unique_recs), generator=self.generator
+        ).tolist()
+        rec_order = [unique_recs[i] for i in rec_perm]
 
-            # 3) 레코딩 내 그룹 순서 셔플 후 연결
-            group_indices = []
-            for r_id in rec_order:
-                g_list = rec_to_groups[r_id]
-                perm = torch.randperm(len(g_list), generator=self.generator).tolist()
-                group_indices.extend(g_list[p] for p in perm)
+        rec_to_groups: dict[int, list[int]] = defaultdict(list)
+        for g_idx, r_id in enumerate(self._group_rec_ids):
+            rec_to_groups[r_id].append(g_idx)
 
-        # 전체 배치 리스트 생성
-        all_batches: list[list[int]] = []
+        group_indices = []
+        for r_id in rec_order:
+            g_list = rec_to_groups[r_id]
+            perm = torch.randperm(len(g_list), generator=self.generator).tolist()
+            group_indices.extend(g_list[p] for p in perm)
+
+        return group_indices
+
+    def _groups_to_batches(self, group_indices: list[int]) -> list[list[int]]:
+        """그룹 인덱스 리스트로부터 배치를 구성한다."""
+        batches: list[list[int]] = []
         batch: list[int] = []
         for g_idx in group_indices:
             group = self._groups[g_idx]
 
             if batch and len(batch) + len(group) > self.batch_size:
-                all_batches.append(batch)
+                batches.append(batch)
                 batch = []
 
             batch.extend(group)
 
             if len(batch) >= self.batch_size:
-                all_batches.append(batch)
+                batches.append(batch)
                 batch = []
 
         if batch:
             if not self.drop_last:
-                all_batches.append(batch)
+                batches.append(batch)
 
-        # DDP: 모든 rank가 동일한 배치를 처리한다.
-        # 배치 분배 없음 — 마스킹/크롭이 rank마다 다르므로 gradient는 다름.
-        # DDP all-reduce가 gradient를 평균하여 regularization 효과.
-        # GroupedBatchSampler의 가변 배치 크기로 인한 DDP deadlock 완전 방지.
-        yield from all_batches
+        return batches
+
+    def __iter__(self) -> Iterator[list[int]]:
+        """배치를 yield한다. 각 배치는 완전한 그룹(들)을 포함한다.
+
+        DDP: 그룹 단위로 rank에 분배한다.
+        - 그룹은 분리되지 않으므로 cross-modal pair 100% 보존
+        - 각 rank가 자기 그룹으로 독립적으로 배치 구성
+        - 배치 수를 deterministic하게 맞춰 deadlock 방지
+        """
+        self.generator.manual_seed(42 + self.epoch)
+        group_indices = self._shuffle_groups()
+
+        if self.world_size <= 1:
+            # 단일 GPU: 전체 그룹 사용
+            yield from self._groups_to_batches(group_indices)
+            return
+
+        # ── DDP: 그룹 단위 분배 ──
+
+        # 1. 그룹 수를 world_size 배수로 패딩
+        n_groups = len(group_indices)
+        per_rank = math.ceil(n_groups / self.world_size)
+        padded = group_indices.copy()
+        while len(padded) < per_rank * self.world_size:
+            padded.append(group_indices[len(padded) % n_groups])
+
+        # 2. 연속 청크로 rank에 분배 (recording locality 보존)
+        my_groups = padded[self.rank * per_rank : (self.rank + 1) * per_rank]
+
+        # 3. 각 rank가 자기 그룹으로 배치 구성
+        my_batches = self._groups_to_batches(my_groups)
+
+        # 4. 모든 rank의 배치 수를 동일하게 맞춤 (통신 없이 deterministic 계산)
+        all_batch_counts = []
+        for r in range(self.world_size):
+            r_groups = padded[r * per_rank : (r + 1) * per_rank]
+            # 배치 수만 카운트 (실제 배치 구성 불필요)
+            count, cur_size = 0, 0
+            for g_idx in r_groups:
+                g_size = len(self._groups[g_idx])
+                if cur_size > 0 and cur_size + g_size > self.batch_size:
+                    count += 1
+                    cur_size = 0
+                cur_size += g_size
+                if cur_size >= self.batch_size:
+                    count += 1
+                    cur_size = 0
+            if cur_size > 0 and not self.drop_last:
+                count += 1
+            all_batch_counts.append(count)
+
+        max_batches = max(all_batch_counts) if all_batch_counts else 0
+
+        # 부족분은 기존 배치 반복으로 패딩
+        if my_batches and len(my_batches) < max_batches:
+            orig_len = len(my_batches)
+            while len(my_batches) < max_batches:
+                my_batches.append(my_batches[len(my_batches) % orig_len])
+
+        yield from my_batches
 
     def __len__(self) -> int:
-        """배치 개수 (근사치).
-
-        정확한 개수는 그룹 크기에 따라 달라지므로,
-        이는 근사치이다. DataLoader의 tqdm 진행률 표시용.
-        """
+        """배치 개수 (근사치)."""
         total_samples = sum(len(g) for g in self._groups)
+        per_rank_samples = total_samples // max(self.world_size, 1)
         if self.drop_last:
-            return total_samples // self.batch_size
+            return per_rank_samples // self.batch_size
         else:
-            return (total_samples + self.batch_size - 1) // self.batch_size
+            return (per_rank_samples + self.batch_size - 1) // self.batch_size
