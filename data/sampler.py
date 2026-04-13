@@ -263,16 +263,10 @@ class GroupedBatchSampler(Sampler[list[int]]):
             if not self.drop_last:
                 all_batches.append(batch)
 
-        # DDP: 배치를 rank별로 분배하되, 모든 rank가 동일한 총 배치 수를 갖도록 보장.
-        # 동일 시드 → 동일 all_batches 리스트 → rank별 슬라이스도 동일 길이.
-        if self.world_size > 1:
-            n = len(all_batches)
-            per_rank = -(-n // self.world_size)  # ceil division
-            # 부족분을 기존 배치 반복으로 패딩
-            while len(all_batches) < per_rank * self.world_size:
-                all_batches.append(all_batches[len(all_batches) % n])
-            all_batches = all_batches[self.rank::self.world_size]
-
+        # DDP: 모든 rank가 동일한 배치를 처리한다.
+        # 배치 분배 없음 — 마스킹/크롭이 rank마다 다르므로 gradient는 다름.
+        # DDP all-reduce가 gradient를 평균하여 regularization 효과.
+        # GroupedBatchSampler의 가변 배치 크기로 인한 DDP deadlock 완전 방지.
         yield from all_batches
 
     def __len__(self) -> int:
