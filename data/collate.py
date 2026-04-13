@@ -145,7 +145,23 @@ class PackCollate:
                 if remaining <= 0:
                     break  # 이미 max_length 도달
 
-                seg_len = min(s.values.shape[0], remaining)
+                # 절대 시작 sample
+                abs_start = s.start_sample + s.win_start
+
+                # 공통 시간 그리드 정렬: abs_start를 patch_size 배수로 올림
+                # 앞부분을 잘라내어 모든 variate의 패치 경계가 동일 절대 시간에 정렬
+                trim = 0
+                if self.patch_size is not None:
+                    remainder = abs_start % self.patch_size
+                    if remainder > 0:
+                        trim = self.patch_size - remainder
+                        abs_start += trim  # patch_size 배수로 올림
+
+                values = s.values[trim:]  # 앞부분 잘라냄
+                seg_len = min(values.shape[0], remaining)
+
+                if seg_len <= 0:
+                    continue
 
                 # per-variate patch 파라미터 결정
                 var_p: int | None = None
@@ -164,10 +180,10 @@ class PackCollate:
                         padded_seg_len = var_p + ((remaining - var_p) // var_s) * var_s
                         seg_len = min(seg_len, padded_seg_len)
                     v = torch.zeros(padded_seg_len)
-                    v[:seg_len] = s.values[:seg_len]
+                    v[:seg_len] = values[:seg_len]
                     effective_len = padded_seg_len
                 else:
-                    v = s.values[:seg_len]
+                    v = values[:seg_len]
                     effective_len = seg_len
                     padded_seg_len = seg_len
 
@@ -180,8 +196,6 @@ class PackCollate:
                 )
                 variate_lengths.append(seg_len)
                 padded_variate_lengths.append(padded_seg_len)
-                # 절대 시작 sample: recording의 start_sample + window의 win_start
-                abs_start = s.start_sample + s.win_start
                 variate_start_samples.append(abs_start)
                 offset += effective_len
 
