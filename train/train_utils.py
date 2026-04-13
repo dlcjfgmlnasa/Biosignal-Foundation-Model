@@ -365,7 +365,7 @@ def train_one_epoch(
 
             loss = losses["total"] + config.aux_loss_weight * aux_loss
 
-        # NaN/Inf 감지
+        # NaN/Inf 감지 — DDP에서는 forward 후 반드시 backward 필요
         if not torch.isfinite(loss):
             if is_main_process():
                 print(
@@ -383,7 +383,16 @@ def train_one_epoch(
                         f"Stopping epoch early."
                     )
                 break
+            # DDP: forward 했으면 backward도 해야 all-reduce deadlock 방지
+            # zero loss로 backward하여 gradient sync 수행
+            zero_loss = loss.new_tensor(0.0, requires_grad=True)
+            if scaler is not None:
+                scaler.scale(zero_loss).backward()
+                scaler.update()
+            else:
+                zero_loss.backward()
             optimizer.zero_grad(set_to_none=True)
+            n_batches += 1
             continue
 
         nan_count = 0  # 정상 batch면 카운터 리셋

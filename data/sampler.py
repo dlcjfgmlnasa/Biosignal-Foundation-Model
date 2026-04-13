@@ -263,12 +263,12 @@ class GroupedBatchSampler(Sampler[list[int]]):
             if not self.drop_last:
                 all_batches.append(batch)
 
-        # DDP: rank별로 배치 분배 (모든 rank가 동일한 배치 수)
+        # DDP: 배치를 rank별로 분배하되, 모든 rank가 동일한 총 배치 수를 갖도록 보장.
+        # 동일 시드 → 동일 all_batches 리스트 → rank별 슬라이스도 동일 길이.
         if self.world_size > 1:
             n = len(all_batches)
-            # 모든 rank가 같은 수의 배치를 갖도록 올림 패딩
             per_rank = -(-n // self.world_size)  # ceil division
-            # 부족분은 앞쪽 배치를 반복하여 패딩
+            # 부족분을 기존 배치 반복으로 패딩
             while len(all_batches) < per_rank * self.world_size:
                 all_batches.append(all_batches[len(all_batches) % n])
             all_batches = all_batches[self.rank::self.world_size]

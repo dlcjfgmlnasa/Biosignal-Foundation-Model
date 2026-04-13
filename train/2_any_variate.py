@@ -404,7 +404,7 @@ def main():
 
     # ── DDP wrap ──
     if use_ddp:
-        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True, static_graph=True)
 
     raw_model = model.module if use_ddp else model
 
