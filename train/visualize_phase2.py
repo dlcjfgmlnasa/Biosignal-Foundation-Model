@@ -474,7 +474,7 @@ def _plot_cross_modal_grouped(
         ax_header.set_facecolor(MECHANISM_GROUP_COLORS[0] + "15")
         ax_header.text(
             0.5, 0.5,
-            "\u2764 Cardiovascular (ECG, ABP, PPG, CVP, PAP, ICP)",
+            "[Cardiovascular] ECG, ABP, PPG, CVP, PAP, ICP",
             transform=ax_header.transAxes,
             ha="center", va="center",
             fontsize=12, fontweight="bold",
@@ -494,7 +494,7 @@ def _plot_cross_modal_grouped(
         ax_header.set_facecolor(MECHANISM_GROUP_COLORS[1] + "15")
         ax_header.text(
             0.5, 0.5,
-            "\U0001FAC1 Respiratory (CO2, AWP)",
+            "[Respiratory] CO2, AWP",
             transform=ax_header.transAxes,
             ha="center", va="center",
             fontsize=12, fontweight="bold",
