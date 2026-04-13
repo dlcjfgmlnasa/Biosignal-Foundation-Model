@@ -3,6 +3,7 @@
 
 Salesforce uni2ts (Apache 2.0)에서 포팅.
 """
+
 from __future__ import annotations
 
 import abc

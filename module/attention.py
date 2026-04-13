@@ -4,6 +4,7 @@
 Salesforce uni2ts (Apache 2.0)에서 포팅.
 RMSNorm을 기본 norm_layer로 사용하도록 수정.
 """
+
 from __future__ import annotations
 
 import math
@@ -23,7 +24,8 @@ def native_scaled_dot_product_attention(
     query: torch.Tensor,  # (*batch, group, hpg, q_len, dim)
     key: torch.Tensor,  # (*batch, group, hpg, kv_len, dim)
     value: torch.Tensor,  # (*batch, group, hpg, kv_len, dim)
-    attn_mask: torch.Tensor | None = None,  # (*batch, #group, #hpg, q_len, kv_len) bool|float
+    attn_mask: torch.Tensor
+    | None = None,  # (*batch, #group, #hpg, q_len, kv_len) bool|float
     dropout_p: float = 0.0,
     scale: float | None = None,
 ) -> torch.Tensor:  # (*batch, group, hpg, q_len, dim)
@@ -277,8 +279,11 @@ class GroupedQueryAttention(nn.Module):
             )
         )
         key = key.expand(
-            *key.shape[:-4], self.num_groups, self.heads_per_group,
-            key.shape[-2], key.shape[-1],
+            *key.shape[:-4],
+            self.num_groups,
+            self.heads_per_group,
+            key.shape[-2],
+            key.shape[-1],
         )  # (*batch, group, hpg, kv_len, dim)
         # V를 (*batch, group, 1, kv_len, dim)으로 reshape 후 expand — 복사 없음.
         value = rearrange(
@@ -287,8 +292,11 @@ class GroupedQueryAttention(nn.Module):
             group=self.num_groups,
         )
         value = value.expand(
-            *value.shape[:-4], self.num_groups, self.heads_per_group,
-            value.shape[-2], value.shape[-1],
+            *value.shape[:-4],
+            self.num_groups,
+            self.heads_per_group,
+            value.shape[-2],
+            value.shape[-1],
         )  # (*batch, group, hpg, kv_len, dim)
 
         query_var_id, kv_var_id = self._get_var_id(query, key, query_var_id, kv_var_id)

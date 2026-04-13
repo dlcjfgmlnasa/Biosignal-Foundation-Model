@@ -57,12 +57,23 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    p.add_argument("--config", type=str, required=True,
-                    help="YAML config 파일 경로 (e.g. configs/phase1.yaml)")
-    p.add_argument("--resume", type=str, default=None,
-                    help="Phase 1 checkpoint 경로 (Phase 2 시 사용)")
-    p.add_argument("--dry-run", action="store_true",
-                    help="1 batch만 실행 후 종료 (shape/에러 검증용)")
+    p.add_argument(
+        "--config",
+        type=str,
+        required=True,
+        help="YAML config 파일 경로 (e.g. configs/phase1.yaml)",
+    )
+    p.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="Phase 1 checkpoint 경로 (Phase 2 시 사용)",
+    )
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="1 batch만 실행 후 종료 (shape/에러 검증용)",
+    )
 
     # CLI 오버라이드 (yaml 값을 덮어씀)
     g = p.add_argument_group("Overrides", "YAML 값을 CLI에서 덮어쓸 수 있음")
@@ -76,18 +87,36 @@ def parse_args() -> argparse.Namespace:
     g.add_argument("--max_subjects", type=int, default=None)
     g.add_argument("--output_dir", type=str, default=None)
     g.add_argument("--seed", type=int, default=None)
-    g.add_argument("--crop_ratio_min", type=float, default=None,
-                    help="Random crop 최소 비율 (0=비활성)")
-    g.add_argument("--crop_ratio_max", type=float, default=None,
-                    help="Random crop 최대 비율 (0=비활성)")
-    g.add_argument("--use_amp", action="store_true",
-                    help="AMP (Automatic Mixed Precision) 활성")
-    g.add_argument("--val_ratio", type=float, default=None,
-                    help="Validation 비율 (subject 단위, 0=비활성)")
-    g.add_argument("--patience", type=int, default=None,
-                    help="Early stopping patience (0=비활성)")
-    g.add_argument("--exp_name", type=str, default=None,
-                    help="실험 이름 (output_dir 하위 서브디렉토리)")
+    g.add_argument(
+        "--crop_ratio_min",
+        type=float,
+        default=None,
+        help="Random crop 최소 비율 (0=비활성)",
+    )
+    g.add_argument(
+        "--crop_ratio_max",
+        type=float,
+        default=None,
+        help="Random crop 최대 비율 (0=비활성)",
+    )
+    g.add_argument(
+        "--use_amp", action="store_true", help="AMP (Automatic Mixed Precision) 활성"
+    )
+    g.add_argument(
+        "--val_ratio",
+        type=float,
+        default=None,
+        help="Validation 비율 (subject 단위, 0=비활성)",
+    )
+    g.add_argument(
+        "--patience", type=int, default=None, help="Early stopping patience (0=비활성)"
+    )
+    g.add_argument(
+        "--exp_name",
+        type=str,
+        default=None,
+        help="실험 이름 (output_dir 하위 서브디렉토리)",
+    )
 
     return p.parse_args()
 
@@ -141,13 +170,13 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # ── 설정 출력 ──
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     print(f"{phase_name} {'(dry-run)' if config.dry_run else ''}")
     if config.exp_name:
         print(f"Experiment: {config.exp_name}")
     print(f"Config: {args.config}")
     print(f"Device: {device}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
     # ── 모델 생성 ──
     model = BiosignalFoundationModel.from_config(config.model_config)
@@ -165,7 +194,9 @@ def main():
             ckpt_path = str(found)
         print(f"Loading Phase 1 checkpoint: {ckpt_path}")
         state = load_checkpoint(ckpt_path, model, device=device)
-        print(f"  Phase 1 epoch: {state.get('epoch', '?')}, loss: {state.get('loss', '?')}")
+        print(
+            f"  Phase 1 epoch: {state.get('epoch', '?')}, loss: {state.get('loss', '?')}"
+        )
 
     model.to(device)
     total_params = sum(p.numel() for p in model.parameters())
@@ -183,9 +214,13 @@ def main():
     val_dataloader = None
     if config.val_ratio > 0 and not config.dry_run:
         train_manifest, val_manifest = split_manifest_by_subject(
-            manifest, val_ratio=config.val_ratio, seed=config.seed,
+            manifest,
+            val_ratio=config.val_ratio,
+            seed=config.seed,
         )
-        print(f"Train/Val split: {len(train_manifest)} train, {len(val_manifest)} val recordings")
+        print(
+            f"Train/Val split: {len(train_manifest)} train, {len(val_manifest)} val recordings"
+        )
     else:
         train_manifest = manifest
 
@@ -232,44 +267,66 @@ def main():
 
     # ── Optimizer & Scheduler ──
     criterion = CombinedLoss(
-        alpha=config.alpha, beta=config.beta, gamma=config.gamma,
-        delta=config.delta, contrastive_temperature=config.contrastive_temperature,
+        alpha=config.alpha,
+        beta=config.beta,
+        gamma=config.gamma,
+        delta=config.delta,
+        contrastive_temperature=config.contrastive_temperature,
         learnable_temperature=config.learnable_temperature,
     )
     optimizer = torch.optim.Adam(
-        list(model.parameters()) + list(criterion.parameters()), lr=config.lr,
+        list(model.parameters()) + list(criterion.parameters()),
+        lr=config.lr,
     )
     scheduler = create_scheduler(optimizer, config)
     scaler = create_scaler(config, device)
     if scaler is not None:
-        print(f"AMP enabled (GradScaler)")
+        print("AMP enabled (GradScaler)")
 
     # ── 실험 정보 & 설정 저장 (재현용) ──
     if not config.dry_run:
         extra = {}
         if is_phase2 and ckpt_path:
             extra["phase1_ckpt"] = ckpt_path
-        save_experiment_info(config, output_dir, phase_name=phase_name, extra_info=extra or None)
+        save_experiment_info(
+            config, output_dir, phase_name=phase_name, extra_info=extra or None
+        )
 
     # ── 학습 루프 ──
     best_loss = float("inf")
-    early_stopper = EarlyStopping(patience=config.patience) if config.patience > 0 and not config.dry_run else None
-    csv_logger = CSVLogger(output_dir / "training_log.csv") if not config.dry_run else None
+    early_stopper = (
+        EarlyStopping(patience=config.patience)
+        if config.patience > 0 and not config.dry_run
+        else None
+    )
+    csv_logger = (
+        CSVLogger(output_dir / "training_log.csv") if not config.dry_run else None
+    )
     print(f"\nStarting training: {config.n_epochs} epochs")
-    print(f"  alpha={config.alpha}, beta={config.beta}, gamma={config.gamma}, delta={config.delta}")
-    print(f"  mask_ratio={config.mask_ratio}, variate_mask_prob={config.variate_mask_prob}")
+    print(
+        f"  alpha={config.alpha}, beta={config.beta}, gamma={config.gamma}, delta={config.delta}"
+    )
+    print(
+        f"  mask_ratio={config.mask_ratio}, variate_mask_prob={config.variate_mask_prob}"
+    )
     if val_dataloader is not None:
         print(f"  val_ratio={config.val_ratio}, patience={config.patience}")
     if config.dry_run:
-        print(f"  *** DRY-RUN: 1 batch만 실행합니다 ***")
-    print(f"{'='*60}")
+        print("  *** DRY-RUN: 1 batch만 실행합니다 ***")
+    print(f"{'=' * 60}")
 
     for epoch in range(config.n_epochs):
         epoch_start = time.time()
         losses = train_one_epoch(
-            model, dataloader, optimizer, criterion,
-            config=config, device=device, epoch=epoch,
-            phase_name=phase_name, scaler=scaler,
+            model,
+            dataloader,
+            optimizer,
+            criterion,
+            config=config,
+            device=device,
+            epoch=epoch,
+            phase_name=phase_name,
+            scaler=scaler,
         )
         scheduler.step()
 
@@ -277,8 +334,12 @@ def main():
         val_losses = None
         if val_dataloader is not None:
             val_losses = validate(
-                model, val_dataloader, criterion,
-                config=config, device=device, phase_name=phase_name,
+                model,
+                val_dataloader,
+                criterion,
+                config=config,
+                device=device,
+                phase_name=phase_name,
             )
         epoch_sec = time.time() - epoch_start
 
@@ -301,9 +362,9 @@ def main():
             csv_logger.log(epoch, phase_name, losses, val_losses, current_lr, epoch_sec)
 
         if config.dry_run:
-            print(f"\n{'='*60}")
+            print(f"\n{'=' * 60}")
             print("Dry-run 완료. forward → loss → backward 정상 동작 확인.")
-            print(f"{'='*60}")
+            print(f"{'=' * 60}")
             break
 
         # Best model 저장 (val_loss 기준, 없으면 train_loss)
@@ -311,17 +372,26 @@ def main():
         if track_loss < best_loss:
             best_loss = track_loss
             path = save_training_checkpoint(
-                model, optimizer, epoch, config,
-                phase_name=phase_tag, loss=best_loss,
-                output_dir=output_dir, tag="best",
+                model,
+                optimizer,
+                epoch,
+                config,
+                phase_name=phase_tag,
+                loss=best_loss,
+                output_dir=output_dir,
+                tag="best",
             )
             print(f"  → Best model saved: {path}")
 
         # 주기적 체크포인트
         if (epoch + 1) % config.checkpoint_every == 0:
             save_training_checkpoint(
-                model, optimizer, epoch, config,
-                phase_name=phase_tag, loss=losses["total"],
+                model,
+                optimizer,
+                epoch,
+                config,
+                phase_name=phase_tag,
+                loss=losses["total"],
                 output_dir=output_dir,
             )
 
@@ -336,17 +406,22 @@ def main():
 
     if not config.dry_run:
         final_path = save_training_checkpoint(
-            model, optimizer, epoch, config,
-            phase_name=phase_tag, loss=losses["total"],
-            output_dir=output_dir, tag="final",
+            model,
+            optimizer,
+            epoch,
+            config,
+            phase_name=phase_tag,
+            loss=losses["total"],
+            output_dir=output_dir,
+            tag="final",
         )
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"{phase_name} complete. Final train loss: {losses['total']:.6f}")
         if val_losses is not None:
             print(f"Final val loss: {val_losses['total']:.6f}")
         print(f"Best {'val' if val_dataloader else 'train'} loss: {best_loss:.6f}")
         print(f"Final checkpoint: {final_path}")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
 
     # 메모리 정리
     del dataloader

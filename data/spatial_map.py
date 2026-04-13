@@ -21,12 +21,14 @@ SPATIAL_MAP: dict[int, dict[str, int]] = {
     # ECG (signal_type=0)
     0: {
         "Unknown": 0,
-        "Lead_II": 1, "Lead_V5": 2,
+        "Lead_II": 1,
+        "Lead_V5": 2,
     },
     # ABP (signal_type=1)
     1: {
         "Unknown": 0,
-        "Radial": 1, "Femoral": 2,
+        "Radial": 1,
+        "Femoral": 2,
     },
     # PPG (signal_type=2)
     2: {
@@ -112,13 +114,21 @@ MECHANISM_GROUP_NAMES: dict[int, str] = {
 # 채널명 → (signal_type, local_spatial_id) 역매핑
 CHANNEL_NAME_TO_SPATIAL: dict[str, tuple[int, int]] = {
     # ECG (0)
-    "ECG Lead II": (0, 1), "ECG II": (0, 1), "II": (0, 1),
-    "ECG Lead V5": (0, 2), "ECG V5": (0, 2), "V5": (0, 2),
+    "ECG Lead II": (0, 1),
+    "ECG II": (0, 1),
+    "II": (0, 1),
+    "ECG Lead V5": (0, 2),
+    "ECG V5": (0, 2),
+    "V5": (0, 2),
     # ABP (1)
-    "ABP Radial": (1, 1), "ART": (1, 1),
-    "ABP Femoral": (1, 2), "FEM": (1, 2),
+    "ABP Radial": (1, 1),
+    "ART": (1, 1),
+    "ABP Femoral": (1, 2),
+    "FEM": (1, 2),
     # PPG (2)
-    "PPG": (2, 0), "PLETH": (2, 1), "PPG Finger": (2, 1),
+    "PPG": (2, 0),
+    "PLETH": (2, 1),
+    "PPG Finger": (2, 1),
     # CVP (3)
     "CVP": (3, 0),
     # CO2 (4)

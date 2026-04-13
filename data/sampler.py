@@ -73,7 +73,9 @@ class RecordingLocalitySampler(Sampler[int]):
 
         # DDP: 레코딩 수를 num_replicas 배수로 패딩 (균등 분배)
         self._n_recs = len(self._rec_ranges)
-        self._n_recs_padded = math.ceil(self._n_recs / self.num_replicas) * self.num_replicas
+        self._n_recs_padded = (
+            math.ceil(self._n_recs / self.num_replicas) * self.num_replicas
+        )
 
     def set_epoch(self, epoch: int) -> None:
         """에폭별 셔플링 시드 설정 (DDP 동기화용)."""
@@ -170,9 +172,12 @@ class GroupedBatchSampler(Sampler[list[int]]):
 
         for idx in range(len(dataset)):
             # 인덱스 디코딩 (dataset.__getitem__과 동일)
-            rec_idx = bisect.bisect_right(
-                dataset._rec_offsets, idx, hi=len(dataset._rec_offsets) - 1
-            ) - 1
+            rec_idx = (
+                bisect.bisect_right(
+                    dataset._rec_offsets, idx, hi=len(dataset._rec_offsets) - 1
+                )
+                - 1
+            )
             local = idx - dataset._rec_offsets[rec_idx]
             n_win = dataset._n_windows_per_rec[rec_idx]
             win_idx = local % n_win
@@ -205,7 +210,9 @@ class GroupedBatchSampler(Sampler[list[int]]):
         if self.shuffle:
             # 1) 레코딩 순서 셔플
             unique_recs = sorted(set(self._group_rec_ids))
-            rec_perm = torch.randperm(len(unique_recs), generator=self.generator).tolist()
+            rec_perm = torch.randperm(
+                len(unique_recs), generator=self.generator
+            ).tolist()
             rec_order = [unique_recs[i] for i in rec_perm]
 
             # 2) 레코딩별 그룹 인덱스 모으기

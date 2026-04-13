@@ -24,7 +24,7 @@ from __future__ import annotations
 import argparse
 import re
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -34,7 +34,14 @@ TARGET_SR: float = 100.0
 
 # signal_type 정수 → 문자열 매핑
 SIGNAL_TYPE_MAP: dict[int, str] = {
-    0: "ecg", 1: "abp", 2: "ppg", 3: "cvp", 4: "co2", 5: "awp", 6: "pap", 7: "icp",
+    0: "ecg",
+    1: "abp",
+    2: "ppg",
+    3: "cvp",
+    4: "co2",
+    5: "awp",
+    6: "pap",
+    7: "icp",
 }
 
 
@@ -44,12 +51,13 @@ SIGNAL_TYPE_MAP: dict[int, str] = {
 @dataclass
 class ForecastSample:
     """미래 저혈압 예측 샘플."""
+
     input_signals: dict[str, np.ndarray]  # {"ecg": (win_samples,), ...}
-    label: int                             # 0=normal, 1=hypotension in future
-    label_value: float                     # future MAP (mmHg)
+    label: int  # 0=normal, 1=hypotension in future
+    label_value: float  # future MAP (mmHg)
     case_id: str
-    win_start_sec: float                   # input window 시작 (초)
-    horizon_sec: float                     # prediction horizon (초)
+    win_start_sec: float  # input window 시작 (초)
+    horizon_sec: float  # prediction horizon (초)
 
 
 # ---- 로컬 .pt 로더 ----
@@ -62,7 +70,8 @@ def _parse_pt_filename(name: str) -> dict | None:
     예: VDB_0239_S0_abp_1_seg0_0.pt
     """
     m = re.match(
-        r"^(.+?)_S(\d+)_([a-z0-9]+)_(\d+)_seg(\d+)_(\d+)\.pt$", name,
+        r"^(.+?)_S(\d+)_([a-z0-9]+)_(\d+)_seg(\d+)_(\d+)\.pt$",
+        name,
     )
     if m is None:
         return None
@@ -145,11 +154,13 @@ def _load_local_pt_aligned_signals(
             signals = {k: v[:min_len] for k, v in signals.items()}
             session_id, seg_i, seg_j = seg_key
 
-            cases.append({
-                "case_id": f"{subject_id}_s{session_id}_seg{seg_i}_{seg_j}",
-                "patient_id": subject_id,
-                "signals": signals,
-            })
+            cases.append(
+                {
+                    "case_id": f"{subject_id}_s{session_id}_seg{seg_i}_{seg_j}",
+                    "patient_id": subject_id,
+                    "signals": signals,
+                }
+            )
 
     print(f"  Loaded {len(cases)} aligned segments with {required_types}")
     return cases
@@ -228,7 +239,7 @@ def extract_forecast_samples(
             input_dict = {}
             for stype in input_signals:
                 if stype in signals:
-                    input_dict[stype] = signals[stype][start:start + win_samples]
+                    input_dict[stype] = signals[stype][start : start + win_samples]
 
             if not input_dict:
                 continue
@@ -241,7 +252,7 @@ def extract_forecast_samples(
             # 미래 구간의 MAP (10초 윈도우별 평균)
             future_maps: list[float] = []
             for j in range(0, len(future_abp) - map_win + 1, map_win):
-                w = future_abp[j:j + map_win]
+                w = future_abp[j : j + map_win]
                 if not np.isnan(w).any():
                     future_maps.append(float(np.mean(w)))
 
@@ -249,21 +260,29 @@ def extract_forecast_samples(
                 continue
 
             # ≥1분 지속 MAP<65 여부 확인
-            label = 1 if _has_sustained_hypotension(
-                future_maps, map_threshold, min_consecutive,
-            ) else 0
+            label = (
+                1
+                if _has_sustained_hypotension(
+                    future_maps,
+                    map_threshold,
+                    min_consecutive,
+                )
+                else 0
+            )
 
             # label_value: 미래 MAP의 최솟값 (참고용)
             min_future_map = min(future_maps)
 
-            samples.append(ForecastSample(
-                input_signals=input_dict,
-                label=label,
-                label_value=min_future_map,
-                case_id=case["case_id"],
-                win_start_sec=start / TARGET_SR,
-                horizon_sec=horizon_sec,
-            ))
+            samples.append(
+                ForecastSample(
+                    input_signals=input_dict,
+                    label=label,
+                    label_value=min_future_map,
+                    case_id=case["case_id"],
+                    win_start_sec=start / TARGET_SR,
+                    horizon_sec=horizon_sec,
+                )
+            )
 
     return samples
 
@@ -285,17 +304,25 @@ def save_dataset(
 
     def _to_tensors(samples: list[ForecastSample]) -> dict:
         if not samples:
-            return {"signals": {}, "labels": torch.tensor([]), "label_values": torch.tensor([])}
+            return {
+                "signals": {},
+                "labels": torch.tensor([]),
+                "label_values": torch.tensor([]),
+            }
 
         # 각 signal type별 텐서 생성
         sig_tensors = {}
         for stype in input_signals:
             arrs = [s.input_signals[stype] for s in samples if stype in s.input_signals]
             if arrs:
-                sig_tensors[stype] = torch.stack([torch.from_numpy(a).float() for a in arrs])
+                sig_tensors[stype] = torch.stack(
+                    [torch.from_numpy(a).float() for a in arrs]
+                )
 
         labels = torch.tensor([s.label for s in samples], dtype=torch.long)
-        label_values = torch.tensor([s.label_value for s in samples], dtype=torch.float32)
+        label_values = torch.tensor(
+            [s.label_value for s in samples], dtype=torch.float32
+        )
         case_ids = [s.case_id for s in samples]
 
         return {
@@ -353,8 +380,10 @@ def print_stats(
     print(f"  {name}: {n_total} samples")
     print(f"    Normal:      {n_normal} ({n_normal / n_total * 100:.1f}%)")
     print(f"    Hypotension: {n_hypo} ({n_hypo / n_total * 100:.1f}%)")
-    print(f"    Future MAP:  [{min(maps):.1f}, {max(maps):.1f}] mmHg, "
-          f"mean={np.mean(maps):.1f} +/- {np.std(maps):.1f}")
+    print(
+        f"    Future MAP:  [{min(maps):.1f}, {max(maps):.1f}] mmHg, "
+        f"mean={np.mean(maps):.1f} +/- {np.std(maps):.1f}"
+    )
 
 
 # ---- 메인 ----
@@ -391,20 +420,23 @@ def prepare_hypotension_forecast(
     min_duration_sec = window_sec + horizon_sec + stride_sec
     mode_str = " + ".join(s.upper() for s in input_signals)
 
-    print(f"{'='*60}")
-    print(f"  Task 1: Hypotension Forecast")
+    print(f"{'=' * 60}")
+    print("  Task 1: Hypotension Forecast")
     print(f"  Data:    {data_dir}")
     print(f"  Input:   {mode_str}")
     print(f"  Horizon: {horizon_min} min")
     print(f"  Window:  {window_sec}s, Stride: {stride_sec}s")
-    print(f"  Label:   MAP<65 sustained >=1min")
-    print(f"  Min duration: {min_duration_sec/60:.1f} min")
-    print(f"{'='*60}")
+    print("  Label:   MAP<65 sustained >=1min")
+    print(f"  Min duration: {min_duration_sec / 60:.1f} min")
+    print(f"{'=' * 60}")
 
     # 1. 데이터 로드
-    print(f"\n[1/4] Loading aligned multi-channel data...")
+    print("\n[1/4] Loading aligned multi-channel data...")
     cases = _load_local_pt_aligned_signals(
-        data_dir, input_signals, min_duration_sec, max_subjects,
+        data_dir,
+        input_signals,
+        min_duration_sec,
+        max_subjects,
     )
 
     if not cases:
@@ -422,15 +454,27 @@ def prepare_hypotension_forecast(
     train_cases = [c for c in cases if c["patient_id"] in train_patients]
     test_cases = [c for c in cases if c["patient_id"] not in train_patients]
     print(f"  Train: {len(train_cases)} cases ({len(train_patients)} patients)")
-    print(f"  Test:  {len(test_cases)} cases ({len(patient_ids) - len(train_patients)} patients)")
+    print(
+        f"  Test:  {len(test_cases)} cases ({len(patient_ids) - len(train_patients)} patients)"
+    )
 
     # 3. 윈도우 추출 + 라벨링
-    print(f"\n[3/4] Extracting forecast samples (horizon={horizon_min}min, sustained>=1min)...")
+    print(
+        f"\n[3/4] Extracting forecast samples (horizon={horizon_min}min, sustained>=1min)..."
+    )
     train_samples = extract_forecast_samples(
-        train_cases, input_signals, window_sec, stride_sec, horizon_sec,
+        train_cases,
+        input_signals,
+        window_sec,
+        stride_sec,
+        horizon_sec,
     )
     test_samples = extract_forecast_samples(
-        test_cases, input_signals, window_sec, stride_sec, horizon_sec,
+        test_cases,
+        input_signals,
+        window_sec,
+        stride_sec,
+        horizon_sec,
     )
 
     print_stats("Train", train_samples)
@@ -441,15 +485,19 @@ def prepare_hypotension_forecast(
         sys.exit(1)
 
     # 4. 저장
-    print(f"\n[4/4] Saving...")
+    print("\n[4/4] Saving...")
     save_path = save_dataset(
-        train_samples, test_samples,
-        input_signals, horizon_sec, window_sec, out_dir,
+        train_samples,
+        test_samples,
+        input_signals,
+        horizon_sec,
+        window_sec,
+        out_dir,
     )
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"  Done! {save_path}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     return save_path
 
 
@@ -457,23 +505,46 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Task 1: Hypotension Forecast - Data Preparation",
     )
-    parser.add_argument("--data-dir", type=str, required=True,
-                        help="Local .pt data directory (e.g. vitaldb_pt_test/)")
-    parser.add_argument("--input-signals", nargs="+", default=["abp"],
-                        choices=["abp", "ecg", "ppg"],
-                        help="Input signal types (label always from ABP)")
-    parser.add_argument("--max-subjects", type=int, default=None,
-                        help="Max number of subjects to load (None=all)")
-    parser.add_argument("--horizon-min", type=float, default=5.0,
-                        help="Prediction horizon in minutes")
-    parser.add_argument("--window-sec", type=float, default=30.0,
-                        help="Input window length in seconds")
-    parser.add_argument("--stride-sec", type=float, default=30.0,
-                        help="Sliding window stride in seconds")
-    parser.add_argument("--train-ratio", type=float, default=0.7,
-                        help="Train/test split ratio")
-    parser.add_argument("--out-dir", type=str, default="outputs/downstream/hypotension",
-                        help="Output directory")
+    parser.add_argument(
+        "--data-dir",
+        type=str,
+        required=True,
+        help="Local .pt data directory (e.g. vitaldb_pt_test/)",
+    )
+    parser.add_argument(
+        "--input-signals",
+        nargs="+",
+        default=["abp"],
+        choices=["abp", "ecg", "ppg"],
+        help="Input signal types (label always from ABP)",
+    )
+    parser.add_argument(
+        "--max-subjects",
+        type=int,
+        default=None,
+        help="Max number of subjects to load (None=all)",
+    )
+    parser.add_argument(
+        "--horizon-min", type=float, default=5.0, help="Prediction horizon in minutes"
+    )
+    parser.add_argument(
+        "--window-sec", type=float, default=30.0, help="Input window length in seconds"
+    )
+    parser.add_argument(
+        "--stride-sec",
+        type=float,
+        default=30.0,
+        help="Sliding window stride in seconds",
+    )
+    parser.add_argument(
+        "--train-ratio", type=float, default=0.7, help="Train/test split ratio"
+    )
+    parser.add_argument(
+        "--out-dir",
+        type=str,
+        default="outputs/downstream/hypotension",
+        help="Output directory",
+    )
     args = parser.parse_args()
 
     prepare_hypotension_forecast(

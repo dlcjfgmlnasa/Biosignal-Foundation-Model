@@ -3,6 +3,7 @@
 
 Salesforce uni2ts (Apache 2.0)에서 포팅.
 """
+
 from __future__ import annotations
 
 import math
@@ -65,7 +66,8 @@ class FeedForward(nn.Module):
         return self.dropout2(self.fc2(self.dropout1(x)))
 
     def _in_proj(
-        self, x: torch.Tensor,  # (..., in_dim)
+        self,
+        x: torch.Tensor,  # (..., in_dim)
     ) -> torch.Tensor:  # (..., out_dim)
         return self.activation(self.fc1(x))
 
@@ -113,7 +115,8 @@ class GatedLinearUnitFeedForward(FeedForward):
         return (int(dim * 2 / 3) + 7) // 8 * 8
 
     def _in_proj(
-        self, x: torch.Tensor,  # (..., in_dim)
+        self,
+        x: torch.Tensor,  # (..., in_dim)
     ) -> torch.Tensor:  # (..., out_dim)
         return self.activation(self.fc_gate(x)) * self.fc1(x)
 
@@ -181,7 +184,7 @@ class MoEFeedForward(nn.Module):
         self.aux_loss: torch.Tensor | None = None
         # Routing 모니터링: forward마다 갱신 (detached, no grad)
         self._expert_counts: torch.Tensor | None = None  # (E,) — expert별 할당 토큰 수
-        self._routing_entropy: float | None = None        # 라우팅 엔트로피 (균등=log(E))
+        self._routing_entropy: float | None = None  # 라우팅 엔트로피 (균등=log(E))
 
     def forward(
         self,
@@ -191,10 +194,14 @@ class MoEFeedForward(nn.Module):
 
         # ── Gate: linear → softmax → topk ──
         gate_logits = self.gate(x_squashed)  # (T, num_experts)
-        gate_probs = F.softmax(gate_logits, dim=1, dtype=torch.float).type_as(x)  # (T, E)
+        gate_probs = F.softmax(gate_logits, dim=1, dtype=torch.float).type_as(
+            x
+        )  # (T, E)
 
         weights, selected_experts = torch.topk(
-            gate_logits, self.num_experts_per_token, dim=1,
+            gate_logits,
+            self.num_experts_per_token,
+            dim=1,
         )  # (T, K), (T, K)
         weights = F.softmax(weights, dim=1, dtype=torch.float).type_as(x)  # (T, K)
 
@@ -202,7 +209,8 @@ class MoEFeedForward(nn.Module):
         # f_i: 각 expert에 할당된 토큰 비율
         num_tokens = x_squashed.shape[0]
         one_hot = F.one_hot(
-            selected_experts.reshape(-1), self.num_experts,
+            selected_experts.reshape(-1),
+            self.num_experts,
         ).float()  # (T*K, E)
         tokens_per_expert = one_hot.sum(dim=0)  # (E,)
         f = tokens_per_expert / (num_tokens * self.num_experts_per_token)  # (E,)
@@ -223,21 +231,35 @@ class MoEFeedForward(nn.Module):
 
         # ── Expert dispatch (argsort 기반 그룹핑) ──
         results = torch.zeros_like(x_squashed)
-        flat_experts = selected_experts.reshape(-1)               # (T * K,)
-        flat_batch = torch.arange(
-            selected_experts.shape[0], device=x.device,
-        ).unsqueeze(-1).expand_as(selected_experts).reshape(-1)   # (T * K,)
-        flat_slot = torch.arange(
-            selected_experts.shape[1], device=x.device,
-        ).unsqueeze(0).expand_as(selected_experts).reshape(-1)    # (T * K,)
-        order = flat_experts.argsort()                            # GPU 1회 sort
+        flat_experts = selected_experts.reshape(-1)  # (T * K,)
+        flat_batch = (
+            torch.arange(
+                selected_experts.shape[0],
+                device=x.device,
+            )
+            .unsqueeze(-1)
+            .expand_as(selected_experts)
+            .reshape(-1)
+        )  # (T * K,)
+        flat_slot = (
+            torch.arange(
+                selected_experts.shape[1],
+                device=x.device,
+            )
+            .unsqueeze(0)
+            .expand_as(selected_experts)
+            .reshape(-1)
+        )  # (T * K,)
+        order = flat_experts.argsort()  # GPU 1회 sort
         sorted_experts = flat_experts[order]
         sorted_batch = flat_batch[order]
         sorted_slot = flat_slot[order]
         # expert 경계를 한 번에 계산
         counts = torch.zeros(self.num_experts, dtype=torch.long, device=x.device)
-        counts.scatter_add_(0, sorted_experts, torch.ones_like(sorted_experts, dtype=torch.long))
-        splits = counts.cumsum(0).tolist()                        # CPU sync 1회 (불가피)
+        counts.scatter_add_(
+            0, sorted_experts, torch.ones_like(sorted_experts, dtype=torch.long)
+        )
+        splits = counts.cumsum(0).tolist()  # CPU sync 1회 (불가피)
         start = 0
         for i, expert in enumerate(self.experts):
             end = splits[i]

@@ -4,6 +4,7 @@
 BiosignalFoundationModel의 모든 아키텍처 파라미터를 하나의 dataclass로 통합하여
 실험 재현성과 checkpoint 직렬화를 보장한다.
 """
+
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, fields

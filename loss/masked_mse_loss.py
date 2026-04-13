@@ -11,7 +11,7 @@ from torch import nn
 
 
 def _multi_resolution_stft_loss(
-    pred: torch.Tensor,    # (M, P)
+    pred: torch.Tensor,  # (M, P)
     target: torch.Tensor,  # (M, P)
     n_ffts: tuple[int, ...] = (16, 32, 64),
 ) -> torch.Tensor:
@@ -44,21 +44,29 @@ def _multi_resolution_stft_loss(
         hop = n_fft // 4
         window = torch.hann_window(n_fft, device=pred.device)
         pred_stft = torch.stft(
-            pred_f, n_fft=n_fft, hop_length=hop,
-            win_length=n_fft, window=window,
+            pred_f,
+            n_fft=n_fft,
+            hop_length=hop,
+            win_length=n_fft,
+            window=window,
             return_complex=True,
         )  # (M, n_fft//2+1, T)
         target_stft = torch.stft(
-            target_f, n_fft=n_fft, hop_length=hop,
-            win_length=n_fft, window=window,
+            target_f,
+            n_fft=n_fft,
+            hop_length=hop,
+            win_length=n_fft,
+            window=window,
             return_complex=True,
         )  # (M, n_fft//2+1, T)
 
-        pred_mag = pred_stft.abs()      # (M, F, T)
+        pred_mag = pred_stft.abs()  # (M, F, T)
         target_mag = target_stft.abs()  # (M, F, T)
 
         # Spectral Convergence: Frobenius norm ratio
-        sc = torch.norm(target_mag - pred_mag, p="fro") / (torch.norm(target_mag, p="fro") + 1e-8)
+        sc = torch.norm(target_mag - pred_mag, p="fro") / (
+            torch.norm(target_mag, p="fro") + 1e-8
+        )
 
         # Log-magnitude L1
         log_mag = (torch.log1p(pred_mag) - torch.log1p(target_mag)).abs().mean()
@@ -69,7 +77,7 @@ def _multi_resolution_stft_loss(
 
 
 def compute_peak_weighted_mse(
-    pred: torch.Tensor,    # (M, P)
+    pred: torch.Tensor,  # (M, P)
     target: torch.Tensor,  # (M, P)
     peak_alpha: float = 0.0,
 ) -> torch.Tensor:
@@ -97,7 +105,7 @@ def compute_peak_weighted_mse(
 
 
 def compute_patch_loss(
-    pred: torch.Tensor,    # (M, P)
+    pred: torch.Tensor,  # (M, P)
     target: torch.Tensor,  # (M, P)
     peak_alpha: float = 0.0,
     lambda_spec: float = 0.0,
@@ -164,20 +172,21 @@ class MaskedPatchLoss(nn.Module):
 
     def forward(
         self,
-        reconstructed: torch.Tensor,     # (B, N, P)
+        reconstructed: torch.Tensor,  # (B, N, P)
         original_patches: torch.Tensor,  # (B, N, P)
-        pred_mask: torch.Tensor,         # (B, N) bool
+        pred_mask: torch.Tensor,  # (B, N) bool
     ) -> dict[str, torch.Tensor]:
         n_masked = pred_mask.float().sum()
         if n_masked == 0:
             zero = reconstructed.new_tensor(0.0)
             return {"mse": zero, "spec": zero, "total": zero}
 
-        pred_m = reconstructed[pred_mask]    # (M, P)
+        pred_m = reconstructed[pred_mask]  # (M, P)
         target_m = original_patches[pred_mask]  # (M, P)
 
         return compute_patch_loss(
-            pred_m, target_m,
+            pred_m,
+            target_m,
             peak_alpha=self.peak_alpha,
             lambda_spec=self.lambda_spec,
             spec_n_ffts=self.spec_n_ffts,
@@ -185,13 +194,13 @@ class MaskedPatchLoss(nn.Module):
 
 
 def create_patch_mask(
-    patch_mask: torch.Tensor,          # (B, N) — 유효 패치 (True=유효)
+    patch_mask: torch.Tensor,  # (B, N) — 유효 패치 (True=유효)
     mask_ratio: float = 0.15,
     patch_variate_id: torch.Tensor | None = None,  # (B, N)
-    variate_mask_prob: float = 0.0,    # Phase 2: 전체 variate 마스킹 확률
-    block_mask: bool = False,          # True면 연속 블록 마스킹
-    block_size_min: int = 3,           # 블록 최소 크기 (패치 수)
-    block_size_max: int = 8,           # 블록 최대 크기 (패치 수)
+    variate_mask_prob: float = 0.0,  # Phase 2: 전체 variate 마스킹 확률
+    block_mask: bool = False,  # True면 연속 블록 마스킹
+    block_size_min: int = 3,  # 블록 최소 크기 (패치 수)
+    block_size_max: int = 8,  # 블록 최대 크기 (패치 수)
 ) -> torch.Tensor:  # (B, N) bool — 마스킹 대상 (True=마스킹)
     """패치 마스킹 생성.
 
@@ -239,7 +248,7 @@ def create_patch_mask(
             unique_vars = valid_var_ids[valid_var_ids > 0].unique()
             if len(unique_vars) > 1:
                 chosen_var = unique_vars[torch.randint(len(unique_vars), (1,)).item()]
-                var_mask = (patch_variate_id[bi] == chosen_var)
+                var_mask = patch_variate_id[bi] == chosen_var
                 pred_mask[bi] = var_mask & patch_mask[bi]
                 continue
 
@@ -256,8 +265,9 @@ def create_patch_mask(
 
             while masked_count < n_mask and runs:
                 # 배치 가능한 run만 필터링
-                eligible = [(i, s, l) for i, (s, l) in enumerate(runs)
-                            if l >= block_size_min]
+                eligible = [
+                    (i, s, l) for i, (s, l) in enumerate(runs) if l >= block_size_min
+                ]
                 if not eligible:
                     break
 
@@ -265,7 +275,9 @@ def create_patch_mask(
                 pick = torch.randint(0, len(eligible), (1,)).item()
                 _, run_start, run_len = eligible[pick]
 
-                bs = torch.randint(block_size_min, min(block_size_max, run_len) + 1, (1,)).item()
+                bs = torch.randint(
+                    block_size_min, min(block_size_max, run_len) + 1, (1,)
+                ).item()
                 bs = min(bs, n_mask - masked_count)  # 초과 방지
                 if bs < 1:
                     break
@@ -273,7 +285,7 @@ def create_patch_mask(
                 max_start = run_len - bs
                 offset = torch.randint(0, max_start + 1, (1,)).item()
                 start_idx = run_start + offset
-                pred_mask[bi, start_idx:start_idx + bs] = True
+                pred_mask[bi, start_idx : start_idx + bs] = True
                 masked_count += bs
 
                 # 배치된 블록 영역 + 양옆 1패치 gap을 run에서 제거
@@ -291,7 +303,7 @@ def create_patch_mask(
                 if right_len > 0:
                     new_runs.append((right_start, right_len))
                 # 기존 run을 교체 (block_size_min 미만 run도 보존 — eligible 필터가 걸러줌)
-                runs = runs[:ri] + new_runs + runs[ri + 1:]
+                runs = runs[:ri] + new_runs + runs[ri + 1 :]
 
             # 목표 미달 시 랜덤으로 나머지 채움
             if masked_count < n_mask:

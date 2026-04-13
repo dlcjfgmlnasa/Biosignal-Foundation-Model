@@ -10,7 +10,6 @@ from loss.masked_mse_loss import MaskedPatchLoss
 from loss.next_prediction_loss import NextPredictionLoss
 
 
-
 class CombinedLoss(nn.Module):
     """α * MPM + β * NextPred (same-variate + γ * cross-modal) + δ * Contrastive 하이브리드 손실 함수.
 
@@ -67,18 +66,20 @@ class CombinedLoss(nn.Module):
 
     def forward(
         self,
-        reconstructed: torch.Tensor,     # (B, N, patch_size)
+        reconstructed: torch.Tensor,  # (B, N, patch_size)
         next_pred: torch.Tensor | None,  # (B, N, patch_size) or None
         original_patches: torch.Tensor,  # (B, N, patch_size)
-        pred_mask: torch.Tensor,         # (B, N) bool — 마스킹된 패치
-        patch_mask: torch.Tensor,        # (B, N) bool — 유효 패치
-        patch_sample_id: torch.Tensor,   # (B, N) long — 패치별 sample_id
+        pred_mask: torch.Tensor,  # (B, N) bool — 마스킹된 패치
+        patch_mask: torch.Tensor,  # (B, N) bool — 유효 패치
+        patch_sample_id: torch.Tensor,  # (B, N) long — 패치별 sample_id
         patch_variate_id: torch.Tensor,  # (B, N) long — 패치별 variate_id
         horizon: int = 1,
         cross_pred: torch.Tensor | None = None,  # (B, N, patch_size) — cross-modal 예측
-        time_id: torch.Tensor | None = None,     # (B, N) long — cross-modal 페어링용
-        contrastive_z: torch.Tensor | None = None,  # (B, N, proj_dim) — contrastive 임베딩
-        patch_signal_types: torch.Tensor | None = None,  # (B, N) long — mechanism group 필터용
+        time_id: torch.Tensor | None = None,  # (B, N) long — cross-modal 페어링용
+        contrastive_z: torch.Tensor
+        | None = None,  # (B, N, proj_dim) — contrastive 임베딩
+        patch_signal_types: torch.Tensor
+        | None = None,  # (B, N) long — mechanism group 필터용
     ) -> dict[str, torch.Tensor]:
         # ── Masked Reconstruction Loss (MSE + Gradient + Spectral) ──
         masked_dict = self.masked_loss_fn(reconstructed, original_patches, pred_mask)
@@ -87,9 +88,14 @@ class CombinedLoss(nn.Module):
         # ── Next-Patch Prediction Loss ──
         if self.beta > 0 and next_pred is not None:
             next_dict = self.next_loss_fn(
-                next_pred, cross_pred, original_patches,
-                patch_mask, patch_sample_id, patch_variate_id,
-                time_id=time_id, patch_signal_types=patch_signal_types,
+                next_pred,
+                cross_pred,
+                original_patches,
+                patch_mask,
+                patch_sample_id,
+                patch_variate_id,
+                time_id=time_id,
+                patch_signal_types=patch_signal_types,
                 horizon=horizon,
             )
             next_loss = next_dict["next_loss"]
@@ -103,8 +109,11 @@ class CombinedLoss(nn.Module):
         # ── Cross-Modal Contrastive Loss ──
         if self.delta > 0 and contrastive_z is not None and time_id is not None:
             contrastive_loss = self.contrastive_loss_fn(
-                contrastive_z, patch_mask,
-                patch_sample_id, patch_variate_id, time_id,
+                contrastive_z,
+                patch_mask,
+                patch_sample_id,
+                patch_variate_id,
+                time_id,
             )
         else:
             contrastive_loss = reconstructed.new_tensor(0.0)

@@ -3,6 +3,7 @@
 생체신호(ECG, ABP, PPG, CVP, CO2, AWP, PAP, ICP) 각각의 생리학적 특성에 맞는
 품질 검사를 제공한다. 파서(_common.py)의 segment_quality_score와 함께 사용된다.
 """
+
 from __future__ import annotations
 
 import numpy as np
@@ -46,15 +47,14 @@ def _autocorrelation_peak(
     zero_lag = autocorr_full[n - 1]
     if zero_lag < 1e-10:
         return 0.0
-    autocorr = autocorr_full[n - 1:] / zero_lag
+    autocorr = autocorr_full[n - 1 :] / zero_lag
 
     min_lag = max(1, int(min_lag_s * sr))
     max_lag = min(len(autocorr) - 1, int(max_lag_s * sr))
     if min_lag >= max_lag:
         return 0.0
 
-    return float(np.max(autocorr[min_lag:max_lag + 1]))
-
+    return float(np.max(autocorr[min_lag : max_lag + 1]))
 
 
 # ── ECG ───────────────────────────────────────────────────────
@@ -71,7 +71,14 @@ def ecg_quality_check(
     """ECG 세그먼트의 QRS peak 기반 심박수 품질 검사."""
     from scipy.signal import find_peaks
 
-    _fail = {"hr": 0.0, "hr_valid": False, "n_peaks": 0, "regularity": 1.0, "autocorr_peak": 0.0, "pass": False}
+    _fail = {
+        "hr": 0.0,
+        "hr_valid": False,
+        "n_peaks": 0,
+        "regularity": 1.0,
+        "autocorr_peak": 0.0,
+        "pass": False,
+    }
 
     if len(segment) < int(sr * 2):
         return _fail
@@ -111,7 +118,9 @@ def ecg_quality_check(
     max_lag_s = 60.0 / min_hr
     autocorr_peak = _autocorrelation_peak(segment, sr, min_lag_s, max_lag_s)
 
-    passed = hr_valid and regularity < regularity_threshold and autocorr_peak >= min_autocorr
+    passed = (
+        hr_valid and regularity < regularity_threshold and autocorr_peak >= min_autocorr
+    )
 
     return {
         "hr": round(hr, 1),
@@ -137,7 +146,13 @@ def abp_quality_check(
     """ABP 세그먼트의 pulse peak regularity 기반 품질 검사."""
     from scipy.signal import find_peaks
 
-    _fail = {"hr": 0.0, "n_peaks": 0, "regularity": 1.0, "autocorr_peak": 0.0, "pass": False}
+    _fail = {
+        "hr": 0.0,
+        "n_peaks": 0,
+        "regularity": 1.0,
+        "autocorr_peak": 0.0,
+        "pass": False,
+    }
 
     if len(segment) < int(sr * 2):
         return _fail
@@ -174,7 +189,9 @@ def abp_quality_check(
     max_lag_s = 60.0 / min_hr
     autocorr_peak = _autocorrelation_peak(segment, sr, min_lag_s, max_lag_s)
 
-    passed = hr_valid and regularity < regularity_threshold and autocorr_peak >= min_autocorr
+    passed = (
+        hr_valid and regularity < regularity_threshold and autocorr_peak >= min_autocorr
+    )
 
     return {
         "hr": round(hr, 1),
@@ -236,7 +253,9 @@ def ppg_quality_check(
     max_lag_s = 60.0 / min_hr
     autocorr_peak = _autocorrelation_peak(segment, sr, min_lag_s, max_lag_s)
 
-    passed = hr_valid and regularity < regularity_threshold and autocorr_peak >= min_autocorr
+    passed = (
+        hr_valid and regularity < regularity_threshold and autocorr_peak >= min_autocorr
+    )
 
     return {
         "hr": round(hr, 1),
@@ -356,8 +375,11 @@ def cvp_quality_check(
     from scipy.signal import find_peaks
 
     _fail = {
-        "hr": 0.0, "n_peaks": 0, "regularity": 1.0,
-        "flatline_ratio": 1.0, "autocorr_peak": 0.0,
+        "hr": 0.0,
+        "n_peaks": 0,
+        "regularity": 1.0,
+        "flatline_ratio": 1.0,
+        "autocorr_peak": 0.0,
         "pass": False,
     }
 
@@ -408,9 +430,7 @@ def cvp_quality_check(
     autocorr_peak = _autocorrelation_peak(segment, sr, min_lag_s, max_lag_s)
 
     passed = (
-        hr_valid
-        and regularity < regularity_threshold
-        and autocorr_peak >= min_autocorr
+        hr_valid and regularity < regularity_threshold and autocorr_peak >= min_autocorr
     )
 
     return {
@@ -435,7 +455,9 @@ def pap_quality_check(
     min_autocorr: float = 0.10,
 ) -> dict:
     """PAP 세그먼트의 pulse peak regularity 기반 품질 검사."""
-    return abp_quality_check(segment, sr, min_hr, max_hr, regularity_threshold, min_autocorr)
+    return abp_quality_check(
+        segment, sr, min_hr, max_hr, regularity_threshold, min_autocorr
+    )
 
 
 # ── ICP ──────────────────────────────────────────────────────
@@ -451,7 +473,15 @@ def icp_quality_check(
     min_autocorr: float = 0.15,
 ) -> dict:
     """ICP 세그먼트의 맥동 기반 품질 검사. CVP와 동일 로직."""
-    return cvp_quality_check(segment, sr, min_hr, max_hr, regularity_threshold, max_flatline_ratio, min_autocorr)
+    return cvp_quality_check(
+        segment,
+        sr,
+        min_hr,
+        max_hr,
+        regularity_threshold,
+        max_flatline_ratio,
+        min_autocorr,
+    )
 
 
 # ── Dispatcher ────────────────────────────────────────────────
@@ -469,7 +499,9 @@ DOMAIN_QUALITY_CHECKS: dict[str, callable] = {
 }
 
 
-def domain_quality_check(stype_key: str, segment: np.ndarray, sr: float = 100.0) -> dict:
+def domain_quality_check(
+    stype_key: str, segment: np.ndarray, sr: float = 100.0
+) -> dict:
     """Signal type에 해당하는 domain-specific 품질 검사를 실행한다.
 
     Parameters

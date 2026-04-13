@@ -51,7 +51,8 @@ from dataclasses import dataclass
 @dataclass
 class TemporalSample:
     """Temporal imputation 샘플."""
-    signal: np.ndarray       # (win_samples,) 전체 waveform (마스킹 전)
+
+    signal: np.ndarray  # (win_samples,) 전체 waveform (마스킹 전)
     signal_type: str
     case_id: str
     win_start_sec: float
@@ -75,11 +76,15 @@ def _load_vitaldb_signals(
 
     results = []
     for c in cases:
-        if signal_type in c.tracks and len(c.tracks[signal_type]) >= int(60 * TARGET_SR):
-            results.append({
-                "case_id": f"vitaldb_{c.case_id}",
-                "signal": c.tracks[signal_type],
-            })
+        if signal_type in c.tracks and len(c.tracks[signal_type]) >= int(
+            60 * TARGET_SR
+        ):
+            results.append(
+                {
+                    "case_id": f"vitaldb_{c.case_id}",
+                    "signal": c.tracks[signal_type],
+                }
+            )
 
     print(f"  Loaded {len(results)} cases with {signal_type.upper()}")
     return results
@@ -93,7 +98,8 @@ def _load_mimic3_signals(
     signal_type: str,
 ) -> list[dict]:
     from data.parser.mimic3_waveform import (
-        scan_abp_records, load_and_preprocess_record,
+        scan_abp_records,
+        load_and_preprocess_record,
     )
 
     if signal_type not in ("abp", "ecg", "ppg"):
@@ -117,10 +123,12 @@ def _load_mimic3_signals(
         if case and signal_type in case.signals:
             sig = case.signals[signal_type]
             if len(sig) >= int(60 * TARGET_SR):
-                results.append({
-                    "case_id": info.record_name,
-                    "signal": sig,
-                })
+                results.append(
+                    {
+                        "case_id": info.record_name,
+                        "signal": sig,
+                    }
+                )
 
     print(f"  Loaded {len(results)} cases with {signal_type.upper()} from MIMIC-III")
     return results
@@ -142,15 +150,17 @@ def extract_temporal_samples(
     for case in cases:
         sig = case["signal"]
         for start in range(0, len(sig) - win_samples + 1, stride_samples):
-            win = sig[start:start + win_samples]
+            win = sig[start : start + win_samples]
             if np.isnan(win).any():
                 continue
-            samples.append(TemporalSample(
-                signal=win,
-                signal_type=signal_type,
-                case_id=case["case_id"],
-                win_start_sec=start / TARGET_SR,
-            ))
+            samples.append(
+                TemporalSample(
+                    signal=win,
+                    signal_type=signal_type,
+                    case_id=case["case_id"],
+                    win_start_sec=start / TARGET_SR,
+                )
+            )
 
     return samples
 
@@ -173,7 +183,9 @@ def save_dataset(
         if not samples:
             return {}
         return {
-            "signals": torch.stack([torch.from_numpy(s.signal).float() for s in samples]),
+            "signals": torch.stack(
+                [torch.from_numpy(s.signal).float() for s in samples]
+            ),
             "case_ids": [s.case_id for s in samples],
         }
 
@@ -205,6 +217,7 @@ def save_dataset(
 def _visualize(samples: list[TemporalSample], signal_type: str, out_dir: Path) -> None:
     try:
         import matplotlib
+
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
     except ImportError:
@@ -224,7 +237,13 @@ def _visualize(samples: list[TemporalSample], signal_type: str, out_dir: Path) -
         mask_end = int(n * 0.65)
 
         ax.plot(t, s.signal, color="steelblue", linewidth=0.6)
-        ax.axvspan(t[mask_start], t[mask_end], alpha=0.2, color="red", label="Masked region (30%)")
+        ax.axvspan(
+            t[mask_start],
+            t[mask_end],
+            alpha=0.2,
+            color="red",
+            label="Masked region (30%)",
+        )
         ax.set_ylabel(signal_type.upper())
         if i == 0:
             ax.legend(fontsize=8)
@@ -258,13 +277,13 @@ def prepare_imputation(
 
     saved_paths = []
     for stype in stypes:
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"  Temporal Imputation: {stype.upper()}")
         print(f"  Source: {source}, Window: {window_sec}s")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
 
         # 1. 로드
-        print(f"\n[1/4] Loading data...")
+        print("\n[1/4] Loading data...")
         if source == "vitaldb":
             cases = _load_vitaldb_signals(n_cases, stype)
         elif source == "mimic3":
@@ -288,9 +307,13 @@ def prepare_imputation(
         print(f"  Train: {len(train_cases)} cases, Test: {len(test_cases)} cases")
 
         # 3. 추출
-        print(f"\n[3/4] Extracting samples...")
-        train_samples = extract_temporal_samples(train_cases, stype, window_sec, stride_sec)
-        test_samples = extract_temporal_samples(test_cases, stype, window_sec, stride_sec)
+        print("\n[3/4] Extracting samples...")
+        train_samples = extract_temporal_samples(
+            train_cases, stype, window_sec, stride_sec
+        )
+        test_samples = extract_temporal_samples(
+            test_cases, stype, window_sec, stride_sec
+        )
         print(f"  Train: {len(train_samples)}, Test: {len(test_samples)}")
 
         if not train_samples and not test_samples:
@@ -298,19 +321,21 @@ def prepare_imputation(
             continue
 
         # 4. 저장
-        print(f"\n[4/4] Saving...")
-        path = save_dataset(train_samples, test_samples, stype, window_sec, source, out_dir)
+        print("\n[4/4] Saving...")
+        path = save_dataset(
+            train_samples, test_samples, stype, window_sec, source, out_dir
+        )
         saved_paths.append(path)
 
         if visualize:
             _visualize(train_samples + test_samples, stype, Path(out_dir))
 
     if saved_paths:
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"  Imputation data ready: {len(saved_paths)} signal type(s)")
         for p in saved_paths:
             print(f"    {p}")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
 
     return saved_paths
 
@@ -319,11 +344,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Temporal Imputation - Data Preparation",
     )
-    parser.add_argument("--source", type=str, default="vitaldb",
-                        choices=["vitaldb", "mimic3"])
-    parser.add_argument("--signal-type", type=str, default="ecg",
-                        choices=ALL_SIGNAL_TYPES + ["all"],
-                        help="Signal type ('all' for all types)")
+    parser.add_argument(
+        "--source", type=str, default="vitaldb", choices=["vitaldb", "mimic3"]
+    )
+    parser.add_argument(
+        "--signal-type",
+        type=str,
+        default="ecg",
+        choices=ALL_SIGNAL_TYPES + ["all"],
+        help="Signal type ('all' for all types)",
+    )
     parser.add_argument("--n-cases", type=int, default=10)
     parser.add_argument("--window-sec", type=float, default=30.0)
     parser.add_argument("--stride-sec", type=float, default=15.0)

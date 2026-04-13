@@ -94,7 +94,7 @@ def compute_pearson_r(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     yc = y_pred - y_pred.mean()
 
     num = (xc * yc).sum()
-    den = np.sqrt((xc ** 2).sum() * (yc ** 2).sum())
+    den = np.sqrt((xc**2).sum() * (yc**2).sum())
 
     if den < 1e-8:
         return 0.0
@@ -270,9 +270,7 @@ def compute_f1(
     total = sum(support_per_class)
     if total == 0:
         return 0.0
-    return float(
-        sum(f * s for f, s in zip(f1_per_class, support_per_class)) / total
-    )
+    return float(sum(f * s for f, s in zip(f1_per_class, support_per_class)) / total)
 
 
 def compute_sensitivity_specificity(

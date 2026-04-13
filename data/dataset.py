@@ -46,7 +46,9 @@ class RecordingManifest:
     sampling_rate: float
     signal_type: int = 0
     session_id: str = ""
-    spatial_ids: list[int] | None = None  # per-channel 로컬 spatial_id, len == n_channels
+    spatial_ids: list[int] | None = (
+        None  # per-channel 로컬 spatial_id, len == n_channels
+    )
 
 
 class BiosignalDataset(Dataset[BiosignalSample]):
@@ -111,8 +113,10 @@ class BiosignalDataset(Dataset[BiosignalSample]):
         for entry in self._manifest:
             if window_seconds is not None:
                 wl = round(window_seconds * entry.sampling_rate)
-                st = round((stride_seconds if stride_seconds is not None else window_seconds)
-                           * entry.sampling_rate)
+                st = round(
+                    (stride_seconds if stride_seconds is not None else window_seconds)
+                    * entry.sampling_rate
+                )
                 n_win = max(0, (entry.n_timesteps - wl) // st + 1)
             else:
                 wl = None
@@ -123,18 +127,18 @@ class BiosignalDataset(Dataset[BiosignalSample]):
             self._n_windows_per_rec.append(n_win)
             self._rec_offsets.append(self._rec_offsets[-1] + entry.n_channels * n_win)
 
-    def _load_recording_impl(
-        self, rec_idx: int
-    ) -> torch.Tensor:  # (channels, time)
+    def _load_recording_impl(self, rec_idx: int) -> torch.Tensor:  # (channels, time)
         path = self._manifest[rec_idx].path
         if "#" in path:
             # HDF5: "subject.h5#dataset_name"
             import h5py
+
             h5_path, ds_name = path.split("#", 1)
             with h5py.File(h5_path, "r") as hf:
                 return torch.from_numpy(hf[ds_name][:]).float()
         if path.endswith(".zarr"):
             import zarr
+
             arr = zarr.open(path, mode="r")
             return torch.from_numpy(arr[:]).float()  # float16 zarr → float32
         return torch.load(path, weights_only=True, mmap=self._use_mmap)
@@ -156,7 +160,10 @@ class BiosignalDataset(Dataset[BiosignalSample]):
         return self._rec_offsets[-1]
 
     def __getitem__(self, idx: int) -> BiosignalSample:
-        rec_idx = bisect.bisect_right(self._rec_offsets, idx, hi=len(self._rec_offsets) - 1) - 1
+        rec_idx = (
+            bisect.bisect_right(self._rec_offsets, idx, hi=len(self._rec_offsets) - 1)
+            - 1
+        )
         local = idx - self._rec_offsets[rec_idx]
         n_win = self._n_windows_per_rec[rec_idx]
         ch_idx = local // n_win
@@ -181,8 +188,10 @@ class BiosignalDataset(Dataset[BiosignalSample]):
             ratio = random.uniform(lo, hi)
             crop_len = max(1, int(len(values) * ratio))
             # patch_size 배수로 정렬 — 마지막 패치의 zero-padding 방지
-            if hasattr(self, '_patch_size') and self._patch_size is not None:
-                crop_len = max(self._patch_size, (crop_len // self._patch_size) * self._patch_size)
+            if hasattr(self, "_patch_size") and self._patch_size is not None:
+                crop_len = max(
+                    self._patch_size, (crop_len // self._patch_size) * self._patch_size
+                )
             if crop_len < len(values):
                 start = random.randint(0, len(values) - crop_len)
                 values = values[start : start + crop_len]

@@ -30,9 +30,7 @@ import numpy as np
 import torch
 
 from data.parser._common import (
-    domain_quality_check,
     resample_to_target,
-    segment_quality_score,
 )
 from data.parser.vitaldb import (
     SIGNAL_CONFIGS,
@@ -68,22 +66,24 @@ PPG_CHANNEL_NAMES = {"PLETH"}
 @dataclass
 class MimicRecordInfo:
     """MIMIC-III 레코드 메타정보."""
-    record_name: str          # e.g., "p000020-2183-04-28-17-47"
-    pn_dir: str               # e.g., "mimic3wdb-matched/1.0/p00/p000020"
-    patient_id: str           # e.g., "p000020"
+
+    record_name: str  # e.g., "p000020-2183-04-28-17-47"
+    pn_dir: str  # e.g., "mimic3wdb-matched/1.0/p00/p000020"
+    patient_id: str  # e.g., "p000020"
     has_abp: bool = False
     has_ecg: bool = False
     has_ppg: bool = False
-    abp_channel: str = ""     # 실제 ABP 채널명 ("ABP" or "ART")
+    abp_channel: str = ""  # 실제 ABP 채널명 ("ABP" or "ART")
     ecg_channel: str = ""
     ppg_channel: str = ""
     n_segments: int = 0
-    total_samples: int = 0    # ABP 신호 총 샘플 수
+    total_samples: int = 0  # ABP 신호 총 샘플 수
 
 
 @dataclass
 class MimicCaseData:
     """전처리된 MIMIC-III 케이스 데이터."""
+
     record_name: str
     patient_id: str
     signals: dict[str, np.ndarray] = field(default_factory=dict)
@@ -155,9 +155,9 @@ def scan_abp_records(
             # 형태: "p000020-2183-04-28-17-47" (환자ID-날짜-시각)
             # 제외: numerics("n" suffix), 개별 segment("_0001" 등)
             wave_records = [
-                r for r in sub_records
-                if r.startswith(patient_id)
-                and not r.endswith("n")
+                r
+                for r in sub_records
+                if r.startswith(patient_id) and not r.endswith("n")
             ]
 
             for rec_name in wave_records:
@@ -224,12 +224,16 @@ def scan_abp_records(
             continue
 
         if verbose and n_scanned % 50 == 0:
-            print(f"  Scanned {n_scanned}/{len(patient_items)} patients, "
-                  f"found {len(abp_records)} ABP records ({n_errors} errors)")
+            print(
+                f"  Scanned {n_scanned}/{len(patient_items)} patients, "
+                f"found {len(abp_records)} ABP records ({n_errors} errors)"
+            )
 
     if verbose:
-        print(f"\nScan complete: {len(abp_records)} ABP records from "
-              f"{n_scanned} patients ({n_errors} errors)")
+        print(
+            f"\nScan complete: {len(abp_records)} ABP records from "
+            f"{n_scanned} patients ({n_errors} errors)"
+        )
 
     # manifest 저장
     if save_path:
@@ -332,12 +336,19 @@ def load_and_preprocess_record(
     # Multi-segment 레코드 처리
     if hasattr(hdr, "seg_name") and hdr.seg_name:
         segments_data = _load_multi_segment(
-            hdr, info.pn_dir, channel_map, min_duration_s, verbose,
+            hdr,
+            info.pn_dir,
+            channel_map,
+            min_duration_s,
+            verbose,
         )
     else:
         # Single-segment
         segments_data = _load_single_segment(
-            info.record_name, info.pn_dir, channel_map, verbose,
+            info.record_name,
+            info.pn_dir,
+            channel_map,
+            verbose,
         )
 
     if not segments_data:
@@ -393,7 +404,9 @@ def _load_multi_segment(
                 data = seg.p_signal[:, ch_idx].astype(np.float64)
                 # NaN이 너무 많으면 스킵
                 nan_ratio = np.isnan(data).sum() / len(data)
-                if nan_ratio < 0.5 and len(data) > int(min_duration_s * MIMIC3_NATIVE_SR):
+                if nan_ratio < 0.5 and len(data) > int(
+                    min_duration_s * MIMIC3_NATIVE_SR
+                ):
                     collected[stype].append(data)
 
     # 각 signal type에서 가장 긴 세그먼트 선택
@@ -491,7 +504,9 @@ def _apply_pipeline(
 
     # Step 2: Spike detection
     if cfg.spike_detection:
-        data, _ = _detect_electrocautery(data, native_sr, threshold_std=cfg.spike_threshold_std)
+        data, _ = _detect_electrocautery(
+            data, native_sr, threshold_std=cfg.spike_threshold_std
+        )
 
     # Step 3: NaN-free segments (가장 긴 것 사용)
     min_samples = int(60.0 * native_sr)
@@ -573,8 +588,10 @@ def parse_and_save(
     cases: list[MimicCaseData] = []
     for i, info in enumerate(records):
         if verbose:
-            print(f"  [{i+1}/{len(records)}] {info.record_name} "
-                  f"(ABP={info.abp_channel}, ECG={info.ecg_channel or 'N/A'})...")
+            print(
+                f"  [{i + 1}/{len(records)}] {info.record_name} "
+                f"(ABP={info.abp_channel}, ECG={info.ecg_channel or 'N/A'})..."
+            )
         t0 = time.time()
         case = load_and_preprocess_record(info, signal_types, verbose=verbose)
         elapsed = time.time() - t0
@@ -583,8 +600,10 @@ def parse_and_save(
             cases.append(case)
             abp_len = len(case.signals.get("abp", []))
             if verbose:
-                print(f"    OK -ABP: {abp_len} samples "
-                      f"({abp_len / TARGET_SR:.1f}s at {TARGET_SR}Hz) [{elapsed:.1f}s]")
+                print(
+                    f"    OK -ABP: {abp_len} samples "
+                    f"({abp_len / TARGET_SR:.1f}s at {TARGET_SR}Hz) [{elapsed:.1f}s]"
+                )
         else:
             if verbose:
                 print(f"    SKIP -no valid data [{elapsed:.1f}s]")
@@ -620,8 +639,7 @@ def parse_and_save(
         }
         if case.numerics:
             case_dict["numerics"] = {
-                k: torch.from_numpy(v).float()
-                for k, v in case.numerics.items()
+                k: torch.from_numpy(v).float() for k, v in case.numerics.items()
             }
         save_dict["cases"].append(case_dict)
 
@@ -634,18 +652,22 @@ def parse_and_save(
 
     # ── 4. 통계 출력 ──
     if verbose:
-        print(f"\n[4/4] Statistics:")
+        print("\n[4/4] Statistics:")
         total_duration = 0.0
         for case in cases:
             abp = case.signals.get("abp")
             if abp is not None:
                 dur = len(abp) / TARGET_SR
                 total_duration += dur
-                print(f"  {case.record_name}: ABP {dur:.0f}s "
-                      f"({dur/60:.1f}min), range=[{abp.min():.1f}, {abp.max():.1f}] mmHg")
+                print(
+                    f"  {case.record_name}: ABP {dur:.0f}s "
+                    f"({dur / 60:.1f}min), range=[{abp.min():.1f}, {abp.max():.1f}] mmHg"
+                )
 
-        print(f"\n  Total: {len(cases)} cases, {total_duration:.0f}s "
-              f"({total_duration/3600:.1f}h)")
+        print(
+            f"\n  Total: {len(cases)} cases, {total_duration:.0f}s "
+            f"({total_duration / 3600:.1f}h)"
+        )
         print(f"  File: {save_path} ({file_size_mb:.2f} MB)")
 
     # ── 시각화 ──
@@ -662,6 +684,7 @@ def _visualize_cases(cases: list[MimicCaseData], out_dir: Path) -> None:
     """전처리된 케이스들의 ABP 파형을 시각화한다."""
     try:
         import matplotlib
+
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
     except ImportError:
@@ -673,7 +696,9 @@ def _visualize_cases(cases: list[MimicCaseData], out_dir: Path) -> None:
     # 1. 각 케이스의 ABP 파형 (처음 60초)
     n_cases = len(cases)
     fig, axes = plt.subplots(n_cases, 1, figsize=(14, 3 * n_cases), squeeze=False)
-    fig.suptitle("MIMIC-III ABP Waveforms (first 60s, preprocessed)", fontsize=14, y=1.02)
+    fig.suptitle(
+        "MIMIC-III ABP Waveforms (first 60s, preprocessed)", fontsize=14, y=1.02
+    )
 
     for i, case in enumerate(cases):
         ax = axes[i, 0]
@@ -685,7 +710,14 @@ def _visualize_cases(cases: list[MimicCaseData], out_dir: Path) -> None:
         n_show = min(len(abp), int(60 * TARGET_SR))
         t = np.arange(n_show) / TARGET_SR
         ax.plot(t, abp[:n_show], linewidth=0.5, color="tab:red")
-        ax.axhline(y=65, color="orange", linestyle="--", linewidth=1, alpha=0.7, label="MAP=65 (threshold)")
+        ax.axhline(
+            y=65,
+            color="orange",
+            linestyle="--",
+            linewidth=1,
+            alpha=0.7,
+            label="MAP=65 (threshold)",
+        )
         ax.set_ylabel("ABP (mmHg)")
         ax.set_title(f"{case.record_name} (patient: {case.patient_id})")
         ax.legend(loc="upper right", fontsize=8)
@@ -706,7 +738,7 @@ def _visualize_cases(cases: list[MimicCaseData], out_dir: Path) -> None:
             continue
         win_size = int(10 * TARGET_SR)
         for start in range(0, len(abp) - win_size + 1, win_size):
-            win_map = float(np.mean(abp[start:start + win_size]))
+            win_map = float(np.mean(abp[start : start + win_size]))
             all_maps.append(win_map)
 
     if all_maps:
@@ -714,11 +746,15 @@ def _visualize_cases(cases: list[MimicCaseData], out_dir: Path) -> None:
 
         # MAP histogram
         ax1.hist(all_maps, bins=50, edgecolor="black", alpha=0.7, color="tab:blue")
-        ax1.axvline(x=65, color="red", linestyle="--", linewidth=2, label="MAP=65 threshold")
+        ax1.axvline(
+            x=65, color="red", linestyle="--", linewidth=2, label="MAP=65 threshold"
+        )
         n_hypo = sum(1 for m in all_maps if m < 65)
-        ax1.set_title(f"MAP Distribution (10s windows)\n"
-                      f"Total: {len(all_maps)}, Hypotension: {n_hypo} "
-                      f"({n_hypo/len(all_maps)*100:.1f}%)")
+        ax1.set_title(
+            f"MAP Distribution (10s windows)\n"
+            f"Total: {len(all_maps)}, Hypotension: {n_hypo} "
+            f"({n_hypo / len(all_maps) * 100:.1f}%)"
+        )
         ax1.set_xlabel("MAP (mmHg)")
         ax1.set_ylabel("Count")
         ax1.legend()
@@ -729,11 +765,15 @@ def _visualize_cases(cases: list[MimicCaseData], out_dir: Path) -> None:
             win_maps = []
             win_times = []
             for start in range(0, len(first_abp) - win_size + 1, win_size):
-                win_maps.append(float(np.mean(first_abp[start:start + win_size])))
+                win_maps.append(float(np.mean(first_abp[start : start + win_size])))
                 win_times.append(start / TARGET_SR / 60)  # minutes
-            ax2.plot(win_times, win_maps, "o-", markersize=2, linewidth=1, color="tab:red")
+            ax2.plot(
+                win_times, win_maps, "o-", markersize=2, linewidth=1, color="tab:red"
+            )
             ax2.axhline(y=65, color="orange", linestyle="--", linewidth=1)
-            ax2.fill_between(win_times, 0, 65, alpha=0.1, color="red", label="Hypotension zone")
+            ax2.fill_between(
+                win_times, 0, 65, alpha=0.1, color="red", label="Hypotension zone"
+            )
             ax2.set_title(f"MAP over time -{cases[0].record_name}")
             ax2.set_xlabel("Time (min)")
             ax2.set_ylabel("MAP (mmHg)")
@@ -746,14 +786,16 @@ def _visualize_cases(cases: list[MimicCaseData], out_dir: Path) -> None:
         print(f"  Saved: {path2}")
 
     # 3. 품질 통계 요약
-    print(f"\n  MAP Statistics:")
+    print("\n  MAP Statistics:")
     if all_maps:
         maps_arr = np.array(all_maps)
         print(f"    Mean: {maps_arr.mean():.1f} mmHg")
         print(f"    Std:  {maps_arr.std():.1f} mmHg")
         print(f"    Min:  {maps_arr.min():.1f}, Max: {maps_arr.max():.1f}")
-        print(f"    Hypotension (MAP<65): {n_hypo}/{len(all_maps)} "
-              f"({n_hypo/len(all_maps)*100:.1f}%)")
+        print(
+            f"    Hypotension (MAP<65): {n_hypo}/{len(all_maps)} "
+            f"({n_hypo / len(all_maps) * 100:.1f}%)"
+        )
 
 
 # ── CLI ──────────────────────────────────────────────────────
@@ -775,7 +817,9 @@ def main() -> None:
     parse_parser.add_argument("--n-cases", type=int, default=5)
     parse_parser.add_argument("--signal-types", nargs="+", default=["abp"])
     parse_parser.add_argument("--manifest", type=str, default=None)
-    parse_parser.add_argument("--out-dir", type=str, default="outputs/downstream/mimic3")
+    parse_parser.add_argument(
+        "--out-dir", type=str, default="outputs/downstream/mimic3"
+    )
     parse_parser.add_argument("--visualize", action="store_true")
 
     args = parser.parse_args()

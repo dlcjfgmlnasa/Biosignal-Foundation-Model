@@ -10,6 +10,7 @@ Usage
 >>> features = wrapper.extract_features(batch)  # (B, d_model)
 >>> probe = LinearProbe(wrapper.d_model, n_classes=3)
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -19,7 +20,6 @@ import torch.nn.functional as F
 from torch import nn
 
 from data.collate import PackedBatch
-from model.checkpoint import load_checkpoint
 from model import ModelConfig
 from model.biosignal_model import BiosignalFoundationModel
 
@@ -47,7 +47,9 @@ class DownstreamModelWrapper(nn.Module):
         self.device = torch.device(device)
 
         # 1. Checkpoint 로드 → config 복원 → 모델 생성
-        state = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+        state = torch.load(
+            checkpoint_path, map_location=self.device, weights_only=False
+        )
 
         if "config" in state:
             config = ModelConfig.from_dict(state["config"])
@@ -60,7 +62,8 @@ class DownstreamModelWrapper(nn.Module):
 
         # 2. State dict 로드
         missing, unexpected = self.model.load_state_dict(
-            state["model_state_dict"], strict=False,
+            state["model_state_dict"],
+            strict=False,
         )
         if missing:
             print(f"  [model_wrapper] Missing keys: {missing}")
@@ -113,7 +116,7 @@ class DownstreamModelWrapper(nn.Module):
         batch = self._batch_to_device(batch)
 
         out = self.model(batch, task="masked")
-        encoded = out["encoded"]       # (B, N, d_model)
+        encoded = out["encoded"]  # (B, N, d_model)
         patch_mask = out["patch_mask"]  # (B, N) bool — True=유효 패치
 
         if pool == "none":
@@ -121,7 +124,9 @@ class DownstreamModelWrapper(nn.Module):
 
         # Mean pooling over valid patches
         mask_f = patch_mask.unsqueeze(-1).float()  # (B, N, 1)
-        pooled = (encoded * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp(min=1.0)  # (B, d_model)
+        pooled = (encoded * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp(
+            min=1.0
+        )  # (B, d_model)
         return pooled
 
     @torch.no_grad()
@@ -166,9 +171,9 @@ class DownstreamModelWrapper(nn.Module):
         reconstructed = out["reconstructed"]  # (B, N, patch_size)
 
         # 원본 패치 추출 (정규화된 값)
-        normalized = (
-            (batch.values.unsqueeze(-1) - out["loc"]) / out["scale"]
-        ).squeeze(-1)  # (b, l)
+        normalized = ((batch.values.unsqueeze(-1) - out["loc"]) / out["scale"]).squeeze(
+            -1
+        )  # (b, l)
         b, l = normalized.shape
         p = self.patch_size
         n = l // p
@@ -179,8 +184,8 @@ class DownstreamModelWrapper(nn.Module):
             return reconstructed.new_tensor(0.0)
 
         loss = F.mse_loss(
-            reconstructed[mask],       # (M, patch_size)
-            original_patches[mask],    # (M, patch_size)
+            reconstructed[mask],  # (M, patch_size)
+            original_patches[mask],  # (M, patch_size)
         )
         return loss
 

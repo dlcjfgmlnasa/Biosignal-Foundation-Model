@@ -34,13 +34,9 @@ class CrossModalContrastiveLoss(nn.Module):
     ) -> None:
         super().__init__()
         if learnable_temperature:
-            self.log_temperature = nn.Parameter(
-                torch.tensor(math.log(temperature))
-            )
+            self.log_temperature = nn.Parameter(torch.tensor(math.log(temperature)))
         else:
-            self.register_buffer(
-                "log_temperature", torch.tensor(math.log(temperature))
-            )
+            self.register_buffer("log_temperature", torch.tensor(math.log(temperature)))
 
     @property
     def temperature(self) -> torch.Tensor:
@@ -48,11 +44,11 @@ class CrossModalContrastiveLoss(nn.Module):
 
     def forward(
         self,
-        z: torch.Tensor,                # (B, N, D) — projected embeddings
-        patch_mask: torch.Tensor,        # (B, N) bool — 유효 패치
-        patch_sample_id: torch.Tensor,   # (B, N) long
+        z: torch.Tensor,  # (B, N, D) — projected embeddings
+        patch_mask: torch.Tensor,  # (B, N) bool — 유효 패치
+        patch_sample_id: torch.Tensor,  # (B, N) long
         patch_variate_id: torch.Tensor,  # (B, N) long
-        time_id: torch.Tensor,           # (B, N) long
+        time_id: torch.Tensor,  # (B, N) long
     ) -> torch.Tensor:  # scalar
         """InfoNCE contrastive loss를 계산한다.
 
@@ -77,11 +73,15 @@ class CrossModalContrastiveLoss(nn.Module):
         k = time_id.max() + 1  # 0-dim 텐서 (CUDA sync 없음)
         group_key = patch_sample_id * k + time_id  # (B, N)
         same_group = group_key.unsqueeze(-1) == group_key.unsqueeze(-2)  # (B, N, N)
-        diff_var = patch_variate_id.unsqueeze(-1) != patch_variate_id.unsqueeze(-2)  # (B, N, N)
+        diff_var = patch_variate_id.unsqueeze(-1) != patch_variate_id.unsqueeze(
+            -2
+        )  # (B, N, N)
         pos_mask = same_group & diff_var & valid_pair  # (B, N, N)
 
         # Self-mask (diagonal 제외)
-        self_mask = torch.eye(n, dtype=torch.bool, device=z.device).unsqueeze(0)  # (1, N, N)
+        self_mask = torch.eye(n, dtype=torch.bool, device=z.device).unsqueeze(
+            0
+        )  # (1, N, N)
 
         # has_pos: positive pair가 있는 유효 anchor
         has_pos = pos_mask.any(dim=-1) & valid  # (B, N)
@@ -91,12 +91,14 @@ class CrossModalContrastiveLoss(nn.Module):
         # Denominator: 자기 자신 제외, 유효 패치만
         denom_mask = valid_pair & ~self_mask  # (B, N, N)
         log_denom = torch.logsumexp(
-            sim.masked_fill(~denom_mask, float("-inf")), dim=-1,
+            sim.masked_fill(~denom_mask, float("-inf")),
+            dim=-1,
         )  # (B, N)
 
         # Numerator: positive pair만
         log_numer = torch.logsumexp(
-            sim.masked_fill(~pos_mask, float("-inf")), dim=-1,
+            sim.masked_fill(~pos_mask, float("-inf")),
+            dim=-1,
         )  # (B, N)
 
         # InfoNCE = -log(sum_pos / sum_all) = -(log_numer - log_denom)

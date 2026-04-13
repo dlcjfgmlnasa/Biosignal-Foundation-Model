@@ -3,6 +3,7 @@
 
 Scaler → PatchEmbedding → SpatialEmbedding → TransformerEncoder → Head 파이프라인.
 """
+
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -82,7 +83,7 @@ class BiosignalFoundationModel(nn.Module):
         use_var_attn_bias: bool = True,
         scaler: PackedScaler | None = None,
         dropout_p: float = 0.0,
-        num_signal_types: int = 8,   # ECG(0),ABP(1),PPG(2),CVP(3),CO2(4),AWP(5),PAP(6),ICP(7)
+        num_signal_types: int = 8,  # ECG(0),ABP(1),PPG(2),CVP(3),CO2(4),AWP(5),PAP(6),ICP(7)
         num_spatial_ids: int = 13,  # TOTAL_SPATIAL_IDS (8 types × 가변 spatial IDs)
         use_spatial_embed: bool = True,
         max_horizon: int = 1,
@@ -97,7 +98,9 @@ class BiosignalFoundationModel(nn.Module):
 
         # 2. Patch Embedding
         self.patch_embed = PatchEmbedding(
-            patch_size=patch_size, d_model=d_model, stride=stride,
+            patch_size=patch_size,
+            d_model=d_model,
+            stride=stride,
         )
 
         # 3. Transformer Encoder
@@ -167,6 +170,7 @@ class BiosignalFoundationModel(nn.Module):
     def from_config(cls, config: ModelConfig) -> BiosignalFoundationModel:
         """ModelConfig로부터 모델 인스턴스를 생성한다."""
         import inspect
+
         valid_params = set(inspect.signature(cls.__init__).parameters.keys()) - {"self"}
         kwargs = {
             f.name: getattr(config, f.name)
@@ -264,9 +268,9 @@ class BiosignalFoundationModel(nn.Module):
         stride = self.patch_embed.stride
         patch_starts = torch.arange(n, device=device) * stride  # (N,)
         patch_starts = patch_starts.clamp(max=loc.shape[1] - 1)
-        patch_loc = loc[:, patch_starts, :]      # (B, N, 1)
+        patch_loc = loc[:, patch_starts, :]  # (B, N, 1)
         patch_scale = scale[:, patch_starts, :]  # (B, N, 1)
-        loc_emb = self.loc_proj(patch_loc)      # (B, N, d_model)
+        loc_emb = self.loc_proj(patch_loc)  # (B, N, d_model)
         scale_emb = self.scale_proj(patch_scale)  # (B, N, d_model)
         embedded = embedded + (loc_emb + scale_emb) * valid_token
 
@@ -274,7 +278,8 @@ class BiosignalFoundationModel(nn.Module):
         pred_mask: torch.Tensor | None = None
         if mask_ratio > 0 and task in ("masked", "both"):
             pred_mask = create_patch_mask(
-                patch_mask, mask_ratio=mask_ratio,
+                patch_mask,
+                mask_ratio=mask_ratio,
                 patch_variate_id=p_vid if variate_mask_prob > 0 else None,
                 variate_mask_prob=variate_mask_prob,
                 block_mask=block_mask,
@@ -308,9 +313,7 @@ class BiosignalFoundationModel(nn.Module):
 
         # causal mask (next_pred, both에서 공유)
         if use_causal:
-            causal_tri = torch.tril(
-                torch.ones(n, n, dtype=torch.bool, device=device)
-            )
+            causal_tri = torch.tril(torch.ones(n, n, dtype=torch.bool, device=device))
             causal_mask = base_attn_mask & causal_tri.unsqueeze(0)  # (B, N, N)
 
         if task == "both":
@@ -319,17 +322,25 @@ class BiosignalFoundationModel(nn.Module):
             if pred_mask is not None:
                 mask_expanded = pred_mask.unsqueeze(-1)  # (B, N, 1)
                 mask_token_expanded = self.mask_token.expand_as(embedded_bi)
-                embedded_bi = torch.where(mask_expanded, mask_token_expanded, embedded_bi)
+                embedded_bi = torch.where(
+                    mask_expanded, mask_token_expanded, embedded_bi
+                )
             result["encoded"] = self.encoder(
-                embedded_bi, attn_mask=base_attn_mask, **encoder_kwargs,
+                embedded_bi,
+                attn_mask=base_attn_mask,
+                **encoder_kwargs,
             )
             # causal: [MASK] 불필요 — causal attention이 미래 정보 차단
             result["encoded_causal"] = self.encoder(
-                embedded.clone(), attn_mask=causal_mask, **encoder_kwargs,
+                embedded.clone(),
+                attn_mask=causal_mask,
+                **encoder_kwargs,
             )
         elif task == "next_pred":
             result["encoded"] = self.encoder(
-                embedded, attn_mask=causal_mask, **encoder_kwargs,
+                embedded,
+                attn_mask=causal_mask,
+                **encoder_kwargs,
             )
         else:  # "masked"
             if pred_mask is not None:
@@ -337,7 +348,9 @@ class BiosignalFoundationModel(nn.Module):
                 mask_token_expanded = self.mask_token.expand_as(embedded)
                 embedded = torch.where(mask_expanded, mask_token_expanded, embedded)
             result["encoded"] = self.encoder(
-                embedded, attn_mask=base_attn_mask, **encoder_kwargs,
+                embedded,
+                attn_mask=base_attn_mask,
+                **encoder_kwargs,
             )
 
         return result
@@ -356,9 +369,12 @@ class BiosignalFoundationModel(nn.Module):
         variate_mask_prob: float = 0.0,
     ) -> dict[str, torch.Tensor]:
         enc = self._encode(
-            batch, task=task,
-            mask_ratio=mask_ratio, block_mask=block_mask,
-            block_size_min=block_size_min, block_size_max=block_size_max,
+            batch,
+            task=task,
+            mask_ratio=mask_ratio,
+            block_mask=block_mask,
+            block_size_min=block_size_min,
+            block_size_max=block_size_max,
             variate_mask_prob=variate_mask_prob,
         )
 
@@ -383,7 +399,9 @@ class BiosignalFoundationModel(nn.Module):
             out_dict["reconstructed"] = self.head(encoded)  # (B, N, patch_size)
             out_dict["cross_pred"] = self.cross_head(encoded)  # (B, N, patch_size)
             if self.contrastive_proj_dim > 0:
-                out_dict["contrastive_z"] = self.contrastive_proj(encoded)  # (B, N, proj_dim)
+                out_dict["contrastive_z"] = self.contrastive_proj(
+                    encoded
+                )  # (B, N, proj_dim)
 
         # ── Next-Patch Prediction ──
         if task in ("next_pred", "both"):
@@ -391,7 +409,9 @@ class BiosignalFoundationModel(nn.Module):
             h_emb = self.horizon_embed(
                 torch.tensor(horizon - 1, device=encoded_for_next.device)
             )  # (d_model,)
-            encoded_h = encoded_for_next + h_emb.unsqueeze(0).unsqueeze(0)  # (B, N, d_model)
+            encoded_h = encoded_for_next + h_emb.unsqueeze(0).unsqueeze(
+                0
+            )  # (B, N, d_model)
             out_dict["next_pred"] = self.next_head(encoded_h)  # (B, N, patch_size)
 
         return out_dict
@@ -565,11 +585,17 @@ def _append_patch_to_batch(
                 [batch.values, torch.zeros(b, pad_size, device=device)], dim=-1
             ),
             sample_id=torch.cat(
-                [batch.sample_id, torch.zeros(b, pad_size, dtype=torch.long, device=device)],
+                [
+                    batch.sample_id,
+                    torch.zeros(b, pad_size, dtype=torch.long, device=device),
+                ],
                 dim=-1,
             ),
             variate_id=torch.cat(
-                [batch.variate_id, torch.zeros(b, pad_size, dtype=torch.long, device=device)],
+                [
+                    batch.variate_id,
+                    torch.zeros(b, pad_size, dtype=torch.long, device=device),
+                ],
                 dim=-1,
             ),
             lengths=batch.lengths,
@@ -583,7 +609,11 @@ def _append_patch_to_batch(
         start = valid_lengths[i].item()
         end = start + patch_size
         batch.values[i, start:end] = new_patch[i]
-        batch.sample_id[i, start:end] = batch.sample_id[i, start - 1] if start > 0 else 1
-        batch.variate_id[i, start:end] = batch.variate_id[i, start - 1] if start > 0 else 1
+        batch.sample_id[i, start:end] = (
+            batch.sample_id[i, start - 1] if start > 0 else 1
+        )
+        batch.variate_id[i, start:end] = (
+            batch.variate_id[i, start - 1] if start > 0 else 1
+        )
 
     return batch

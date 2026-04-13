@@ -54,8 +54,9 @@ def _load_mimic3_cases(
     """
     import wfdb
     from data.parser.mimic3_waveform import (
-        PN_DB, ABP_CHANNEL_NAMES, ECG_CHANNEL_NAMES, PPG_CHANNEL_NAMES,
-        scan_abp_records, load_manifest, _apply_pipeline,
+        scan_abp_records,
+        load_manifest,
+        _apply_pipeline,
         MIMIC3_NATIVE_SR,
     )
 
@@ -66,7 +67,7 @@ def _load_mimic3_cases(
     elif manifest_file.exists():
         records = load_manifest(str(manifest_file))
     else:
-        print(f"  Scanning for ABP records...")
+        print("  Scanning for ABP records...")
         records = scan_abp_records(
             max_records=n_cases * 5,
             save_path=str(manifest_file),
@@ -93,7 +94,7 @@ def _load_mimic3_cases(
     # 각 레코드에서 시간 정렬된 다채널 데이터 추출
     cases = []
     for i, info in enumerate(filtered):
-        print(f"  [{i+1}/{len(filtered)}] {info.record_name}...", end=" ")
+        print(f"  [{i + 1}/{len(filtered)}] {info.record_name}...", end=" ")
         t0 = time.time()
 
         try:
@@ -116,7 +117,9 @@ def _load_mimic3_cases(
             ch_map["ppg"] = info.ppg_channel
 
         if len(ch_map) < len(signal_types):
-            print(f"SKIP (missing channels: need {signal_types}, have {list(ch_map.keys())})")
+            print(
+                f"SKIP (missing channels: need {signal_types}, have {list(ch_map.keys())})"
+            )
             continue
 
         # 모든 채널이 동시에 존재하는 가장 긴 세그먼트 찾기
@@ -131,8 +134,7 @@ def _load_mimic3_cases(
                 if seg_hdr.sig_name is None:
                     continue
                 all_present = all(
-                    ch_name in seg_hdr.sig_name
-                    for ch_name in ch_map.values()
+                    ch_name in seg_hdr.sig_name for ch_name in ch_map.values()
                 )
                 if all_present and seg_len > best_len:
                     best_seg = seg_name
@@ -141,7 +143,7 @@ def _load_mimic3_cases(
                 continue
 
         if best_seg is None or best_len < int(min_duration_sec * MIMIC3_NATIVE_SR):
-            print(f"SKIP (no aligned segment >= {min_duration_sec/60:.0f}min)")
+            print(f"SKIP (no aligned segment >= {min_duration_sec / 60:.0f}min)")
             continue
 
         # 가장 긴 정렬 세그먼트 로드
@@ -183,11 +185,13 @@ def _load_mimic3_cases(
         dur_min = min_len / TARGET_SR / 60
         print(f"OK ({dur_min:.1f}min, {len(signals)} ch) [{elapsed:.1f}s]")
 
-        cases.append({
-            "case_id": info.record_name,
-            "patient_id": info.patient_id,
-            "signals": signals,
-        })
+        cases.append(
+            {
+                "case_id": info.record_name,
+                "patient_id": info.patient_id,
+                "signals": signals,
+            }
+        )
 
     return cases
 
@@ -228,11 +232,13 @@ def _load_vitaldb_cases(
             continue
 
         signals = {st: rc.tracks[st][:min_len] for st in signal_types}
-        cases.append({
-            "case_id": f"vitaldb_{rc.case_id}",
-            "patient_id": str(rc.case_id),
-            "signals": signals,
-        })
+        cases.append(
+            {
+                "case_id": f"vitaldb_{rc.case_id}",
+                "patient_id": str(rc.case_id),
+                "signals": signals,
+            }
+        )
 
     print(f"  Loaded {len(cases)} cases with all required signals")
     return cases
@@ -268,7 +274,7 @@ def extract_aligned_windows(
             win = {}
             valid = True
             for st in signal_types:
-                seg = signals[st][start:start + win_samples]
+                seg = signals[st][start : start + win_samples]
                 # NaN 체크
                 if np.isnan(seg).any():
                     valid = False
@@ -276,11 +282,13 @@ def extract_aligned_windows(
                 win[st] = seg
 
             if valid:
-                windows.append({
-                    "case_id": case["case_id"],
-                    "patient_id": case["patient_id"],
-                    "signals": win,
-                })
+                windows.append(
+                    {
+                        "case_id": case["case_id"],
+                        "patient_id": case["patient_id"],
+                        "signals": win,
+                    }
+                )
 
     return windows
 
@@ -357,8 +365,10 @@ def print_stats(
 
     for st in signal_types:
         vals = np.concatenate([w["signals"][st] for w in windows])
-        print(f"    {st:5s}: range=[{vals.min():.2f}, {vals.max():.2f}], "
-              f"mean={vals.mean():.2f}, std={vals.std():.2f}")
+        print(
+            f"    {st:5s}: range=[{vals.min():.2f}, {vals.max():.2f}], "
+            f"mean={vals.mean():.2f}, std={vals.std():.2f}"
+        )
 
 
 # ---- 메인 ----
@@ -393,23 +403,28 @@ def prepare_any_to_any(
     min_duration_sec = window_sec + stride_sec  # 최소 1 윈도우 + 1 stride
     types_str = " + ".join(s.upper() for s in signal_types)
 
-    print(f"{'='*60}")
-    print(f"  Task 8: Any-to-Any Cross-modal — Data Preparation")
+    print(f"{'=' * 60}")
+    print("  Task 8: Any-to-Any Cross-modal — Data Preparation")
     print(f"  Source:  {source}")
     print(f"  Signals: {types_str}")
     print(f"  Window:  {window_sec}s, Stride: {stride_sec}s")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
     # 1. 데이터 로드
-    print(f"\n[1/4] Loading aligned multi-channel data...")
+    print("\n[1/4] Loading aligned multi-channel data...")
     if source == "mimic3":
         cases = _load_mimic3_cases(
-            n_cases, signal_types, min_duration_sec, manifest_path,
+            n_cases,
+            signal_types,
+            min_duration_sec,
+            manifest_path,
             out_dir=str(Path(out_dir).parent / "mimic3"),
         )
     elif source == "vitaldb":
         cases = _load_vitaldb_cases(
-            n_cases, signal_types, min_duration_sec,
+            n_cases,
+            signal_types,
+            min_duration_sec,
         )
     else:
         print(f"ERROR: Unknown source '{source}'", file=sys.stderr)
@@ -430,12 +445,20 @@ def prepare_any_to_any(
     train_cases = [c for c in cases if c["patient_id"] in train_patients]
     test_cases = [c for c in cases if c["patient_id"] not in train_patients]
     print(f"  Train: {len(train_cases)} cases ({len(train_patients)} patients)")
-    print(f"  Test:  {len(test_cases)} cases ({len(patient_ids) - len(train_patients)} patients)")
+    print(
+        f"  Test:  {len(test_cases)} cases ({len(patient_ids) - len(train_patients)} patients)"
+    )
 
     # 3. 윈도우 추출
-    print(f"\n[3/4] Extracting aligned windows (window={window_sec}s, stride={stride_sec}s)...")
-    train_windows = extract_aligned_windows(train_cases, signal_types, window_sec, stride_sec)
-    test_windows = extract_aligned_windows(test_cases, signal_types, window_sec, stride_sec)
+    print(
+        f"\n[3/4] Extracting aligned windows (window={window_sec}s, stride={stride_sec}s)..."
+    )
+    train_windows = extract_aligned_windows(
+        train_cases, signal_types, window_sec, stride_sec
+    )
+    test_windows = extract_aligned_windows(
+        test_cases, signal_types, window_sec, stride_sec
+    )
 
     print_stats("Train", train_windows, signal_types)
     print_stats("Test", test_windows, signal_types)
@@ -445,16 +468,20 @@ def prepare_any_to_any(
         sys.exit(1)
 
     # 4. 저장
-    print(f"\n[4/4] Saving...")
+    print("\n[4/4] Saving...")
     save_path = save_dataset(
-        train_windows, test_windows,
-        signal_types, window_sec, source, out_dir,
+        train_windows,
+        test_windows,
+        signal_types,
+        window_sec,
+        source,
+        out_dir,
     )
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"  Done! {save_path}")
     print(f"  Train: {len(train_windows)} windows, Test: {len(test_windows)} windows")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     return save_path
 
 
@@ -462,26 +489,47 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Task 8: Any-to-Any Cross-modal — Data Preparation",
     )
-    parser.add_argument("--source", type=str, default="vitaldb",
-                        choices=["mimic3", "vitaldb"],
-                        help="Data source")
-    parser.add_argument("--signal-types", nargs="+",
-                        default=["ecg", "abp", "ppg", "cvp"],
-                        choices=["ecg", "abp", "ppg", "cvp", "co2", "awp", "pap", "icp"],
-                        help="Signal types to extract")
-    parser.add_argument("--n-cases", type=int, default=10,
-                        help="Number of cases to load")
-    parser.add_argument("--window-sec", type=float, default=30.0,
-                        help="Window length in seconds")
-    parser.add_argument("--stride-sec", type=float, default=15.0,
-                        help="Sliding window stride in seconds")
-    parser.add_argument("--train-ratio", type=float, default=0.7,
-                        help="Train/test split ratio (patient-level)")
-    parser.add_argument("--out-dir", type=str,
-                        default="outputs/downstream/any_to_any",
-                        help="Output directory")
-    parser.add_argument("--manifest", type=str, default=None,
-                        help="MIMIC-III manifest JSON path")
+    parser.add_argument(
+        "--source",
+        type=str,
+        default="vitaldb",
+        choices=["mimic3", "vitaldb"],
+        help="Data source",
+    )
+    parser.add_argument(
+        "--signal-types",
+        nargs="+",
+        default=["ecg", "abp", "ppg", "cvp"],
+        choices=["ecg", "abp", "ppg", "cvp", "co2", "awp", "pap", "icp"],
+        help="Signal types to extract",
+    )
+    parser.add_argument(
+        "--n-cases", type=int, default=10, help="Number of cases to load"
+    )
+    parser.add_argument(
+        "--window-sec", type=float, default=30.0, help="Window length in seconds"
+    )
+    parser.add_argument(
+        "--stride-sec",
+        type=float,
+        default=15.0,
+        help="Sliding window stride in seconds",
+    )
+    parser.add_argument(
+        "--train-ratio",
+        type=float,
+        default=0.7,
+        help="Train/test split ratio (patient-level)",
+    )
+    parser.add_argument(
+        "--out-dir",
+        type=str,
+        default="outputs/downstream/any_to_any",
+        help="Output directory",
+    )
+    parser.add_argument(
+        "--manifest", type=str, default=None, help="MIMIC-III manifest JSON path"
+    )
     args = parser.parse_args()
 
     prepare_any_to_any(

@@ -65,38 +65,113 @@ class SignalConfig:
         CO2: 느린 capnogram, flatline 구간 → hf=1.0, flatline=0.3
         AWP: P95=0.54, 1.0 이상 스파이크 → 1.0
     """
+
     valid_range: tuple[float, float] | None  # (min, max) — None이면 range check 안 함
-    filter_type: str = "none"                # "bandpass" | "lowpass" | "none"
-    filter_freq: tuple[float, float] | None = None  # bandpass=(lo,hi), lowpass=(hi,) → (0, hi)로 저장
-    max_flatline_ratio: float = 0.5          # 50% 이상 flat이면 불량
-    max_clip_ratio: float = 0.1              # 10% 이상 clipping이면 불량
-    max_high_freq_ratio: float = 2.0         # 기본값; 신호별로 아래에서 재정의
-    min_amplitude: float = 0.0               # 최소 peak-to-peak 진폭 (0=비활성)
-    max_amplitude: float = 0.0               # 최대 peak-to-peak 진폭 (0=비활성)
-    min_high_freq_ratio: float = 0.0         # 최소 hf ratio (0=비활성, ECG용: QRS 없으면 불량)
-    notch_freq: float | None = None          # 50 또는 60Hz notch filter (None=비활성)
-    spike_detection: bool = False            # 스파이크/아티팩트 검출 적용 여부
-    spike_threshold_std: float = 10.0        # spike 검출 threshold (MAD 배수)
-    median_kernel: int = 0                   # median filter kernel size (0=비활성, 홀수만)
-    quality_window_s: float = 5.0            # 품질 검사 윈도우 크기 (초). 호흡 신호는 10초 권장
+    filter_type: str = "none"  # "bandpass" | "lowpass" | "none"
+    filter_freq: tuple[float, float] | None = (
+        None  # bandpass=(lo,hi), lowpass=(hi,) → (0, hi)로 저장
+    )
+    max_flatline_ratio: float = 0.5  # 50% 이상 flat이면 불량
+    max_clip_ratio: float = 0.1  # 10% 이상 clipping이면 불량
+    max_high_freq_ratio: float = 2.0  # 기본값; 신호별로 아래에서 재정의
+    min_amplitude: float = 0.0  # 최소 peak-to-peak 진폭 (0=비활성)
+    max_amplitude: float = 0.0  # 최대 peak-to-peak 진폭 (0=비활성)
+    min_high_freq_ratio: float = 0.0  # 최소 hf ratio (0=비활성, ECG용: QRS 없으면 불량)
+    notch_freq: float | None = None  # 50 또는 60Hz notch filter (None=비활성)
+    spike_detection: bool = False  # 스파이크/아티팩트 검출 적용 여부
+    spike_threshold_std: float = 10.0  # spike 검출 threshold (MAD 배수)
+    median_kernel: int = 0  # median filter kernel size (0=비활성, 홀수만)
+    quality_window_s: float = 5.0  # 품질 검사 윈도우 크기 (초). 호흡 신호는 10초 권장
 
 
 SIGNAL_CONFIGS: dict[str, SignalConfig] = {
     # ECG: bandpass — baseline wander(저주파) + 고주파 노이즈 동시 제거
     #   notch 60Hz (한국, 60Hz 전원), spike detection 활성
-    "ecg": SignalConfig(valid_range=(-5.0, 5.0),       filter_type="bandpass", filter_freq=(0.5, 40.0),  max_high_freq_ratio=1.0, min_amplitude=0.3, min_high_freq_ratio=0.05, notch_freq=60.0, spike_detection=True, spike_threshold_std=10.0),
+    "ecg": SignalConfig(
+        valid_range=(-5.0, 5.0),
+        filter_type="bandpass",
+        filter_freq=(0.5, 40.0),
+        max_high_freq_ratio=1.0,
+        min_amplitude=0.3,
+        min_high_freq_ratio=0.05,
+        notch_freq=60.0,
+        spike_detection=True,
+        spike_threshold_std=10.0,
+    ),
     # ABP/PPG/CVP: lowpass — DC(절대값) 보존, 고주파 노이즈만 제거
     #   PPG/ABP: median filter로 임펄스 노이즈 제거, spike detection 활성
-    "abp": SignalConfig(valid_range=(20.0, 300.0),     filter_type="lowpass",  filter_freq=(0.0, 15.0),  max_high_freq_ratio=0.5, max_flatline_ratio=0.3, min_amplitude=10.0, spike_detection=True, spike_threshold_std=6.0, median_kernel=5),
-    "ppg": SignalConfig(valid_range=(0.0, 2000.0),     filter_type="lowpass",  filter_freq=(0.0, 8.0),   max_high_freq_ratio=0.05, max_flatline_ratio=0.3, min_amplitude=5.0, notch_freq=60.0, spike_detection=True, spike_threshold_std=6.0, median_kernel=5),
-    "cvp": SignalConfig(valid_range=(-5.0, 40.0),      filter_type="lowpass",  filter_freq=(0.0, 10.0),  max_high_freq_ratio=0.5, spike_detection=True, spike_threshold_std=8.0),
+    "abp": SignalConfig(
+        valid_range=(20.0, 300.0),
+        filter_type="lowpass",
+        filter_freq=(0.0, 15.0),
+        max_high_freq_ratio=0.5,
+        max_flatline_ratio=0.3,
+        min_amplitude=10.0,
+        spike_detection=True,
+        spike_threshold_std=6.0,
+        median_kernel=5,
+    ),
+    "ppg": SignalConfig(
+        valid_range=(0.0, 2000.0),
+        filter_type="lowpass",
+        filter_freq=(0.0, 8.0),
+        max_high_freq_ratio=0.05,
+        max_flatline_ratio=0.3,
+        min_amplitude=5.0,
+        notch_freq=60.0,
+        spike_detection=True,
+        spike_threshold_std=6.0,
+        median_kernel=5,
+    ),
+    "cvp": SignalConfig(
+        valid_range=(-5.0, 40.0),
+        filter_type="lowpass",
+        filter_freq=(0.0, 10.0),
+        max_high_freq_ratio=0.5,
+        spike_detection=True,
+        spike_threshold_std=8.0,
+    ),
     # CO2/AWP: lowpass — 느린 호흡 신호, DC 보존
-    "co2": SignalConfig(valid_range=(0.0, 100.0),      filter_type="lowpass",  filter_freq=(0.0, 5.0),   max_high_freq_ratio=1.0, max_flatline_ratio=0.3, min_amplitude=5.0, quality_window_s=15.0),
-    "awp": SignalConfig(valid_range=(-20.0, 80.0),     filter_type="lowpass",  filter_freq=(0.0, 20.0),  max_high_freq_ratio=1.0, min_amplitude=2.0, quality_window_s=15.0),
+    "co2": SignalConfig(
+        valid_range=(0.0, 100.0),
+        filter_type="lowpass",
+        filter_freq=(0.0, 5.0),
+        max_high_freq_ratio=1.0,
+        max_flatline_ratio=0.3,
+        min_amplitude=5.0,
+        quality_window_s=15.0,
+    ),
+    "awp": SignalConfig(
+        valid_range=(-20.0, 80.0),
+        filter_type="lowpass",
+        filter_freq=(0.0, 20.0),
+        max_high_freq_ratio=1.0,
+        min_amplitude=2.0,
+        quality_window_s=15.0,
+    ),
     # PAP: 폐동맥압 — ABP와 유사한 동맥 압력 파형 (체순환보다 낮은 압력)
-    "pap": SignalConfig(valid_range=(5.0, 80.0),       filter_type="lowpass",  filter_freq=(0.0, 15.0),  max_high_freq_ratio=0.5, max_flatline_ratio=0.3, min_amplitude=5.0, spike_detection=True, spike_threshold_std=6.0, median_kernel=5),
+    "pap": SignalConfig(
+        valid_range=(5.0, 80.0),
+        filter_type="lowpass",
+        filter_freq=(0.0, 15.0),
+        max_high_freq_ratio=0.5,
+        max_flatline_ratio=0.3,
+        min_amplitude=5.0,
+        spike_detection=True,
+        spike_threshold_std=6.0,
+        median_kernel=5,
+    ),
     # ICP: 두개내압 — 저압 맥동 파형, CVP와 유사한 특성
-    "icp": SignalConfig(valid_range=(-10.0, 80.0),     filter_type="lowpass",  filter_freq=(0.0, 10.0),  max_high_freq_ratio=0.5, max_flatline_ratio=0.3, min_amplitude=1.0, spike_detection=True, spike_threshold_std=8.0),
+    "icp": SignalConfig(
+        valid_range=(-10.0, 80.0),
+        filter_type="lowpass",
+        filter_freq=(0.0, 10.0),
+        max_high_freq_ratio=0.5,
+        max_flatline_ratio=0.3,
+        min_amplitude=1.0,
+        spike_detection=True,
+        spike_threshold_std=8.0,
+    ),
 }
 
 
@@ -109,51 +184,60 @@ SIGNAL_CONFIGS: dict[str, SignalConfig] = {
 TRACK_MAP: dict[str, tuple[str, int]] = {
     # ── VitalDB Open (SNUADC, OR) ──
     # ECG (0) — 500Hz, mV
-    "SNUADC/ECG_II": ("ecg", 1),    # Lead II
-    "SNUADC/ECG_V5": ("ecg", 2),    # Lead V5
-    "SNUADC/ECG_I": ("ecg", 0),     # Lead I (비공식)
-    "SNUADC/ECG_III": ("ecg", 0),   # Lead III (비공식)
-    "Solar8000/ECG_II": ("ecg", 1), # Lead II — Solar8000 대체
+    "SNUADC/ECG_II": ("ecg", 1),  # Lead II
+    "SNUADC/ECG_V5": ("ecg", 2),  # Lead V5
+    "SNUADC/ECG_I": ("ecg", 0),  # Lead I (비공식)
+    "SNUADC/ECG_III": ("ecg", 0),  # Lead III (비공식)
+    "Solar8000/ECG_II": ("ecg", 1),  # Lead II — Solar8000 대체
     # ABP (1) — 500Hz, mmHg
-    "SNUADC/ART": ("abp", 1),       # Radial artery
-    "SNUADC/FEM": ("abp", 2),       # Femoral artery
+    "SNUADC/ART": ("abp", 1),  # Radial artery
+    "SNUADC/FEM": ("abp", 2),  # Femoral artery
     # PPG (2) — 500Hz, unitless
-    "SNUADC/PLETH": ("ppg", 1),     # Finger
+    "SNUADC/PLETH": ("ppg", 1),  # Finger
     "Solar8000/PLETH": ("ppg", 1),  # Finger — Solar8000 대체
     # CVP (3) — 500Hz, mmHg
-    "SNUADC/CVP": ("cvp", 0),       # Central venous pressure
+    "SNUADC/CVP": ("cvp", 0),  # Central venous pressure
     # CO2 (4) — Primus 62.5Hz, mmHg
-    "Primus/CO2": ("co2", 0),       # Capnography
-    "Solar8000/CO2": ("co2", 0),    # Capnography — Solar8000 대체
+    "Primus/CO2": ("co2", 0),  # Capnography
+    "Solar8000/CO2": ("co2", 0),  # Capnography — Solar8000 대체
     # AWP (5) — Primus 62.5Hz, hPa
-    "Primus/AWP": ("awp", 0),       # Airway pressure
-    "Solar8000/AWP": ("awp", 0),    # Airway pressure — Solar8000 대체
+    "Primus/AWP": ("awp", 0),  # Airway pressure
+    "Solar8000/AWP": ("awp", 0),  # Airway pressure — Solar8000 대체
     # PAP (6) — 500Hz, mmHg
-    "SNUADC/PAP": ("pap", 0),       # Pulmonary arterial pressure
+    "SNUADC/PAP": ("pap", 0),  # Pulmonary arterial pressure
     # ICP (7) — 500Hz, mmHg
-    "SNUADC/ICP": ("icp", 0),       # Intracranial pressure
+    "SNUADC/ICP": ("icp", 0),  # Intracranial pressure
     # ── K-MIMIC-MORTAL (SNUADCM, ICU) ──
-    "SNUADCM/ECG_II": ("ecg", 1),   # Lead II
-    "SNUADCM/ECG_V5": ("ecg", 2),   # Lead V5
-    "SNUADCM/ART": ("abp", 1),      # Radial artery
-    "SNUADCM/PLETH": ("ppg", 1),    # Finger
-    "SNUADCM/CVP": ("cvp", 0),      # Central venous pressure
-    "SNUADCM/PAP": ("pap", 0),      # Pulmonary arterial pressure
-    "SNUADCM/ICP": ("icp", 0),      # Intracranial pressure
+    "SNUADCM/ECG_II": ("ecg", 1),  # Lead II
+    "SNUADCM/ECG_V5": ("ecg", 2),  # Lead V5
+    "SNUADCM/ART": ("abp", 1),  # Radial artery
+    "SNUADCM/PLETH": ("ppg", 1),  # Finger
+    "SNUADCM/CVP": ("cvp", 0),  # Central venous pressure
+    "SNUADCM/PAP": ("pap", 0),  # Pulmonary arterial pressure
+    "SNUADCM/ICP": ("icp", 0),  # Intracranial pressure
 }
 
 SIGNAL_TYPES: dict[str, int] = {
-    "ecg": 0, "abp": 1, "ppg": 2, "cvp": 3, "co2": 4, "awp": 5,
-    "pap": 6, "icp": 7,
+    "ecg": 0,
+    "abp": 1,
+    "ppg": 2,
+    "cvp": 3,
+    "co2": 4,
+    "awp": 5,
+    "pap": 6,
+    "icp": 7,
 }
 
 
 # ── 전처리 함수 ────────────────────────────────────────────────
 
 
-def _apply_notch_filter(data: np.ndarray, freq: float, sr: float, Q: float = 30.0) -> np.ndarray:
+def _apply_notch_filter(
+    data: np.ndarray, freq: float, sr: float, Q: float = 30.0
+) -> np.ndarray:
     """전원 간섭(50/60Hz) 제거를 위한 notch filter (1D)."""
     from scipy.signal import filtfilt, iirnotch
+
     nyq = sr / 2.0
     if freq >= nyq:
         return data
@@ -164,6 +248,7 @@ def _apply_notch_filter(data: np.ndarray, freq: float, sr: float, Q: float = 30.
 def _apply_median_filter(data: np.ndarray, kernel_size: int = 5) -> np.ndarray:
     """임펄스 노이즈 제거를 위한 median filter (1D)."""
     from scipy.signal import medfilt
+
     if kernel_size < 3:
         return data
     if kernel_size % 2 == 0:
@@ -172,8 +257,10 @@ def _apply_median_filter(data: np.ndarray, kernel_size: int = 5) -> np.ndarray:
 
 
 def _detect_step_change(
-    data: np.ndarray, sr: float,
-    threshold_std: float = 6.0, blank_ms: float = 300.0,
+    data: np.ndarray,
+    sr: float,
+    threshold_std: float = 6.0,
+    blank_ms: float = 300.0,
 ) -> tuple[np.ndarray, int]:
     """ABP/PPG 계단형 아티팩트 검출: 1차 미분 기반 급격한 level shift를 NaN으로 마킹.
 
@@ -201,8 +288,10 @@ def _detect_step_change(
 
 
 def _detect_motion_artifact(
-    data: np.ndarray, sr: float,
-    threshold_std: float = 5.0, blank_ms: float = 200.0,
+    data: np.ndarray,
+    sr: float,
+    threshold_std: float = 5.0,
+    blank_ms: float = 200.0,
 ) -> tuple[np.ndarray, int]:
     """PPG motion artifact 검출: 2차 미분 기반 baseline shift를 NaN으로 마킹."""
     out = data.copy()
@@ -224,7 +313,9 @@ def _detect_motion_artifact(
     return out, n_blanked
 
 
-def _apply_range_check(data: np.ndarray, valid_range: tuple[float, float]) -> tuple[np.ndarray, int]:
+def _apply_range_check(
+    data: np.ndarray, valid_range: tuple[float, float]
+) -> tuple[np.ndarray, int]:
     """범위 밖 값을 NaN으로 마킹한다 (1D, 원본 비파괴 복사)."""
     lo, hi = valid_range
     out = data.copy()
@@ -272,8 +363,9 @@ def _apply_filter(data: np.ndarray, cfg: SignalConfig, sr: float) -> np.ndarray:
     return data
 
 
-def _detect_electrocautery(data: np.ndarray, sr: float, threshold_std: float = 10.0,
-                           blank_ms: float = 100.0) -> tuple[np.ndarray, int]:
+def _detect_electrocautery(
+    data: np.ndarray, sr: float, threshold_std: float = 10.0, blank_ms: float = 100.0
+) -> tuple[np.ndarray, int]:
     """전기소작기 아티팩트 구간을 NaN으로 마킹한다. (ECG 등 spike detection 활성 신호용)
 
     급격한 진폭 변화(미분의 절대값)가 threshold_std배 이상인 구간을
@@ -452,34 +544,51 @@ def process_vital(
             data, n_bad = _apply_range_check(data, cfg.valid_range)
             if n_bad > 0:
                 pct = n_bad / len(data) * 100
-                print(f"    [RANGE] {track_name}: {n_bad} samples ({pct:.1f}%) out of range", file=sys.stderr)
+                print(
+                    f"    [RANGE] {track_name}: {n_bad} samples ({pct:.1f}%) out of range",
+                    file=sys.stderr,
+                )
 
         # ── Step 2: 스파이크/아티팩트 제거 (SignalConfig.spike_detection 기반) ──
         if cfg.spike_detection:
-            data, n_blanked = _detect_electrocautery(data, native_sr, threshold_std=cfg.spike_threshold_std)
+            data, n_blanked = _detect_electrocautery(
+                data, native_sr, threshold_std=cfg.spike_threshold_std
+            )
             if n_blanked > 0:
                 pct = n_blanked / len(data) * 100
-                print(f"    [SPIKE] {track_name}: {n_blanked} samples ({pct:.1f}%) blanked", file=sys.stderr)
+                print(
+                    f"    [SPIKE] {track_name}: {n_blanked} samples ({pct:.1f}%) blanked",
+                    file=sys.stderr,
+                )
 
         # ── Step 2b: ABP/PPG step change (계단형 아티팩트) 제거 ──
         if stype_key in ("abp", "ppg"):
             data, n_step = _detect_step_change(data, native_sr)
             if n_step > 0:
                 pct = n_step / len(data) * 100
-                print(f"    [STEP] {track_name}: {n_step} samples ({pct:.1f}%) blanked", file=sys.stderr)
+                print(
+                    f"    [STEP] {track_name}: {n_step} samples ({pct:.1f}%) blanked",
+                    file=sys.stderr,
+                )
 
         # ── Step 2c: PPG motion artifact 제거 ──
         if stype_key == "ppg":
             data, n_motion = _detect_motion_artifact(data, native_sr)
             if n_motion > 0:
                 pct = n_motion / len(data) * 100
-                print(f"    [MOTION] {track_name}: {n_motion} samples ({pct:.1f}%) blanked", file=sys.stderr)
+                print(
+                    f"    [MOTION] {track_name}: {n_motion} samples ({pct:.1f}%) blanked",
+                    file=sys.stderr,
+                )
 
         # ── Step 3: NaN-free 세그먼트 추출 ──
         min_samples = int(min_duration_s * native_sr)
         segments = _extract_nan_free_segments(data, min_samples)
         if not segments:
-            print(f"    [SKIP] {track_name}: 유효 세그먼트 없음 (min={min_duration_s}s)", file=sys.stderr)
+            print(
+                f"    [SKIP] {track_name}: 유효 세그먼트 없음 (min={min_duration_s}s)",
+                file=sys.stderr,
+            )
             continue
 
         # ── Step 4: 각 세그먼트 → 필터/리샘플 → 윈도우 단위 품질 검사 → 저장 ──
@@ -492,12 +601,16 @@ def process_vital(
             if cfg.median_kernel > 0:
                 segment = _apply_median_filter(segment, kernel_size=cfg.median_kernel)
             if cfg.notch_freq is not None:
-                segment = _apply_notch_filter(segment, freq=cfg.notch_freq, sr=native_sr)
+                segment = _apply_notch_filter(
+                    segment, freq=cfg.notch_freq, sr=native_sr
+                )
             segment = _apply_filter(segment, cfg, native_sr)
 
             # 리샘플링 → TARGET_SR (100Hz)
             if native_sr != TARGET_SR:
-                segment = resample_to_target(segment, orig_sr=native_sr, target_sr=TARGET_SR)
+                segment = resample_to_target(
+                    segment, orig_sr=native_sr, target_sr=TARGET_SR
+                )
 
             # 윈도우 단위 품질 검사 → 연속 통과 윈도우를 그룹으로 수집
             win_samples = int(quality_window_s * TARGET_SR)
@@ -510,7 +623,7 @@ def process_vital(
             for win_idx, win_start in enumerate(
                 range(0, len(segment) - win_samples + 1, win_samples)
             ):
-                win = segment[win_start:win_start + win_samples]
+                win = segment[win_start : win_start + win_samples]
                 n_windows += 1
 
                 # 기본 품질 검사
@@ -578,7 +691,9 @@ def process_vital(
                 if duration_s < min_duration_s:
                     continue
 
-                pt_name = f"{session_id}_{stype_key}_{spatial_id}_seg{seg_idx}_{group_idx}.pt"
+                pt_name = (
+                    f"{session_id}_{stype_key}_{spatial_id}_seg{seg_idx}_{group_idx}.pt"
+                )
                 save_recording(torch.from_numpy(channel_data), str(subj_out / pt_name))
 
                 rec = {
@@ -595,9 +710,9 @@ def process_vital(
 
             pct = n_good_total / n_windows * 100 if n_windows > 0 else 0
             n_groups = len(contiguous_groups)
-            total_dur = sum(
-                np.concatenate(g).shape[0] for g in contiguous_groups
-            ) / TARGET_SR
+            total_dur = (
+                sum(np.concatenate(g).shape[0] for g in contiguous_groups) / TARGET_SR
+            )
             print(
                 f"    saved {stype_key} seg{seg_idx}: {n_groups} contiguous group(s), "
                 f"{total_dur:.0f}s total"
@@ -622,7 +737,9 @@ def _process_one_worker(
     """단일 vital 파일 처리 (multiprocessing worker 호환)."""
     try:
         return process_vital(
-            vf_path, out_dir, min_duration_s=min_duration_s,
+            vf_path,
+            out_dir,
+            min_duration_s=min_duration_s,
             signal_types=signal_types,
         )
     except Exception as exc:
@@ -639,7 +756,9 @@ def _worker_split(task_tuple: tuple) -> tuple | None:
     """병렬 처리용 worker. (vf_path, out_dir) 튜플을 받아 처리한다."""
     vf_path, target_dir = task_tuple
     return _process_one_worker(
-        vf_path, out_dir=target_dir, min_duration_s=_mp_min_dur,
+        vf_path,
+        out_dir=target_dir,
+        min_duration_s=_mp_min_dur,
         signal_types=_mp_sig_filter,
     )
 
@@ -649,43 +768,60 @@ def main() -> None:
         description="VitalDB (.vital) → .pt 변환 (100Hz 리샘플링, train/test 분할 지원)"
     )
     parser.add_argument(
-        "--raw", required=True,
+        "--raw",
+        required=True,
         help="VitalDB .vital 파일이 있는 디렉토리",
     )
     parser.add_argument(
-        "--out", default=None,
+        "--out",
+        default=None,
         help="처리 결과를 저장할 루트 디렉토리 (--discover 시 불필요)",
     )
     parser.add_argument(
-        "--min-duration", type=float, default=60.0,
+        "--min-duration",
+        type=float,
+        default=60.0,
         help="최소 유효 신호 길이 (초, 기본 60)",
     )
     parser.add_argument(
-        "--discover", action="store_true",
+        "--discover",
+        action="store_true",
         help="트랙 탐색 모드: 파일 내 트랙명만 출력",
     )
     parser.add_argument(
-        "--max-files", type=int, default=None,
+        "--max-files",
+        type=int,
+        default=None,
         help="처리할 최대 파일 수 (테스트용)",
     )
     parser.add_argument(
-        "--signal-types", type=int, nargs="+", default=None,
+        "--signal-types",
+        type=int,
+        nargs="+",
+        default=None,
         help="파싱할 signal type IDs (0=ECG,1=ABP,2=PPG,3=CVP,4=CO2,5=AWP,6=PAP,7=ICP). 미지정 시 전부.",
     )
     parser.add_argument(
-        "--workers", type=int, default=1,
+        "--workers",
+        type=int,
+        default=1,
         help="병렬 처리 worker 수 (기본 1=순차 처리)",
     )
     parser.add_argument(
-        "--test-ratio", type=float, default=0.0,
+        "--test-ratio",
+        type=float,
+        default=0.0,
         help="Test split 비율 (0.0~1.0). 0이면 분할 없이 전체 --out으로. 예: 0.2이면 20%% test.",
     )
     parser.add_argument(
-        "--test-out", default=None,
+        "--test-out",
+        default=None,
         help="Test split 출력 디렉토리. --test-ratio > 0일 때 필수.",
     )
     parser.add_argument(
-        "--split-seed", type=int, default=42,
+        "--split-seed",
+        type=int,
+        default=42,
         help="Train/test 분할 랜덤 시드 (기본 42)",
     )
     args = parser.parse_args()
@@ -726,9 +862,12 @@ def main() -> None:
     test_ratio = args.test_ratio
     if test_ratio > 0:
         if args.test_out is None:
-            print("ERROR: --test-ratio > 0이면 --test-out을 지정하세요.", file=sys.stderr)
+            print(
+                "ERROR: --test-ratio > 0이면 --test-out을 지정하세요.", file=sys.stderr
+            )
             sys.exit(1)
         import random
+
         random.seed(args.split_seed)
         indices = list(range(len(vital_files)))
         random.shuffle(indices)
@@ -737,7 +876,9 @@ def main() -> None:
         train_indices = set(indices[n_test:])
         test_out_dir = Path(args.test_out)
         test_out_dir.mkdir(parents=True, exist_ok=True)
-        print(f"Train/Test split: {len(train_indices)} train, {len(test_indices)} test (seed={args.split_seed})\n")
+        print(
+            f"Train/Test split: {len(train_indices)} train, {len(test_indices)} test (seed={args.split_seed})\n"
+        )
     else:
         test_indices = set()
         train_indices = set(range(len(vital_files)))
@@ -764,21 +905,23 @@ def main() -> None:
     sig_filter = set(args.signal_types) if args.signal_types else None
     min_dur = args.min_duration
 
-    n_train, n_test = 0, 0
+    counts = {"train": 0, "test": 0}
 
     def _append_manifest(directory: Path, subject_id: str) -> None:
         jp = directory / "manifest.jsonl"
         prev = ""
         if jp.exists():
             prev = jp.read_text(encoding="utf-8")
-        new_line = json.dumps(
-            {"subject_id": subject_id, "manifest": f"{subject_id}/manifest.json"},
-            ensure_ascii=False,
-        ) + "\n"
+        new_line = (
+            json.dumps(
+                {"subject_id": subject_id, "manifest": f"{subject_id}/manifest.json"},
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
         jp.write_text(prev + new_line, encoding="utf-8")
 
     def _handle_result(result, file_idx: int) -> None:
-        nonlocal n_train, n_test
         if result is None:
             return
         subject_id, session_id, recordings = result
@@ -789,16 +932,15 @@ def main() -> None:
             if subject_id not in existing_test:
                 _append_manifest(test_out_dir, subject_id)
                 existing_test.add(subject_id)
-            n_test += 1
+            counts["test"] += 1
         else:
             if subject_id not in existing_train:
                 _append_manifest(out_dir, subject_id)
                 existing_train.add(subject_id)
-            n_train += 1
+            counts["train"] += 1
 
     if args.workers > 1:
         from multiprocessing import Pool
-        from functools import partial
 
         print(f"병렬 처리: {args.workers} workers\n")
 
@@ -822,20 +964,22 @@ def main() -> None:
             split_tag = "[TEST]" if i in test_indices else "[TRAIN]"
             print(f"{split_tag} [{vf_path.name}]")
             result = _process_one_worker(
-                vf_path, out_dir=target_dir, min_duration_s=min_dur,
+                vf_path,
+                out_dir=target_dir,
+                min_duration_s=min_dur,
                 signal_types=sig_filter,
             )
             if result is None:
                 continue
             subject_id, session_id, recordings = result
             if not recordings:
-                print(f"    [SKIP] 유효 레코딩 없음")
+                print("    [SKIP] 유효 레코딩 없음")
                 continue
             _handle_result(result, i)
 
-    print(f"\n완료: train {n_train}명 → {out_dir}")
+    print(f"\n완료: train {counts['train']}명 → {out_dir}")
     if test_out_dir:
-        print(f"       test {n_test}명 → {test_out_dir}")
+        print(f"       test {counts['test']}명 → {test_out_dir}")
     print(f"인덱스: {out_dir / 'manifest.jsonl'}")
     if test_out_dir:
         print(f"        {test_out_dir / 'manifest.jsonl'}")

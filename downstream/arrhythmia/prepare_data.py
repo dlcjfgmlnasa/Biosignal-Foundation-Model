@@ -168,7 +168,7 @@ def prepare_arrhythmia_data(
             print(f"    {cls_name}({cls_id}): {cnt} ({pct:.1f}%)")
 
     # 4. .pt 저장
-    print(f"\n[4/4] Saving to .pt...")
+    print("\n[4/4] Saving to .pt...")
 
     save_dict = {
         "metadata": {
@@ -186,7 +186,7 @@ def prepare_arrhythmia_data(
         samples, labels = splits[split_name]
         if samples:
             save_dict[split_name] = {
-                "signals": torch.stack(samples),       # (N, 1000)
+                "signals": torch.stack(samples),  # (N, 1000)
                 "labels": torch.tensor(labels, dtype=torch.long),  # (N,)
             }
         else:
@@ -206,11 +206,11 @@ def prepare_arrhythmia_data(
 
     # 요약
     total = sum(len(splits[s][0]) for s in ["train", "val", "test"])
-    print(f"\n{'='*50}")
-    print(f"  Arrhythmia Detection data ready")
+    print(f"\n{'=' * 50}")
+    print("  Arrhythmia Detection data ready")
     print(f"  Total: {total} ECGs, 5 classes, Lead {lead}")
     print(f"  File: {save_path}")
-    print(f"{'='*50}")
+    print(f"{'=' * 50}")
 
     return save_path
 
@@ -219,6 +219,7 @@ def _visualize(splits, class_names, out_dir, lead):
     """클래스별 ECG 예시 + 분포 시각화."""
     try:
         import matplotlib
+
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
     except ImportError:
@@ -235,6 +236,7 @@ def _visualize(splits, class_names, out_dir, lead):
     fig.suptitle(f"PTB-XL ECG Examples (Lead {lead}, 100Hz)", fontsize=14)
 
     from collections import defaultdict
+
     by_class = defaultdict(list)
     for s, l in zip(samples, labels):
         by_class[l].append(s)
@@ -258,6 +260,7 @@ def _visualize(splits, class_names, out_dir, lead):
 
     # 2. 클래스 분포
     from collections import Counter
+
     fig, axes = plt.subplots(1, 3, figsize=(14, 4))
 
     for idx, split_name in enumerate(["train", "val", "test"]):
@@ -267,12 +270,19 @@ def _visualize(splits, class_names, out_dir, lead):
             continue
         dist = Counter(labs)
         counts = [dist.get(i, 0) for i in range(5)]
-        bars = ax.bar(class_names, counts, color=["green", "red", "orange", "purple", "brown"])
+        bars = ax.bar(
+            class_names, counts, color=["green", "red", "orange", "purple", "brown"]
+        )
         ax.set_title(f"{split_name} (n={len(labs)})")
         ax.set_ylabel("Count")
         for bar, c in zip(bars, counts):
-            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 5,
-                    str(c), ha="center", fontsize=8)
+            ax.text(
+                bar.get_x() + bar.get_width() / 2,
+                bar.get_height() + 5,
+                str(c),
+                ha="center",
+                fontsize=8,
+            )
 
     plt.suptitle("PTB-XL Class Distribution", fontsize=13)
     plt.tight_layout()
@@ -292,10 +302,10 @@ def main() -> None:
     parser.add_argument("--data-dir", type=str, default="datasets/ptb-xl/1.0.3")
     parser.add_argument("--lead", type=str, default="II")
     parser.add_argument("--out-dir", type=str, default="outputs/downstream/arrhythmia")
-    parser.add_argument("--download", action="store_true",
-                        help="Download PTB-XL first")
-    parser.add_argument("--n-records", type=int, default=0,
-                        help="Number of records to download (0=all)")
+    parser.add_argument("--download", action="store_true", help="Download PTB-XL first")
+    parser.add_argument(
+        "--n-records", type=int, default=0, help="Number of records to download (0=all)"
+    )
     parser.add_argument("--visualize", action="store_true")
     args = parser.parse_args()
 

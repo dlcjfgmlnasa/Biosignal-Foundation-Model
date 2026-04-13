@@ -4,6 +4,7 @@
 연속 신호를 고정 크기 패치 단위로 나누어 트랜스포머 입력 토큰으로 변환한다.
 PackCollate의 patch_size/stride 정렬과 함께 사용한다.
 """
+
 from __future__ import annotations
 
 import torch
@@ -98,7 +99,8 @@ class PatchEmbedding(nn.Module):
     def project(
         self,
         patches: torch.Tensor,  # (batch, num_patches, patch_size)
-        patch_signal_types: torch.Tensor | None = None,  # (batch, num_patches) long — unused, kept for API compat
+        patch_signal_types: torch.Tensor
+        | None = None,  # (batch, num_patches) long — unused, kept for API compat
     ) -> torch.Tensor:  # (batch, num_patches, d_model)
         """Raw patches를 d_model 임베딩으로 투영한다 (Residual MLP)."""
         return self.proj(patches)
@@ -117,7 +119,9 @@ class PatchEmbedding(nn.Module):
         torch.Tensor,  # (batch, num_patches) bool — patch_mask (True=유효)
     ]:
         patches, p_sid, p_vid, time_id, patch_mask = self.patchify(
-            values, sample_id, variate_id,
+            values,
+            sample_id,
+            variate_id,
         )
         embedded = self.project(patches, patch_signal_types)
         return embedded, p_sid, p_vid, time_id, patch_mask
@@ -160,9 +164,7 @@ class PatchEmbedding(nn.Module):
         p = self.patch_size
         s = self.stride
         b, l = values.shape
-        assert l >= p, (
-            f"max_length({l})가 patch_size({p})보다 작습니다."
-        )
+        assert l >= p, f"max_length({l})가 patch_size({p})보다 작습니다."
         assert (l - p) % s == 0, (
             f"(max_length({l}) - patch_size({p})) % stride({s}) != 0. "
             f"PackCollate(patch_size={p}, stride={s})를 사용하세요."

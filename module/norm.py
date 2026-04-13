@@ -29,7 +29,7 @@ class RMSNorm(nn.Module):
     ):
         super().__init__()
         if isinstance(normalized_shape, int):
-            normalized_shape = (normalized_shape, )
+            normalized_shape = (normalized_shape,)
 
         self.normalized_shape = normalized_shape
         self.eps = eps
@@ -41,7 +41,8 @@ class RMSNorm(nn.Module):
             self.register_parameter("weight", None)
 
     def forward(
-        self, x: torch.Tensor,  # (*batch, *normalized_shape)
+        self,
+        x: torch.Tensor,  # (*batch, *normalized_shape)
     ) -> torch.Tensor:  # (*batch, *normalized_shape)
         output = x * torch.rsqrt(
             x.pow(2).mean(dim=self.mean_dim, keepdim=True) + self.eps

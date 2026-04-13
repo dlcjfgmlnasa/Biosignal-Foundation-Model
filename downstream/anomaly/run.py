@@ -16,6 +16,7 @@ python -m downstream.anomaly.run --checkpoint outputs/phase1_v1/best.pt --signal
 # 더미 테스트:
 python -m downstream.anomaly.run --dummy --signal-type ecg
 """
+
 from __future__ import annotations
 
 import argparse
@@ -35,7 +36,14 @@ from data.spatial_map import get_global_spatial_id
 TARGET_SR = 100.0
 
 SIGNAL_TYPE_INDEX: dict[str, int] = {
-    "ecg": 0, "abp": 1, "ppg": 2, "cvp": 3, "co2": 4, "awp": 5, "pap": 6, "icp": 7,
+    "ecg": 0,
+    "abp": 1,
+    "ppg": 2,
+    "cvp": 3,
+    "co2": 4,
+    "awp": 5,
+    "pap": 6,
+    "icp": 7,
 }
 
 
@@ -45,11 +53,12 @@ SIGNAL_TYPE_INDEX: dict[str, int] = {
 @dataclass
 class AnomalyWindow:
     """이상 탐지용 윈도우."""
-    signal: np.ndarray     # (win_samples,) at 100Hz
+
+    signal: np.ndarray  # (win_samples,) at 100Hz
     signal_type: str
     case_id: int
-    label: int             # 0=normal, 1=anomaly
-    quality_score: dict    # segment_quality_score 결과
+    label: int  # 0=normal, 1=anomaly
+    quality_score: dict  # segment_quality_score 결과
 
 
 # ── 데이터 준비 ───────────────────────────────────────────────
@@ -78,8 +87,10 @@ def prepare_anomaly_windows(
     for case in cases:
         # quality_check=False로 모든 윈도우 추출 (FAIL 포함)
         windows = extract_windows(
-            case, signal_type=signal_type,
-            window_sec=window_sec, stride_sec=stride_sec,
+            case,
+            signal_type=signal_type,
+            window_sec=window_sec,
+            stride_sec=stride_sec,
             quality_check=False,
         )
 
@@ -92,13 +103,15 @@ def prepare_anomaly_windows(
             is_normal = basic["pass"] and domain["pass"]
             label = 0 if is_normal else 1
 
-            results.append(AnomalyWindow(
-                signal=w.signal,
-                signal_type=signal_type,
-                case_id=w.case_id,
-                label=label,
-                quality_score={**basic, "domain_pass": domain["pass"]},
-            ))
+            results.append(
+                AnomalyWindow(
+                    signal=w.signal,
+                    signal_type=signal_type,
+                    case_id=w.case_id,
+                    label=label,
+                    quality_score={**basic, "domain_pass": domain["pass"]},
+                )
+            )
 
     return results
 
@@ -119,11 +132,15 @@ def create_dummy_windows(
         t = np.arange(win_samples) / TARGET_SR
         sig = np.sin(2 * np.pi * freq * t).astype(np.float32)
         sig += rng.normal(0, 0.05, win_samples).astype(np.float32)
-        results.append(AnomalyWindow(
-            signal=sig, signal_type=signal_type,
-            case_id=8000 + i, label=0,
-            quality_score={"pass": True, "flatline_ratio": 0.0},
-        ))
+        results.append(
+            AnomalyWindow(
+                signal=sig,
+                signal_type=signal_type,
+                case_id=8000 + i,
+                label=0,
+                quality_score={"pass": True, "flatline_ratio": 0.0},
+            )
+        )
 
     # 이상: 스파이크, flatline, 랜덤 노이즈
     for i in range(n_anomaly):
@@ -141,11 +158,18 @@ def create_dummy_windows(
             # Pure random noise
             sig = rng.normal(0, 1.0, win_samples).astype(np.float32)
 
-        results.append(AnomalyWindow(
-            signal=sig, signal_type=signal_type,
-            case_id=9000 + i, label=1,
-            quality_score={"pass": False, "flatline_ratio": 0.5 if anomaly_type == 1 else 0.0},
-        ))
+        results.append(
+            AnomalyWindow(
+                signal=sig,
+                signal_type=signal_type,
+                case_id=9000 + i,
+                label=1,
+                quality_score={
+                    "pass": False,
+                    "flatline_ratio": 0.5 if anomaly_type == 1 else 0.0,
+                },
+            )
+        )
 
     return results
 
@@ -209,7 +233,7 @@ def compute_anomaly_scores(
         out = wrapper.forward_masked(batch)
 
         reconstructed = out["reconstructed"]  # (1, N, P)
-        patch_mask = out["patch_mask"]        # (1, N) bool
+        patch_mask = out["patch_mask"]  # (1, N) bool
 
         # 원본 패치 추출 (정규화 후)
         normalized = (
@@ -226,8 +250,10 @@ def compute_anomaly_scores(
         # 마스킹 위치의 MSE
         if pred_mask.any():
             mse = (
-                (reconstructed[pred_mask] - original_patches[pred_mask]) ** 2
-            ).mean().item()
+                ((reconstructed[pred_mask] - original_patches[pred_mask]) ** 2)
+                .mean()
+                .item()
+            )
         else:
             mse = 0.0
 
@@ -258,10 +284,12 @@ def find_optimal_threshold(
 
     candidates = np.percentile(normal_scores, [80, 85, 90, 95, 97.5, 99])
     # score 분포의 균등 분할도 추가
-    candidates = np.concatenate([
-        candidates,
-        np.linspace(scores_arr.min(), scores_arr.max(), 20),
-    ])
+    candidates = np.concatenate(
+        [
+            candidates,
+            np.linspace(scores_arr.min(), scores_arr.max(), 20),
+        ]
+    )
 
     best_f1 = 0.0
     best_thresh = float(candidates[0])
@@ -288,6 +316,7 @@ def plot_score_distribution(
 ) -> None:
     """정상/이상 reconstruction MSE 분포 히스토그램을 저장한다."""
     import matplotlib
+
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
@@ -305,12 +334,29 @@ def plot_score_distribution(
         50,
     )
 
-    ax.hist(normal_scores, bins=bins, alpha=0.6, color="steelblue",
-            label=f"Normal (n={len(normal_scores)})", density=True)
-    ax.hist(anomaly_scores, bins=bins, alpha=0.6, color="salmon",
-            label=f"Anomaly (n={len(anomaly_scores)})", density=True)
-    ax.axvline(threshold, color="red", linestyle="--", linewidth=1.5,
-               label=f"Threshold = {threshold:.4f}")
+    ax.hist(
+        normal_scores,
+        bins=bins,
+        alpha=0.6,
+        color="steelblue",
+        label=f"Normal (n={len(normal_scores)})",
+        density=True,
+    )
+    ax.hist(
+        anomaly_scores,
+        bins=bins,
+        alpha=0.6,
+        color="salmon",
+        label=f"Anomaly (n={len(anomaly_scores)})",
+        density=True,
+    )
+    ax.axvline(
+        threshold,
+        color="red",
+        linestyle="--",
+        linewidth=1.5,
+        label=f"Threshold = {threshold:.4f}",
+    )
 
     ax.set_xlabel("Reconstruction MSE (anomaly score)")
     ax.set_ylabel("Density")
@@ -345,7 +391,12 @@ class DummyWrapper:
 
         # Per-variate normalization (scaler 시뮬레이션)
         loc = values.mean(dim=-1, keepdim=True).unsqueeze(-1).expand(B, L, 1)
-        scale = values.std(dim=-1, keepdim=True).unsqueeze(-1).clamp(min=1e-8).expand(B, L, 1)
+        scale = (
+            values.std(dim=-1, keepdim=True)
+            .unsqueeze(-1)
+            .clamp(min=1e-8)
+            .expand(B, L, 1)
+        )
 
         # Normalized → patches
         normalized = ((values.unsqueeze(-1) - loc) / scale).squeeze(-1)
@@ -355,7 +406,9 @@ class DummyWrapper:
         # 입력의 분산이 높으면 (비정상) 더 큰 노이즈 추가
         input_var = values.var().item()
         noise_scale = 0.05 + 0.1 * min(input_var, 5.0)
-        reconstructed = original_patches + torch.randn_like(original_patches) * noise_scale
+        reconstructed = (
+            original_patches + torch.randn_like(original_patches) * noise_scale
+        )
 
         return {
             "reconstructed": reconstructed,
@@ -374,23 +427,39 @@ class DummyWrapper:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Task 6: Anomaly Detection")
-    parser.add_argument("--checkpoint", type=str, default=None,
-                        help="사전학습 checkpoint 경로 (.pt)")
-    parser.add_argument("--model-version", type=str, default="v1",
-                        choices=["v1", "v2"], help="모델 버전")
-    parser.add_argument("--signal-type", type=str, default="ecg",
-                        choices=["ecg", "abp", "ppg", "cvp", "co2", "awp"],
-                        help="평가할 신호 타입")
-    parser.add_argument("--n-cases", type=int, default=30,
-                        help="로드할 VitalDB 케이스 수")
-    parser.add_argument("--window-sec", type=float, default=10.0,
-                        help="윈도우 길이 (초)")
-    parser.add_argument("--mask-ratio", type=float, default=0.15,
-                        help="마스킹 비율")
-    parser.add_argument("--output-dir", type=str, default="outputs/task6_anomaly",
-                        help="결과 저장 디렉토리")
-    parser.add_argument("--dummy", action="store_true",
-                        help="더미 모델로 파이프라인 테스트")
+    parser.add_argument(
+        "--checkpoint", type=str, default=None, help="사전학습 checkpoint 경로 (.pt)"
+    )
+    parser.add_argument(
+        "--model-version",
+        type=str,
+        default="v1",
+        choices=["v1", "v2"],
+        help="모델 버전",
+    )
+    parser.add_argument(
+        "--signal-type",
+        type=str,
+        default="ecg",
+        choices=["ecg", "abp", "ppg", "cvp", "co2", "awp"],
+        help="평가할 신호 타입",
+    )
+    parser.add_argument(
+        "--n-cases", type=int, default=30, help="로드할 VitalDB 케이스 수"
+    )
+    parser.add_argument(
+        "--window-sec", type=float, default=10.0, help="윈도우 길이 (초)"
+    )
+    parser.add_argument("--mask-ratio", type=float, default=0.15, help="마스킹 비율")
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="outputs/task6_anomaly",
+        help="결과 저장 디렉토리",
+    )
+    parser.add_argument(
+        "--dummy", action="store_true", help="더미 모델로 파이프라인 테스트"
+    )
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -400,7 +469,8 @@ def main() -> None:
     if args.dummy:
         print(f"[Task 6] Dummy mode: {args.signal_type} Synthetic data")
         windows = create_dummy_windows(
-            n_normal=40, n_anomaly=20,
+            n_normal=40,
+            n_anomaly=20,
             win_samples=int(args.window_sec * TARGET_SR),
             signal_type=args.signal_type,
         )
@@ -429,9 +499,12 @@ def main() -> None:
         print(f"[Task 6] DummyWrapper 사용 (patch_size={patch_size})")
     else:
         from downstream.model_wrapper import DownstreamModelWrapper
+
         device = "cuda" if torch.cuda.is_available() else "cpu"
         wrapper = DownstreamModelWrapper(
-            args.checkpoint, model_version=args.model_version, device=device,
+            args.checkpoint,
+            model_version=args.model_version,
+            device=device,
         )
         patch_size = wrapper.patch_size
         print(f"[Task 6] 모델 로드: {args.model_version}, patch_size={patch_size}")
@@ -439,13 +512,14 @@ def main() -> None:
     # ── Anomaly Scoring ──
     print(f"[Task 6] Computing anomaly scores ({len(windows)} windows)...")
     scores = compute_anomaly_scores(
-        wrapper, windows,
+        wrapper,
+        windows,
         patch_size=patch_size,
         mask_ratio=args.mask_ratio,
     )
 
     # ── 메트릭 계산 ──
-    from downstream.metrics import compute_auroc, compute_auprc, compute_f1
+    from downstream.metrics import compute_auroc, compute_auprc
 
     scores_arr = np.array(scores)
     labels_arr = np.array(labels)
@@ -479,12 +553,15 @@ def main() -> None:
     from downstream.viz import plot_roc_curve
 
     plot_score_distribution(
-        scores, labels, best_thresh,
+        scores,
+        labels,
+        best_thresh,
         save_path=output_dir / f"score_dist_{args.signal_type}.png",
         title=f"Anomaly Score Distribution — {args.signal_type.upper()}",
     )
     plot_roc_curve(
-        labels_arr, scores_arr,
+        labels_arr,
+        scores_arr,
         save_path=output_dir / f"roc_{args.signal_type}.png",
         title=f"Anomaly Detection ROC — {args.signal_type.upper()}",
     )
@@ -499,8 +576,12 @@ def main() -> None:
     print(f"  AUPRC              : {metrics['auprc']:.4f}")
     print(f"  F1@optimal         : {metrics['f1_at_optimal']:.4f}")
     print(f"  Optimal threshold  : {metrics['optimal_threshold']:.6f}")
-    print(f"  Normal MSE (mean)  : {metrics['normal_score_mean']:.6f} +/- {metrics['normal_score_std']:.6f}")
-    print(f"  Anomaly MSE (mean) : {metrics['anomaly_score_mean']:.6f} +/- {metrics['anomaly_score_std']:.6f}")
+    print(
+        f"  Normal MSE (mean)  : {metrics['normal_score_mean']:.6f} +/- {metrics['normal_score_std']:.6f}"
+    )
+    print(
+        f"  Anomaly MSE (mean) : {metrics['anomaly_score_mean']:.6f} +/- {metrics['anomaly_score_std']:.6f}"
+    )
     print("=" * 60)
 
     # JSON 저장

@@ -39,7 +39,6 @@ from data.parser.vitaldb import SIGNAL_TYPES
 
 from downstream.data_utils import (
     LabeledWindow,
-    TARGET_SR,
 )
 from downstream.metrics import (
     compute_auroc,
@@ -62,7 +61,9 @@ DEFAULT_SR = 100.0
 class ConcatProbe(nn.Module):
     """N개 윈도우 feature를 concatenate -> Linear."""
 
-    def __init__(self, d_model: int, n_windows: int, n_classes: int = 1, dropout_p: float = 0.1):
+    def __init__(
+        self, d_model: int, n_windows: int, n_classes: int = 1, dropout_p: float = 0.1
+    ):
         super().__init__()
         self.head = nn.Sequential(
             nn.LayerNorm(d_model * n_windows),
@@ -70,7 +71,9 @@ class ConcatProbe(nn.Module):
             nn.Linear(d_model * n_windows, n_classes),
         )
 
-    def forward(self, features: torch.Tensor) -> torch.Tensor:  # (B, n_windows, d_model)
+    def forward(
+        self, features: torch.Tensor
+    ) -> torch.Tensor:  # (B, n_windows, d_model)
         B = features.shape[0]
         flat = features.reshape(B, -1)  # (B, n_windows * d_model)
         return self.head(flat)  # (B, n_classes)
@@ -79,7 +82,13 @@ class ConcatProbe(nn.Module):
 class LSTMProbe(nn.Module):
     """N개 윈도우 feature를 LSTM -> last hidden -> Linear."""
 
-    def __init__(self, d_model: int, hidden_dim: int = 64, n_classes: int = 1, dropout_p: float = 0.1):
+    def __init__(
+        self,
+        d_model: int,
+        hidden_dim: int = 64,
+        n_classes: int = 1,
+        dropout_p: float = 0.1,
+    ):
         super().__init__()
         self.lstm = nn.LSTM(d_model, hidden_dim, batch_first=True, num_layers=1)
         self.head = nn.Sequential(
@@ -88,7 +97,9 @@ class LSTMProbe(nn.Module):
             nn.Linear(hidden_dim, n_classes),
         )
 
-    def forward(self, features: torch.Tensor) -> torch.Tensor:  # (B, n_windows, d_model)
+    def forward(
+        self, features: torch.Tensor
+    ) -> torch.Tensor:  # (B, n_windows, d_model)
         _, (h_n, _) = self.lstm(features)  # h_n: (1, B, hidden_dim)
         return self.head(h_n.squeeze(0))  # (B, n_classes)
 
@@ -104,7 +115,9 @@ class MeanProbe(nn.Module):
             nn.Linear(d_model, n_classes),
         )
 
-    def forward(self, features: torch.Tensor) -> torch.Tensor:  # (B, n_windows, d_model)
+    def forward(
+        self, features: torch.Tensor
+    ) -> torch.Tensor:  # (B, n_windows, d_model)
         pooled = features.mean(dim=1)  # (B, d_model)
         return self.head(pooled)  # (B, n_classes)
 
@@ -115,9 +128,10 @@ class MeanProbe(nn.Module):
 @dataclass
 class MultiWindowSample:
     """N개 연속 윈도우 + 라벨."""
-    windows: list[LabeledWindow]   # context windows (시간순)
-    label: int                     # target label (0=normal, 1=hypotension)
-    label_value: float             # target MAP
+
+    windows: list[LabeledWindow]  # context windows (시간순)
+    label: int  # target label (0=normal, 1=hypotension)
+    label_value: float  # target MAP
     case_id: int
 
 
@@ -168,35 +182,39 @@ def create_multiwindow_samples(
     if horizon_sec <= 0:
         # No horizon: 연속 N개 윈도우, 마지막 윈도우가 label
         for i in range(n_context - 1, len(labeled)):
-            context = labeled[i - n_context + 1:i + 1]
+            context = labeled[i - n_context + 1 : i + 1]
 
             # 연속성 체크: stride 간격으로 정렬되어 있는지 확인
             # (extract_windows가 stride로 추출하므로 인덱스 연속이면 시간 연속)
-            samples.append(MultiWindowSample(
-                windows=context,
-                label=context[-1].label,
-                label_value=context[-1].label_value,
-                case_id=case_data.case_id,
-            ))
+            samples.append(
+                MultiWindowSample(
+                    windows=context,
+                    label=context[-1].label,
+                    label_value=context[-1].label_value,
+                    case_id=case_data.case_id,
+                )
+            )
     else:
         # With horizon: context N개 + horizon 뒤의 윈도우에서 라벨
         horizon_windows = int(horizon_sec / stride_sec)  # horizon에 해당하는 윈도우 수
         total_needed = n_context + horizon_windows
 
         for i in range(n_context - 1, len(labeled) - horizon_windows):
-            context = labeled[i - n_context + 1:i + 1]
+            context = labeled[i - n_context + 1 : i + 1]
             target_idx = i + horizon_windows
 
             if target_idx >= len(labeled):
                 break
 
             target = labeled[target_idx]
-            samples.append(MultiWindowSample(
-                windows=context,
-                label=target.label,
-                label_value=target.label_value,
-                case_id=case_data.case_id,
-            ))
+            samples.append(
+                MultiWindowSample(
+                    windows=context,
+                    label=target.label,
+                    label_value=target.label_value,
+                    case_id=case_data.case_id,
+                )
+            )
 
     return samples
 
@@ -209,18 +227,20 @@ def _labeled_windows_to_samples(labeled: list[LabeledWindow]) -> list[BiosignalS
     for i, lw in enumerate(labeled):
         stype_int = SIGNAL_TYPES.get(lw.signal_type, 1)
         spatial_id = get_global_spatial_id(lw.signal_type, 0)
-        samples.append(BiosignalSample(
-            values=torch.from_numpy(lw.signal).float(),
-            length=len(lw.signal),
-            channel_idx=0,
-            recording_idx=i,
-            sampling_rate=DEFAULT_SR,
-            n_channels=1,
-            win_start=0,
-            signal_type=stype_int,
-            session_id=f"case_{lw.case_id}",
-            spatial_id=spatial_id,
-        ))
+        samples.append(
+            BiosignalSample(
+                values=torch.from_numpy(lw.signal).float(),
+                length=len(lw.signal),
+                channel_idx=0,
+                recording_idx=i,
+                sampling_rate=DEFAULT_SR,
+                n_channels=1,
+                win_start=0,
+                signal_type=stype_int,
+                session_id=f"case_{lw.case_id}",
+                spatial_id=spatial_id,
+            )
+        )
     return samples
 
 
@@ -232,9 +252,11 @@ def _make_single_batches(
 ) -> list[tuple[PackedBatch, torch.Tensor]]:
     """단일 윈도우 모드: (batch, labels)."""
     batches = []
-    collate = PackCollate(max_length=max_length, collate_mode="ci", patch_size=patch_size)
+    collate = PackCollate(
+        max_length=max_length, collate_mode="ci", patch_size=patch_size
+    )
     for i in range(0, len(labeled), batch_size):
-        chunk = labeled[i:i + batch_size]
+        chunk = labeled[i : i + batch_size]
         samples = _labeled_windows_to_samples(chunk)
         labels = torch.tensor([lw.label for lw in chunk], dtype=torch.float32)
         batch = collate(samples)
@@ -253,10 +275,12 @@ def _make_multi_batches(
     각 시간 스텝의 윈도우를 별도 PackedBatch로 생성한다.
     """
     batches = []
-    collate = PackCollate(max_length=max_length, collate_mode="ci", patch_size=patch_size)
+    collate = PackCollate(
+        max_length=max_length, collate_mode="ci", patch_size=patch_size
+    )
 
     for i in range(0, len(mw_samples), batch_size):
-        chunk = mw_samples[i:i + batch_size]
+        chunk = mw_samples[i : i + batch_size]
         n_ctx = len(chunk[0].windows)
         labels = torch.tensor([s.label for s in chunk], dtype=torch.float32)
 
@@ -290,7 +314,12 @@ class DummyFeatureExtractor:
 
 
 def train_probe_single(
-    model, probe, train_batches, epochs, lr, device,
+    model,
+    probe,
+    train_batches,
+    epochs,
+    lr,
+    device,
 ) -> list[float]:
     probe = probe.to(device)
     probe.train()
@@ -334,7 +363,12 @@ def evaluate_probe_single(model, probe, test_batches, device):
 
 
 def train_probe_multi(
-    model, probe, train_batches, epochs, lr, device,
+    model,
+    probe,
+    train_batches,
+    epochs,
+    lr,
+    device,
 ) -> list[float]:
     probe = probe.to(device)
     probe.train()
@@ -437,18 +471,38 @@ def main() -> None:
     parser.add_argument("--out-dir", type=str, default=".")
     parser.add_argument("--dummy", action="store_true")
     parser.add_argument("--device", type=str, default="cpu")
-    parser.add_argument("--data-path", type=str, default=None,
-                        help="Prepared .pt file from prepare_data.py")
-    parser.add_argument("--data-dir", type=str, default=None,
-                        help="Local .pt data directory (e.g. vitaldb_pt_test/)")
+    parser.add_argument(
+        "--data-path",
+        type=str,
+        default=None,
+        help="Prepared .pt file from prepare_data.py",
+    )
+    parser.add_argument(
+        "--data-dir",
+        type=str,
+        default=None,
+        help="Local .pt data directory (e.g. vitaldb_pt_test/)",
+    )
     # Multi-window args
-    parser.add_argument("--n-context-windows", type=int, default=1,
-                        help="과거 context 윈도우 수 (1=단일 윈도우, >1=다중)")
-    parser.add_argument("--prediction-horizon-sec", type=float, default=0.0,
-                        help="예측 horizon (초). 0=현재 윈도우 분류")
-    parser.add_argument("--aggregator", type=str, default="concat",
-                        choices=["concat", "lstm", "mean"],
-                        help="다중 윈도우 집계 방식")
+    parser.add_argument(
+        "--n-context-windows",
+        type=int,
+        default=1,
+        help="과거 context 윈도우 수 (1=단일 윈도우, >1=다중)",
+    )
+    parser.add_argument(
+        "--prediction-horizon-sec",
+        type=float,
+        default=0.0,
+        help="예측 horizon (초). 0=현재 윈도우 분류",
+    )
+    parser.add_argument(
+        "--aggregator",
+        type=str,
+        default="concat",
+        choices=["concat", "lstm", "mean"],
+        help="다중 윈도우 집계 방식",
+    )
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -464,6 +518,7 @@ def main() -> None:
         d_model = 128
     elif args.checkpoint:
         from downstream.model_wrapper import DownstreamModelWrapper
+
         print(f"Loading checkpoint: {args.checkpoint}")
         model = DownstreamModelWrapper(args.checkpoint, args.model_version, args.device)
         d_model = model.d_model
@@ -474,7 +529,8 @@ def main() -> None:
     mode_str = (
         f"Multi-window (n_ctx={args.n_context_windows}, "
         f"horizon={args.prediction_horizon_sec}s, agg={args.aggregator})"
-        if multi_mode else "Single-window"
+        if multi_mode
+        else "Single-window"
     )
     print(f"Mode: {mode_str}")
 
@@ -486,7 +542,9 @@ def main() -> None:
         meta = data.get("metadata", {})
         print(f"  Task: {meta.get('task', '?')}, Source: {meta.get('source', '?')}")
         print(f"  Input signals: {meta.get('input_signals', '?')}")
-        print(f"  Horizon: {meta.get('horizon_sec', 0)/60:.0f}min, Window: {meta.get('window_sec', '?')}s")
+        print(
+            f"  Horizon: {meta.get('horizon_sec', 0) / 60:.0f}min, Window: {meta.get('window_sec', '?')}s"
+        )
 
         # train/test signals + labels 추출
         train_data = data["train"]
@@ -503,16 +561,20 @@ def main() -> None:
             labeled = []
             sig_key = input_keys[0]
             signals_t = split_data["signals"][sig_key]  # (N, win_samples)
-            labels_t = split_data["labels"]              # (N,)
+            labels_t = split_data["labels"]  # (N,)
             label_values_t = split_data["label_values"]  # (N,)
             for i in range(len(labels_t)):
-                labeled.append(LabeledWindow(
-                    signal=signals_t[i].numpy(),
-                    signal_type=sig_key,
-                    case_id=split_data["case_ids"][i] if "case_ids" in split_data else 0,
-                    label=int(labels_t[i].item()),
-                    label_value=float(label_values_t[i].item()),
-                ))
+                labeled.append(
+                    LabeledWindow(
+                        signal=signals_t[i].numpy(),
+                        signal_type=sig_key,
+                        case_id=split_data["case_ids"][i]
+                        if "case_ids" in split_data
+                        else 0,
+                        label=int(labels_t[i].item()),
+                        label_value=float(label_values_t[i].item()),
+                    )
+                )
             return labeled
 
         train_labeled = _pt_to_labeled(train_data)
@@ -520,20 +582,30 @@ def main() -> None:
 
         n_pos_train = sum(1 for lw in train_labeled if lw.label == 1)
         n_pos_test = sum(1 for lw in test_labeled if lw.label == 1)
-        print(f"  Train: {len(train_labeled)} samples ({n_pos_train} hypo, {n_pos_train / max(len(train_labeled), 1) * 100:.1f}%)")
-        print(f"  Test:  {len(test_labeled)} samples ({n_pos_test} hypo, {n_pos_test / max(len(test_labeled), 1) * 100:.1f}%)")
+        print(
+            f"  Train: {len(train_labeled)} samples ({n_pos_train} hypo, {n_pos_train / max(len(train_labeled), 1) * 100:.1f}%)"
+        )
+        print(
+            f"  Test:  {len(test_labeled)} samples ({n_pos_test} hypo, {n_pos_test / max(len(test_labeled), 1) * 100:.1f}%)"
+        )
 
         if not train_labeled or not test_labeled:
             print("Insufficient data.", file=sys.stderr)
             sys.exit(1)
 
         max_length = len(train_labeled[0].signal)
-        train_batches = _make_single_batches(train_labeled, args.batch_size, args.patch_size, max_length)
-        test_batches = _make_single_batches(test_labeled, args.batch_size, args.patch_size, max_length)
+        train_batches = _make_single_batches(
+            train_labeled, args.batch_size, args.patch_size, max_length
+        )
+        test_batches = _make_single_batches(
+            test_labeled, args.batch_size, args.patch_size, max_length
+        )
 
         probe = LinearProbe(d_model, n_classes=1)
         print(f"\nTraining LinearProbe (d_model={d_model})...")
-        train_losses = train_probe_single(model, probe, train_batches, args.epochs, args.lr, device)
+        train_losses = train_probe_single(
+            model, probe, train_batches, args.epochs, args.lr, device
+        )
 
         print("\nEvaluating...")
         metrics = evaluate_probe_single(model, probe, test_batches, device)
@@ -544,13 +616,19 @@ def main() -> None:
             _load_local_pt_aligned_signals,
             extract_forecast_samples,
         )
+
         print(f"\nLoading from local .pt directory: {args.data_dir}")
         input_sigs = ["abp"]
-        horizon_sec = args.prediction_horizon_sec if args.prediction_horizon_sec > 0 else 300.0
+        horizon_sec = (
+            args.prediction_horizon_sec if args.prediction_horizon_sec > 0 else 300.0
+        )
         min_dur = args.window_sec + horizon_sec + args.stride_sec
 
         cases = _load_local_pt_aligned_signals(
-            args.data_dir, input_sigs, min_dur, max_subjects=args.n_cases,
+            args.data_dir,
+            input_sigs,
+            min_dur,
+            max_subjects=args.n_cases,
         )
         if not cases:
             print("No valid cases loaded.", file=sys.stderr)
@@ -568,10 +646,18 @@ def main() -> None:
         print(f"Split: {len(train_cases)} train, {len(test_cases)} test cases")
 
         train_samples = extract_forecast_samples(
-            train_cases, input_sigs, args.window_sec, args.stride_sec, horizon_sec,
+            train_cases,
+            input_sigs,
+            args.window_sec,
+            args.stride_sec,
+            horizon_sec,
         )
         test_samples = extract_forecast_samples(
-            test_cases, input_sigs, args.window_sec, args.stride_sec, horizon_sec,
+            test_cases,
+            input_sigs,
+            args.window_sec,
+            args.stride_sec,
+            horizon_sec,
         )
 
         # Convert to LabeledWindow for batching
@@ -579,13 +665,15 @@ def main() -> None:
             labeled = []
             for s in samples:
                 sig_key = list(s.input_signals.keys())[0]
-                labeled.append(LabeledWindow(
-                    signal=s.input_signals[sig_key],
-                    signal_type=sig_key,
-                    case_id=s.case_id,
-                    label=s.label,
-                    label_value=s.label_value,
-                ))
+                labeled.append(
+                    LabeledWindow(
+                        signal=s.input_signals[sig_key],
+                        signal_type=sig_key,
+                        case_id=s.case_id,
+                        label=s.label,
+                        label_value=s.label_value,
+                    )
+                )
             return labeled
 
         train_labeled = _forecast_to_labeled(train_samples)
@@ -593,20 +681,30 @@ def main() -> None:
 
         n_pos_train = sum(1 for lw in train_labeled if lw.label == 1)
         n_pos_test = sum(1 for lw in test_labeled if lw.label == 1)
-        print(f"Train: {len(train_labeled)} samples ({n_pos_train} hypo, {n_pos_train / max(len(train_labeled), 1) * 100:.1f}%)")
-        print(f"Test:  {len(test_labeled)} samples ({n_pos_test} hypo, {n_pos_test / max(len(test_labeled), 1) * 100:.1f}%)")
+        print(
+            f"Train: {len(train_labeled)} samples ({n_pos_train} hypo, {n_pos_train / max(len(train_labeled), 1) * 100:.1f}%)"
+        )
+        print(
+            f"Test:  {len(test_labeled)} samples ({n_pos_test} hypo, {n_pos_test / max(len(test_labeled), 1) * 100:.1f}%)"
+        )
 
         if not train_labeled or not test_labeled:
             print("Insufficient data.", file=sys.stderr)
             sys.exit(1)
 
         max_length = len(train_labeled[0].signal)
-        train_batches = _make_single_batches(train_labeled, args.batch_size, args.patch_size, max_length)
-        test_batches = _make_single_batches(test_labeled, args.batch_size, args.patch_size, max_length)
+        train_batches = _make_single_batches(
+            train_labeled, args.batch_size, args.patch_size, max_length
+        )
+        test_batches = _make_single_batches(
+            test_labeled, args.batch_size, args.patch_size, max_length
+        )
 
         probe = LinearProbe(d_model, n_classes=1)
         print(f"\nTraining LinearProbe (d_model={d_model})...")
-        train_losses = train_probe_single(model, probe, train_batches, args.epochs, args.lr, device)
+        train_losses = train_probe_single(
+            model, probe, train_batches, args.epochs, args.lr, device
+        )
 
         print("\nEvaluating...")
         metrics = evaluate_probe_single(model, probe, test_batches, device)
@@ -619,17 +717,21 @@ def main() -> None:
     y_true = metrics.pop("y_true")
     y_score = metrics.pop("y_score")
 
-    print(f"\n{'='*50}")
+    print(f"\n{'=' * 50}")
     print(f"  AUROC:       {metrics['auroc']:.4f}")
     print(f"  AUPRC:       {metrics['auprc']:.4f}")
     print(f"  Threshold:   {metrics['optimal_threshold']:.3f}")
     print(f"  Sensitivity: {metrics['sensitivity']:.4f}")
     print(f"  Specificity: {metrics['specificity']:.4f}")
-    print(f"  Prevalence:  {metrics['prevalence']:.3f} ({metrics['n_positive']}/{metrics['n_total']})")
-    print(f"{'='*50}")
+    print(
+        f"  Prevalence:  {metrics['prevalence']:.3f} ({metrics['n_positive']}/{metrics['n_total']})"
+    )
+    print(f"{'=' * 50}")
 
     roc_path = out_dir / "task1_roc_curve.png"
-    plot_roc_curve(y_true, y_score, roc_path, title="Task 1: Hypotension Prediction — ROC Curve")
+    plot_roc_curve(
+        y_true, y_score, roc_path, title="Task 1: Hypotension Prediction — ROC Curve"
+    )
     print(f"\nROC curve saved: {roc_path}")
 
     results = {

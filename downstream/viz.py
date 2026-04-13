@@ -2,6 +2,7 @@
 
 ROC curve, Bland-Altman plot, Reconstruction 비교 플롯을 제공한다.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -19,6 +20,7 @@ def plot_roc_curve(
 ) -> None:
     """ROC curve를 플롯하고 파일로 저장한다."""
     import matplotlib
+
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
@@ -70,6 +72,7 @@ def plot_bland_altman(
 ) -> None:
     """Bland-Altman plot을 저장한다."""
     import matplotlib
+
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
@@ -87,10 +90,20 @@ def plot_bland_altman(
     fig, ax = plt.subplots(1, 1, figsize=(8, 5))
     ax.scatter(mean_vals, diff_vals, alpha=0.4, s=10, color="steelblue")
     ax.axhline(bias, color="red", linewidth=1.5, label=f"Bias = {bias:.2f}")
-    ax.axhline(loa_upper, color="orange", linewidth=1, linestyle="--",
-               label=f"+1.96 SD = {loa_upper:.2f}")
-    ax.axhline(loa_lower, color="orange", linewidth=1, linestyle="--",
-               label=f"-1.96 SD = {loa_lower:.2f}")
+    ax.axhline(
+        loa_upper,
+        color="orange",
+        linewidth=1,
+        linestyle="--",
+        label=f"+1.96 SD = {loa_upper:.2f}",
+    )
+    ax.axhline(
+        loa_lower,
+        color="orange",
+        linewidth=1,
+        linestyle="--",
+        label=f"-1.96 SD = {loa_lower:.2f}",
+    )
     ax.set_xlabel("Mean of True and Predicted")
     ax.set_ylabel("Difference (Predicted - True)")
     ax.set_title(title)
@@ -111,6 +124,7 @@ def plot_reconstruction(
 ) -> None:
     """원본 vs 복원 파형을 비교 플롯한다."""
     import matplotlib
+
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
@@ -125,13 +139,20 @@ def plot_reconstruction(
     n_timesteps = original.shape[1]
     time_axis = np.arange(n_timesteps) / sr
 
-    fig, axes = plt.subplots(n_channels, 1, figsize=(12, 2.5 * n_channels),
-                             squeeze=False, sharex=True)
+    fig, axes = plt.subplots(
+        n_channels, 1, figsize=(12, 2.5 * n_channels), squeeze=False, sharex=True
+    )
 
     for ch in range(n_channels):
         ax = axes[ch, 0]
         ax.plot(time_axis, original[ch], linewidth=0.8, alpha=0.8, label="Original")
-        ax.plot(time_axis, reconstructed[ch], linewidth=0.8, alpha=0.8, label="Reconstructed")
+        ax.plot(
+            time_axis,
+            reconstructed[ch],
+            linewidth=0.8,
+            alpha=0.8,
+            label="Reconstructed",
+        )
         ax.set_ylabel(f"Ch {ch}")
         if ch == 0:
             ax.legend(loc="upper right", fontsize=8)

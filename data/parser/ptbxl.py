@@ -20,6 +20,7 @@ Usage
     CD    — Conduction Disturbance
     HYP   — Hypertrophy
 """
+
 from __future__ import annotations
 
 import ast
@@ -118,7 +119,7 @@ def load_ptbxl(
     n_failed = 0
 
     for ecg_id, row in df.iterrows():
-        filename = row[f"filename_hr" if sampling_rate == 500 else "filename_lr"]
+        filename = row["filename_hr" if sampling_rate == 500 else "filename_lr"]
         record_path = str(data_dir / filename)
 
         try:
@@ -140,11 +141,14 @@ def load_ptbxl(
             continue
 
     print(f"PTB-XL loaded: {n_loaded} samples ({n_failed} failed)")
-    print(f"  Lead: {lead}, SR: {sampling_rate}Hz, Length: {samples[0].shape[0] if samples else 0} samples")
+    print(
+        f"  Lead: {lead}, SR: {sampling_rate}Hz, Length: {samples[0].shape[0] if samples else 0} samples"
+    )
     print(f"  Classes: {SUPERCLASS_NAMES}")
 
     # 클래스 분포
     from collections import Counter
+
     dist = Counter(labels)
     for cls_name, cls_id in SUPERCLASS_MAP.items():
         print(f"    {cls_name} ({cls_id}): {dist.get(cls_id, 0)}")
@@ -231,6 +235,7 @@ def load_ptbxl_split(
 
     for split_name, (samps, labs) in splits.items():
         from collections import Counter
+
         dist = Counter(labs)
         print(f"  {split_name}: {len(samps)} samples - {dict(dist)}")
 

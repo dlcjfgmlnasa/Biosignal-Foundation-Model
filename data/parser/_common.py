@@ -6,8 +6,6 @@
 from __future__ import annotations
 
 import math
-from pathlib import Path
-
 import numpy as np
 import torch
 
@@ -111,7 +109,13 @@ def segment_quality_score(
     """
     n = len(segment)
     if n < 2:
-        return {"flatline_ratio": 1.0, "clip_ratio": 1.0, "high_freq_ratio": 1.0, "amplitude": 0.0, "pass": False}
+        return {
+            "flatline_ratio": 1.0,
+            "clip_ratio": 1.0,
+            "high_freq_ratio": 1.0,
+            "amplitude": 0.0,
+            "pass": False,
+        }
 
     # 1. Flatline: 연속 동일 값 비율
     diffs = np.diff(segment)
@@ -127,8 +131,8 @@ def segment_quality_score(
         clip_ratio = float(at_min + at_max) / n
 
     # 3. High-frequency noise ratio (1차 미분 에너지 / 신호 에너지)
-    sig_energy = float(np.mean(segment ** 2))
-    diff_energy = float(np.mean(diffs ** 2))
+    sig_energy = float(np.mean(segment**2))
+    diff_energy = float(np.mean(diffs**2))
     if sig_energy < 1e-10:
         high_freq_ratio = 1.0
     else:
@@ -181,76 +185,3 @@ def save_recording(tensor: torch.Tensor, out_path: str) -> None:
         저장 경로 (.pt).
     """
     torch.save(tensor.to(torch.float32), out_path)
-
-
-def save_recording_h5(
-    data: np.ndarray,
-    h5_path: str | Path,
-    dataset_name: str,
-) -> None:
-    """(C, T) float32 배열을 HDF5 파일의 dataset으로 저장한다.
-
-    subject당 단일 HDF5 파일에 여러 recording을 dataset으로 추가한다.
-    이미 파일이 있으면 append, 없으면 생성.
-
-    Parameters
-    ----------
-    data:
-        (n_channels, n_timesteps) float32 배열.
-    h5_path:
-        HDF5 파일 경로 (.h5).
-    dataset_name:
-        HDF5 내 dataset 이름 (e.g., "VDB_0001_S0_ecg_1_seg0").
-    """
-    import h5py
-
-    with h5py.File(str(h5_path), "a") as hf:  # "a" = append mode
-        if dataset_name in hf:
-            del hf[dataset_name]  # 이미 존재하면 덮어쓰기
-        hf.create_dataset(
-            dataset_name, data=data.astype(np.float16),
-            compression="gzip", compression_opts=4,
-            chunks=(data.shape[0], min(data.shape[1], 100_000)),
-        )
-
-
-def save_recording_zarr(
-    data: np.ndarray,
-    out_path: str | Path,
-    compressor=None,
-) -> None:
-    """(C, T) float32 배열을 zarr 압축 포맷으로 저장한다.
-
-    Parameters
-    ----------
-    data:
-        (n_channels, n_timesteps) float32 배열.
-    out_path:
-        저장 경로 (.zarr 디렉토리).
-    compressor:
-        zarr compressor. None이면 blosc(zstd, clevel=3)을 사용한다.
-    """
-    import zarr
-
-    # float16으로 저장하여 용량 절반 절감 (학습 시 scaler가 정규화하므로 정밀도 충분)
-    store_dtype = "float16"
-
-    # zarr v3: codecs 파라미터 사용, v2: compressor 파라미터 사용
-    try:
-        from zarr.codecs import BloscCodec, BytesCodec
-        z = zarr.open(
-            str(out_path), mode="w", shape=data.shape, dtype=store_dtype,
-            chunks=(data.shape[0], min(data.shape[1], 100_000)),
-            codecs=[BytesCodec(), BloscCodec(cname="zstd", clevel=5, shuffle="bitshuffle")],
-        )
-    except ImportError:
-        # zarr v2 fallback
-        import numcodecs
-        if compressor is None:
-            compressor = numcodecs.Blosc(cname="zstd", clevel=5, shuffle=numcodecs.Blosc.BITSHUFFLE)
-        z = zarr.open(
-            str(out_path), mode="w", shape=data.shape, dtype=store_dtype,
-            chunks=(data.shape[0], min(data.shape[1], 100_000)),
-            compressor=compressor,
-        )
-    z[:] = data.astype(np.float16)

@@ -51,6 +51,7 @@ class PackedBatch:
 
 # ── 내부 데이터 구조 ────────────────────────────────────────────
 
+
 @dataclass
 class _PackUnit:
     """FFD 패킹의 단위. 같은 그룹의 variate들을 이어 붙인 시퀀스."""
@@ -99,9 +100,7 @@ class PackCollate:
             assert patch_size % self.stride == 0, (
                 f"patch_size({patch_size})는 stride({self.stride})의 배수여야 합니다."
             )
-            max_length = max(
-                patch_size, -(-max_length // self.stride) * self.stride
-            )
+            max_length = max(patch_size, -(-max_length // self.stride) * self.stride)
         else:
             self.stride = None
 
@@ -213,7 +212,8 @@ class PackCollate:
 
         for row_idx, contents in enumerate(bins):
             row_len = min(
-                sum(u.total_length for u in contents), self.max_length,
+                sum(u.total_length for u in contents),
+                self.max_length,
             )
             row_offset = 0
             for local_id, unit in enumerate(contents, start=1):
@@ -222,7 +222,9 @@ class PackCollate:
                 actual_seg_len = end_offset - row_offset
 
                 if actual_seg_len > 0:
-                    padded_values[row_idx, row_offset:end_offset] = unit.values[:actual_seg_len]
+                    padded_values[row_idx, row_offset:end_offset] = unit.values[
+                        :actual_seg_len
+                    ]
                     padded_ids[row_idx, row_offset:end_offset] = local_id
 
                     # variate_id 할당
@@ -254,9 +256,7 @@ class PackCollate:
                             all_padded_lengths.append(included)
                             all_rates.append(unit.variate_rates[var_id])
                             all_types.append(unit.variate_types[var_id])
-                            all_spatial_ids.append(
-                                unit.variate_spatial_ids[var_id]
-                            )
+                            all_spatial_ids.append(unit.variate_spatial_ids[var_id])
 
                 row_offset += actual_seg_len
                 if row_offset >= row_len:
@@ -286,7 +286,7 @@ class PackCollate:
         sorted_units = sorted(units, key=lambda u: u.total_length, reverse=True)
 
         # [최적화] 버전 번호를 사용하여 오래된 항목 제거
-        heap: list[tuple[int, int, int]] = []   # (-remaining, bin_idx, version)
+        heap: list[tuple[int, int, int]] = []  # (-remaining, bin_idx, version)
         bin_remaining: list[int] = []
         bin_version: list[int] = []  # 각 bin의 현재 버전
         bin_contents: list[list[_PackUnit]] = []
@@ -308,7 +308,9 @@ class PackCollate:
                     bin_remaining[bin_idx] = new_remaining
                     bin_version[bin_idx] += 1
                     if new_remaining > 0:
-                        heapq.heappush(heap, (-new_remaining, bin_idx, bin_version[bin_idx]))
+                        heapq.heappush(
+                            heap, (-new_remaining, bin_idx, bin_version[bin_idx])
+                        )
                     placed = True
 
             if not placed:

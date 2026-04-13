@@ -18,10 +18,8 @@ import argparse
 import gc
 import os
 import time
-from pathlib import Path
 
 import torch
-import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from data import BiosignalDataset, create_dataloader
@@ -35,7 +33,6 @@ from .train_utils import (
     cleanup_ddp,
     create_scaler,
     create_scheduler,
-    get_model_config,
     is_main_process,
     load_manifest_from_processed,
     resolve_device,
@@ -57,12 +54,18 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Phase 1: Channel-Independent Pre-training")
 
     # Config file + dry-run
-    p.add_argument("--config", type=str, default=None,
-                   help="YAML config file path. CLI args override YAML values.")
-    p.add_argument("--dry-run", action="store_true",
-                   help="1 batch만 실행 후 종료 (OOM/NaN 검증용)")
-    p.add_argument("--resume", type=str, default=None,
-                   help="학습 재개할 checkpoint 경로 (.pt)")
+    p.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="YAML config file path. CLI args override YAML values.",
+    )
+    p.add_argument(
+        "--dry-run", action="store_true", help="1 batch만 실행 후 종료 (OOM/NaN 검증용)"
+    )
+    p.add_argument(
+        "--resume", type=str, default=None, help="학습 재개할 checkpoint 경로 (.pt)"
+    )
 
     # Model
     g = p.add_argument_group("Model")
@@ -74,23 +77,38 @@ def parse_args() -> argparse.Namespace:
     g.add_argument("--use_glu", action=argparse.BooleanOptionalAction, default=True)
     g.add_argument("--use_moe", action=argparse.BooleanOptionalAction, default=False)
     g.add_argument("--use_rope", action=argparse.BooleanOptionalAction, default=True)
-    g.add_argument("--use_var_attn_bias", action=argparse.BooleanOptionalAction, default=True)
+    g.add_argument(
+        "--use_var_attn_bias", action=argparse.BooleanOptionalAction, default=True
+    )
     g.add_argument("--dropout_p", type=float, default=0.0)
     g.add_argument("--max_horizon", type=int, default=5)
 
     # Data
     g = p.add_argument_group("Data")
     g.add_argument("--data_dir", type=str, default="datasets/processed")
-    g.add_argument("--signal_types", type=int, nargs="+", default=[0, 1, 2, 3, 4, 5],
-                   help="Signal type IDs (0=ECG, 1=ABP, 2=PPG, 3=CVP, 4=CO2, 5=AWP, 6=PAP, 7=ICP)")
+    g.add_argument(
+        "--signal_types",
+        type=int,
+        nargs="+",
+        default=[0, 1, 2, 3, 4, 5],
+        help="Signal type IDs (0=ECG, 1=ABP, 2=PPG, 3=CVP, 4=CO2, 5=AWP, 6=PAP, 7=ICP)",
+    )
     g.add_argument("--max_subjects", type=int, default=None)
     g.add_argument("--window_seconds", type=float, default=30.0)
     g.add_argument("--max_length", type=int, default=50000)
     g.add_argument("--cache_size", type=int, default=16)
-    g.add_argument("--crop_ratio_min", type=float, default=0.0,
-                   help="Random crop 최소 비율 (0=비활성)")
-    g.add_argument("--crop_ratio_max", type=float, default=0.0,
-                   help="Random crop 최대 비율 (0=비활성)")
+    g.add_argument(
+        "--crop_ratio_min",
+        type=float,
+        default=0.0,
+        help="Random crop 최소 비율 (0=비활성)",
+    )
+    g.add_argument(
+        "--crop_ratio_max",
+        type=float,
+        default=0.0,
+        help="Random crop 최대 비율 (0=비활성)",
+    )
 
     # Training
     g = p.add_argument_group("Training")
@@ -102,28 +120,49 @@ def parse_args() -> argparse.Namespace:
     g.add_argument("--mask_ratio", type=float, default=0.15)
     g.add_argument("--gradient_clip", type=float, default=1.0)
     g.add_argument("--seed", type=int, default=42)
-    g.add_argument("--alpha", type=float, default=1.0, help="Masked reconstruction weight")
-    g.add_argument("--beta", type=float, default=1.0, help="Next-patch prediction weight")
-    g.add_argument("--delta", type=float, default=0.0, help="Contrastive loss weight (0=disabled)")
-    g.add_argument("--val_ratio", type=float, default=0.2,
-                   help="Validation 비율 (subject 단위, 0=비활성)")
-    g.add_argument("--patience", type=int, default=10,
-                   help="Early stopping patience (0=비활성)")
+    g.add_argument(
+        "--alpha", type=float, default=1.0, help="Masked reconstruction weight"
+    )
+    g.add_argument(
+        "--beta", type=float, default=1.0, help="Next-patch prediction weight"
+    )
+    g.add_argument(
+        "--delta", type=float, default=0.0, help="Contrastive loss weight (0=disabled)"
+    )
+    g.add_argument(
+        "--val_ratio",
+        type=float,
+        default=0.2,
+        help="Validation 비율 (subject 단위, 0=비활성)",
+    )
+    g.add_argument(
+        "--patience", type=int, default=10, help="Early stopping patience (0=비활성)"
+    )
 
     # System
     g = p.add_argument_group("System")
-    g.add_argument("--use_amp", action="store_true",
-                   help="AMP (Automatic Mixed Precision) 활성")
+    g.add_argument(
+        "--use_amp", action="store_true", help="AMP (Automatic Mixed Precision) 활성"
+    )
     g.add_argument("--device", type=str, default="auto")
     g.add_argument("--num_workers", type=int, default=4)
     g.add_argument("--output_dir", type=str, default="outputs/phase1_ci")
     g.add_argument("--checkpoint_every", type=int, default=10)
-    g.add_argument("--max_batches", type=int, default=0,
-                   help="에폭당 최대 배치 수 (0=무제한)")
-    g.add_argument("--viz_every", type=int, default=5,
-                   help="N 에폭마다 reconstruction 시각화 저장 (0=비활성)")
-    g.add_argument("--exp_name", type=str, default="",
-                   help="실험 이름 (output_dir 하위 서브디렉토리)")
+    g.add_argument(
+        "--max_batches", type=int, default=0, help="에폭당 최대 배치 수 (0=무제한)"
+    )
+    g.add_argument(
+        "--viz_every",
+        type=int,
+        default=5,
+        help="N 에폭마다 reconstruction 시각화 저장 (0=비활성)",
+    )
+    g.add_argument(
+        "--exp_name",
+        type=str,
+        default="",
+        help="실험 이름 (output_dir 하위 서브디렉토리)",
+    )
 
     return p.parse_args()
 
@@ -172,7 +211,6 @@ def main():
 
         config = TrainConfig(
             model_config=model_config,
-
             # 데이터
             data_dir=args.data_dir,
             signal_types=args.signal_types,
@@ -182,7 +220,6 @@ def main():
             cache_size=args.cache_size,
             crop_ratio_min=args.crop_ratio_min,
             crop_ratio_max=args.crop_ratio_max,
-
             # 학습
             batch_size=args.batch_size,
             lr=args.lr,
@@ -193,26 +230,20 @@ def main():
             gradient_clip=args.gradient_clip,
             seed=args.seed,
             collate_mode="ci",
-
             # Loss
             alpha=args.alpha,
             beta=args.beta,
             gamma=0.0,
             delta=args.delta,
-
             # Phase 1
             variate_mask_prob=0.0,
-
             # Validation & Early Stopping
             val_ratio=args.val_ratio,
             patience=args.patience,
-
             # Mixed Precision
             use_amp=args.use_amp,
-
             # 실험 관리
             exp_name=args.exp_name,
-
             # 시스템
             device=args.device,
             num_workers=args.num_workers,
@@ -236,12 +267,12 @@ def main():
         save_experiment_info(config, output_dir, phase_name="Phase1_CI")
 
     if rank0:
-        print(f"{'='*60}")
-        print(f"Phase 1: Channel-Independent Pre-training")
+        print(f"{'=' * 60}")
+        print("Phase 1: Channel-Independent Pre-training")
         if config.exp_name:
             print(f"Experiment: {config.exp_name}")
         print(f"Device: {device}" + (f" (DDP: {world_size} GPUs)" if use_ddp else ""))
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
 
     # ── 데이터 로딩 ──
     manifest = load_manifest_from_processed(
@@ -256,10 +287,14 @@ def main():
     val_dataloader = None
     if config.val_ratio > 0:
         train_manifest, val_manifest = split_manifest_by_subject(
-            manifest, val_ratio=config.val_ratio, seed=config.seed,
+            manifest,
+            val_ratio=config.val_ratio,
+            seed=config.seed,
         )
         if rank0:
-            print(f"Train/Val split: {len(train_manifest)} train, {len(val_manifest)} val recordings")
+            print(
+                f"Train/Val split: {len(train_manifest)} train, {len(val_manifest)} val recordings"
+            )
     else:
         train_manifest = manifest
 
@@ -311,7 +346,7 @@ def main():
             val_manifest,
             window_seconds=config.window_seconds,
             cache_size=config.cache_size,
-                patch_size=config.model_config.patch_size,
+            patch_size=config.model_config.patch_size,
         )
         val_sampler = RecordingLocalitySampler(
             val_dataset,
@@ -332,7 +367,9 @@ def main():
             sampler=val_sampler,
         )
         if rank0:
-            print(f"Val dataset: {len(val_dataset)} windows, {len(val_dataloader)} batches")
+            print(
+                f"Val dataset: {len(val_dataset)} windows, {len(val_dataloader)} batches"
+            )
 
     # ── 모델 (V2) ──
     model = BiosignalFoundationModel.from_config(config.model_config)
@@ -348,37 +385,49 @@ def main():
 
     # ── Optimizer & Scheduler ──
     criterion = CombinedLoss(
-        alpha=config.alpha, beta=config.beta, gamma=config.gamma,
-        delta=config.delta, peak_alpha=config.peak_alpha,
-        lambda_spec=config.lambda_spec, spec_n_ffts=config.spec_n_ffts,
+        alpha=config.alpha,
+        beta=config.beta,
+        gamma=config.gamma,
+        delta=config.delta,
+        peak_alpha=config.peak_alpha,
+        lambda_spec=config.lambda_spec,
+        spec_n_ffts=config.spec_n_ffts,
         contrastive_temperature=config.contrastive_temperature,
         learnable_temperature=config.learnable_temperature,
     ).to(device)
     optimizer = torch.optim.Adam(
-        list(model.parameters()) + list(criterion.parameters()), lr=config.lr,
+        list(model.parameters()) + list(criterion.parameters()),
+        lr=config.lr,
     )
     scheduler = create_scheduler(optimizer, config)
     scaler = create_scaler(config, device)
     if rank0 and scaler is not None:
-        print(f"AMP enabled (GradScaler)")
+        print("AMP enabled (GradScaler)")
 
     # ── Resume from checkpoint ──
     start_epoch = 0
     best_loss = float("inf")
     if args.resume:
         raw_model_for_load = model.module if use_ddp else model
-        state = load_checkpoint(args.resume, raw_model_for_load, optimizer=optimizer, device=device)
+        state = load_checkpoint(
+            args.resume, raw_model_for_load, optimizer=optimizer, device=device
+        )
         start_epoch = state.get("epoch", 0) + 1
         best_loss = state.get("loss", float("inf"))
         # scheduler를 resume epoch까지 진행 (warning 억제)
         import warnings
+
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             for _ in range(start_epoch):
                 scheduler.step()
         if rank0:
-            print(f"Resumed from {args.resume} (epoch {state.get('epoch', '?')}, loss {best_loss:.6f})")
-            print(f"  Continuing from epoch {start_epoch}, LR={optimizer.param_groups[0]['lr']:.6e}")
+            print(
+                f"Resumed from {args.resume} (epoch {state.get('epoch', '?')}, loss {best_loss:.6f})"
+            )
+            print(
+                f"  Continuing from epoch {start_epoch}, LR={optimizer.param_groups[0]['lr']:.6e}"
+            )
 
     # ── 시각화용 배치 캐시 (rank 0만) ──
     viz_every = getattr(args, "viz_every", 5)
@@ -392,7 +441,9 @@ def main():
         viz_iter = iter(val_dataloader)
         viz_batches = []
         seen_types: set[int] = set()
-        all_types = set(config.signal_types) if hasattr(config, "signal_types") else set()
+        all_types = (
+            set(config.signal_types) if hasattr(config, "signal_types") else set()
+        )
         max_viz_batches = min(100, len(val_dataloader))
         for _ in range(max_viz_batches):
             try:
@@ -411,32 +462,42 @@ def main():
         viz_np_dir = viz_dir / "next_pred"
         viz_recon_dir.mkdir(parents=True, exist_ok=True)
         viz_np_dir.mkdir(parents=True, exist_ok=True)
-        n_types = len({
-            int(b.signal_types[j])
-            for b in viz_batches
-            for j in range(len(b.signal_types))
-        })
-        print(f"Visualization every {viz_every} epochs -> {viz_dir}"
-              f"  ({len(viz_batches)} batches, {n_types} signal types)")
+        n_types = len(
+            {
+                int(b.signal_types[j])
+                for b in viz_batches
+                for j in range(len(b.signal_types))
+            }
+        )
+        print(
+            f"Visualization every {viz_every} epochs -> {viz_dir}"
+            f"  ({len(viz_batches)} batches, {n_types} signal types)"
+        )
 
     # ── 학습 루프 ──
     if not args.resume:
         best_loss = float("inf")
-    early_stopper = EarlyStopping(patience=config.patience) if config.patience > 0 else None
+    early_stopper = (
+        EarlyStopping(patience=config.patience) if config.patience > 0 else None
+    )
     csv_logger = CSVLogger(output_dir / "training_log.csv") if rank0 else None
     if rank0:
         print(f"\nStarting training: {config.n_epochs} epochs")
         print(f"  alpha={config.alpha}, beta={config.beta}, gamma={config.gamma}")
-        print(f"  max_horizon={config.model_config.max_horizon}, mask_ratio={config.mask_ratio}")
+        print(
+            f"  max_horizon={config.model_config.max_horizon}, mask_ratio={config.mask_ratio}"
+        )
         if config.model_config.max_horizon > 1:
             n = config.n_epochs
-            print(f"  horizon_curriculum: epoch 0~{int(n*0.4)-1}→H=1, "
-                  f"{int(n*0.4)}~{int(n*0.7)-1}→H≤{max(1,-(-config.model_config.max_horizon*3//5))}, "
-                  f"{int(n*0.7)}~{n-1}→H≤{config.model_config.max_horizon}")
+            print(
+                f"  horizon_curriculum: epoch 0~{int(n * 0.4) - 1}→H=1, "
+                f"{int(n * 0.4)}~{int(n * 0.7) - 1}→H≤{max(1, -(-config.model_config.max_horizon * 3 // 5))}, "
+                f"{int(n * 0.7)}~{n - 1}→H≤{config.model_config.max_horizon}"
+            )
         print(f"  warmup_epochs={config.warmup_epochs}")
         if val_dataloader is not None:
             print(f"  val_ratio={config.val_ratio}, patience={config.patience}")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
 
     prev_max_h = None
     for epoch in range(start_epoch, config.n_epochs):
@@ -444,15 +505,21 @@ def main():
         cur_max_h = get_max_horizon(config, epoch)
         if cur_max_h != prev_max_h:
             if rank0:
-                print(f"  [Horizon] epoch {epoch}: max_horizon {prev_max_h} -> {cur_max_h}")
+                print(
+                    f"  [Horizon] epoch {epoch}: max_horizon {prev_max_h} -> {cur_max_h}"
+                )
             # 새 horizon embed를 이전 최고 horizon embed로 초기화
             if prev_max_h is not None and cur_max_h > prev_max_h:
                 raw = model.module if use_ddp else model
                 with torch.no_grad():
                     for h in range(prev_max_h, cur_max_h):
-                        raw.horizon_embed.weight.data[h] = raw.horizon_embed.weight.data[prev_max_h - 1].clone()
+                        raw.horizon_embed.weight.data[h] = (
+                            raw.horizon_embed.weight.data[prev_max_h - 1].clone()
+                        )
                         if rank0:
-                            print(f"    → horizon_embed[{h}] initialized from embed[{prev_max_h - 1}]")
+                            print(
+                                f"    → horizon_embed[{h}] initialized from embed[{prev_max_h - 1}]"
+                            )
             prev_max_h = cur_max_h
 
         # DDP: sampler 에폭 설정 (셔플링 동기화)
@@ -461,7 +528,10 @@ def main():
 
         epoch_start = time.time()
         losses = train_one_epoch(
-            model, dataloader, optimizer, criterion,
+            model,
+            dataloader,
+            optimizer,
+            criterion,
             config=config,
             device=device,
             epoch=epoch,
@@ -474,8 +544,12 @@ def main():
         val_losses = None
         if val_dataloader is not None:
             val_losses = validate(
-                model, val_dataloader, criterion,
-                config=config, device=device, phase_name="Phase1_CI",
+                model,
+                val_dataloader,
+                criterion,
+                config=config,
+                device=device,
+                phase_name="Phase1_CI",
                 epoch=epoch,
             )
         epoch_sec = time.time() - epoch_start
@@ -495,14 +569,21 @@ def main():
 
             # CSV 로깅
             if csv_logger is not None:
-                csv_logger.log(epoch, "Phase1_CI", losses, val_losses, current_lr, epoch_sec)
+                csv_logger.log(
+                    epoch, "Phase1_CI", losses, val_losses, current_lr, epoch_sec
+                )
 
             # Reconstruction & Next-Pred 시각화
-            if viz_batches is not None and (epoch % viz_every == 0 or epoch == config.n_epochs - 1):
+            if viz_batches is not None and (
+                epoch % viz_every == 0 or epoch == config.n_epochs - 1
+            ):
                 viz_model = model.module if use_ddp else model
                 fig_path = save_reconstruction_figure(
-                    viz_model, viz_batches, epoch=epoch,
-                    output_dir=viz_recon_dir, mask_ratio=config.mask_ratio,
+                    viz_model,
+                    viz_batches,
+                    epoch=epoch,
+                    output_dir=viz_recon_dir,
+                    mask_ratio=config.mask_ratio,
                     device=device,
                     block_mask=config.block_mask,
                     block_size_min=config.block_size_min,
@@ -510,21 +591,31 @@ def main():
                 )
                 print(f"  -> Reconstruction figure saved: {fig_path}")
                 np_path = save_next_pred_figure(
-                    viz_model, viz_batches, epoch=epoch,
-                    output_dir=viz_np_dir, horizon=1,
+                    viz_model,
+                    viz_batches,
+                    epoch=epoch,
+                    output_dir=viz_np_dir,
+                    horizon=1,
                     device=device,
                 )
                 print(f"  -> Next-pred figure saved: {np_path}")
 
             # Best model 저장 (val_loss 기준, 없으면 train_loss)
-            track_loss = val_losses["total"] if val_losses is not None else losses["total"]
+            track_loss = (
+                val_losses["total"] if val_losses is not None else losses["total"]
+            )
             if track_loss < best_loss:
                 best_loss = track_loss
                 save_model = model.module if use_ddp else model
                 path = save_training_checkpoint(
-                    save_model, optimizer, epoch, config,
-                    phase_name="phase1_ci", loss=best_loss,
-                    output_dir=output_dir, tag="best",
+                    save_model,
+                    optimizer,
+                    epoch,
+                    config,
+                    phase_name="phase1_ci",
+                    loss=best_loss,
+                    output_dir=output_dir,
+                    tag="best",
                 )
                 print(f"  -> Best model saved: {path}")
 
@@ -532,8 +623,12 @@ def main():
             if (epoch + 1) % config.checkpoint_every == 0:
                 save_model = model.module if use_ddp else model
                 save_training_checkpoint(
-                    save_model, optimizer, epoch, config,
-                    phase_name="phase1_ci", loss=losses["total"],
+                    save_model,
+                    optimizer,
+                    epoch,
+                    config,
+                    phase_name="phase1_ci",
+                    loss=losses["total"],
                     output_dir=output_dir,
                 )
 
@@ -551,17 +646,22 @@ def main():
     if rank0:
         save_model = model.module if use_ddp else model
         final_path = save_training_checkpoint(
-            save_model, optimizer, epoch, config,
-            phase_name="phase1_ci", loss=losses["total"],
-            output_dir=output_dir, tag="final",
+            save_model,
+            optimizer,
+            epoch,
+            config,
+            phase_name="phase1_ci",
+            loss=losses["total"],
+            output_dir=output_dir,
+            tag="final",
         )
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"Phase 1 complete. Final train loss: {losses['total']:.6f}")
         if val_losses is not None:
             print(f"Final val loss: {val_losses['total']:.6f}")
         print(f"Best {'val' if val_dataloader else 'train'} loss: {best_loss:.6f}")
         print(f"Final checkpoint: {final_path}")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
 
     # 정리
     del dataloader

@@ -3,6 +3,7 @@
 
 에폭 종료 후 원본 vs 복원/예측 파형을 비교하는 figure를 생성한다.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -11,6 +12,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 from matplotlib.patches import Patch  # noqa: E402
@@ -22,14 +24,24 @@ from model import BiosignalFoundationModel
 
 # ── 상수 & 데이터 구조 ────────────────────────────────────────
 
-SIGNAL_TYPE_NAMES = {0: "ECG", 1: "ABP", 2: "PPG", 3: "CVP", 4: "CO2", 5: "AWP", 6: "PAP", 7: "ICP"}
+SIGNAL_TYPE_NAMES = {
+    0: "ECG",
+    1: "ABP",
+    2: "PPG",
+    3: "CVP",
+    4: "CO2",
+    5: "AWP",
+    6: "PAP",
+    7: "ICP",
+}
 
 
 @dataclass
 class RowCandidate:
     """시각화 후보 row 데이터."""
-    orig_patches: np.ndarray     # (N_valid, P)
-    pred_patches: np.ndarray     # (N_valid, P)
+
+    orig_patches: np.ndarray  # (N_valid, P)
+    pred_patches: np.ndarray  # (N_valid, P)
     signal_type: int
     signal_name: str
     n_valid: int
@@ -121,7 +133,6 @@ def _plot_figure_grid(
     mode: str,  # "masked" or "next_pred"
     horizon: int = 1,
     next_pred_ratio: float = 0.3,
-
 ) -> Path:
     """행=신호 타입, 열=샘플로 grid figure를 그려 저장한다."""
     types = sorted(grid.keys())
@@ -134,7 +145,9 @@ def _plot_figure_grid(
     p = next(iter(grid.values()))[0].patch_size
     max_patches = max(1, int(max_duration_s * sampling_rate / p))
 
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(8 * n_cols, 3 * n_rows), squeeze=False)
+    fig, axes = plt.subplots(
+        n_rows, n_cols, figsize=(8 * n_cols, 3 * n_rows), squeeze=False
+    )
 
     if mode == "masked":
         pred_color = "orangered"
@@ -163,12 +176,15 @@ def _plot_figure_grid(
             # next_pred: crop 후 범위에서 균등 샘플링
             if mode == "next_pred":
                 valid_pred_indices = [
-                    p_idx for p_idx in range(n_show)
+                    p_idx
+                    for p_idx in range(n_show)
                     if not np.isnan(pred_patches_cropped[p_idx, 0])
                 ]
                 n_to_show = max(1, int(len(valid_pred_indices) * next_pred_ratio))
                 if len(valid_pred_indices) > n_to_show:
-                    sampled = np.linspace(0, len(valid_pred_indices) - 1, n_to_show, dtype=int)
+                    sampled = np.linspace(
+                        0, len(valid_pred_indices) - 1, n_to_show, dtype=int
+                    )
                     keep = set(valid_pred_indices[s] for s in sampled)
                 else:
                     keep = set(valid_pred_indices)
@@ -187,10 +203,13 @@ def _plot_figure_grid(
                 end = start + p
                 patch_pred = pred_wave[start:end]
                 if not np.isnan(patch_pred[0]):
-                    ax.axvspan(start / sampling_rate, end / sampling_rate,
-                               alpha=0.12, color=highlight_color)
-                    ax.plot(t[start:end], patch_pred,
-                            color=pred_color, linewidth=1.2)
+                    ax.axvspan(
+                        start / sampling_rate,
+                        end / sampling_rate,
+                        alpha=0.12,
+                        color=highlight_color,
+                    )
+                    ax.plot(t[start:end], patch_pred, color=pred_color, linewidth=1.2)
                     n_pred += 1
 
             if col == 0:
@@ -199,7 +218,8 @@ def _plot_figure_grid(
             duration_shown = n_show * p / sampling_rate
             ax.set_title(
                 f"{n_pred}/{n_show} patches | {duration_shown:.0f}s",
-                fontsize=8, loc="right",
+                fontsize=8,
+                loc="right",
             )
             ax.tick_params(labelsize=7)
             if row == n_rows - 1:
@@ -247,16 +267,16 @@ def _extract_patches_and_scales(
         N: 패치 수
     """
     p = model.patch_size
-    loc = out["loc"]      # (B, L, 1)
+    loc = out["loc"]  # (B, L, 1)
     scale = out["scale"]  # (B, L, 1)
     b, l = batch.values.shape[0], batch.values.shape[1]
     n = l // p
-    original_patches = batch.values[:, :n * p].reshape(b, n, p)
+    original_patches = batch.values[:, : n * p].reshape(b, n, p)
 
     stride = model.patch_embed.stride
     patch_starts = torch.arange(n, device=loc.device) * stride
     patch_starts = patch_starts.clamp(max=loc.shape[1] - 1)
-    patch_loc = loc[:, patch_starts, 0]      # (B, N)
+    patch_loc = loc[:, patch_starts, 0]  # (B, N)
     patch_scale = scale[:, patch_starts, 0]  # (B, N)
 
     return original_patches, patch_loc, patch_scale, n
@@ -266,15 +286,15 @@ def _extract_candidates(
     batch: PackedBatch,
     out: dict,
     original_patches: torch.Tensor,  # (B, N, P)
-    patch_loc: torch.Tensor,         # (B, N)
-    patch_scale: torch.Tensor,       # (B, N)
-    pred_tensor: torch.Tensor,       # (B, N, P) — reconstructed or next_pred
-    build_pred_fn,                   # (seg_orig, seg_pred_denorm, seg_indices, ...) -> pred array
+    patch_loc: torch.Tensor,  # (B, N)
+    patch_scale: torch.Tensor,  # (B, N)
+    pred_tensor: torch.Tensor,  # (B, N, P) — reconstructed or next_pred
+    build_pred_fn,  # (seg_orig, seg_pred_denorm, seg_indices, ...) -> pred array
     patch_size: int,
 ) -> list[RowCandidate]:
     """(sample_id, variate_id) 단위로 RowCandidate를 추출한다."""
-    patch_mask = out["patch_mask"]   # (B, N)
-    p_sid = out["patch_sample_id"]   # (B, N)
+    patch_mask = out["patch_mask"]  # (B, N)
+    p_sid = out["patch_sample_id"]  # (B, N)
     p_vid = out["patch_variate_id"]  # (B, N)
     batch_size = original_patches.shape[0]
 
@@ -311,14 +331,16 @@ def _extract_candidates(
             sig_type = sig_map.get((bi, sid, vid), -1)
             sig_name = SIGNAL_TYPE_NAMES.get(sig_type, "?")
 
-            candidates.append(RowCandidate(
-                orig_patches=seg_orig,
-                pred_patches=pred,
-                signal_type=sig_type,
-                signal_name=sig_name,
-                n_valid=n_seg,
-                patch_size=patch_size,
-            ))
+            candidates.append(
+                RowCandidate(
+                    orig_patches=seg_orig,
+                    pred_patches=pred,
+                    signal_type=sig_type,
+                    signal_name=sig_name,
+                    n_valid=n_seg,
+                    patch_size=patch_size,
+                )
+            )
 
     return candidates
 
@@ -339,9 +361,17 @@ def _process_recon_batch(
     if device is not None:
         _batch_to_device(batch, device)
 
-    out = model(batch, task="masked", mask_ratio=mask_ratio,
-                block_mask=block_mask, block_size_min=block_size_min, block_size_max=block_size_max)
-    original_patches, patch_loc, patch_scale, n = _extract_patches_and_scales(model, batch, out)
+    out = model(
+        batch,
+        task="masked",
+        mask_ratio=mask_ratio,
+        block_mask=block_mask,
+        block_size_min=block_size_min,
+        block_size_max=block_size_max,
+    )
+    original_patches, patch_loc, patch_scale, n = _extract_patches_and_scales(
+        model, batch, out
+    )
     p = model.patch_size
 
     pred_mask = out["pred_mask"]
@@ -395,14 +425,16 @@ def _process_recon_batch(
             sig_type = sig_map.get((bi, sid, vid), -1)
             sig_name = SIGNAL_TYPE_NAMES.get(sig_type, "?")
 
-            candidates.append(RowCandidate(
-                orig_patches=seg_orig,
-                pred_patches=pred,
-                signal_type=sig_type,
-                signal_name=sig_name,
-                n_valid=n_seg,
-                patch_size=p,
-            ))
+            candidates.append(
+                RowCandidate(
+                    orig_patches=seg_orig,
+                    pred_patches=pred,
+                    signal_type=sig_type,
+                    signal_name=sig_name,
+                    n_valid=n_seg,
+                    patch_size=p,
+                )
+            )
 
     return candidates
 
@@ -421,7 +453,9 @@ def _process_next_pred_batch(
         _batch_to_device(batch, device)
 
     out = model(batch, task="next_pred", horizon=horizon)
-    original_patches, patch_loc, patch_scale, n = _extract_patches_and_scales(model, batch, out)
+    original_patches, patch_loc, patch_scale, n = _extract_patches_and_scales(
+        model, batch, out
+    )
     p = model.patch_size
 
     next_pred = out["next_pred"]
@@ -455,19 +489,21 @@ def _process_next_pred_batch(
             seg_scale = patch_scale[bi, seg_indices].unsqueeze(-1)
             seg_next = (seg_next_norm * seg_scale + seg_loc).cpu().numpy()
             pred = np.full((n_seg, p), np.nan)
-            pred[horizon:n_seg] = seg_next[:n_seg - horizon]
+            pred[horizon:n_seg] = seg_next[: n_seg - horizon]
 
             sig_type = sig_map.get((bi, sid, vid), -1)
             sig_name = SIGNAL_TYPE_NAMES.get(sig_type, "?")
 
-            candidates.append(RowCandidate(
-                orig_patches=seg_orig,
-                pred_patches=pred,
-                signal_type=sig_type,
-                signal_name=sig_name,
-                n_valid=n_seg,
-                patch_size=p,
-            ))
+            candidates.append(
+                RowCandidate(
+                    orig_patches=seg_orig,
+                    pred_patches=pred,
+                    signal_type=sig_type,
+                    signal_name=sig_name,
+                    n_valid=n_seg,
+                    patch_size=p,
+                )
+            )
 
     return candidates
 
@@ -506,10 +542,17 @@ def save_reconstruction_figure(
 
     all_candidates: list[RowCandidate] = []
     for b in batches:
-        all_candidates.extend(_process_recon_batch(
-            model, b, mask_ratio, device,
-            block_mask=block_mask, block_size_min=block_size_min, block_size_max=block_size_max,
-        ))
+        all_candidates.extend(
+            _process_recon_batch(
+                model,
+                b,
+                mask_ratio,
+                device,
+                block_mask=block_mask,
+                block_size_min=block_size_min,
+                block_size_max=block_size_max,
+            )
+        )
 
     grid = _select_diverse_grid(all_candidates, samples_per_type=samples_per_type)
 
@@ -518,8 +561,12 @@ def save_reconstruction_figure(
         return output_dir / f"recon_epoch{epoch:03d}.png"
 
     path = _plot_figure_grid(
-        grid, epoch, output_dir,
-        max_duration_s, sampling_rate, mode="masked",
+        grid,
+        epoch,
+        output_dir,
+        max_duration_s,
+        sampling_rate,
+        mode="masked",
     )
 
     model.train()
@@ -563,8 +610,13 @@ def save_next_pred_figure(
         return output_dir / f"next_pred_epoch{epoch:03d}.png"
 
     path = _plot_figure_grid(
-        grid, epoch, output_dir,
-        max_duration_s, sampling_rate, mode="next_pred", horizon=horizon,
+        grid,
+        epoch,
+        output_dir,
+        max_duration_s,
+        sampling_rate,
+        mode="next_pred",
+        horizon=horizon,
     )
     model.train()
     return path

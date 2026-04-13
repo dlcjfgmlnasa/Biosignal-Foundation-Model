@@ -9,6 +9,7 @@ Zero-shot (forward(masked) → reconstructed) — 추가 학습 없음.
     python -m downstream.imputation.run --checkpoint path/to/best.pt \
         --data-path outputs/downstream/imputation/imputation_vitaldb_ecg.pt
 """
+
 from __future__ import annotations
 
 import argparse
@@ -53,25 +54,29 @@ class DummyModel:
 # ---- Batch construction ----
 
 
-def _signals_to_batch(signals: torch.Tensor, signal_type: str, patch_size: int) -> PackedBatch:
+def _signals_to_batch(
+    signals: torch.Tensor, signal_type: str, patch_size: int
+) -> PackedBatch:
     """(N, win_samples) tensor -> PackedBatch list."""
     stype_int = SIGNAL_TYPES.get(signal_type, 0)
     samples = []
     for i in range(signals.shape[0]):
         sig = signals[i]
         n_usable = (len(sig) // patch_size) * patch_size
-        samples.append(BiosignalSample(
-            values=sig[:n_usable].float(),
-            length=n_usable,
-            channel_idx=0,
-            recording_idx=i,
-            sampling_rate=TARGET_SR,
-            n_channels=1,
-            win_start=0,
-            signal_type=stype_int,
-            session_id=f"imp_{i}",
-            spatial_id=0,
-        ))
+        samples.append(
+            BiosignalSample(
+                values=sig[:n_usable].float(),
+                length=n_usable,
+                channel_idx=0,
+                recording_idx=i,
+                sampling_rate=TARGET_SR,
+                n_channels=1,
+                win_start=0,
+                signal_type=stype_int,
+                session_id=f"imp_{i}",
+                spatial_id=0,
+            )
+        )
     collate = PackCollate(
         max_length=int(signals.shape[1]),
         collate_mode="ci",
@@ -100,7 +105,7 @@ def evaluate_imputation(
 
     batch_size = 32
     for start in range(0, n_samples, batch_size):
-        chunk = signals[start:start + batch_size]
+        chunk = signals[start : start + batch_size]
         batch = _signals_to_batch(chunk, signal_type, patch_size)
         batch.values = batch.values.to(device)
         batch.sample_id = batch.sample_id.to(device)
@@ -108,15 +113,17 @@ def evaluate_imputation(
 
         out = model(batch, task="masked")
         reconstructed = out["reconstructed"]  # (b, n, p)
-        patch_mask = out["patch_mask"]        # (b, n)
+        patch_mask = out["patch_mask"]  # (b, n)
 
         # Original patches (normalized)
         loc = out["loc"]
         scale = out["scale"]
         b, l = batch.values.shape
         n = l // patch_size
-        normalized = ((batch.values.unsqueeze(-1) - loc) / scale.clamp(min=1e-8)).squeeze(-1)
-        original_patches = normalized[:, :n * patch_size].reshape(b, n, patch_size)
+        normalized = (
+            (batch.values.unsqueeze(-1) - loc) / scale.clamp(min=1e-8)
+        ).squeeze(-1)
+        original_patches = normalized[:, : n * patch_size].reshape(b, n, patch_size)
 
         # Create mask
         pred_mask = create_patch_mask(patch_mask, mask_ratio=mask_ratio)
@@ -174,6 +181,7 @@ def main() -> None:
         device = "cpu"
     elif args.checkpoint:
         from downstream.model_wrapper import DownstreamModelWrapper
+
         device = "cuda" if torch.cuda.is_available() else "cpu"
         wrapper = DownstreamModelWrapper(args.checkpoint, args.model_version, device)
         model = wrapper.model
@@ -200,18 +208,22 @@ def main() -> None:
     # Evaluate
     print(f"\nEvaluating temporal imputation (mask_ratio={args.mask_ratio})...")
     metrics = evaluate_imputation(
-        model, test_signals, signal_type,
-        patch_size=PATCH_SIZE, mask_ratio=args.mask_ratio, device=device,
+        model,
+        test_signals,
+        signal_type,
+        patch_size=PATCH_SIZE,
+        mask_ratio=args.mask_ratio,
+        device=device,
     )
 
-    print(f"\n{'='*50}")
+    print(f"\n{'=' * 50}")
     print(f"  Temporal Imputation - {signal_type.upper()}")
-    print(f"{'='*50}")
+    print(f"{'=' * 50}")
     print(f"  MSE:       {metrics['mse']:.6f}")
     print(f"  MAE:       {metrics['mae']:.6f}")
     print(f"  Pearson r: {metrics['pearson_r']:.4f}")
     print(f"  Windows:   {metrics['n_windows']}")
-    print(f"{'='*50}")
+    print(f"{'=' * 50}")
 
     results_path = out_dir / f"imputation_{signal_type}_results.json"
     with open(results_path, "w") as f:

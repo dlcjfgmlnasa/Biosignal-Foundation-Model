@@ -11,7 +11,6 @@ import json
 import math
 import os
 import random
-import time
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
@@ -63,7 +62,7 @@ class TrainConfig:
 
     # Loss 가중치
     alpha: float = 1.0  # masked reconstruction
-    beta: float = 0.0   # next-patch prediction
+    beta: float = 0.0  # next-patch prediction
     gamma: float = 0.0  # cross-modal (beta 내부 가중)
     delta: float = 0.0  # cross-modal contrastive
     peak_alpha: float = 0.0  # Peak-Weighted MSE 강도 (0=일반 MSE)
@@ -79,9 +78,9 @@ class TrainConfig:
 
     # Masking 전략
     variate_mask_prob: float = 0.0  # Phase 2: variate-level 마스킹 확률
-    block_mask: bool = False       # True면 연속 블록 단위 마스킹
-    block_size_min: int = 3        # 블록 최소 크기 (패치 수, 즉 초)
-    block_size_max: int = 8        # 블록 최대 크기 (패치 수, 즉 초)
+    block_mask: bool = False  # True면 연속 블록 단위 마스킹
+    block_size_min: int = 3  # 블록 최소 크기 (패치 수, 즉 초)
+    block_size_max: int = 8  # 블록 최대 크기 (패치 수, 즉 초)
 
     # 시스템
     device: str = "auto"  # "auto", "cuda", "cpu"
@@ -114,7 +113,9 @@ class TrainConfig:
         d = asdict(self)
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
-            yaml.dump(d, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+            yaml.dump(
+                d, f, default_flow_style=False, allow_unicode=True, sort_keys=False
+            )
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "TrainConfig":
@@ -135,7 +136,9 @@ class TrainConfig:
 
     @classmethod
     def from_yaml_with_overrides(
-        cls, path: str | Path, overrides: dict[str, Any] | None = None,
+        cls,
+        path: str | Path,
+        overrides: dict[str, Any] | None = None,
     ) -> "TrainConfig":
         """YAML 파일을 로드한 뒤, CLI 인자 등으로 오버라이드한다."""
         config = cls.from_yaml(path)
@@ -252,8 +255,8 @@ def get_max_horizon(config: TrainConfig, epoch: int) -> int:
         return 1
 
     n = config.n_epochs
-    phase1_end = int(n * 0.4)   # 40%
-    phase2_end = int(n * 0.7)   # 70%
+    phase1_end = int(n * 0.4)  # 40%
+    phase2_end = int(n * 0.7)  # 70%
 
     if epoch < phase1_end:
         return 1
@@ -308,7 +311,9 @@ def train_one_epoch(
             task = "both" if enable_next else "masked"
 
             out = model(
-                batch, task=task, horizon=h,
+                batch,
+                task=task,
+                horizon=h,
                 mask_ratio=config.mask_ratio,
                 block_mask=config.block_mask,
                 block_size_min=config.block_size_min,
@@ -317,11 +322,11 @@ def train_one_epoch(
             )
 
             reconstructed = out["reconstructed"]  # (B, N, patch_size)
-            cross_pred = out["cross_pred"]        # (B, N, patch_size)
-            patch_mask = out["patch_mask"]        # (B, N) bool
-            time_id = out["time_id"]              # (B, N)
-            next_pred = out.get("next_pred")      # (B, N, patch_size) or None
-            pred_mask = out["pred_mask"]          # (B, N) bool — 모델 내부에서 생성
+            cross_pred = out["cross_pred"]  # (B, N, patch_size)
+            patch_mask = out["patch_mask"]  # (B, N) bool
+            time_id = out["time_id"]  # (B, N)
+            next_pred = out.get("next_pred")  # (B, N, patch_size) or None
+            pred_mask = out["pred_mask"]  # (B, N) bool — 모델 내부에서 생성
 
             # MoE aux_loss 수집
             aux_loss = torch.zeros(1, device=device)
@@ -331,7 +336,9 @@ def train_one_epoch(
 
             # 원본 패치 추출 (정규화된 값)
             p = raw_model.patch_size
-            normalized = ((batch.values.unsqueeze(-1) - out["loc"]) / out["scale"]).squeeze(-1)
+            normalized = (
+                (batch.values.unsqueeze(-1) - out["loc"]) / out["scale"]
+            ).squeeze(-1)
             b, l = normalized.shape
             n = l // p
             original_patches = normalized.reshape(b, n, p)  # (B, N, P)
@@ -390,7 +397,8 @@ def train_one_epoch(
 
         # Gradient NaN/Inf 감지
         grad_norm = nn.utils.clip_grad_norm_(
-            raw_model.parameters(), max_norm=config.gradient_clip,
+            raw_model.parameters(),
+            max_norm=config.gradient_clip,
         )
         if not torch.isfinite(grad_norm):
             if is_main_process():
@@ -426,15 +434,15 @@ def train_one_epoch(
                 f"total: {loss.item():.6f}",
                 f"masked: {losses['masked_loss'].item():.6f}",
             ]
-            if losses.get('masked_grad', torch.tensor(0.0)).item() > 0:
+            if losses.get("masked_grad", torch.tensor(0.0)).item() > 0:
                 parts.append(f"grad: {losses['masked_grad'].item():.6f}")
-            if losses.get('masked_spec', torch.tensor(0.0)).item() > 0:
+            if losses.get("masked_spec", torch.tensor(0.0)).item() > 0:
                 parts.append(f"spec: {losses['masked_spec'].item():.6f}")
-            if losses['next_loss'].item() > 0:
+            if losses["next_loss"].item() > 0:
                 parts.append(f"next: {losses['next_loss'].item():.6f}")
-            if losses['cross_modal_loss'].item() > 0:
+            if losses["cross_modal_loss"].item() > 0:
                 parts.append(f"cross: {losses['cross_modal_loss'].item():.6f}")
-            if losses['contrastive_loss'].item() > 0:
+            if losses["contrastive_loss"].item() > 0:
                 parts.append(f"contrastive: {losses['contrastive_loss'].item():.6f}")
             if aux_loss.item() > 0:
                 parts.append(f"aux: {aux_loss.item():.6f}")
@@ -450,7 +458,9 @@ def train_one_epoch(
         # max_batches 제한
         if config.max_batches > 0 and n_batches >= config.max_batches:
             if is_main_process():
-                print(f"  [{phase_name}] max_batches={config.max_batches} 도달, 에폭 종료.")
+                print(
+                    f"  [{phase_name}] max_batches={config.max_batches} 도달, 에폭 종료."
+                )
             break
 
     denom = max(n_batches, 1)
@@ -509,7 +519,9 @@ def validate(
         with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
             task = "both" if enable_next else "masked"
             out = raw_model(
-                batch, task=task, horizon=h,
+                batch,
+                task=task,
+                horizon=h,
                 mask_ratio=config.mask_ratio,
                 block_mask=config.block_mask,
                 block_size_min=config.block_size_min,
@@ -531,7 +543,9 @@ def validate(
                     aux_loss += layer.ffn.aux_loss.item()
 
             p = raw_model.patch_size
-            normalized = ((batch.values.unsqueeze(-1) - out["loc"]) / out["scale"]).squeeze(-1)
+            normalized = (
+                (batch.values.unsqueeze(-1) - out["loc"]) / out["scale"]
+            ).squeeze(-1)
             b, l = normalized.shape
             n = l // p
             original_patches = normalized.reshape(b, n, p)
@@ -568,7 +582,9 @@ def validate(
         epoch_aux += aux_loss
         n_batches += 1
 
-        val_limit = config.val_max_batches if config.val_max_batches > 0 else config.max_batches
+        val_limit = (
+            config.val_max_batches if config.val_max_batches > 0 else config.max_batches
+        )
         if val_limit > 0 and n_batches >= val_limit:
             break
 
@@ -628,12 +644,22 @@ class CSVLogger:
     """
 
     COLUMNS = [
-        "epoch", "phase",
-        "train_total", "train_masked", "train_next", "train_cross", "train_contrastive",
+        "epoch",
+        "phase",
+        "train_total",
+        "train_masked",
+        "train_next",
+        "train_cross",
+        "train_contrastive",
         "train_aux",
-        "val_total", "val_masked", "val_next", "val_cross", "val_contrastive",
+        "val_total",
+        "val_masked",
+        "val_next",
+        "val_cross",
+        "val_contrastive",
         "val_aux",
-        "lr", "epoch_sec",
+        "lr",
+        "epoch_sec",
     ]
 
     def __init__(self, path: str | Path) -> None:
@@ -657,7 +683,8 @@ class CSVLogger:
     ) -> None:
         """1에폭 결과를 CSV에 추가한다."""
         row = [
-            epoch, phase,
+            epoch,
+            phase,
             train_losses["total"],
             train_losses["masked_loss"],
             train_losses["next_loss"],
@@ -678,8 +705,11 @@ class CSVLogger:
                 csv.writer(f).writerow(row)
         except OSError:
             # 네트워크 파일시스템에서 append 미지원 시 read+write 우회
-            existing = self.path.read_text(encoding="utf-8") if self.path.exists() else ""
+            existing = (
+                self.path.read_text(encoding="utf-8") if self.path.exists() else ""
+            )
             import io
+
             buf = io.StringIO()
             csv.writer(buf).writerow(row)
             with open(self.path, "w", newline="", encoding="utf-8") as f:
@@ -689,7 +719,9 @@ class CSVLogger:
 # ── 유틸리티 ────────────────────────────────────────────────────
 
 
-def create_scaler(config: TrainConfig, device: torch.device) -> torch.amp.GradScaler | None:
+def create_scaler(
+    config: TrainConfig, device: torch.device
+) -> torch.amp.GradScaler | None:
     """AMP가 활성이고 CUDA 디바이스일 때 GradScaler를 생성한다."""
     if config.use_amp and device.type == "cuda":
         return torch.amp.GradScaler("cuda")
@@ -749,7 +781,9 @@ def create_scheduler(
         if epoch < warmup:
             return (epoch + 1) / max(warmup, 1)
         progress = (epoch - warmup) / max(total - warmup, 1)
-        return min_ratio + 0.5 * (1.0 - min_ratio) * (1.0 + math.cos(math.pi * progress))
+        return min_ratio + 0.5 * (1.0 - min_ratio) * (
+            1.0 + math.cos(math.pi * progress)
+        )
 
     return LambdaLR(optimizer, lr_lambda)
 
@@ -767,7 +801,12 @@ def resolve_output_dir(config: TrainConfig) -> Path:
     return base
 
 
-def save_experiment_info(config: TrainConfig, output_dir: Path, phase_name: str, extra_info: dict[str, Any] | None = None) -> None:
+def save_experiment_info(
+    config: TrainConfig,
+    output_dir: Path,
+    phase_name: str,
+    extra_info: dict[str, Any] | None = None,
+) -> None:
     """실험 정보를 experiment_info.txt 와 config.yaml로 저장한다."""
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -779,8 +818,8 @@ def save_experiment_info(config: TrainConfig, output_dir: Path, phase_name: str,
     lines = [
         f"# Experiment: {config.exp_name or phase_name}",
         f"# Phase: {phase_name}",
-        f"",
-        f"[Model]",
+        "",
+        "[Model]",
         f"d_model        = {mc.d_model}",
         f"num_layers     = {mc.num_layers}",
         f"patch_size     = {mc.patch_size}",
@@ -790,8 +829,8 @@ def save_experiment_info(config: TrainConfig, output_dir: Path, phase_name: str,
         f"use_moe        = {mc.use_moe}",
         f"use_rope       = {mc.use_rope}",
         f"max_horizon    = {mc.max_horizon}",
-        f"",
-        f"[Training]",
+        "",
+        "[Training]",
         f"batch_size     = {config.batch_size}",
         f"lr             = {config.lr}",
         f"n_epochs       = {config.n_epochs}",
@@ -799,15 +838,15 @@ def save_experiment_info(config: TrainConfig, output_dir: Path, phase_name: str,
         f"mask_ratio     = {config.mask_ratio}",
         f"collate_mode   = {config.collate_mode}",
         f"seed           = {config.seed}",
-        f"",
-        f"[Loss]",
+        "",
+        "[Loss]",
         f"alpha (masked)      = {config.alpha}",
         f"beta  (next-pred)   = {config.beta}",
         f"gamma (cross-modal) = {config.gamma}",
         f"delta (contrastive) = {config.delta}",
         f"variate_mask_prob   = {config.variate_mask_prob}",
-        f"",
-        f"[Data]",
+        "",
+        "[Data]",
         f"data_dir  = {config.data_dir}",
         f"signal_types   = {config.signal_types}",
         f"max_subjects   = {config.max_subjects}",
@@ -841,8 +880,12 @@ def save_training_checkpoint(
     filename = f"checkpoint_{phase_name}_epoch{epoch:03d}{suffix}.pt"
     path = ckpt_dir / filename
     save_checkpoint(
-        path, model, optimizer=optimizer, epoch=epoch,
+        path,
+        model,
+        optimizer=optimizer,
+        epoch=epoch,
         config=get_model_config(config),
-        phase=phase_name, loss=loss,
+        phase=phase_name,
+        loss=loss,
     )
     return path

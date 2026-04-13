@@ -33,6 +33,7 @@ import torch
 from torch import nn
 
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
@@ -81,7 +82,7 @@ def load_prepared_data(
     splits = {}
     for split_name in ["train", "val", "test"]:
         signals = data[split_name]["signals"]  # (N, 1000)
-        labels = data[split_name]["labels"]    # (N,)
+        labels = data[split_name]["labels"]  # (N,)
 
         if max_samples > 0 and len(signals) > max_samples:
             # 클래스 비율 유지하면서 서브샘플링
@@ -101,36 +102,40 @@ def load_prepared_data(
 
 def _signals_to_batches(
     signals: torch.Tensor,  # (N, signal_len)
-    labels: torch.Tensor,   # (N,)
+    labels: torch.Tensor,  # (N,)
     batch_size: int,
     patch_size: int,
 ) -> list[tuple[PackedBatch, torch.Tensor]]:
     """ECG 텐서를 PackedBatch + labels 리스트로 변환한다."""
     max_length = signals.shape[1]
-    collate = PackCollate(max_length=max_length, collate_mode="ci", patch_size=patch_size)
+    collate = PackCollate(
+        max_length=max_length, collate_mode="ci", patch_size=patch_size
+    )
 
     # ECG signal_type=0, spatial_id는 ecg lead II
     spatial_id = get_global_spatial_id("ecg", 0)
 
     batches = []
     for i in range(0, len(signals), batch_size):
-        batch_signals = signals[i:i + batch_size]
-        batch_labels = labels[i:i + batch_size]
+        batch_signals = signals[i : i + batch_size]
+        batch_labels = labels[i : i + batch_size]
 
         samples = []
         for j, sig in enumerate(batch_signals):
-            samples.append(BiosignalSample(
-                values=sig.float(),
-                length=len(sig),
-                channel_idx=0,
-                recording_idx=i + j,
-                sampling_rate=DEFAULT_SR,
-                n_channels=1,
-                win_start=0,
-                signal_type=0,  # ecg
-                session_id=f"ptbxl_{i + j}",
-                spatial_id=spatial_id,
-            ))
+            samples.append(
+                BiosignalSample(
+                    values=sig.float(),
+                    length=len(sig),
+                    channel_idx=0,
+                    recording_idx=i + j,
+                    sampling_rate=DEFAULT_SR,
+                    n_channels=1,
+                    win_start=0,
+                    signal_type=0,  # ecg
+                    session_id=f"ptbxl_{i + j}",
+                    spatial_id=spatial_id,
+                )
+            )
 
         batch = collate(samples)
         batches.append((batch, batch_labels))
@@ -332,8 +337,16 @@ def plot_confusion_matrix(
     for i in range(N_CLASSES):
         for j in range(N_CLASSES):
             color = "white" if cm_arr[i, j] > thresh else "black"
-            ax.text(j, i, str(cm_arr[i, j]), ha="center", va="center",
-                    fontsize=11, fontweight="bold", color=color)
+            ax.text(
+                j,
+                i,
+                str(cm_arr[i, j]),
+                ha="center",
+                va="center",
+                fontsize=11,
+                fontweight="bold",
+                color=color,
+            )
 
     ax.set_xlabel("Predicted", fontsize=11)
     ax.set_ylabel("True", fontsize=11)
@@ -359,14 +372,27 @@ def plot_per_class_auroc(
 
     fig, ax = plt.subplots(1, 1, figsize=(8, 4))
     colors = ["#2ecc71", "#e74c3c", "#f39c12", "#9b59b6", "#3498db"]
-    bars = ax.bar(classes, values, color=colors[:len(classes)], edgecolor="black", linewidth=0.5)
+    bars = ax.bar(
+        classes, values, color=colors[: len(classes)], edgecolor="black", linewidth=0.5
+    )
 
     # Macro 라인
-    ax.axhline(y=macro, color="black", linestyle="--", linewidth=1.0, label=f"Macro={macro:.3f}")
+    ax.axhline(
+        y=macro,
+        color="black",
+        linestyle="--",
+        linewidth=1.0,
+        label=f"Macro={macro:.3f}",
+    )
 
     for bar, v in zip(bars, values):
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
-                f"{v:.3f}", ha="center", fontsize=9)
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height() + 0.01,
+            f"{v:.3f}",
+            ha="center",
+            fontsize=9,
+        )
 
     ax.set_ylim(0, 1.1)
     ax.set_ylabel("AUROC", fontsize=11)
@@ -385,21 +411,27 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Arrhythmia Detection: PTB-XL 5-class ECG Classification",
     )
-    parser.add_argument("--checkpoint", type=str, default=None,
-                        help="사전학습 checkpoint 경로")
+    parser.add_argument(
+        "--checkpoint", type=str, default=None, help="사전학습 checkpoint 경로"
+    )
     parser.add_argument("--model-version", type=str, default="v1", choices=["v1", "v2"])
-    parser.add_argument("--data-path", type=str,
-                        default="outputs/downstream/arrhythmia/arrhythmia_ptbxl_II.pt",
-                        help="prepare_data.py가 생성한 .pt 파일 경로")
-    parser.add_argument("--max-samples", type=int, default=0,
-                        help="각 split 최대 샘플 수 (0=전체)")
+    parser.add_argument(
+        "--data-path",
+        type=str,
+        default="outputs/downstream/arrhythmia/arrhythmia_ptbxl_II.pt",
+        help="prepare_data.py가 생성한 .pt 파일 경로",
+    )
+    parser.add_argument(
+        "--max-samples", type=int, default=0, help="각 split 최대 샘플 수 (0=전체)"
+    )
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--patch-size", type=int, default=DEFAULT_PATCH_SIZE)
     parser.add_argument("--out-dir", type=str, default=".")
-    parser.add_argument("--dummy", action="store_true",
-                        help="더미 feature extractor로 파이프라인 검증")
+    parser.add_argument(
+        "--dummy", action="store_true", help="더미 feature extractor로 파이프라인 검증"
+    )
     parser.add_argument("--device", type=str, default="cpu")
     args = parser.parse_args()
 
@@ -414,6 +446,7 @@ def main() -> None:
         d_model = 128
     elif args.checkpoint:
         from downstream.model_wrapper import DownstreamModelWrapper
+
         print(f"Loading checkpoint: {args.checkpoint}")
         model = DownstreamModelWrapper(args.checkpoint, args.model_version, args.device)
         d_model = model.d_model
@@ -441,7 +474,9 @@ def main() -> None:
         print(f"  {split_name}: {n} samples  {dist}")
 
     # ── 배치 생성 ──
-    print(f"\nCreating batches (batch_size={args.batch_size}, patch_size={args.patch_size})...")
+    print(
+        f"\nCreating batches (batch_size={args.batch_size}, patch_size={args.patch_size})..."
+    )
     train_signals, train_labels = splits["train"]
     val_signals, val_labels = splits["val"]
     test_signals, test_labels = splits["test"]
@@ -450,19 +485,35 @@ def main() -> None:
         print("ERROR: Insufficient data.", file=sys.stderr)
         sys.exit(1)
 
-    train_batches = _signals_to_batches(train_signals, train_labels, args.batch_size, args.patch_size)
-    val_batches = _signals_to_batches(val_signals, val_labels, args.batch_size, args.patch_size) if len(val_signals) > 0 else None
-    test_batches = _signals_to_batches(test_signals, test_labels, args.batch_size, args.patch_size)
+    train_batches = _signals_to_batches(
+        train_signals, train_labels, args.batch_size, args.patch_size
+    )
+    val_batches = (
+        _signals_to_batches(val_signals, val_labels, args.batch_size, args.patch_size)
+        if len(val_signals) > 0
+        else None
+    )
+    test_batches = _signals_to_batches(
+        test_signals, test_labels, args.batch_size, args.patch_size
+    )
 
-    print(f"  Train: {len(train_batches)} batches, Val: {len(val_batches) if val_batches else 0} batches, Test: {len(test_batches)} batches")
+    print(
+        f"  Train: {len(train_batches)} batches, Val: {len(val_batches) if val_batches else 0} batches, Test: {len(test_batches)} batches"
+    )
 
     # ── Probe 학습 ──
     probe = LinearProbe(d_model, n_classes=N_CLASSES)
-    print(f"\nTraining LinearProbe (d_model={d_model}, {N_CLASSES} classes, epochs={args.epochs})...")
+    print(
+        f"\nTraining LinearProbe (d_model={d_model}, {N_CLASSES} classes, epochs={args.epochs})..."
+    )
     history = train_probe(
-        model, probe, train_batches,
+        model,
+        probe,
+        train_batches,
         val_batches=val_batches,
-        epochs=args.epochs, lr=args.lr, device=device,
+        epochs=args.epochs,
+        lr=args.lr,
+        device=device,
     )
 
     # ── 평가 ──
@@ -474,33 +525,35 @@ def main() -> None:
     y_prob = metrics.pop("y_prob")
 
     # ── 결과 출력 ──
-    print(f"\n{'='*55}")
-    print(f"  Arrhythmia Detection (PTB-XL 5-class)")
-    print(f"{'='*55}")
+    print(f"\n{'=' * 55}")
+    print("  Arrhythmia Detection (PTB-XL 5-class)")
+    print(f"{'=' * 55}")
     print(f"  Accuracy:       {metrics['accuracy']:.4f}")
     print(f"  AUROC (macro):  {metrics['auroc_macro']:.4f}")
     print(f"  AUPRC (macro):  {metrics['auprc_macro']:.4f}")
     print(f"  F1 (macro):     {metrics['f1_macro']:.4f}")
     print(f"  F1 (weighted):  {metrics['f1_weighted']:.4f}")
-    print(f"  ---")
+    print("  ---")
     for cls_name in CLASS_NAMES.values():
         auroc = metrics["auroc_per_class"].get(cls_name, 0.0)
         acc = metrics["per_class_accuracy"].get(cls_name, 0.0)
         n = metrics["class_distribution"].get(cls_name, 0)
         print(f"  {cls_name:5s}: AUROC={auroc:.4f}  acc={acc:.4f}  n={n}")
-    print(f"{'='*55}")
+    print(f"{'=' * 55}")
 
     # ── 시각화 ──
     cm_path = out_dir / "arrhythmia_confusion_matrix.png"
     plot_confusion_matrix(
-        metrics["confusion_matrix"], cm_path,
+        metrics["confusion_matrix"],
+        cm_path,
         title="Arrhythmia Detection (PTB-XL) — Confusion Matrix",
     )
     print(f"\nConfusion matrix saved: {cm_path}")
 
     auroc_path = out_dir / "arrhythmia_auroc_per_class.png"
     plot_per_class_auroc(
-        metrics["auroc_per_class"], auroc_path,
+        metrics["auroc_per_class"],
+        auroc_path,
         title="Arrhythmia Detection — Per-class AUROC",
     )
     print(f"Per-class AUROC saved: {auroc_path}")

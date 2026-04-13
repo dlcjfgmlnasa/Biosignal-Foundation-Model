@@ -12,6 +12,7 @@ python -m downstream.any_to_any.run --dummy
 # Real evaluation:
 python -m downstream.any_to_any.run --checkpoint path/to/best.pt
 """
+
 from __future__ import annotations
 
 import argparse
@@ -27,7 +28,14 @@ from data.dataset import BiosignalSample
 
 # signal_type_key -> signal_type_id
 SIGNAL_TYPE_IDS: dict[str, int] = {
-    "ecg": 0, "abp": 1, "ppg": 2, "cvp": 3, "co2": 4, "awp": 5, "pap": 6, "icp": 7,
+    "ecg": 0,
+    "abp": 1,
+    "ppg": 2,
+    "cvp": 3,
+    "co2": 4,
+    "awp": 5,
+    "pap": 6,
+    "icp": 7,
 }
 
 # Mechanism groups for analysis
@@ -45,39 +53,43 @@ MECHANISM_GROUPS: dict[str, str] = {
 
 # ── Scenarios ────────────────────────────────────────────────
 
+
 @dataclass
 class Scenario:
     """Input -> target prediction scenario."""
+
     name: str
-    inputs: list[str]       # signal type keys to provide
-    target: str             # signal type key to predict
-    group_type: str         # "intra" (same mechanism group) or "inter"
-    n_inputs: int           # number of input channels (for analysis)
+    inputs: list[str]  # signal type keys to provide
+    target: str  # signal type key to predict
+    group_type: str  # "intra" (same mechanism group) or "inter"
+    n_inputs: int  # number of input channels (for analysis)
 
 
 def get_default_scenarios() -> list[Scenario]:
     """Default evaluation scenarios spanning various complexities."""
     scenarios = [
         # 1-to-1: Cardiovascular intra-group
-        Scenario("ECG->ABP",    ["ecg"],             "abp", "intra", 1),
-        Scenario("ABP->ECG",    ["abp"],             "ecg", "intra", 1),
-        Scenario("PPG->ABP",    ["ppg"],             "abp", "intra", 1),
+        Scenario("ECG->ABP", ["ecg"], "abp", "intra", 1),
+        Scenario("ABP->ECG", ["abp"], "ecg", "intra", 1),
+        Scenario("PPG->ABP", ["ppg"], "abp", "intra", 1),
         # 2-to-1: Cardiovascular intra-group
-        Scenario("ECG+PPG->ABP", ["ecg", "ppg"],     "abp", "intra", 2),
-        Scenario("ECG+ABP->PPG", ["ecg", "abp"],     "ppg", "intra", 2),
+        Scenario("ECG+PPG->ABP", ["ecg", "ppg"], "abp", "intra", 2),
+        Scenario("ECG+ABP->PPG", ["ecg", "abp"], "ppg", "intra", 2),
         # 3-to-1: Rich input
         Scenario("ECG+PPG+CVP->ABP", ["ecg", "ppg", "cvp"], "abp", "intra", 3),
         # Inter-group (baseline - expect low performance)
-        Scenario("ECG->CO2",    ["ecg"],             "co2", "inter", 1),
+        Scenario("ECG->CO2", ["ecg"], "co2", "inter", 1),
     ]
     return scenarios
 
 
 # ── Result ───────────────────────────────────────────────────
 
+
 @dataclass
 class AnyToAnyResult:
     """Single scenario evaluation result."""
+
     scenario_name: str
     inputs: list[str]
     target: str
@@ -96,6 +108,7 @@ class AnyToAnyResult:
 
 # ── Batch construction (reuse Task 3 pattern) ───────────────
 
+
 def build_multivariate_batch(
     signals: dict[str, np.ndarray],
     patch_size: int = 100,
@@ -112,18 +125,20 @@ def build_multivariate_batch(
             continue
         signal = signal[:n_usable]
 
-        samples.append(BiosignalSample(
-            values=torch.tensor(signal, dtype=torch.float32),
-            length=n_usable,
-            channel_idx=ch_idx,
-            recording_idx=0,
-            sampling_rate=sr,
-            n_channels=len(signals),
-            win_start=0,
-            signal_type=signal_type,
-            session_id=session_id,
-            spatial_id=0,
-        ))
+        samples.append(
+            BiosignalSample(
+                values=torch.tensor(signal, dtype=torch.float32),
+                length=n_usable,
+                channel_idx=ch_idx,
+                recording_idx=0,
+                sampling_rate=sr,
+                n_channels=len(signals),
+                win_start=0,
+                signal_type=signal_type,
+                session_id=session_id,
+                spatial_id=0,
+            )
+        )
 
     if not samples:
         raise ValueError("No valid signals for batch construction")
@@ -138,6 +153,7 @@ def build_multivariate_batch(
 
 
 # ── Evaluation ───────────────────────────────────────────────
+
 
 def evaluate_scenario(
     model: torch.nn.Module,
@@ -158,18 +174,16 @@ def evaluate_scenario(
     with torch.no_grad():
         out = model(batch, task="masked")
 
-    reconstructed = out["reconstructed"]         # (B, N, patch_size)
-    cross_pred = out.get("cross_pred")           # (B, N, patch_size) or None
+    reconstructed = out["reconstructed"]  # (B, N, patch_size)
+    cross_pred = out.get("cross_pred")  # (B, N, patch_size) or None
     patch_signal_types = out["patch_signal_types"]  # (B, N)
-    patch_mask = out["patch_mask"]               # (B, N) bool
+    patch_mask = out["patch_mask"]  # (B, N) bool
 
     if patch_signal_types is None:
         return None
 
     # Original patches (normalized scale)
-    normalized = (
-        (batch.values.unsqueeze(-1) - out["loc"]) / out["scale"]
-    ).squeeze(-1)
+    normalized = ((batch.values.unsqueeze(-1) - out["loc"]) / out["scale"]).squeeze(-1)
     B, L = normalized.shape
     N = L // patch_size
     original_patches = normalized.reshape(B, N, patch_size)
@@ -197,8 +211,12 @@ def evaluate_scenario(
         cross_mse = cross_mae = cross_r = 0.0
 
     return {
-        "recon_mse": recon_mse, "recon_mae": recon_mae, "recon_pearson_r": recon_r,
-        "cross_mse": cross_mse, "cross_mae": cross_mae, "cross_pearson_r": cross_r,
+        "recon_mse": recon_mse,
+        "recon_mae": recon_mae,
+        "recon_pearson_r": recon_r,
+        "cross_mse": cross_mse,
+        "cross_mae": cross_mae,
+        "cross_pearson_r": cross_r,
         "n_patches": int(target_mask.sum().item()),
     }
 
@@ -215,8 +233,14 @@ def _pearson_r(x: torch.Tensor, y: torch.Tensor) -> float:
 # ── Synthetic signal generation ──────────────────────────────
 
 _SYNTH_FREQS: dict[str, float] = {
-    "ecg": 1.2, "abp": 1.1, "ppg": 1.0, "cvp": 0.9,
-    "co2": 0.25, "awp": 0.3, "pap": 1.0, "icp": 0.15,
+    "ecg": 1.2,
+    "abp": 1.1,
+    "ppg": 1.0,
+    "cvp": 0.9,
+    "co2": 0.25,
+    "awp": 0.3,
+    "pap": 1.0,
+    "icp": 0.15,
 }
 
 
@@ -231,6 +255,7 @@ def _gen_synthetic(stype: str, n_samples: int = 3000, sr: float = 100.0) -> np.n
 
 
 # ── Dummy test ───────────────────────────────────────────────
+
 
 def run_dummy_test() -> list[AnyToAnyResult]:
     """Run all scenarios with a random (untrained) model."""
@@ -256,25 +281,29 @@ def run_dummy_test() -> list[AnyToAnyResult]:
         batch = build_multivariate_batch(signals, patch_size=config.patch_size)
         target_type_id = SIGNAL_TYPE_IDS[sc.target]
 
-        metrics = evaluate_scenario(model, batch, target_type_id, config.patch_size, device)
+        metrics = evaluate_scenario(
+            model, batch, target_type_id, config.patch_size, device
+        )
         if metrics is None:
             print(f"  SKIP: {sc.name} (target not found in batch)")
             continue
 
-        results.append(AnyToAnyResult(
-            scenario_name=sc.name,
-            inputs=sc.inputs,
-            target=sc.target,
-            group_type=sc.group_type,
-            n_inputs=sc.n_inputs,
-            recon_mse=round(metrics["recon_mse"], 6),
-            recon_mae=round(metrics["recon_mae"], 6),
-            recon_pearson_r=round(metrics["recon_pearson_r"], 4),
-            cross_mse=round(metrics["cross_mse"], 6),
-            cross_mae=round(metrics["cross_mae"], 6),
-            cross_pearson_r=round(metrics["cross_pearson_r"], 4),
-            n_patches=metrics["n_patches"],
-        ))
+        results.append(
+            AnyToAnyResult(
+                scenario_name=sc.name,
+                inputs=sc.inputs,
+                target=sc.target,
+                group_type=sc.group_type,
+                n_inputs=sc.n_inputs,
+                recon_mse=round(metrics["recon_mse"], 6),
+                recon_mae=round(metrics["recon_mae"], 6),
+                recon_pearson_r=round(metrics["recon_pearson_r"], 4),
+                cross_mse=round(metrics["cross_mse"], 6),
+                cross_mae=round(metrics["cross_mae"], 6),
+                cross_pearson_r=round(metrics["cross_pearson_r"], 4),
+                n_patches=metrics["n_patches"],
+            )
+        )
 
     _print_results_table(results)
     _print_analysis(results)
@@ -282,6 +311,7 @@ def run_dummy_test() -> list[AnyToAnyResult]:
 
 
 # ── Real evaluation ──────────────────────────────────────────
+
 
 def run_checkpoint_eval(
     checkpoint_path: str,
@@ -295,7 +325,7 @@ def run_checkpoint_eval(
     from downstream.data_utils import load_pilot_cases
 
     print("=" * 70)
-    print(f"Task 8: Any-to-Any Prediction")
+    print("Task 8: Any-to-Any Prediction")
     print(f"  checkpoint: {checkpoint_path}")
     print(f"  model_version: {model_version}")
     print("=" * 70)
@@ -329,33 +359,43 @@ def run_checkpoint_eval(
             stride_samples = int(stride_sec * 100.0)
 
             for start in range(0, min_len - win_samples + 1, stride_samples):
-                signals = {t: case.tracks[t][start:start + win_samples] for t in needed_types}
+                signals = {
+                    t: case.tracks[t][start : start + win_samples] for t in needed_types
+                }
 
                 try:
                     batch = build_multivariate_batch(signals, patch_size=patch_size)
                     target_type_id = SIGNAL_TYPE_IDS[sc.target]
-                    m = evaluate_scenario(model, batch, target_type_id, patch_size, device)
+                    m = evaluate_scenario(
+                        model, batch, target_type_id, patch_size, device
+                    )
                     if m is not None:
                         sc_metrics.append(m)
-                except Exception as e:
+                except Exception:
                     continue
 
         if sc_metrics:
             # Aggregate across windows
-            results.append(AnyToAnyResult(
-                scenario_name=sc.name,
-                inputs=sc.inputs,
-                target=sc.target,
-                group_type=sc.group_type,
-                n_inputs=sc.n_inputs,
-                recon_mse=round(np.mean([m["recon_mse"] for m in sc_metrics]), 6),
-                recon_mae=round(np.mean([m["recon_mae"] for m in sc_metrics]), 6),
-                recon_pearson_r=round(np.mean([m["recon_pearson_r"] for m in sc_metrics]), 4),
-                cross_mse=round(np.mean([m["cross_mse"] for m in sc_metrics]), 6),
-                cross_mae=round(np.mean([m["cross_mae"] for m in sc_metrics]), 6),
-                cross_pearson_r=round(np.mean([m["cross_pearson_r"] for m in sc_metrics]), 4),
-                n_patches=sum(m["n_patches"] for m in sc_metrics),
-            ))
+            results.append(
+                AnyToAnyResult(
+                    scenario_name=sc.name,
+                    inputs=sc.inputs,
+                    target=sc.target,
+                    group_type=sc.group_type,
+                    n_inputs=sc.n_inputs,
+                    recon_mse=round(np.mean([m["recon_mse"] for m in sc_metrics]), 6),
+                    recon_mae=round(np.mean([m["recon_mae"] for m in sc_metrics]), 6),
+                    recon_pearson_r=round(
+                        np.mean([m["recon_pearson_r"] for m in sc_metrics]), 4
+                    ),
+                    cross_mse=round(np.mean([m["cross_mse"] for m in sc_metrics]), 6),
+                    cross_mae=round(np.mean([m["cross_mae"] for m in sc_metrics]), 6),
+                    cross_pearson_r=round(
+                        np.mean([m["cross_pearson_r"] for m in sc_metrics]), 4
+                    ),
+                    n_patches=sum(m["n_patches"] for m in sc_metrics),
+                )
+            )
         else:
             print(f"  SKIP: {sc.name} (no valid windows)")
 
@@ -369,6 +409,7 @@ def run_checkpoint_eval(
 
 
 # ── Output ───────────────────────────────────────────────────
+
 
 def _print_results_table(results: list[AnyToAnyResult]) -> None:
     """Print results comparing reconstructed vs cross_pred heads."""
@@ -400,7 +441,9 @@ def _print_analysis(results: list[AnyToAnyResult]) -> None:
         if grp:
             avg_recon_r = np.mean([r.recon_pearson_r for r in grp])
             avg_cross_r = np.mean([r.cross_pearson_r for r in grp])
-            print(f"  {group:5s}: recon_r={avg_recon_r:.4f}  cross_r={avg_cross_r:.4f}  (n={len(grp)} scenarios)")
+            print(
+                f"  {group:5s}: recon_r={avg_recon_r:.4f}  cross_r={avg_cross_r:.4f}  (n={len(grp)} scenarios)"
+            )
 
     print("\n--- Input Channel Count Effect ---")
     for n_in in sorted(set(r.n_inputs for r in results)):
@@ -408,26 +451,33 @@ def _print_analysis(results: list[AnyToAnyResult]) -> None:
         if grp:
             avg_recon_r = np.mean([r.recon_pearson_r for r in grp])
             avg_cross_r = np.mean([r.cross_pearson_r for r in grp])
-            print(f"  {n_in}->1: recon_r={avg_recon_r:.4f}  cross_r={avg_cross_r:.4f}  (n={len(grp)} scenarios)")
+            print(
+                f"  {n_in}->1: recon_r={avg_recon_r:.4f}  cross_r={avg_cross_r:.4f}  (n={len(grp)} scenarios)"
+            )
 
     # Which head is better?
     recon_wins = sum(1 for r in results if r.recon_pearson_r > r.cross_pearson_r)
     cross_wins = sum(1 for r in results if r.cross_pearson_r > r.recon_pearson_r)
-    print(f"\n--- Head Comparison ---")
+    print("\n--- Head Comparison ---")
     print(f"  reconstructed wins: {recon_wins}/{len(results)}")
     print(f"  cross_pred wins:    {cross_wins}/{len(results)}")
 
 
 # ── CLI ──────────────────────────────────────────────────────
 
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Task 8: Any-to-Any cross-modal prediction")
+    parser = argparse.ArgumentParser(
+        description="Task 8: Any-to-Any cross-modal prediction"
+    )
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--model-version", type=str, default="v1", choices=["v1", "v2"])
     parser.add_argument("--n-cases", type=int, default=20)
     parser.add_argument("--window-sec", type=float, default=30.0)
     parser.add_argument("--stride-sec", type=float, default=15.0)
-    parser.add_argument("--dummy", action="store_true", help="Dummy test with random model")
+    parser.add_argument(
+        "--dummy", action="store_true", help="Dummy test with random model"
+    )
     args = parser.parse_args()
 
     if args.dummy:

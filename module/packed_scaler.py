@@ -4,6 +4,7 @@
 Salesforce uni2ts (Apache 2.0)에서 포팅.
 scatter_add 기반 O(L) 구현 (기존 O(L^2) pairwise mask 대체).
 """
+
 from __future__ import annotations
 
 import torch
@@ -36,9 +37,7 @@ class PackedScaler(nn.Module):
                 target.shape[:-1], dtype=torch.long, device=target.device
             )
 
-        loc, scale = self._get_loc_scale(
-            target, observed_mask, sample_id, variate_id
-        )
+        loc, scale = self._get_loc_scale(target, observed_mask, sample_id, variate_id)
         return loc, scale
 
     def _get_loc_scale(
@@ -128,11 +127,15 @@ class PackedStdScaler(PackedScaler):
         obs_float = observed_mask.to(target.dtype)  # (B, L, D)
 
         # 그룹별 관측 수
-        group_count = torch.zeros(B, n_groups, D, dtype=target.dtype, device=target.device)
+        group_count = torch.zeros(
+            B, n_groups, D, dtype=target.dtype, device=target.device
+        )
         group_count.scatter_add_(1, gk, obs_float)  # (B, n_groups, D)
 
         # 그룹별 합
-        group_sum = torch.zeros(B, n_groups, D, dtype=target.dtype, device=target.device)
+        group_sum = torch.zeros(
+            B, n_groups, D, dtype=target.dtype, device=target.device
+        )
         group_sum.scatter_add_(1, gk, target * obs_float)  # (B, n_groups, D)
 
         # 그룹별 평균 → per-timestep loc
@@ -141,10 +144,14 @@ class PackedStdScaler(PackedScaler):
 
         # 그룹별 분산
         diff_sq = ((target - loc) ** 2) * obs_float  # (B, L, D)
-        group_var_sum = torch.zeros(B, n_groups, D, dtype=target.dtype, device=target.device)
+        group_var_sum = torch.zeros(
+            B, n_groups, D, dtype=target.dtype, device=target.device
+        )
         group_var_sum.scatter_add_(1, gk, diff_sq)  # (B, n_groups, D)
 
-        group_var = safe_div(group_var_sum, (group_count - self.correction).clamp(min=0))
+        group_var = safe_div(
+            group_var_sum, (group_count - self.correction).clamp(min=0)
+        )
         group_scale = torch.sqrt(group_var + self.minimum_scale)  # (B, n_groups, D)
         scale = group_scale.gather(1, gk)  # (B, L, D)
 
@@ -188,11 +195,15 @@ class PackedAbsMeanScaler(PackedScaler):
         obs_float = observed_mask.to(target.dtype)  # (B, L, D)
 
         # 그룹별 관측 수
-        group_count = torch.zeros(B, n_groups, D, dtype=target.dtype, device=target.device)
+        group_count = torch.zeros(
+            B, n_groups, D, dtype=target.dtype, device=target.device
+        )
         group_count.scatter_add_(1, gk, obs_float)
 
         # 그룹별 절대값 합
-        group_abs_sum = torch.zeros(B, n_groups, D, dtype=target.dtype, device=target.device)
+        group_abs_sum = torch.zeros(
+            B, n_groups, D, dtype=target.dtype, device=target.device
+        )
         group_abs_sum.scatter_add_(1, gk, target.abs() * obs_float)
 
         # 그룹별 절대 평균 → scale

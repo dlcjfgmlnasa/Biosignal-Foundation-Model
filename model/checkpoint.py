@@ -3,6 +3,7 @@
 
 모델 constructor args를 ``config``에 저장하여 재구성 가능하게 한다.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -75,7 +76,8 @@ def load_checkpoint(
     """
     state = torch.load(path, map_location=device, weights_only=False)
     missing, unexpected = model.load_state_dict(
-        state["model_state_dict"], strict=False,
+        state["model_state_dict"],
+        strict=False,
     )
     if missing:
         print(f"  [checkpoint] Missing keys (newly added): {missing}")

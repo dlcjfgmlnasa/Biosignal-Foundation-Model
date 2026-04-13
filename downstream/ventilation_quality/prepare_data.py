@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import argparse
 import sys
-import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -38,7 +37,7 @@ NATIVE_SR_CO2: float = 62.5
 NATIVE_SR_AWP: float = 62.5
 
 # ETCO2 기반 2-class 라벨 기준
-ETCO2_THRESHOLD = 35.0   # < 35: 과환기, >= 35: 정상
+ETCO2_THRESHOLD = 35.0  # < 35: 과환기, >= 35: 정상
 CLASS_NAMES = ["Hyperventilation", "Normal"]
 
 
@@ -48,9 +47,10 @@ CLASS_NAMES = ["Hyperventilation", "Normal"]
 @dataclass
 class VentilationSample:
     """환기 품질 샘플."""
+
     signals: dict[str, np.ndarray]  # {"co2": (win_samples,), "awp": (win_samples,)}
-    label: int                       # 0=hyper, 1=normal, 2=hypo
-    etco2_value: float               # ETCO2 (mmHg)
+    label: int  # 0=hyper, 1=normal, 2=hypo
+    etco2_value: float  # ETCO2 (mmHg)
     case_id: int
     win_start_sec: float
 
@@ -67,7 +67,9 @@ def _load_vitaldb_cases(
     import vitaldb
     from data.parser._common import resample_to_target
     from data.parser.vitaldb import (
-        SIGNAL_CONFIGS, _apply_filter, _apply_range_check,
+        SIGNAL_CONFIGS,
+        _apply_filter,
+        _apply_range_check,
         _extract_nan_free_segments,
     )
 
@@ -80,12 +82,14 @@ def _load_vitaldb_cases(
     end_idx = max(0, total - offset_from_end)
     target_ids = all_cases[start_idx:end_idx]
 
-    print(f"  Loading {len(target_ids)} cases (IDs {target_ids[0]}~{target_ids[-1]})...")
+    print(
+        f"  Loading {len(target_ids)} cases (IDs {target_ids[0]}~{target_ids[-1]})..."
+    )
 
     cases = []
     for i, case_id in enumerate(target_ids):
         if (i + 1) % 5 == 0:
-            print(f"  [{i+1}/{len(target_ids)}]...", end=" ")
+            print(f"  [{i + 1}/{len(target_ids)}]...", end=" ")
 
         try:
             # Waveform 로드
@@ -141,11 +145,13 @@ def _load_vitaldb_cases(
             min_wave_len = min(len(s) for s in signals.values())
             signals = {k: v[:min_wave_len] for k, v in signals.items()}
 
-            cases.append({
-                "case_id": case_id,
-                "signals": signals,
-                "etco2": etco2,
-            })
+            cases.append(
+                {
+                    "case_id": case_id,
+                    "signals": signals,
+                    "etco2": etco2,
+                }
+            )
 
         except Exception:
             continue
@@ -220,13 +226,15 @@ def extract_ventilation_samples(
             else:
                 label = 1  # Normal
 
-            samples.append(VentilationSample(
-                signals=input_dict,
-                label=label,
-                etco2_value=etco2_val,
-                case_id=case["case_id"],
-                win_start_sec=start / TARGET_SR,
-            ))
+            samples.append(
+                VentilationSample(
+                    signals=input_dict,
+                    label=label,
+                    etco2_value=etco2_val,
+                    case_id=case["case_id"],
+                    win_start_sec=start / TARGET_SR,
+                )
+            )
 
     return samples
 
@@ -252,12 +260,16 @@ def save_dataset(
         for stype in input_signals:
             arrs = [s.signals[stype] for s in samples if stype in s.signals]
             if arrs:
-                sig_tensors[stype] = torch.stack([torch.from_numpy(a).float() for a in arrs])
+                sig_tensors[stype] = torch.stack(
+                    [torch.from_numpy(a).float() for a in arrs]
+                )
 
         return {
             "signals": sig_tensors,
             "labels": torch.tensor([s.label for s in samples], dtype=torch.long),
-            "etco2_values": torch.tensor([s.etco2_value for s in samples], dtype=torch.float32),
+            "etco2_values": torch.tensor(
+                [s.etco2_value for s in samples], dtype=torch.float32
+            ),
             "case_ids": [s.case_id for s in samples],
         }
 
@@ -298,23 +310,29 @@ def print_stats(name: str, samples: list[VentilationSample]) -> None:
 
     n = len(samples)
     from collections import Counter
+
     dist = Counter(s.label for s in samples)
     etco2s = [s.etco2_value for s in samples]
 
     print(f"  {name}: {n} samples")
     for cls_id, cls_name in enumerate(CLASS_NAMES):
         cnt = dist.get(cls_id, 0)
-        print(f"    {cls_name}({cls_id}): {cnt} ({cnt/n*100:.1f}%)")
-    print(f"    ETCO2: {np.mean(etco2s):.1f} +/- {np.std(etco2s):.1f} mmHg "
-          f"[{np.min(etco2s):.1f}, {np.max(etco2s):.1f}]")
+        print(f"    {cls_name}({cls_id}): {cnt} ({cnt / n * 100:.1f}%)")
+    print(
+        f"    ETCO2: {np.mean(etco2s):.1f} +/- {np.std(etco2s):.1f} mmHg "
+        f"[{np.min(etco2s):.1f}, {np.max(etco2s):.1f}]"
+    )
 
 
 # ---- 시각화 ----
 
 
-def _visualize(samples: list[VentilationSample], input_signals: list[str], out_dir: Path) -> None:
+def _visualize(
+    samples: list[VentilationSample], input_signals: list[str], out_dir: Path
+) -> None:
     try:
         import matplotlib
+
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
     except ImportError:
@@ -325,6 +343,7 @@ def _visualize(samples: list[VentilationSample], input_signals: list[str], out_d
 
     # 1. 클래스별 waveform 예시
     from collections import defaultdict
+
     by_class = defaultdict(list)
     for s in samples:
         by_class[s.label].append(s)
@@ -354,8 +373,15 @@ def _visualize(samples: list[VentilationSample], input_signals: list[str], out_d
             ax.set_xlim(0, t[-1])
 
     for col, stype in enumerate(input_signals):
-        axes[0, col].text(0.5, 1.15, stype.upper(), transform=axes[0, col].transAxes,
-                          ha="center", fontsize=12, fontweight="bold")
+        axes[0, col].text(
+            0.5,
+            1.15,
+            stype.upper(),
+            transform=axes[0, col].transAxes,
+            ha="center",
+            fontsize=12,
+            fontweight="bold",
+        )
 
     fig.suptitle("Ventilation Quality - Waveform Examples", fontsize=13, y=1.02)
     plt.tight_layout()
@@ -372,9 +398,21 @@ def _visualize(samples: list[VentilationSample], input_signals: list[str], out_d
     for cls_id, cls_name in enumerate(CLASS_NAMES):
         vals = [e for e, l in zip(etco2s, labels) if l == cls_id]
         if vals:
-            ax.hist(vals, bins=30, alpha=0.6, color=colors[cls_id], label=f"{cls_name} (n={len(vals)})")
+            ax.hist(
+                vals,
+                bins=30,
+                alpha=0.6,
+                color=colors[cls_id],
+                label=f"{cls_name} (n={len(vals)})",
+            )
 
-    ax.axvline(ETCO2_THRESHOLD, color="red", linestyle="--", linewidth=1.5, label=f"Threshold = {ETCO2_THRESHOLD} mmHg")
+    ax.axvline(
+        ETCO2_THRESHOLD,
+        color="red",
+        linestyle="--",
+        linewidth=1.5,
+        label=f"Threshold = {ETCO2_THRESHOLD} mmHg",
+    )
     ax.set_xlabel("ETCO2 (mmHg)")
     ax.set_ylabel("Count")
     ax.set_title("ETCO2 Distribution by Ventilation Quality Class")
@@ -403,13 +441,13 @@ def prepare_ventilation_quality(
         input_signals = ["co2", "awp"]
 
     mode_str = " + ".join(s.upper() for s in input_signals)
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     print(f"  Ventilation Quality: {mode_str} -> 2-class")
     print(f"  Window: {window_sec}s, Stride: {stride_sec}s")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
     # 1. 데이터 로드
-    print(f"\n[1/4] Loading VitalDB cases...")
+    print("\n[1/4] Loading VitalDB cases...")
     cases = _load_vitaldb_cases(n_cases, input_signals, offset_from_end)
 
     if not cases:
@@ -429,9 +467,13 @@ def prepare_ventilation_quality(
     print(f"  Train: {len(train_cases)} cases, Test: {len(test_cases)} cases")
 
     # 3. 윈도우 추출 + 라벨링
-    print(f"\n[3/4] Extracting ventilation samples...")
-    train_samples = extract_ventilation_samples(train_cases, input_signals, window_sec, stride_sec)
-    test_samples = extract_ventilation_samples(test_cases, input_signals, window_sec, stride_sec)
+    print("\n[3/4] Extracting ventilation samples...")
+    train_samples = extract_ventilation_samples(
+        train_cases, input_signals, window_sec, stride_sec
+    )
+    test_samples = extract_ventilation_samples(
+        test_cases, input_signals, window_sec, stride_sec
+    )
 
     print_stats("Train", train_samples)
     print_stats("Test", test_samples)
@@ -441,18 +483,20 @@ def prepare_ventilation_quality(
         sys.exit(1)
 
     # 4. 저장
-    print(f"\n[4/4] Saving...")
-    save_path = save_dataset(train_samples, test_samples, input_signals, window_sec, out_dir)
+    print("\n[4/4] Saving...")
+    save_path = save_dataset(
+        train_samples, test_samples, input_signals, window_sec, out_dir
+    )
 
     if visualize:
         all_samples = train_samples + test_samples
         _visualize(all_samples, input_signals, Path(out_dir))
 
     total = len(train_samples) + len(test_samples)
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"  Ventilation Quality data ready: {total} samples, 2 classes")
     print(f"  File: {save_path}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     return save_path
 
 
@@ -460,15 +504,21 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Ventilation Quality - Data Preparation (CO2+AWP -> 3-class)",
     )
-    parser.add_argument("--input-signals", nargs="+", default=["co2", "awp"],
-                        choices=["co2", "awp"],
-                        help="Input signal types")
+    parser.add_argument(
+        "--input-signals",
+        nargs="+",
+        default=["co2", "awp"],
+        choices=["co2", "awp"],
+        help="Input signal types",
+    )
     parser.add_argument("--n-cases", type=int, default=10)
     parser.add_argument("--window-sec", type=float, default=30.0)
     parser.add_argument("--stride-sec", type=float, default=15.0)
     parser.add_argument("--train-ratio", type=float, default=0.7)
     parser.add_argument("--offset-from-end", type=int, default=200)
-    parser.add_argument("--out-dir", type=str, default="outputs/downstream/ventilation_quality")
+    parser.add_argument(
+        "--out-dir", type=str, default="outputs/downstream/ventilation_quality"
+    )
     parser.add_argument("--visualize", action="store_true")
     args = parser.parse_args()
 

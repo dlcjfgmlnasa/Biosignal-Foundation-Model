@@ -14,7 +14,6 @@ VitalDB 뒤쪽 케이스를 pilot test 전용으로 사용한다.
 
 from __future__ import annotations
 
-import sys
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -26,8 +25,6 @@ from data.parser._common import (
 )
 from data.parser.vitaldb import (
     SIGNAL_CONFIGS,
-    SIGNAL_TYPES,
-    TRACK_MAP,
     TARGET_SR,
     _apply_filter,
     _apply_median_filter,
@@ -54,8 +51,12 @@ PREFERRED_TRACKS: dict[str, list[str]] = {
 
 # 트랙별 native sampling rate (Hz)
 NATIVE_SR: dict[str, float] = {
-    "ecg": 500.0, "abp": 500.0, "ppg": 500.0,
-    "cvp": 500.0, "co2": 62.5, "awp": 62.5,
+    "ecg": 500.0,
+    "abp": 500.0,
+    "ppg": 500.0,
+    "cvp": 500.0,
+    "co2": 62.5,
+    "awp": 62.5,
 }
 
 
@@ -65,6 +66,7 @@ NATIVE_SR: dict[str, float] = {
 @dataclass
 class CaseData:
     """단일 VitalDB 케이스에서 로드된 데이터."""
+
     case_id: int
     tracks: dict[str, np.ndarray] = field(default_factory=dict)
     # tracks: {signal_type_key: (n_timesteps,) resampled 100Hz array}
@@ -73,21 +75,23 @@ class CaseData:
 @dataclass
 class Window:
     """단일 시간 윈도우."""
-    signal: np.ndarray        # (win_samples,) at TARGET_SR
-    signal_type: str          # "ecg", "abp", etc.
+
+    signal: np.ndarray  # (win_samples,) at TARGET_SR
+    signal_type: str  # "ecg", "abp", etc.
     case_id: int
-    win_start: int            # sample index in resampled signal
+    win_start: int  # sample index in resampled signal
     quality_passed: bool
 
 
 @dataclass
 class LabeledWindow:
     """라벨이 부여된 윈도우."""
-    signal: np.ndarray        # (win_samples,)
+
+    signal: np.ndarray  # (win_samples,)
     signal_type: str
     case_id: int
-    label: int                # task-specific label
-    label_value: float        # 연속값 (MAP, HR 등)
+    label: int  # task-specific label
+    label_value: float  # 연속값 (MAP, HR 등)
 
 
 # ── Pilot 케이스 로딩 ──────────────────────────────────────────
@@ -199,7 +203,9 @@ def _apply_full_pipeline(
 
     # Step 2: Spike detection
     if cfg.spike_detection:
-        data, _ = _detect_electrocautery(data, native_sr, threshold_std=cfg.spike_threshold_std)
+        data, _ = _detect_electrocautery(
+            data, native_sr, threshold_std=cfg.spike_threshold_std
+        )
 
     # Step 2b: PPG motion artifact
     if stype_key == "ppg":
@@ -271,7 +277,7 @@ def extract_windows(
     cfg = SIGNAL_CONFIGS.get(signal_type)
 
     for start in range(0, len(signal) - win_samples + 1, stride_samples):
-        win = signal[start:start + win_samples]
+        win = signal[start : start + win_samples]
 
         passed = True
         if quality_check and cfg is not None:
@@ -290,13 +296,15 @@ def extract_windows(
             else:
                 passed = False
 
-        windows.append(Window(
-            signal=win,
-            signal_type=signal_type,
-            case_id=case_data.case_id,
-            win_start=start,
-            quality_passed=passed,
-        ))
+        windows.append(
+            Window(
+                signal=win,
+                signal_type=signal_type,
+                case_id=case_data.case_id,
+                win_start=start,
+                quality_passed=passed,
+            )
+        )
 
     return windows
 
@@ -390,13 +398,15 @@ def create_labeled_dataset_hypotension(
         map_value = float(np.mean(w.signal))
         label = 1 if map_value < map_threshold else 0
 
-        labeled.append(LabeledWindow(
-            signal=w.signal,
-            signal_type=w.signal_type,
-            case_id=w.case_id,
-            label=label,
-            label_value=map_value,
-        ))
+        labeled.append(
+            LabeledWindow(
+                signal=w.signal,
+                signal_type=w.signal_type,
+                case_id=w.case_id,
+                label=label,
+                label_value=map_value,
+            )
+        )
 
     return labeled
 
@@ -469,12 +479,14 @@ def create_labeled_dataset_bradytachy(
         else:
             label = 1  # normal
 
-        labeled.append(LabeledWindow(
-            signal=segment,
-            signal_type=w.signal_type,
-            case_id=w.case_id,
-            label=label,
-            label_value=hr,
-        ))
+        labeled.append(
+            LabeledWindow(
+                signal=segment,
+                signal_type=w.signal_type,
+                case_id=w.case_id,
+                label=label,
+                label_value=hr,
+            )
+        )
 
     return labeled
