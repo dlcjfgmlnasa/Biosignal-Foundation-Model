@@ -163,6 +163,7 @@ class DownstreamModelWrapper(nn.Module):
                 child = getattr(module, target, None)
                 if child is not None and isinstance(child, nn.Linear):
                     lora = LoRALinear(child, rank=rank, alpha=alpha, dropout_p=dropout_p)
+                    lora = lora.to(self.device)
                     setattr(module, target, lora)
                     n_lora_params += rank * (child.in_features + child.out_features)
 
