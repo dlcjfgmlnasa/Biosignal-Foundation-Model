@@ -1,10 +1,9 @@
 # -*- coding:utf-8 -*-
 """Task 1: Hypotension Prediction (MAP < 65 mmHg, >=1min sustained).
 
-3가지 모드:
+2가지 모드:
   - linear_probe: Frozen encoder + LinearProbe (representation 품질 평가)
   - lora:         Frozen encoder + LoRA adapters + LinearProbe (효율적 fine-tuning)
-  - from_scratch: 랜덤 초기화 encoder + LinearProbe (사전학습 이득 측정)
 
 입력: 최대 10분(600초) 윈도우 → Foundation Model encoder → mean pool → LinearProbe
 
@@ -16,10 +15,6 @@
     # LoRA fine-tuning
     python -m downstream.classification.hypotension.run \
         --checkpoint best.pt --mode lora --lr 1e-4 --epochs 30 --lora-rank 8
-
-    # From scratch (사전학습 없이)
-    python -m downstream.classification.hypotension.run \
-        --checkpoint best.pt --mode from_scratch --lr 1e-4 --epochs 30
 """
 
 from __future__ import annotations
@@ -271,58 +266,6 @@ def evaluate_lora(
     return _compute_metrics(np.concatenate(all_labels), np.concatenate(all_scores))
 
 
-# ── From scratch (전체 파라미터 학습) ────────────────────────
-
-
-def train_from_scratch(
-    model,  # DownstreamModelWrapper (unfrozen)
-    probe: LinearProbe,
-    train_batches: list[tuple[PackedBatch, torch.Tensor]],
-    epochs: int,
-    lr: float,
-    device: torch.device,
-    gradient_clip: float = 1.0,
-) -> list[float]:
-    model.model.train()
-    probe = probe.to(device)
-    probe.train()
-
-    optimizer = torch.optim.AdamW([
-        {"params": model.model.parameters(), "lr": lr},
-        {"params": probe.parameters(), "lr": lr},
-    ], weight_decay=0.01)
-
-    criterion = nn.BCEWithLogitsLoss()
-    losses = []
-
-    for epoch in range(epochs):
-        epoch_loss, n = 0.0, 0
-        for batch, labels in train_batches:
-            batch = model.batch_to_device(batch)
-            out = model.model(batch, task="masked")
-            features = _mean_pool(out["encoded"], out["patch_mask"])
-
-            logits = probe(features)
-            loss = criterion(logits, labels.to(device).unsqueeze(-1))
-
-            optimizer.zero_grad()
-            loss.backward()
-            nn.utils.clip_grad_norm_(
-                list(model.model.parameters()) + list(probe.parameters()),
-                gradient_clip,
-            )
-            optimizer.step()
-            epoch_loss += loss.item()
-            n += 1
-
-        avg = epoch_loss / max(n, 1)
-        losses.append(avg)
-        if (epoch + 1) % 5 == 0 or epoch == 0:
-            print(f"  Epoch {epoch + 1}/{epochs}  loss={avg:.4f}")
-
-    return losses
-
-
 # ── 공통 메트릭 계산 ─────────────────────────────────────────
 
 
@@ -468,9 +411,8 @@ def main() -> None:
         "--mode",
         type=str,
         default="linear_probe",
-        choices=["linear_probe", "lora", "from_scratch"],
-        help="linear_probe: frozen encoder, lora: LoRA adapters, "
-        "from_scratch: random init encoder",
+        choices=["linear_probe", "lora"],
+        help="linear_probe: frozen encoder, lora: LoRA adapters",
     )
     parser.add_argument("--lora-rank", type=int, default=8, help="LoRA rank")
     parser.add_argument("--lora-alpha", type=float, default=16.0, help="LoRA alpha")
@@ -517,14 +459,6 @@ def main() -> None:
                 rank=args.lora_rank,
                 alpha=args.lora_alpha,
             )
-        elif args.mode == "from_scratch":
-            # 같은 구조, 랜덤 초기화
-            print("  Re-initializing encoder weights (from_scratch)")
-            for p in model.model.parameters():
-                if p.dim() >= 2:
-                    nn.init.xavier_uniform_(p)
-                else:
-                    nn.init.zeros_(p)
     else:
         print("ERROR: --checkpoint or --dummy required.", file=sys.stderr)
         sys.exit(1)
@@ -576,17 +510,6 @@ def main() -> None:
         print(f"\nTraining LoRA + Probe (rank={args.lora_rank}, "
               f"LoRA={n_lora:,} + Probe={n_probe:,} params)...")
         train_losses = train_lora(
-            model, probe, train_batches, args.epochs, args.lr, device
-        )
-        print("\nEvaluating...")
-        metrics = evaluate_lora(model, probe, test_batches, device)
-
-    elif args.mode == "from_scratch":
-        model.unfreeze_encoder()
-        n_total = sum(p.numel() for p in model.model.parameters())
-        n_probe = sum(p.numel() for p in probe.parameters())
-        print(f"\nFrom scratch (encoder={n_total:,} + probe={n_probe:,} params)...")
-        train_losses = train_from_scratch(
             model, probe, train_batches, args.epochs, args.lr, device
         )
         print("\nEvaluating...")
