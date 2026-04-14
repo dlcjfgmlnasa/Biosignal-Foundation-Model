@@ -1,23 +1,25 @@
 # -*- coding:utf-8 -*-
 """Task 1: Hypotension Prediction (MAP < 65 mmHg, >=1min sustained).
 
-Frozen encoder + probe로 ABP 윈도우의 저혈압 여부를 분류한다.
+3가지 모드:
+  - linear_probe: Frozen encoder + LinearProbe (representation 품질 평가)
+  - lora:         Frozen encoder + LoRA adapters + LinearProbe (효율적 fine-tuning)
+  - from_scratch: 랜덤 초기화 encoder + LinearProbe (사전학습 이득 측정)
 
-모드:
-  - 단일 윈도우: 현재 윈도우 feature -> probe -> 현재 MAP<65 분류
-  - 다중 윈도우: N개 과거 윈도우 features -> aggregator -> 미래 MAP<65 예측
-
-데이터 소스: prepare_data.py로 생성된 .pt 파일 또는 --data-dir에서 직접 로딩
+입력: 최대 10분(600초) 윈도우 → Foundation Model encoder → mean pool → LinearProbe
 
 사용법:
-    # Prepared .pt 파일 사용
+    # Linear probe (기본)
     python -m downstream.classification.hypotension.run \
-        --data-path outputs/downstream/hypotension/task1_hypotension_abp_h5min.pt \
-        --dummy
+        --checkpoint best.pt --mode linear_probe
 
-    # 로컬 .pt 디렉토리에서 직접 로딩
+    # LoRA fine-tuning
     python -m downstream.classification.hypotension.run \
-        --data-dir vitaldb_pt_test --dummy
+        --checkpoint best.pt --mode lora --lr 1e-4 --epochs 30 --lora-rank 8
+
+    # From scratch (사전학습 없이)
+    python -m downstream.classification.hypotension.run \
+        --checkpoint best.pt --mode from_scratch --lr 1e-4 --epochs 30
 """
 
 from __future__ import annotations
@@ -37,12 +39,6 @@ from data.dataset import BiosignalSample
 from data.spatial_map import get_global_spatial_id
 from data.parser.vitaldb import SIGNAL_TYPES
 
-from downstream.data_utils import (
-    LabeledWindow,
-    extract_windows,
-    apply_pipeline,
-    create_labeled_dataset_hypotension,
-)
 from downstream.metrics import (
     compute_auroc,
     compute_auprc,
@@ -58,245 +54,64 @@ DEFAULT_PATCH_SIZE = 100
 DEFAULT_SR = 100.0
 
 
-# ── Aggregator probes ────────────────────────────────────────
-
-
-class ConcatProbe(nn.Module):
-    """N개 윈도우 feature를 concatenate -> Linear."""
-
-    def __init__(
-        self, d_model: int, n_windows: int, n_classes: int = 1, dropout_p: float = 0.1
-    ):
-        super().__init__()
-        self.head = nn.Sequential(
-            nn.LayerNorm(d_model * n_windows),
-            nn.Dropout(dropout_p),
-            nn.Linear(d_model * n_windows, n_classes),
-        )
-
-    def forward(
-        self, features: torch.Tensor
-    ) -> torch.Tensor:  # (B, n_windows, d_model)
-        B = features.shape[0]
-        flat = features.reshape(B, -1)  # (B, n_windows * d_model)
-        return self.head(flat)  # (B, n_classes)
-
-
-class LSTMProbe(nn.Module):
-    """N개 윈도우 feature를 LSTM -> last hidden -> Linear."""
-
-    def __init__(
-        self,
-        d_model: int,
-        hidden_dim: int = 64,
-        n_classes: int = 1,
-        dropout_p: float = 0.1,
-    ):
-        super().__init__()
-        self.lstm = nn.LSTM(d_model, hidden_dim, batch_first=True, num_layers=1)
-        self.head = nn.Sequential(
-            nn.LayerNorm(hidden_dim),
-            nn.Dropout(dropout_p),
-            nn.Linear(hidden_dim, n_classes),
-        )
-
-    def forward(
-        self, features: torch.Tensor
-    ) -> torch.Tensor:  # (B, n_windows, d_model)
-        _, (h_n, _) = self.lstm(features)  # h_n: (1, B, hidden_dim)
-        return self.head(h_n.squeeze(0))  # (B, n_classes)
-
-
-class MeanProbe(nn.Module):
-    """N개 윈도우 feature를 mean pool -> Linear."""
-
-    def __init__(self, d_model: int, n_classes: int = 1, dropout_p: float = 0.1):
-        super().__init__()
-        self.head = nn.Sequential(
-            nn.LayerNorm(d_model),
-            nn.Dropout(dropout_p),
-            nn.Linear(d_model, n_classes),
-        )
-
-    def forward(
-        self, features: torch.Tensor
-    ) -> torch.Tensor:  # (B, n_windows, d_model)
-        pooled = features.mean(dim=1)  # (B, d_model)
-        return self.head(pooled)  # (B, n_classes)
-
-
-# ── Multi-window 데이터 생성 ─────────────────────────────────
-
-
-@dataclass
-class MultiWindowSample:
-    """N개 연속 윈도우 + 라벨."""
-
-    windows: list[LabeledWindow]  # context windows (시간순)
-    label: int  # target label (0=normal, 1=hypotension)
-    label_value: float  # target MAP
-    case_id: int
-
-
-def create_multiwindow_samples(
-    case_data: CaseData,
-    n_context: int,
-    window_sec: float,
-    stride_sec: float,
-    horizon_sec: float = 0.0,
-    map_threshold: float = 65.0,
-) -> list[MultiWindowSample]:
-    """연속 N개 윈도우 + horizon 뒤의 라벨을 생성한다.
-
-    Parameters
-    ----------
-    case_data: 로드된 케이스.
-    n_context: 과거 context 윈도우 수.
-    window_sec: 각 윈도우 길이 (초).
-    stride_sec: 윈도우 간 보폭 (초).
-    horizon_sec: prediction horizon (초). 0이면 마지막 context 윈도우로 라벨링.
-    map_threshold: MAP 미만이면 hypotension.
-
-    Returns
-    -------
-    list[MultiWindowSample]
-    """
-    if "abp" not in case_data.tracks:
-        return []
-
-    signal = case_data.tracks["abp"]
-    sr = DEFAULT_SR
-    win_samples = int(window_sec * sr)
-    stride_samples = int(stride_sec * sr)
-    horizon_samples = int(horizon_sec * sr)
-
-    # 모든 유효 윈도우를 시간순으로 추출
-    all_windows: list[LabeledWindow] = []
-    wins = extract_windows(case_data, "abp", window_sec, stride_sec)
-    good_wins = apply_pipeline(wins)
-    labeled = create_labeled_dataset_hypotension(good_wins, map_threshold)
-
-    if len(labeled) < n_context + (1 if horizon_sec > 0 else 0):
-        return []
-
-    # 시간순 정렬 (win_start 기준, 같은 case 내이므로 이미 정렬됨)
-    samples: list[MultiWindowSample] = []
-
-    if horizon_sec <= 0:
-        # No horizon: 연속 N개 윈도우, 마지막 윈도우가 label
-        for i in range(n_context - 1, len(labeled)):
-            context = labeled[i - n_context + 1 : i + 1]
-
-            # 연속성 체크: stride 간격으로 정렬되어 있는지 확인
-            # (extract_windows가 stride로 추출하므로 인덱스 연속이면 시간 연속)
-            samples.append(
-                MultiWindowSample(
-                    windows=context,
-                    label=context[-1].label,
-                    label_value=context[-1].label_value,
-                    case_id=case_data.case_id,
-                )
-            )
-    else:
-        # With horizon: context N개 + horizon 뒤의 윈도우에서 라벨
-        horizon_windows = int(horizon_sec / stride_sec)  # horizon에 해당하는 윈도우 수
-        total_needed = n_context + horizon_windows
-
-        for i in range(n_context - 1, len(labeled) - horizon_windows):
-            context = labeled[i - n_context + 1 : i + 1]
-            target_idx = i + horizon_windows
-
-            if target_idx >= len(labeled):
-                break
-
-            target = labeled[target_idx]
-            samples.append(
-                MultiWindowSample(
-                    windows=context,
-                    label=target.label,
-                    label_value=target.label_value,
-                    case_id=case_data.case_id,
-                )
-            )
-
-    return samples
-
-
 # ── 배치 생성 ─────────────────────────────────────────────────
 
 
-def _labeled_windows_to_samples(labeled: list[LabeledWindow]) -> list[BiosignalSample]:
+@dataclass
+class MultiSignalWindow:
+    """다중 신호 윈도우 + 라벨."""
+
+    signals: dict[str, np.ndarray]  # {"ecg": (win_samples,), "ppg": ...}
+    label: int
+    label_value: float
+    case_id: str | int
+
+
+def _multi_window_to_samples(mw: MultiSignalWindow, idx: int) -> list[BiosignalSample]:
+    """MultiSignalWindow → 신호별 BiosignalSample 리스트."""
     samples = []
-    for i, lw in enumerate(labeled):
-        stype_int = SIGNAL_TYPES.get(lw.signal_type, 1)
-        spatial_id = get_global_spatial_id(lw.signal_type, 0)
+    for ch, (sig_type, signal) in enumerate(mw.signals.items()):
+        stype_int = SIGNAL_TYPES.get(sig_type, 1)
+        spatial_id = get_global_spatial_id(sig_type, 0)
         samples.append(
             BiosignalSample(
-                values=torch.from_numpy(lw.signal).float(),
-                length=len(lw.signal),
-                channel_idx=0,
-                recording_idx=i,
+                values=torch.from_numpy(signal).float(),
+                length=len(signal),
+                channel_idx=ch,
+                recording_idx=idx,
                 sampling_rate=DEFAULT_SR,
-                n_channels=1,
+                n_channels=len(mw.signals),
                 win_start=0,
                 signal_type=stype_int,
-                session_id=f"case_{lw.case_id}",
+                session_id=f"case_{mw.case_id}",
                 spatial_id=spatial_id,
             )
         )
     return samples
 
 
-def _make_single_batches(
-    labeled: list[LabeledWindow],
+def _make_batches(
+    windows: list[MultiSignalWindow],
     batch_size: int,
     patch_size: int,
     max_length: int,
 ) -> list[tuple[PackedBatch, torch.Tensor]]:
-    """단일 윈도우 모드: (batch, labels)."""
-    batches = []
+    """(batch, labels) 리스트 생성. 다중 신호는 any_variate collate."""
+    multi = any(len(w.signals) > 1 for w in windows)
+    collate_mode = "any_variate" if multi else "ci"
     collate = PackCollate(
-        max_length=max_length, collate_mode="ci", patch_size=patch_size
+        max_length=max_length, collate_mode=collate_mode, patch_size=patch_size
     )
-    for i in range(0, len(labeled), batch_size):
-        chunk = labeled[i : i + batch_size]
-        samples = _labeled_windows_to_samples(chunk)
-        labels = torch.tensor([lw.label for lw in chunk], dtype=torch.float32)
-        batch = collate(samples)
+
+    batches = []
+    for i in range(0, len(windows), batch_size):
+        chunk = windows[i : i + batch_size]
+        all_samples = []
+        for j, mw in enumerate(chunk):
+            all_samples.extend(_multi_window_to_samples(mw, idx=i + j))
+        labels = torch.tensor([mw.label for mw in chunk], dtype=torch.float32)
+        batch = collate(all_samples)
         batches.append((batch, labels))
-    return batches
-
-
-def _make_multi_batches(
-    mw_samples: list[MultiWindowSample],
-    batch_size: int,
-    patch_size: int,
-    max_length: int,
-) -> list[tuple[list[PackedBatch], torch.Tensor]]:
-    """다중 윈도우 모드: (list[batch_per_window], labels).
-
-    각 시간 스텝의 윈도우를 별도 PackedBatch로 생성한다.
-    """
-    batches = []
-    collate = PackCollate(
-        max_length=max_length, collate_mode="ci", patch_size=patch_size
-    )
-
-    for i in range(0, len(mw_samples), batch_size):
-        chunk = mw_samples[i : i + batch_size]
-        n_ctx = len(chunk[0].windows)
-        labels = torch.tensor([s.label for s in chunk], dtype=torch.float32)
-
-        # 각 시간 스텝별로 배치 생성
-        step_batches: list[PackedBatch] = []
-        for t in range(n_ctx):
-            step_windows = [s.windows[t] for s in chunk]
-            step_samples = _labeled_windows_to_samples(step_windows)
-            step_batch = collate(step_samples)
-            step_batches.append(step_batch)
-
-        batches.append((step_batches, labels))
-
     return batches
 
 
@@ -313,16 +128,27 @@ class DummyFeatureExtractor:
         return torch.randn(B, self.d_model)
 
 
-# ── 학습/평가 (단일 윈도우) ──────────────────────────────────
+# ── Mean pooling helper ──────────────────────────────────────
 
 
-def train_probe_single(
+def _mean_pool(
+    encoded: torch.Tensor,  # (B, N, d_model)
+    patch_mask: torch.Tensor,  # (B, N)
+) -> torch.Tensor:  # (B, d_model)
+    mask_f = patch_mask.unsqueeze(-1).float()  # (B, N, 1)
+    return (encoded * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp(min=1.0)
+
+
+# ── Linear Probe (encoder frozen) ───────────────────────────
+
+
+def train_linear_probe(
     model,
-    probe,
-    train_batches,
-    epochs,
-    lr,
-    device,
+    probe: LinearProbe,
+    train_batches: list[tuple[PackedBatch, torch.Tensor]],
+    epochs: int,
+    lr: float,
+    device: torch.device,
 ) -> list[float]:
     probe = probe.to(device)
     probe.train()
@@ -350,7 +176,12 @@ def train_probe_single(
 
 
 @torch.no_grad()
-def evaluate_probe_single(model, probe, test_batches, device):
+def evaluate_linear_probe(
+    model,
+    probe: LinearProbe,
+    test_batches: list[tuple[PackedBatch, torch.Tensor]],
+    device: torch.device,
+) -> dict:
     probe.to(device).eval()
     all_labels, all_scores = [], []
     for batch, labels in test_batches:
@@ -362,39 +193,48 @@ def evaluate_probe_single(model, probe, test_batches, device):
     return _compute_metrics(np.concatenate(all_labels), np.concatenate(all_scores))
 
 
-# ── 학습/평가 (다중 윈도우) ──────────────────────────────────
+# ── LoRA fine-tuning (encoder frozen + LoRA adapters) ────────
 
 
-def train_probe_multi(
-    model,
-    probe,
-    train_batches,
-    epochs,
-    lr,
-    device,
+def train_lora(
+    model,  # DownstreamModelWrapper (with LoRA injected)
+    probe: LinearProbe,
+    train_batches: list[tuple[PackedBatch, torch.Tensor]],
+    epochs: int,
+    lr: float,
+    device: torch.device,
+    gradient_clip: float = 1.0,
 ) -> list[float]:
+    model.model.train()
     probe = probe.to(device)
     probe.train()
-    optimizer = torch.optim.Adam(probe.parameters(), lr=lr)
+
+    # LoRA params + probe params만 학습
+    lora_params = model.lora_parameters()
+    optimizer = torch.optim.AdamW([
+        {"params": lora_params, "lr": lr},
+        {"params": probe.parameters(), "lr": lr},
+    ], weight_decay=0.01)
+
     criterion = nn.BCEWithLogitsLoss()
     losses = []
 
     for epoch in range(epochs):
         epoch_loss, n = 0.0, 0
-        for step_batches, labels in train_batches:
-            # Extract features for each time step
-            step_features = []
-            for step_batch in step_batches:
-                with torch.no_grad():
-                    feat = model.extract_features(step_batch, pool="mean").to(device)
-                step_features.append(feat)
+        for batch, labels in train_batches:
+            batch = model.batch_to_device(batch)
+            out = model.model(batch, task="masked")
+            features = _mean_pool(out["encoded"], out["patch_mask"])
 
-            features = torch.stack(step_features, dim=1)  # (B, n_windows, d_model)
-            logits = probe(features)  # (B, 1)
+            logits = probe(features)
             loss = criterion(logits, labels.to(device).unsqueeze(-1))
 
             optimizer.zero_grad()
             loss.backward()
+            nn.utils.clip_grad_norm_(
+                lora_params + list(probe.parameters()),
+                gradient_clip,
+            )
             optimizer.step()
             epoch_loss += loss.item()
             n += 1
@@ -403,24 +243,84 @@ def train_probe_multi(
         losses.append(avg)
         if (epoch + 1) % 5 == 0 or epoch == 0:
             print(f"  Epoch {epoch + 1}/{epochs}  loss={avg:.4f}")
+
     return losses
 
 
 @torch.no_grad()
-def evaluate_probe_multi(model, probe, test_batches, device):
+def evaluate_lora(
+    model,
+    probe: LinearProbe,
+    test_batches: list[tuple[PackedBatch, torch.Tensor]],
+    device: torch.device,
+) -> dict:
+    model.model.eval()
     probe.to(device).eval()
     all_labels, all_scores = [], []
-    for step_batches, labels in test_batches:
-        step_features = []
-        for step_batch in step_batches:
-            feat = model.extract_features(step_batch, pool="mean").to(device)
-            step_features.append(feat)
-        features = torch.stack(step_features, dim=1)
+
+    for batch, labels in test_batches:
+        batch = model.batch_to_device(batch)
+        out = model.model(batch, task="masked")
+        features = _mean_pool(out["encoded"], out["patch_mask"])
+
         logits = probe(features)
         probs = torch.sigmoid(logits).squeeze(-1).cpu().numpy()
         all_labels.append(labels.numpy())
         all_scores.append(probs)
+
     return _compute_metrics(np.concatenate(all_labels), np.concatenate(all_scores))
+
+
+# ── From scratch (전체 파라미터 학습) ────────────────────────
+
+
+def train_from_scratch(
+    model,  # DownstreamModelWrapper (unfrozen)
+    probe: LinearProbe,
+    train_batches: list[tuple[PackedBatch, torch.Tensor]],
+    epochs: int,
+    lr: float,
+    device: torch.device,
+    gradient_clip: float = 1.0,
+) -> list[float]:
+    model.model.train()
+    probe = probe.to(device)
+    probe.train()
+
+    optimizer = torch.optim.AdamW([
+        {"params": model.model.parameters(), "lr": lr},
+        {"params": probe.parameters(), "lr": lr},
+    ], weight_decay=0.01)
+
+    criterion = nn.BCEWithLogitsLoss()
+    losses = []
+
+    for epoch in range(epochs):
+        epoch_loss, n = 0.0, 0
+        for batch, labels in train_batches:
+            batch = model.batch_to_device(batch)
+            out = model.model(batch, task="masked")
+            features = _mean_pool(out["encoded"], out["patch_mask"])
+
+            logits = probe(features)
+            loss = criterion(logits, labels.to(device).unsqueeze(-1))
+
+            optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(
+                list(model.model.parameters()) + list(probe.parameters()),
+                gradient_clip,
+            )
+            optimizer.step()
+            epoch_loss += loss.item()
+            n += 1
+
+        avg = epoch_loss / max(n, 1)
+        losses.append(avg)
+        if (epoch + 1) % 5 == 0 or epoch == 0:
+            print(f"  Epoch {epoch + 1}/{epochs}  loss={avg:.4f}")
+
+    return losses
 
 
 # ── 공통 메트릭 계산 ─────────────────────────────────────────
@@ -456,60 +356,149 @@ def _compute_metrics(y_true: np.ndarray, y_score: np.ndarray) -> dict:
     }
 
 
+# ── 데이터 로딩 ──────────────────────────────────────────────
+
+
+def _load_data(args) -> tuple[list[MultiSignalWindow], list[MultiSignalWindow]]:
+    """args에서 train/test MultiSignalWindow 리스트를 반환한다."""
+    if args.data_path and Path(args.data_path).exists():
+        print(f"\nLoading prepared data: {args.data_path}")
+        data = torch.load(args.data_path, weights_only=False)
+        meta = data.get("metadata", {})
+        print(f"  Task: {meta.get('task', '?')}, Source: {meta.get('source', '?')}")
+        print(f"  Input signals: {meta.get('input_signals', '?')}")
+        print(
+            f"  Horizon: {meta.get('horizon_sec', 0) / 60:.0f}min, "
+            f"Window: {meta.get('window_sec', '?')}s"
+        )
+
+        train_data = data["train"]
+        test_data = data["test"]
+
+        input_keys = list(train_data["signals"].keys())
+        if not input_keys:
+            print("ERROR: No signals in prepared data.", file=sys.stderr)
+            sys.exit(1)
+
+        def _pt_to_windows(split_data):
+            windows = []
+            labels_t = split_data["labels"]
+            label_values_t = split_data["label_values"]
+            n = len(labels_t)
+            for i in range(n):
+                signals = {
+                    k: split_data["signals"][k][i].numpy()
+                    for k in input_keys
+                    if k in split_data["signals"]
+                }
+                windows.append(
+                    MultiSignalWindow(
+                        signals=signals,
+                        label=int(labels_t[i].item()),
+                        label_value=float(label_values_t[i].item()),
+                        case_id=split_data["case_ids"][i]
+                        if "case_ids" in split_data
+                        else 0,
+                    )
+                )
+            return windows
+
+        return _pt_to_windows(train_data), _pt_to_windows(test_data)
+
+    elif args.data_dir and Path(args.data_dir).is_dir():
+        from downstream.classification.hypotension.prepare_data import (
+            _load_local_pt_aligned_signals,
+            extract_forecast_samples,
+        )
+
+        print(f"\nLoading from local .pt directory: {args.data_dir}")
+        input_sigs = args.input_signals
+        horizon_sec = 300.0
+        min_dur = args.window_sec + horizon_sec + args.stride_sec
+
+        cases = _load_local_pt_aligned_signals(
+            args.data_dir, input_sigs, min_dur, max_subjects=args.n_cases,
+        )
+        if not cases:
+            print("No valid cases loaded.", file=sys.stderr)
+            sys.exit(1)
+
+        rng = np.random.default_rng(42)
+        patient_ids = list({c["patient_id"] for c in cases})
+        rng.shuffle(patient_ids)
+        n_train_p = max(1, int(len(patient_ids) * args.train_ratio))
+        train_pats = set(patient_ids[:n_train_p])
+
+        train_cases = [c for c in cases if c["patient_id"] in train_pats]
+        test_cases = [c for c in cases if c["patient_id"] not in train_pats]
+        print(f"Split: {len(train_cases)} train, {len(test_cases)} test cases")
+
+        train_samples = extract_forecast_samples(
+            train_cases, input_sigs, args.window_sec, args.stride_sec, horizon_sec,
+        )
+        test_samples = extract_forecast_samples(
+            test_cases, input_sigs, args.window_sec, args.stride_sec, horizon_sec,
+        )
+
+        def _forecast_to_windows(samples):
+            windows = []
+            for s in samples:
+                windows.append(
+                    MultiSignalWindow(
+                        signals=s.input_signals,
+                        label=s.label,
+                        label_value=s.label_value,
+                        case_id=s.case_id,
+                    )
+                )
+            return windows
+
+        return _forecast_to_windows(train_samples), _forecast_to_windows(test_samples)
+
+    else:
+        print("ERROR: --data-path or --data-dir required.", file=sys.stderr)
+        sys.exit(1)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Task 1: Hypotension Prediction")
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--model-version", type=str, default="v1", choices=["v1", "v2"])
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="linear_probe",
+        choices=["linear_probe", "lora", "from_scratch"],
+        help="linear_probe: frozen encoder, lora: LoRA adapters, "
+        "from_scratch: random init encoder",
+    )
+    parser.add_argument("--lora-rank", type=int, default=8, help="LoRA rank")
+    parser.add_argument("--lora-alpha", type=float, default=16.0, help="LoRA alpha")
     parser.add_argument("--n-cases", type=int, default=20)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--window-sec", type=float, default=10.0)
-    parser.add_argument("--stride-sec", type=float, default=10.0)
+    parser.add_argument("--window-sec", type=float, default=600.0)
+    parser.add_argument("--stride-sec", type=float, default=60.0)
     parser.add_argument("--patch-size", type=int, default=DEFAULT_PATCH_SIZE)
     parser.add_argument("--train-ratio", type=float, default=0.7)
     parser.add_argument("--out-dir", type=str, default=".")
     parser.add_argument("--dummy", action="store_true")
     parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--data-path", type=str, default=None)
+    parser.add_argument("--data-dir", type=str, default=None)
     parser.add_argument(
-        "--data-path",
-        type=str,
-        default=None,
-        help="Prepared .pt file from prepare_data.py",
-    )
-    parser.add_argument(
-        "--data-dir",
-        type=str,
-        default=None,
-        help="Local .pt data directory (e.g. vitaldb_pt_test/)",
-    )
-    # Multi-window args
-    parser.add_argument(
-        "--n-context-windows",
-        type=int,
-        default=1,
-        help="과거 context 윈도우 수 (1=단일 윈도우, >1=다중)",
-    )
-    parser.add_argument(
-        "--prediction-horizon-sec",
-        type=float,
-        default=0.0,
-        help="예측 horizon (초). 0=현재 윈도우 분류",
-    )
-    parser.add_argument(
-        "--aggregator",
-        type=str,
-        default="concat",
-        choices=["concat", "lstm", "mean"],
-        help="다중 윈도우 집계 방식",
+        "--input-signals",
+        nargs="+",
+        default=["abp"],
+        choices=["abp", "ecg", "ppg"],
+        help="Input signal types (label always from ABP)",
     )
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device(args.device)
-    max_length = int(args.window_sec * DEFAULT_SR)
-    multi_mode = args.n_context_windows > 1
 
     # ── 모델 로드 ──
     if args.dummy:
@@ -522,215 +511,108 @@ def main() -> None:
         print(f"Loading checkpoint: {args.checkpoint}")
         model = DownstreamModelWrapper(args.checkpoint, args.model_version, args.device)
         d_model = model.d_model
+
+        if args.mode == "lora":
+            model.inject_lora(
+                rank=args.lora_rank,
+                alpha=args.lora_alpha,
+            )
+        elif args.mode == "from_scratch":
+            # 같은 구조, 랜덤 초기화
+            print("  Re-initializing encoder weights (from_scratch)")
+            for p in model.model.parameters():
+                if p.dim() >= 2:
+                    nn.init.xavier_uniform_(p)
+                else:
+                    nn.init.zeros_(p)
     else:
         print("ERROR: --checkpoint or --dummy required.", file=sys.stderr)
         sys.exit(1)
 
-    mode_str = (
-        f"Multi-window (n_ctx={args.n_context_windows}, "
-        f"horizon={args.prediction_horizon_sec}s, agg={args.aggregator})"
-        if multi_mode
-        else "Single-window"
-    )
-    print(f"Mode: {mode_str}")
+    sig_str = " + ".join(s.upper() for s in args.input_signals)
+    print(f"Mode: {args.mode} | Input: {sig_str} | Window: {args.window_sec}s")
 
     # ── 데이터 로드 ──
-    if args.data_path and Path(args.data_path).exists():
-        # Prepared .pt 파일에서 로드 (prepare_data.py로 생성)
-        print(f"\nLoading prepared data: {args.data_path}")
-        data = torch.load(args.data_path, weights_only=False)
-        meta = data.get("metadata", {})
-        print(f"  Task: {meta.get('task', '?')}, Source: {meta.get('source', '?')}")
-        print(f"  Input signals: {meta.get('input_signals', '?')}")
-        print(
-            f"  Horizon: {meta.get('horizon_sec', 0) / 60:.0f}min, Window: {meta.get('window_sec', '?')}s"
-        )
+    train_labeled, test_labeled = _load_data(args)
 
-        # train/test signals + labels 추출
-        train_data = data["train"]
-        test_data = data["test"]
+    n_pos_train = sum(1 for lw in train_labeled if lw.label == 1)
+    n_pos_test = sum(1 for lw in test_labeled if lw.label == 1)
+    print(
+        f"  Train: {len(train_labeled)} samples "
+        f"({n_pos_train} hypo, {n_pos_train / max(len(train_labeled), 1) * 100:.1f}%)"
+    )
+    print(
+        f"  Test:  {len(test_labeled)} samples "
+        f"({n_pos_test} hypo, {n_pos_test / max(len(test_labeled), 1) * 100:.1f}%)"
+    )
 
-        # signals에서 첫 번째 signal type의 텐서 사용
-        input_keys = list(train_data["signals"].keys())
-        if not input_keys:
-            print("ERROR: No signals in prepared data.", file=sys.stderr)
-            sys.exit(1)
-
-        # 각 signal을 LabeledWindow로 변환
-        def _pt_to_labeled(split_data):
-            labeled = []
-            sig_key = input_keys[0]
-            signals_t = split_data["signals"][sig_key]  # (N, win_samples)
-            labels_t = split_data["labels"]  # (N,)
-            label_values_t = split_data["label_values"]  # (N,)
-            for i in range(len(labels_t)):
-                labeled.append(
-                    LabeledWindow(
-                        signal=signals_t[i].numpy(),
-                        signal_type=sig_key,
-                        case_id=split_data["case_ids"][i]
-                        if "case_ids" in split_data
-                        else 0,
-                        label=int(labels_t[i].item()),
-                        label_value=float(label_values_t[i].item()),
-                    )
-                )
-            return labeled
-
-        train_labeled = _pt_to_labeled(train_data)
-        test_labeled = _pt_to_labeled(test_data)
-
-        n_pos_train = sum(1 for lw in train_labeled if lw.label == 1)
-        n_pos_test = sum(1 for lw in test_labeled if lw.label == 1)
-        print(
-            f"  Train: {len(train_labeled)} samples ({n_pos_train} hypo, {n_pos_train / max(len(train_labeled), 1) * 100:.1f}%)"
-        )
-        print(
-            f"  Test:  {len(test_labeled)} samples ({n_pos_test} hypo, {n_pos_test / max(len(test_labeled), 1) * 100:.1f}%)"
-        )
-
-        if not train_labeled or not test_labeled:
-            print("Insufficient data.", file=sys.stderr)
-            sys.exit(1)
-
-        max_length = len(train_labeled[0].signal)
-        train_batches = _make_single_batches(
-            train_labeled, args.batch_size, args.patch_size, max_length
-        )
-        test_batches = _make_single_batches(
-            test_labeled, args.batch_size, args.patch_size, max_length
-        )
-
-        probe = LinearProbe(d_model, n_classes=1)
-        print(f"\nTraining LinearProbe (d_model={d_model})...")
-        train_losses = train_probe_single(
-            model, probe, train_batches, args.epochs, args.lr, device
-        )
-
-        print("\nEvaluating...")
-        metrics = evaluate_probe_single(model, probe, test_batches, device)
-
-    elif args.data_dir and Path(args.data_dir).is_dir():
-        # ── 로컬 .pt 디렉토리에서 로딩 → prepare_data로 변환 후 사용 ──
-        from downstream.classification.hypotension.prepare_data import (
-            _load_local_pt_aligned_signals,
-            extract_forecast_samples,
-        )
-
-        print(f"\nLoading from local .pt directory: {args.data_dir}")
-        input_sigs = ["abp"]
-        horizon_sec = (
-            args.prediction_horizon_sec if args.prediction_horizon_sec > 0 else 300.0
-        )
-        min_dur = args.window_sec + horizon_sec + args.stride_sec
-
-        cases = _load_local_pt_aligned_signals(
-            args.data_dir,
-            input_sigs,
-            min_dur,
-            max_subjects=args.n_cases,
-        )
-        if not cases:
-            print("No valid cases loaded.", file=sys.stderr)
-            sys.exit(1)
-
-        # Patient-level split
-        rng = np.random.default_rng(42)
-        patient_ids = list({c["patient_id"] for c in cases})
-        rng.shuffle(patient_ids)
-        n_train_p = max(1, int(len(patient_ids) * args.train_ratio))
-        train_pats = set(patient_ids[:n_train_p])
-
-        train_cases = [c for c in cases if c["patient_id"] in train_pats]
-        test_cases = [c for c in cases if c["patient_id"] not in train_pats]
-        print(f"Split: {len(train_cases)} train, {len(test_cases)} test cases")
-
-        train_samples = extract_forecast_samples(
-            train_cases,
-            input_sigs,
-            args.window_sec,
-            args.stride_sec,
-            horizon_sec,
-        )
-        test_samples = extract_forecast_samples(
-            test_cases,
-            input_sigs,
-            args.window_sec,
-            args.stride_sec,
-            horizon_sec,
-        )
-
-        # Convert to LabeledWindow for batching
-        def _forecast_to_labeled(samples):
-            labeled = []
-            for s in samples:
-                sig_key = list(s.input_signals.keys())[0]
-                labeled.append(
-                    LabeledWindow(
-                        signal=s.input_signals[sig_key],
-                        signal_type=sig_key,
-                        case_id=s.case_id,
-                        label=s.label,
-                        label_value=s.label_value,
-                    )
-                )
-            return labeled
-
-        train_labeled = _forecast_to_labeled(train_samples)
-        test_labeled = _forecast_to_labeled(test_samples)
-
-        n_pos_train = sum(1 for lw in train_labeled if lw.label == 1)
-        n_pos_test = sum(1 for lw in test_labeled if lw.label == 1)
-        print(
-            f"Train: {len(train_labeled)} samples ({n_pos_train} hypo, {n_pos_train / max(len(train_labeled), 1) * 100:.1f}%)"
-        )
-        print(
-            f"Test:  {len(test_labeled)} samples ({n_pos_test} hypo, {n_pos_test / max(len(test_labeled), 1) * 100:.1f}%)"
-        )
-
-        if not train_labeled or not test_labeled:
-            print("Insufficient data.", file=sys.stderr)
-            sys.exit(1)
-
-        max_length = len(train_labeled[0].signal)
-        train_batches = _make_single_batches(
-            train_labeled, args.batch_size, args.patch_size, max_length
-        )
-        test_batches = _make_single_batches(
-            test_labeled, args.batch_size, args.patch_size, max_length
-        )
-
-        probe = LinearProbe(d_model, n_classes=1)
-        print(f"\nTraining LinearProbe (d_model={d_model})...")
-        train_losses = train_probe_single(
-            model, probe, train_batches, args.epochs, args.lr, device
-        )
-
-        print("\nEvaluating...")
-        metrics = evaluate_probe_single(model, probe, test_batches, device)
-
-    else:
-        print("ERROR: --data-path or --data-dir required.", file=sys.stderr)
+    if not train_labeled or not test_labeled:
+        print("Insufficient data.", file=sys.stderr)
         sys.exit(1)
+
+    first_sig = next(iter(train_labeled[0].signals.values()))
+    max_length = len(first_sig)
+    train_batches = _make_batches(
+        train_labeled, args.batch_size, args.patch_size, max_length
+    )
+    test_batches = _make_batches(
+        test_labeled, args.batch_size, args.patch_size, max_length
+    )
+
+    # ── 학습 ──
+    probe = LinearProbe(d_model, n_classes=1)
+
+    if args.mode == "linear_probe":
+        print(f"\nTraining LinearProbe (frozen encoder, d_model={d_model})...")
+        train_losses = train_linear_probe(
+            model, probe, train_batches, args.epochs, args.lr, device
+        )
+        print("\nEvaluating...")
+        metrics = evaluate_linear_probe(model, probe, test_batches, device)
+
+    elif args.mode == "lora":
+        n_lora = sum(p.numel() for p in model.lora_parameters())
+        n_probe = sum(p.numel() for p in probe.parameters())
+        print(f"\nTraining LoRA + Probe (rank={args.lora_rank}, "
+              f"LoRA={n_lora:,} + Probe={n_probe:,} params)...")
+        train_losses = train_lora(
+            model, probe, train_batches, args.epochs, args.lr, device
+        )
+        print("\nEvaluating...")
+        metrics = evaluate_lora(model, probe, test_batches, device)
+
+    elif args.mode == "from_scratch":
+        model.unfreeze_encoder()
+        n_total = sum(p.numel() for p in model.model.parameters())
+        n_probe = sum(p.numel() for p in probe.parameters())
+        print(f"\nFrom scratch (encoder={n_total:,} + probe={n_probe:,} params)...")
+        train_losses = train_from_scratch(
+            model, probe, train_batches, args.epochs, args.lr, device
+        )
+        print("\nEvaluating...")
+        metrics = evaluate_lora(model, probe, test_batches, device)
 
     # ── 결과 출력 ──
     y_true = metrics.pop("y_true")
     y_score = metrics.pop("y_score")
 
     print(f"\n{'=' * 50}")
+    print(f"  Mode:        {args.mode}")
     print(f"  AUROC:       {metrics['auroc']:.4f}")
     print(f"  AUPRC:       {metrics['auprc']:.4f}")
     print(f"  Threshold:   {metrics['optimal_threshold']:.3f}")
     print(f"  Sensitivity: {metrics['sensitivity']:.4f}")
     print(f"  Specificity: {metrics['specificity']:.4f}")
     print(
-        f"  Prevalence:  {metrics['prevalence']:.3f} ({metrics['n_positive']}/{metrics['n_total']})"
+        f"  Prevalence:  {metrics['prevalence']:.3f} "
+        f"({metrics['n_positive']}/{metrics['n_total']})"
     )
     print(f"{'=' * 50}")
 
-    roc_path = out_dir / "task1_roc_curve.png"
+    roc_path = out_dir / f"task1_roc_{args.mode}.png"
     plot_roc_curve(
-        y_true, y_score, roc_path, title="Task 1: Hypotension Prediction — ROC Curve"
+        y_true, y_score, roc_path,
+        title=f"Task 1: Hypotension — {args.mode} ROC",
     )
     print(f"\nROC curve saved: {roc_path}")
 
@@ -738,18 +620,19 @@ def main() -> None:
         **metrics,
         "train_losses": train_losses,
         "config": {
+            "mode": args.mode,
+            "input_signals": args.input_signals,
+            "lora_rank": args.lora_rank if args.mode == "lora" else None,
+            "lora_alpha": args.lora_alpha if args.mode == "lora" else None,
             "n_cases": args.n_cases,
             "window_sec": args.window_sec,
             "stride_sec": args.stride_sec,
             "epochs": args.epochs,
             "lr": args.lr,
             "train_ratio": args.train_ratio,
-            "n_context_windows": args.n_context_windows,
-            "prediction_horizon_sec": args.prediction_horizon_sec,
-            "aggregator": args.aggregator if multi_mode else "linear",
         },
     }
-    results_path = out_dir / "task1_results.json"
+    results_path = out_dir / f"task1_results_{args.mode}.json"
     with open(results_path, "w") as f:
         json.dump(results, f, indent=2)
     print(f"Results saved: {results_path}")

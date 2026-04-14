@@ -10,13 +10,15 @@ Input 소스: 선택된 signal type의 현재 윈도우
 데이터 소스: 로컬 전처리된 .pt 파일 (vitaldb_pt_test/)
 
 사용법:
-    # ABP 입력, 5분 후 예측
+    # 단일 조합
     python -m downstream.classification.hypotension.prepare_data \
-        --data-dir vitaldb_pt_test --input-signals abp --horizon-min 5
+        --data-dir vitaldb_pt_test --input-signals abp \
+        --window-secs 30 --horizon-mins 5
 
-    # ECG+PPG 입력, 10분 후 예측
+    # Sweep: window × horizon 전체 조합 생성
     python -m downstream.classification.hypotension.prepare_data \
-        --data-dir vitaldb_pt_test --input-signals ecg ppg --horizon-min 10
+        --data-dir vitaldb_pt_test --input-signals abp \
+        --window-secs 30 60 300 600 --horizon-mins 5 10 15
 """
 
 from __future__ import annotations
@@ -351,7 +353,8 @@ def save_dataset(
 
     mode_str = "_".join(input_signals)
     horizon_min = int(horizon_sec / 60)
-    filename = f"task1_hypotension_{mode_str}_h{horizon_min}min.pt"
+    win_int = int(window_sec)
+    filename = f"task1_hypotension_{mode_str}_w{win_int}s_h{horizon_min}min.pt"
     save_path = out_path / filename
     torch.save(save_dict, save_path)
 
@@ -389,62 +392,47 @@ def print_stats(
 # ---- 메인 ----
 
 
-def prepare_hypotension_forecast(
+def prepare_hypotension_sweep(
     data_dir: str,
-    input_signals: list[str] | None = None,
-    max_subjects: int | None = None,
-    horizon_min: float = 5.0,
-    window_sec: float = 30.0,
+    input_signals: list[str],
+    window_secs: list[float],
+    horizon_mins: list[float],
     stride_sec: float = 30.0,
     train_ratio: float = 0.7,
+    max_subjects: int | None = None,
     out_dir: str = "outputs/downstream/hypotension",
-) -> Path:
-    """Hypotension forecast 데이터를 준비한다.
+) -> list[Path]:
+    """(window, horizon) 조합을 sweep하여 데이터셋을 생성한다.
 
-    Parameters
-    ----------
-    data_dir : 로컬 .pt 데이터 디렉토리 (vitaldb_pt_test/).
-    input_signals : 입력 signal types. None이면 ["abp"].
-    max_subjects : 최대 subject 수. None이면 전체.
-    horizon_min : prediction horizon (분).
-    window_sec : 입력 윈도우 길이 (초).
-    stride_sec : 슬라이드 보폭 (초).
-    train_ratio : train/test 분할 비율.
-    out_dir : 저장 디렉토리.
+    데이터 로딩과 train/test 분할은 한번만 수행하고,
+    윈도우 추출 + 라벨링만 조합별로 반복한다.
     """
-    if input_signals is None:
-        input_signals = ["abp"]
+    # ── 1. 데이터 로딩 (1회) ──
+    # 가장 긴 window + horizon 기준으로 min_duration 설정
+    max_window = max(window_secs)
+    max_horizon_sec = max(horizon_mins) * 60.0
+    min_duration_sec = max_window + max_horizon_sec + stride_sec
 
-    horizon_sec = horizon_min * 60.0
-    # window + horizon + 여유분 (최소 1 stride)
-    min_duration_sec = window_sec + horizon_sec + stride_sec
     mode_str = " + ".join(s.upper() for s in input_signals)
-
-    print(f"{'=' * 60}")
-    print("  Task 1: Hypotension Forecast")
+    print(f"\n{'=' * 60}")
+    print(f"  Task 1: Hypotension Forecast — Sweep")
     print(f"  Data:    {data_dir}")
     print(f"  Input:   {mode_str}")
-    print(f"  Horizon: {horizon_min} min")
-    print(f"  Window:  {window_sec}s, Stride: {stride_sec}s")
-    print("  Label:   MAP<65 sustained >=1min")
+    print(f"  Windows: {window_secs}")
+    print(f"  Horizons: {horizon_mins}")
     print(f"  Min duration: {min_duration_sec / 60:.1f} min")
     print(f"{'=' * 60}")
 
-    # 1. 데이터 로드
-    print("\n[1/4] Loading aligned multi-channel data...")
+    print("\n[1/3] Loading aligned multi-channel data (once)...")
     cases = _load_local_pt_aligned_signals(
-        data_dir,
-        input_signals,
-        min_duration_sec,
-        max_subjects,
+        data_dir, input_signals, min_duration_sec, max_subjects,
     )
-
     if not cases:
         print("ERROR: No valid cases loaded.", file=sys.stderr)
         sys.exit(1)
 
-    # 2. Train/Test 분할 (patient 단위)
-    print(f"\n[2/4] Splitting by patient (ratio={train_ratio})...")
+    # ── 2. Train/Test 분할 (1회) ──
+    print(f"\n[2/3] Splitting by patient (ratio={train_ratio})...")
     rng = np.random.default_rng(42)
     patient_ids = list({c["patient_id"] for c in cases})
     rng.shuffle(patient_ids)
@@ -454,51 +442,41 @@ def prepare_hypotension_forecast(
     train_cases = [c for c in cases if c["patient_id"] in train_patients]
     test_cases = [c for c in cases if c["patient_id"] not in train_patients]
     print(f"  Train: {len(train_cases)} cases ({len(train_patients)} patients)")
-    print(
-        f"  Test:  {len(test_cases)} cases ({len(patient_ids) - len(train_patients)} patients)"
-    )
+    print(f"  Test:  {len(test_cases)} cases ({len(patient_ids) - n_train_patients} patients)")
 
-    # 3. 윈도우 추출 + 라벨링
-    print(
-        f"\n[3/4] Extracting forecast samples (horizon={horizon_min}min, sustained>=1min)..."
-    )
-    train_samples = extract_forecast_samples(
-        train_cases,
-        input_signals,
-        window_sec,
-        stride_sec,
-        horizon_sec,
-    )
-    test_samples = extract_forecast_samples(
-        test_cases,
-        input_signals,
-        window_sec,
-        stride_sec,
-        horizon_sec,
-    )
+    # ── 3. 조합별 윈도우 추출 + 저장 ──
+    combos = [(w, h) for w in window_secs for h in horizon_mins]
+    print(f"\n[3/3] Generating {len(combos)} datasets...")
 
-    print_stats("Train", train_samples)
-    print_stats("Test", test_samples)
+    saved_paths: list[Path] = []
+    for i, (window_sec, horizon_min) in enumerate(combos, 1):
+        horizon_sec = horizon_min * 60.0
+        print(f"\n  [{i}/{len(combos)}] window={window_sec}s, horizon={horizon_min}min")
 
-    if not train_samples and not test_samples:
-        print("ERROR: No samples extracted.", file=sys.stderr)
-        sys.exit(1)
+        train_samples = extract_forecast_samples(
+            train_cases, input_signals, window_sec, stride_sec, horizon_sec,
+        )
+        test_samples = extract_forecast_samples(
+            test_cases, input_signals, window_sec, stride_sec, horizon_sec,
+        )
 
-    # 4. 저장
-    print("\n[4/4] Saving...")
-    save_path = save_dataset(
-        train_samples,
-        test_samples,
-        input_signals,
-        horizon_sec,
-        window_sec,
-        out_dir,
-    )
+        print_stats("    Train", train_samples)
+        print_stats("    Test", test_samples)
+
+        if not train_samples and not test_samples:
+            print("    SKIP: No samples extracted.")
+            continue
+
+        save_path = save_dataset(
+            train_samples, test_samples, input_signals,
+            horizon_sec, window_sec, out_dir,
+        )
+        saved_paths.append(save_path)
 
     print(f"\n{'=' * 60}")
-    print(f"  Done! {save_path}")
+    print(f"  Done! {len(saved_paths)}/{len(combos)} datasets saved to {out_dir}")
     print(f"{'=' * 60}")
-    return save_path
+    return saved_paths
 
 
 def main() -> None:
@@ -525,10 +503,18 @@ def main() -> None:
         help="Max number of subjects to load (None=all)",
     )
     parser.add_argument(
-        "--horizon-min", type=float, default=5.0, help="Prediction horizon in minutes"
+        "--horizon-mins",
+        nargs="+",
+        type=float,
+        default=[5.0],
+        help="Prediction horizons in minutes (e.g. 5 10 15)",
     )
     parser.add_argument(
-        "--window-sec", type=float, default=30.0, help="Input window length in seconds"
+        "--window-secs",
+        nargs="+",
+        type=float,
+        default=[30.0],
+        help="Input window lengths in seconds (e.g. 30 60 300 600)",
     )
     parser.add_argument(
         "--stride-sec",
@@ -547,14 +533,14 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    prepare_hypotension_forecast(
+    prepare_hypotension_sweep(
         data_dir=args.data_dir,
         input_signals=args.input_signals,
-        max_subjects=args.max_subjects,
-        horizon_min=args.horizon_min,
-        window_sec=args.window_sec,
+        window_secs=args.window_secs,
+        horizon_mins=args.horizon_mins,
         stride_sec=args.stride_sec,
         train_ratio=args.train_ratio,
+        max_subjects=args.max_subjects,
         out_dir=args.out_dir,
     )
 
