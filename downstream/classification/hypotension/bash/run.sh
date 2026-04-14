@@ -1,11 +1,11 @@
 #!/bin/bash
-# Hypotension Prediction — 전체 실험 실행 스크립트
-# 6가지 신호 조합 × 4 windows × 3 horizons × 2 modes = 144 실험
+# Hypotension Prediction — 전체 실험 실행 스크립트 (Paired Comparison)
+# 4가지 신호 조합 × 4 windows × 3 horizons × 2 modes = 96 실험
 #
 # 사전 조건: prepare_data.sh로 .pt 데이터셋이 생성되어 있어야 함
 #
 # 사용법:
-#   bash downstream/classification/hypotension/run.sh
+#   bash downstream/classification/hypotension/bash/run.sh
 
 set -e
 
@@ -25,8 +25,8 @@ LORA_LR=1e-4
 LORA_RANK=8
 LORA_ALPHA=16
 
-# ── 실험 조합 ──
-SIGNAL_COMBOS=("abp" "ecg" "ppg" "ecg_ppg" "ecg_abp" "ecg_ppg_abp")
+# ── 실험 조합 (Paired: 동일 환자 풀) ──
+SIGNAL_COMBOS=("abp" "ecg" "ecg_ppg" "ecg_ppg_abp")
 WINDOWS=(30 60 300 600)
 HORIZONS=(5 10 15)
 MODES=("linear_probe" "lora")
@@ -35,7 +35,7 @@ TOTAL=$(( ${#SIGNAL_COMBOS[@]} * ${#WINDOWS[@]} * ${#HORIZONS[@]} * ${#MODES[@]}
 COUNT=0
 
 echo "============================================================"
-echo "  Hypotension Prediction — Experiment Sweep"
+echo "  Hypotension Prediction — Paired Comparison Experiment Sweep"
 echo "  Checkpoint: $CHECKPOINT"
 echo "  Data:       $DATA_DIR"
 echo "  Output:     $OUT_DIR"

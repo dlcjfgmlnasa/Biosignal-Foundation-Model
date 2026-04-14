@@ -92,6 +92,7 @@ def _load_local_pt_aligned_signals(
     input_signals: list[str],
     min_duration_sec: float = 1200.0,
     max_subjects: int | None = None,
+    required_signals: list[str] | None = None,
 ) -> list[dict]:
     """로컬 .pt 디렉토리에서 시간 정렬된 다채널 데이터를 로드한다.
 
@@ -101,6 +102,9 @@ def _load_local_pt_aligned_signals(
     input_signals : 입력으로 사용할 signal types (예: ["ecg", "ppg"]).
     min_duration_sec : 최소 유효 신호 길이 (초).
     max_subjects : 최대 subject 수. None이면 전체.
+    required_signals : 로딩 시 반드시 존재해야 하는 signal types.
+        None이면 input_signals + abp. Paired comparison을 위해
+        모든 조합에서 동일 환자를 사용하려면 ["ecg", "ppg", "abp"] 지정.
 
     Returns
     -------
@@ -111,7 +115,10 @@ def _load_local_pt_aligned_signals(
         print(f"  ERROR: Data directory not found: {root}")
         return []
 
-    required_types = set(input_signals) | {"abp"}
+    if required_signals is not None:
+        required_types = set(required_signals) | {"abp"}
+    else:
+        required_types = set(input_signals) | {"abp"}
 
     subject_dirs = sorted([d for d in root.iterdir() if d.is_dir()])
     if max_subjects is not None:
@@ -401,6 +408,7 @@ def prepare_hypotension_sweep(
     train_ratio: float = 0.7,
     max_subjects: int | None = None,
     out_dir: str = "outputs/downstream/hypotension",
+    required_signals: list[str] | None = None,
 ) -> list[Path]:
     """(window, horizon) 조합을 sweep하여 데이터셋을 생성한다.
 
@@ -414,10 +422,12 @@ def prepare_hypotension_sweep(
     min_duration_sec = max_window + max_horizon_sec + stride_sec
 
     mode_str = " + ".join(s.upper() for s in input_signals)
+    req_str = " + ".join(s.upper() for s in required_signals) if required_signals else "auto"
     print(f"\n{'=' * 60}")
     print(f"  Task 1: Hypotension Forecast — Sweep")
     print(f"  Data:    {data_dir}")
     print(f"  Input:   {mode_str}")
+    print(f"  Required: {req_str}")
     print(f"  Windows: {window_secs}")
     print(f"  Horizons: {horizon_mins}")
     print(f"  Min duration: {min_duration_sec / 60:.1f} min")
@@ -426,6 +436,7 @@ def prepare_hypotension_sweep(
     print("\n[1/3] Loading aligned multi-channel data (once)...")
     cases = _load_local_pt_aligned_signals(
         data_dir, input_signals, min_duration_sec, max_subjects,
+        required_signals=required_signals,
     )
     if not cases:
         print("ERROR: No valid cases loaded.", file=sys.stderr)
@@ -531,6 +542,14 @@ def main() -> None:
         default="outputs/downstream/hypotension",
         help="Output directory",
     )
+    parser.add_argument(
+        "--required-signals",
+        nargs="+",
+        default=None,
+        choices=["abp", "ecg", "ppg"],
+        help="Signals required for loading (paired comparison). "
+        "e.g. --required-signals ecg ppg abp ensures all combos use same patients.",
+    )
     args = parser.parse_args()
 
     prepare_hypotension_sweep(
@@ -542,6 +561,7 @@ def main() -> None:
         train_ratio=args.train_ratio,
         max_subjects=args.max_subjects,
         out_dir=args.out_dir,
+        required_signals=args.required_signals,
     )
 
 
