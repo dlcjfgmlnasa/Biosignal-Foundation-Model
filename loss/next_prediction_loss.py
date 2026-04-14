@@ -206,14 +206,37 @@ class NextPredictionLoss(nn.Module):
             return {"mse": zero, "spec": zero, "total": zero}
 
         # Target signal type에 맞는 prediction 선택
+        source_st = patch_signal_types[b_idx, i_idx]  # (K,)
         target_st = patch_signal_types[b_idx, j_idx]  # (K,)
         pred_p = cross_pred_per_type[b_idx, i_idx, target_st]  # (K, P)
         target_p = original_patches[b_idx, j_idx]  # (K, P)
 
-        return compute_patch_loss(
-            pred_p,
-            target_p,
-            peak_alpha=self.peak_alpha,
-            lambda_spec=self.lambda_spec,
-            spec_n_ffts=self.spec_n_ffts,
-        )
+        # 쌍 타입별 균등 가중 평균 (pair-balanced loss)
+        # pair_key: (source_type, target_type) → 쌍 타입 식별
+        pair_key = source_st * _MAX_ST + target_st  # (K,)
+        unique_pairs = pair_key.unique()
+
+        mse_sum = pred_p.new_tensor(0.0)
+        spec_sum = pred_p.new_tensor(0.0)
+        total_sum = pred_p.new_tensor(0.0)
+        n_pairs = 0
+
+        for pk in unique_pairs:
+            mask = pair_key == pk
+            pair_loss = compute_patch_loss(
+                pred_p[mask],
+                target_p[mask],
+                peak_alpha=self.peak_alpha,
+                lambda_spec=self.lambda_spec,
+                spec_n_ffts=self.spec_n_ffts,
+            )
+            mse_sum = mse_sum + pair_loss["mse"]
+            spec_sum = spec_sum + pair_loss["spec"]
+            total_sum = total_sum + pair_loss["total"]
+            n_pairs += 1
+
+        return {
+            "mse": mse_sum / max(n_pairs, 1),
+            "spec": spec_sum / max(n_pairs, 1),
+            "total": total_sum / max(n_pairs, 1),
+        }
