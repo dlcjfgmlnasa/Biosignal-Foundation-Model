@@ -8,7 +8,7 @@
 set -e
 
 DATA_DIR=/home/coder/workspace/updown/bio_fm/data/test/vitaldb
-OUT_DIR=/home/coder/workspace/updown/bio_fm/outputs/downstream/hypotension
+OUT_DIR=/home/coder/workspace/updown/bio_fm/data/downstream/hypotension
 WINDOWS="30 60 300 600"
 HORIZONS="5 10 15"
 
