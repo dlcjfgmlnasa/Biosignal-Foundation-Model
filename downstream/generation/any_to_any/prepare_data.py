@@ -7,6 +7,7 @@ run.py에서 오프라인으로 로드하여 평가에 사용.
 데이터 소스:
   - VitalDB (수술중 모니터링, 내부 평가)
   - MIMIC-III Waveform (ICU, 외부 평가)
+  - local: 미리 파싱된 .pt 디렉토리 (parser 출력물)
 
 사용법:
     # VitalDB, 기본 4채널 (ecg, abp, ppg, cvp), 10케이스
@@ -16,6 +17,11 @@ run.py에서 오프라인으로 로드하여 평가에 사용.
     # MIMIC-III, 3채널 (ecg, abp, ppg), 5케이스
     python -m downstream.generation.any_to_any.prepare_data \
         --source mimic3 --signal-types ecg abp ppg --n-cases 5
+
+    # Local .pt directory (e.g. mimic3_ext_ppg parser output)
+    python -m downstream.generation.any_to_any.prepare_data \
+        --source local --data-dir /path/to/parsed_dir \
+        --signal-types ecg abp ppg --n-cases 20
 
     # 짧은 윈도우, 좁은 stride
     python -m downstream.generation.any_to_any.prepare_data \
@@ -244,6 +250,154 @@ def _load_vitaldb_cases(
     return cases
 
 
+# ---- Local .pt directory 로더 ----
+
+
+def _load_local_pt_cases(
+    data_dir: str,
+    signal_types: list[str],
+    min_duration_sec: float = 600.0,
+    max_subjects: int | None = None,
+) -> list[dict]:
+    """로컬 .pt 디렉토리에서 시간 정렬된 다채널 데이터를 로드한다.
+
+    manifest.json을 읽고, 각 subject의 signal type별 .pt 파일을 로드한다.
+    parser 출력 디렉토리 구조::
+
+        data_dir/
+            manifest.json     # [{"subject_id": "...", "files": {"ecg": "path", ...}, ...}, ...]
+            subjectA/
+                ecg.pt        # {"values": Tensor(T,), "sampling_rate": 100.0, ...}
+                abp.pt
+                ppg.pt
+
+    manifest.json이 없으면, 디렉토리 구조를 직접 스캔한다.
+    (subject 디렉토리 아래 {signal_type}.pt 파일)
+
+    Returns
+    -------
+    list of {"case_id": str, "patient_id": str, "signals": {stype: np.array}}
+    """
+    import json as _json
+
+    data_path = Path(data_dir)
+    if not data_path.is_dir():
+        print(f"  ERROR: data_dir not found: {data_dir}")
+        return []
+
+    min_samples = int(min_duration_sec * TARGET_SR)
+    manifest_file = data_path / "manifest.json"
+
+    subjects: list[dict] = []
+
+    if manifest_file.exists():
+        # manifest.json 기반 로드
+        with open(manifest_file) as f:
+            manifest = _json.load(f)
+
+        for entry in manifest:
+            subject_id = entry.get("subject_id", entry.get("record_id", "unknown"))
+            files = entry.get("files", {})
+
+            # signal_types 중 필요한 파일이 모두 있는지 확인
+            has_all = True
+            for st in signal_types:
+                if st not in files:
+                    has_all = False
+                    break
+            if not has_all:
+                continue
+
+            subjects.append({"subject_id": str(subject_id), "files": files})
+    else:
+        # 디렉토리 스캔: subject_dir/{signal_type}.pt
+        print(f"  No manifest.json, scanning directories...")
+        for sub_dir in sorted(data_path.iterdir()):
+            if not sub_dir.is_dir():
+                continue
+            files = {}
+            has_all = True
+            for st in signal_types:
+                pt_file = sub_dir / f"{st}.pt"
+                if pt_file.exists():
+                    files[st] = str(pt_file)
+                else:
+                    has_all = False
+                    break
+            if has_all:
+                subjects.append({"subject_id": sub_dir.name, "files": files})
+
+    if max_subjects is not None:
+        subjects = subjects[:max_subjects]
+
+    print(f"  Found {len(subjects)} subjects with {signal_types}")
+
+    cases = []
+    for i, subj in enumerate(subjects):
+        subject_id = subj["subject_id"]
+        files = subj["files"]
+
+        signals = {}
+        valid = True
+
+        for st in signal_types:
+            file_path = files[st]
+            # Resolve relative paths against data_dir
+            fp = Path(file_path)
+            if not fp.is_absolute():
+                fp = data_path / fp
+
+            try:
+                pt_data = torch.load(str(fp), weights_only=False)
+            except Exception as e:
+                print(f"  [{i + 1}] {subject_id}: SKIP ({st} load error: {e})")
+                valid = False
+                break
+
+            # Extract values tensor
+            if isinstance(pt_data, dict):
+                values = pt_data.get("values", pt_data.get("signal", None))
+                if values is None:
+                    # Try first tensor value
+                    for v in pt_data.values():
+                        if isinstance(v, torch.Tensor):
+                            values = v
+                            break
+            elif isinstance(pt_data, torch.Tensor):
+                values = pt_data
+            else:
+                print(f"  [{i + 1}] {subject_id}: SKIP ({st} unknown format)")
+                valid = False
+                break
+
+            if values is None or values.numel() < min_samples:
+                valid = False
+                break
+
+            signals[st] = values.numpy().astype(np.float64).ravel()
+
+        if not valid:
+            continue
+
+        # Align to same length
+        min_len = min(len(s) for s in signals.values())
+        if min_len < min_samples:
+            continue
+        signals = {k: v[:min_len] for k, v in signals.items()}
+
+        dur_min = min_len / TARGET_SR / 60
+        print(f"  [{i + 1}] {subject_id}: OK ({dur_min:.1f}min, {len(signals)} ch)")
+
+        cases.append({
+            "case_id": f"local_{subject_id}",
+            "patient_id": str(subject_id),
+            "signals": signals,
+        })
+
+    print(f"  Loaded {len(cases)} cases")
+    return cases
+
+
 # ---- 윈도우 추출 ----
 
 
@@ -383,12 +537,13 @@ def prepare_any_to_any(
     train_ratio: float = 0.7,
     out_dir: str = "outputs/downstream/any_to_any",
     manifest_path: str | None = None,
+    data_dir: str | None = None,
 ) -> Path:
     """Any-to-Any cross-modal 평가 데이터를 준비한다.
 
     Parameters
     ----------
-    source : "vitaldb" 또는 "mimic3".
+    source : "vitaldb", "mimic3", 또는 "local".
     signal_types : 추출할 signal type 목록. None이면 ["ecg", "abp", "ppg", "cvp"].
     n_cases : 로드할 케이스 수.
     window_sec : 윈도우 길이 (초).
@@ -396,6 +551,7 @@ def prepare_any_to_any(
     train_ratio : patient 단위 train/test 분할 비율.
     out_dir : 저장 디렉토리.
     manifest_path : MIMIC-III manifest 경로.
+    data_dir : local source 시 .pt 디렉토리 경로.
     """
     if signal_types is None:
         signal_types = ["ecg", "abp", "ppg", "cvp"]
@@ -425,6 +581,16 @@ def prepare_any_to_any(
             n_cases,
             signal_types,
             min_duration_sec,
+        )
+    elif source == "local":
+        if not data_dir:
+            print("ERROR: --data-dir required for source=local", file=sys.stderr)
+            sys.exit(1)
+        cases = _load_local_pt_cases(
+            data_dir,
+            signal_types,
+            min_duration_sec,
+            max_subjects=n_cases,
         )
     else:
         print(f"ERROR: Unknown source '{source}'", file=sys.stderr)
@@ -493,8 +659,14 @@ def main() -> None:
         "--source",
         type=str,
         default="vitaldb",
-        choices=["mimic3", "vitaldb"],
+        choices=["mimic3", "vitaldb", "local"],
         help="Data source",
+    )
+    parser.add_argument(
+        "--data-dir",
+        type=str,
+        default=None,
+        help="Local .pt directory path (required for source=local)",
     )
     parser.add_argument(
         "--signal-types",
@@ -541,6 +713,7 @@ def main() -> None:
         train_ratio=args.train_ratio,
         out_dir=args.out_dir,
         manifest_path=args.manifest,
+        data_dir=args.data_dir,
     )
 
 
