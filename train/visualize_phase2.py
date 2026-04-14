@@ -360,51 +360,57 @@ def _plot_pair_rows(
         p = pair["orig_a"].shape[1]  # patch_size
         max_patches = max(1, int(max_duration_s * sampling_rate / p))
 
+        # Row 0: target=B 원본 vs A→B 예측 (둘 다 B 스케일)
+        # Row 1: target=A 원본 vs B→A 예측 (둘 다 A 스케일)
         for sub_row, (
-            key_orig,
-            key_cross,
-            sig_name,
-            sig_type,
+            key_target_orig,
+            key_cross_pred,
+            target_name,
+            target_type,
+            source_name,
             n_p,
-            other_name,
         ) in enumerate(
             [
                 (
-                    "orig_a",
-                    "cross_pred_a",
-                    pair["sig_name_a"],
-                    pair["sig_type_a"],
-                    pair["n_patches_a"],
-                    pair["sig_name_b"],
-                ),
-                (
-                    "orig_b",
-                    "cross_pred_b",
+                    "orig_b",         # target 원본: B
+                    "cross_pred_a",   # A→B 예측
                     pair["sig_name_b"],
                     pair["sig_type_b"],
-                    pair["n_patches_b"],
                     pair["sig_name_a"],
+                    pair["n_patches_a"],
+                ),
+                (
+                    "orig_a",         # target 원본: A
+                    "cross_pred_b",   # B→A 예측
+                    pair["sig_name_a"],
+                    pair["sig_type_a"],
+                    pair["sig_name_b"],
+                    pair["n_patches_b"],
                 ),
             ]
         ):
             row_idx = row_offset + pi * 2 + sub_row
             ax = axes[row_idx, 0]
-            orig = pair[key_orig]
-            cross = pair[key_cross]
+            orig = pair[key_target_orig]
+            cross = pair[key_cross_pred]
 
             n_show = min(n_p, max_patches)
             orig_wave = orig[:n_show].reshape(-1)
             cross_wave = cross[:n_show].reshape(-1)
-            t = np.arange(len(orig_wave)) / sampling_rate
+            # 길이 맞춤 (n_common으로 잘린 경우)
+            min_len = min(len(orig_wave), len(cross_wave))
+            orig_wave = orig_wave[:min_len]
+            cross_wave = cross_wave[:min_len]
+            t = np.arange(min_len) / sampling_rate
 
-            orig_color = SIGNAL_TYPE_COLORS.get(sig_type, "steelblue")
+            orig_color = SIGNAL_TYPE_COLORS.get(target_type, "steelblue")
             ax.plot(
                 t,
                 orig_wave,
                 color=orig_color,
                 linewidth=0.8,
                 alpha=0.7,
-                label=f"Original {sig_name}",
+                label=f"Original {target_name}",
             )
             ax.plot(
                 t,
@@ -412,30 +418,30 @@ def _plot_pair_rows(
                 color="darkorange",
                 linewidth=0.9,
                 alpha=0.8,
-                label=f"Cross-Pred (from {other_name})",
+                label=f"Predicted {target_name} (from {source_name})",
             )
 
             mse = np.mean((orig_wave - cross_wave) ** 2)
             corr = (
-                np.corrcoef(orig_wave, cross_wave)[0, 1] if len(orig_wave) > 1 else 0.0
+                np.corrcoef(orig_wave, cross_wave)[0, 1] if min_len > 1 else 0.0
             )
 
             duration = n_show * p / sampling_rate
-            ax.set_ylabel(sig_name, fontsize=10, color=orig_color, fontweight="bold")
+            ax.set_ylabel(target_name, fontsize=10, color=orig_color, fontweight="bold")
             ax.tick_params(labelsize=7)
             ax.legend(loc="upper right", fontsize=7)
 
             if sub_row == 0:
                 ax.set_title(
                     f"{pair['sig_name_a']} \u2194 {pair['sig_name_b']}  |  "
-                    f"MSE={mse:.4f}  r={corr:.3f}  |  {duration:.0f}s",
+                    f"{source_name}\u2192{target_name}  MSE={mse:.4f}  r={corr:.3f}  |  {duration:.0f}s",
                     fontsize=10,
                     loc="left",
                     fontweight="bold",
                 )
             else:
                 ax.set_title(
-                    f"MSE={mse:.4f}  r={corr:.3f}  |  {duration:.0f}s",
+                    f"{source_name}\u2192{target_name}  MSE={mse:.4f}  r={corr:.3f}  |  {duration:.0f}s",
                     fontsize=9,
                     loc="left",
                 )
