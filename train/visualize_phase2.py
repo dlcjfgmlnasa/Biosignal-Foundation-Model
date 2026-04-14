@@ -306,25 +306,27 @@ def _extract_cross_modal_pairs(
                     tid_a = time_id[bi, idx_a]
                     tid_b = time_id[bi, idx_b]
 
-                    # denorm
-                    orig_a = original_patches[bi, idx_a].cpu().numpy()
-                    orig_b = original_patches[bi, idx_b].cpu().numpy()
-
                     sig_type_a = sig_map.get((bi, sid, vid_a), -1)
                     sig_type_b = sig_map.get((bi, sid, vid_b), -1)
 
-                    # target-conditioned cross_pred 선택
-                    # cp_a: A 위치에서 B(target)를 예측 → target type = sig_type_b
+                    # target-conditioned cross_pred 선택 + target의 loc/scale로 denorm
+                    # cp_a: A 위치에서 B(target)를 예측 → B의 loc/scale로 denorm
                     cp_a = cross_pred_per_type[bi, idx_a, sig_type_b] if sig_type_b >= 0 else cross_pred_per_type[bi, idx_a, 0]
-                    loc_a = patch_loc[bi, idx_a].unsqueeze(-1)
-                    scl_a = patch_scale[bi, idx_a].unsqueeze(-1)
-                    cpred_a = (cp_a * scl_a + loc_a).detach().cpu().numpy()
+                    loc_b_denorm = patch_loc[bi, idx_b].unsqueeze(-1)
+                    scl_b_denorm = patch_scale[bi, idx_b].unsqueeze(-1)
+                    # idx_a와 idx_b 길이가 다를 수 있으므로, 짧은 쪽에 맞춤
+                    n_common = min(len(idx_a), len(idx_b))
+                    cpred_a = (cp_a[:n_common] * scl_b_denorm[:n_common] + loc_b_denorm[:n_common]).detach().cpu().numpy()
 
-                    # cp_b: B 위치에서 A(target)를 예측 → target type = sig_type_a
+                    # cp_b: B 위치에서 A(target)를 예측 → A의 loc/scale로 denorm
                     cp_b = cross_pred_per_type[bi, idx_b, sig_type_a] if sig_type_a >= 0 else cross_pred_per_type[bi, idx_b, 0]
-                    loc_b = patch_loc[bi, idx_b].unsqueeze(-1)
-                    scl_b = patch_scale[bi, idx_b].unsqueeze(-1)
-                    cpred_b = (cp_b * scl_b + loc_b).detach().cpu().numpy()
+                    loc_a_denorm = patch_loc[bi, idx_a].unsqueeze(-1)
+                    scl_a_denorm = patch_scale[bi, idx_a].unsqueeze(-1)
+                    cpred_b = (cp_b[:n_common] * scl_a_denorm[:n_common] + loc_a_denorm[:n_common]).detach().cpu().numpy()
+
+                    # 원본도 n_common에 맞춤
+                    orig_a = original_patches[bi, idx_a[:n_common]].cpu().numpy()
+                    orig_b = original_patches[bi, idx_b[:n_common]].cpu().numpy()
 
                     pairs.append(
                         {
@@ -336,8 +338,8 @@ def _extract_cross_modal_pairs(
                             "sig_type_b": sig_type_b,
                             "sig_name_a": SIGNAL_TYPE_NAMES.get(sig_type_a, "?"),
                             "sig_name_b": SIGNAL_TYPE_NAMES.get(sig_type_b, "?"),
-                            "n_patches_a": len(idx_a),
-                            "n_patches_b": len(idx_b),
+                            "n_patches_a": n_common,
+                            "n_patches_b": n_common,
                             "time_ids_a": tid_a.cpu().numpy(),
                             "time_ids_b": tid_b.cpu().numpy(),
                         }
