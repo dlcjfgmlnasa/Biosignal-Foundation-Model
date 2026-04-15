@@ -108,6 +108,7 @@ def prepare_dataset(
     out_dir: Path,
 ) -> Path:
     """window_sec에 맞게 잘라서 train/test .pt를 저장한다."""
+    out_dir.mkdir(parents=True, exist_ok=True)
     win_samples = int(window_sec * TARGET_SR)
 
     # 윈도우 트리밍 + 길이 통일
