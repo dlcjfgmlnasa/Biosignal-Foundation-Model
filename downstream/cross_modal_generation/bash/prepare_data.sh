@@ -16,7 +16,7 @@ PARSED_MIMIC3_PPG="${PARSED_MIMIC3_PPG:-}"
 # ── Cardiovascular: MIMIC-III-Ext-PPG (local .pt) ───────────
 if [ -n "$PARSED_MIMIC3_PPG" ] && [ -d "$PARSED_MIMIC3_PPG" ]; then
     echo "=== Cardiovascular (MIMIC-III-Ext-PPG, local) ==="
-    python -m downstream.generation.any_to_any.prepare_data \
+    python -m downstream.cross_modal_generation.prepare_data \
         --source local \
         --data-dir "$PARSED_MIMIC3_PPG" \
         --signal-types ecg abp ppg \
@@ -27,7 +27,7 @@ if [ -n "$PARSED_MIMIC3_PPG" ] && [ -d "$PARSED_MIMIC3_PPG" ]; then
         --out-dir "$OUT_DIR"
 else
     echo "=== Cardiovascular (VitalDB fallback) ==="
-    python -m downstream.generation.any_to_any.prepare_data \
+    python -m downstream.cross_modal_generation.prepare_data \
         --source vitaldb \
         --signal-types ecg abp ppg cvp \
         --n-cases "$N_CASES" \
@@ -40,7 +40,7 @@ fi
 # ── Respiratory: VitalDB ────────────────────────────────────
 echo ""
 echo "=== Respiratory (VitalDB) ==="
-python -m downstream.generation.any_to_any.prepare_data \
+python -m downstream.cross_modal_generation.prepare_data \
     --source vitaldb \
     --signal-types co2 awp \
     --n-cases "$N_CASES" \

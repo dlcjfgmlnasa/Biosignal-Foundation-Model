@@ -12,19 +12,19 @@ Temporal Imputation: 같은 채널의 시간 구간을 마스킹 -> 앞뒤 conte
 
 사용법:
     # ECG temporal imputation
-    python -m downstream.generation.imputation.prepare_data \
+    python -m downstream.imputation.prepare_data \
         --signal-type ecg --n-cases 5
 
     # MIMIC-III ABP
-    python -m downstream.generation.imputation.prepare_data \
+    python -m downstream.imputation.prepare_data \
         --source mimic3 --signal-type abp --n-cases 5
 
     # 모든 신호
-    python -m downstream.generation.imputation.prepare_data \
+    python -m downstream.imputation.prepare_data \
         --signal-type all --n-cases 10
 
     # 시각화 포함
-    python -m downstream.generation.imputation.prepare_data \
+    python -m downstream.imputation.prepare_data \
         --signal-type ecg --n-cases 5 --visualize
 """
 

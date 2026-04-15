@@ -48,7 +48,7 @@ if [ -f "$CARDIO_DATA" ]; then
     for sc in "${CARDIO_SCENARIOS[@]}"; do
         echo ""
         echo ">>> Zero-shot: $sc"
-        python -m downstream.generation.any_to_any.run \
+        python -m downstream.cross_modal_generation.run \
             $COMMON --mode zero_shot \
             --data-path "$CARDIO_DATA" \
             --scenario "$sc"
@@ -58,7 +58,7 @@ if [ -f "$CARDIO_DATA" ]; then
     for sc in "${CARDIO_SCENARIOS[@]}"; do
         echo ""
         echo ">>> LoRA: $sc"
-        python -m downstream.generation.any_to_any.run \
+        python -m downstream.cross_modal_generation.run \
             $COMMON --mode lora \
             --data-path "$CARDIO_DATA" \
             --scenario "$sc" \
@@ -84,7 +84,7 @@ if [ -f "$RESP_DATA" ]; then
     for sc in "${RESP_SCENARIOS[@]}"; do
         echo ""
         echo ">>> Zero-shot: $sc"
-        python -m downstream.generation.any_to_any.run \
+        python -m downstream.cross_modal_generation.run \
             $COMMON --mode zero_shot \
             --data-path "$RESP_DATA" \
             --scenario "$sc"
@@ -93,7 +93,7 @@ if [ -f "$RESP_DATA" ]; then
     for sc in "${RESP_SCENARIOS[@]}"; do
         echo ""
         echo ">>> LoRA: $sc"
-        python -m downstream.generation.any_to_any.run \
+        python -m downstream.cross_modal_generation.run \
             $COMMON --mode lora \
             --data-path "$RESP_DATA" \
             --scenario "$sc" \

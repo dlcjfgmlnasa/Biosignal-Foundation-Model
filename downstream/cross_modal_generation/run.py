@@ -8,14 +8,14 @@
 Usage
 -----
 # Dummy test (no checkpoint):
-python -m downstream.generation.any_to_any.run --dummy
+python -m downstream.cross_modal_generation.run --dummy
 
 # Zero-shot evaluation:
-python -m downstream.generation.any_to_any.run \
+python -m downstream.cross_modal_generation.run \
     --checkpoint path/to/best.pt --mode zero_shot
 
 # LoRA regression:
-python -m downstream.generation.any_to_any.run \
+python -m downstream.cross_modal_generation.run \
     --checkpoint path/to/best.pt --mode lora \
     --data-path outputs/downstream/any_to_any/task8_xxx.pt \
     --scenario "ECG->ABP" --epochs 30 --lr 1e-4

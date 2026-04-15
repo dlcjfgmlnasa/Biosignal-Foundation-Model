@@ -11,20 +11,20 @@ run.py에서 오프라인으로 로드하여 평가에 사용.
 
 사용법:
     # VitalDB, 기본 4채널 (ecg, abp, ppg, cvp), 10케이스
-    python -m downstream.generation.any_to_any.prepare_data \
+    python -m downstream.cross_modal_generation.prepare_data \
         --source vitaldb --n-cases 10
 
     # MIMIC-III, 3채널 (ecg, abp, ppg), 5케이스
-    python -m downstream.generation.any_to_any.prepare_data \
+    python -m downstream.cross_modal_generation.prepare_data \
         --source mimic3 --signal-types ecg abp ppg --n-cases 5
 
     # Local .pt directory (e.g. mimic3_ext_ppg parser output)
-    python -m downstream.generation.any_to_any.prepare_data \
+    python -m downstream.cross_modal_generation.prepare_data \
         --source local --data-dir /path/to/parsed_dir \
         --signal-types ecg abp ppg --n-cases 20
 
     # 짧은 윈도우, 좁은 stride
-    python -m downstream.generation.any_to_any.prepare_data \
+    python -m downstream.cross_modal_generation.prepare_data \
         --source vitaldb --window-sec 10 --stride-sec 5 --n-cases 20
 """
 
