@@ -1,6 +1,6 @@
 #!/bin/bash
-# ICU False Alarm Reduction — 전체 실험 실행 스크립트
-# 3가지 신호 조합 × 4 윈도우 × 2 모드 = 24 실험
+# Anomaly Detection — Reconstruction Error 기반 실험 스크립트
+# 3가지 신호 조합 × 3 윈도우 = 9 실험 (학습 없음, zero-shot)
 #
 # 사전 조건: prepare_data.sh로 .pt 데이터셋 생성 완료
 #
@@ -11,43 +11,34 @@ set -e
 
 # ── 설정 ──
 CHECKPOINT=/home/coder/workspace/updown/bio_fm/output/phase2/base/checkpoints/best.pt
-DATA_DIR=/home/coder/workspace/updown/bio_fm/datasets/processed/anomaly_detection
-OUT_DIR=/home/coder/workspace/updown/bio_fm/data/downstream/anomaly_detection
+DATA_DIR=/home/coder/workspace/updown/bio_fm/data/downstream/anomaly_detection
+OUT_DIR=/home/coder/workspace/updown/bio_fm/data/downstream/anomaly_detection/results
 DEVICE=cuda
 
-# Linear Probe 설정
-LP_EPOCHS=20
-LP_LR=1e-3
-
-# LoRA 설정
-LORA_EPOCHS=30
-LORA_LR=1e-4
-LORA_RANK=8
-LORA_ALPHA=16
+MASK_RATIO=0.5
+N_TRIALS=5
 
 # ── 실험 조합 ──
 SIGNAL_COMBOS=("ecg" "ecg_ppg" "ecg_ppg_abp")
-WINDOWS=(30 60 120 300)
-MODES=("linear_probe" "lora")
+WINDOWS=(10 20 30)
 
-TOTAL=$(( ${#SIGNAL_COMBOS[@]} * ${#WINDOWS[@]} * ${#MODES[@]} ))
+TOTAL=$(( ${#SIGNAL_COMBOS[@]} * ${#WINDOWS[@]} ))
 COUNT=0
 
 echo "============================================================"
-echo "  ICU False Alarm Reduction — Experiment Sweep"
+echo "  Anomaly Detection — Reconstruction Error (Zero-Shot)"
 echo "  Checkpoint: $CHECKPOINT"
 echo "  Data:       $DATA_DIR"
 echo "  Output:     $OUT_DIR"
 echo "  Device:     $DEVICE"
 echo "  Signals:    ${SIGNAL_COMBOS[*]}"
 echo "  Windows:    ${WINDOWS[*]}"
-echo "  Modes:      ${MODES[*]}"
+echo "  Mask ratio: $MASK_RATIO, Trials: $N_TRIALS"
 echo "  Total:      $TOTAL experiments"
 echo "============================================================"
 
 for SIGNALS in "${SIGNAL_COMBOS[@]}"; do
     for W in "${WINDOWS[@]}"; do
-        # .pt 파일 경로: underscore → signal 조합
         PT_FILE="${DATA_DIR}/false_alarm_${SIGNALS}_w${W}s.pt"
 
         if [ ! -f "$PT_FILE" ]; then
@@ -55,39 +46,25 @@ for SIGNALS in "${SIGNAL_COMBOS[@]}"; do
             continue
         fi
 
-        for MODE in "${MODES[@]}"; do
-            COUNT=$((COUNT + 1))
-            EXP_DIR="${OUT_DIR}/${MODE}/${SIGNALS}_w${W}s"
-            mkdir -p "$EXP_DIR"
+        COUNT=$((COUNT + 1))
+        EXP_DIR="${OUT_DIR}/${SIGNALS}_w${W}s"
+        mkdir -p "$EXP_DIR"
 
-            echo -e "\n[${COUNT}/${TOTAL}] ${MODE} | ${SIGNALS} | w=${W}s"
+        echo -e "\n[${COUNT}/${TOTAL}] ${SIGNALS} | w=${W}s"
 
-            # 모드별 인자 설정
-            if [ "$MODE" = "linear_probe" ]; then
-                EPOCHS=$LP_EPOCHS
-                LR=$LP_LR
-                EXTRA_ARGS=""
-            else
-                EPOCHS=$LORA_EPOCHS
-                LR=$LORA_LR
-                EXTRA_ARGS="--lora-rank $LORA_RANK --lora-alpha $LORA_ALPHA"
-            fi
+        # --input-signals: underscore → space 변환
+        INPUT_SIGNALS=$(echo "$SIGNALS" | tr '_' ' ')
 
-            # --input-signals: underscore → space 변환
-            INPUT_SIGNALS=$(echo "$SIGNALS" | tr '_' ' ')
+        python -m downstream.anomaly_detection.run \
+            --checkpoint "$CHECKPOINT" \
+            --data-path "$PT_FILE" \
+            --input-signals $INPUT_SIGNALS \
+            --window-sec "$W" \
+            --mask-ratio "$MASK_RATIO" \
+            --n-trials "$N_TRIALS" \
+            --device "$DEVICE" \
+            --out-dir "$EXP_DIR"
 
-            python -m downstream.anomaly_detection.run \
-                --checkpoint "$CHECKPOINT" \
-                --mode "$MODE" \
-                --data-path "$PT_FILE" \
-                --input-signals $INPUT_SIGNALS \
-                --epochs "$EPOCHS" \
-                --lr "$LR" \
-                --device "$DEVICE" \
-                --out-dir "$EXP_DIR" \
-                $EXTRA_ARGS
-
-        done
     done
 done
 

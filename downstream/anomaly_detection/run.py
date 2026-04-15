@@ -1,30 +1,24 @@
 # -*- coding:utf-8 -*-
-"""ICU False Alarm Reduction (PhysioNet/CinC Challenge 2015).
+"""Anomaly Detection — Reconstruction Error 기반 이상 탐지.
 
-ICU 부정맥 알람의 True/False를 판별하는 binary classification task.
-ECG(2ch) + ABP/PPG 다채널 입력 → Foundation Model → True alarm 확률.
+Foundation model의 masked reconstruction error를 anomaly score로 사용한다.
+정상 신호는 reconstruction error가 낮고, 이상 신호는 높다.
+학습 없이(zero-shot) pretrained model만으로 이상 탐지를 수행한다.
 
-5가지 알람 타입:
-  Asystole, Extreme Bradycardia, Extreme Tachycardia,
-  Ventricular Tachycardia, Ventricular Flutter/Fibrillation
-
-모드:
-  - linear_probe: Frozen encoder + LinearProbe
-  - lora:         Frozen encoder + LoRA adapters + LinearProbe
-
-평가 메트릭:
-  - AUROC, AUPRC (전체 + 알람 타입별)
-  - Challenge Score: 100 * (TP+TN) / (TP+TN+FP+5*FN)  — FN에 5배 페널티
-  - Sensitivity, Specificity
+평가 데이터: PhysioNet/CinC Challenge 2015 (ICU False Alarm)
+- True alarm (실제 부정맥) = anomaly → reconstruction error 높을 것
+- False alarm (artifact 등) = 정상 변이 → reconstruction error 낮을 것
 
 사용법:
     python -m downstream.anomaly_detection.run \
-        --checkpoint best.pt --data-dir datasets/processed/anomaly_detection \
-        --mode linear_probe --window-sec 60
+        --checkpoint best.pt \
+        --data-path datasets/processed/anomaly_detection/false_alarm_ecg_w10s.pt \
+        --device cuda
 
     python -m downstream.anomaly_detection.run \
-        --checkpoint best.pt --data-dir datasets/processed/anomaly_detection \
-        --mode lora --lr 1e-4 --lora-rank 8
+        --checkpoint best.pt \
+        --data-dir datasets/processed/anomaly_detection \
+        --input-signals ecg ppg abp --window-sec 10
 """
 
 from __future__ import annotations
@@ -36,7 +30,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from torch import nn
 
 from data.collate import PackCollate, PackedBatch
 from data.dataset import BiosignalSample
@@ -50,7 +43,6 @@ from downstream.metrics import (
     compute_sensitivity_specificity,
 )
 from downstream.viz import plot_roc_curve
-from downstream.model_wrapper import LinearProbe
 
 
 # ── 설정 ──────────────────────────────────────────────────────
@@ -58,7 +50,6 @@ from downstream.model_wrapper import LinearProbe
 DEFAULT_PATCH_SIZE = 100
 DEFAULT_SR = 100.0
 
-# 알람 타입 목록
 ALARM_TYPES = [
     "asystole",
     "extreme_bradycardia",
@@ -67,7 +58,6 @@ ALARM_TYPES = [
     "ventricular_flutter_fib",
 ]
 
-# signal_name → signal_type 매핑 (ECG lead가 여러 개이므로 첫 번째만 사용하는 경우)
 SIGNAL_NAME_TO_TYPE: dict[str, str] = {
     "II": "ecg", "I": "ecg", "III": "ecg",
     "V": "ecg", "V1": "ecg", "V2": "ecg", "V5": "ecg",
@@ -78,46 +68,15 @@ SIGNAL_NAME_TO_TYPE: dict[str, str] = {
 }
 
 
-# ── Challenge Score ──────────────────────────────────────────
-
-
-def challenge_score(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    """PhysioNet 2015 Challenge Score.
-
-    Score = 100 * (TP + TN) / (TP + TN + FP + 5*FN)
-    FN에 5배 페널티 — 실제 알람을 놓치는 것이 가장 위험.
-    """
-    tp = int(((y_pred == 1) & (y_true == 1)).sum())
-    tn = int(((y_pred == 0) & (y_true == 0)).sum())
-    fp = int(((y_pred == 1) & (y_true == 0)).sum())
-    fn = int(((y_pred == 0) & (y_true == 1)).sum())
-
-    denom = tp + tn + fp + 5 * fn
-    if denom == 0:
-        return 0.0
-    return 100.0 * (tp + tn) / denom
-
-
 # ── 데이터 로딩 ──────────────────────────────────────────────
 
 
 def load_records(
     data_dir: str | Path,
     input_signals: list[str],
-    window_sec: float = 60.0,
+    window_sec: float = 10.0,
 ) -> list[dict]:
-    """manifest.json에서 레코드를 로드하고 윈도우를 추출한다.
-
-    Parameters
-    ----------
-    data_dir: processed 디렉토리 (manifest.json + .pt 파일).
-    input_signals: 사용할 signal_type 목록 (e.g., ["ecg", "ppg", "abp"]).
-    window_sec: 알람 직전 윈도우 길이 (초). 전체 5분 중 마지막 N초 사용.
-
-    Returns
-    -------
-    list of dict: {signals: {stype: ndarray}, label: int, alarm_type: str, record: str}
-    """
+    """manifest.json에서 레코드를 로드한다."""
     data_path = Path(data_dir)
     manifest_path = data_path / "manifest.json"
 
@@ -131,14 +90,10 @@ def load_records(
         label = 1 if rec_info["label"] else 0
         alarm_type = rec_info.get("alarm_type", "unknown")
 
-        # 레코드에서 요청한 signal_type별로 .pt 로드
-        # ECG가 2ch일 수 있으므로 signal_type별 첫 번째만 사용
         signals: dict[str, np.ndarray] = {}
         type_loaded: set[str] = set()
 
         for sig_info in rec_info.get("signals", []):
-            sig_file = sig_info.get("file", "")
-            # signal_type 결정: sig_info에 있으면 사용, 없으면 파일명에서 추출
             sig_type = sig_info.get("signal_type")
             if sig_type is None:
                 sig_name = sig_info.get("signal_name", "")
@@ -146,16 +101,15 @@ def load_records(
             if sig_type is None or sig_type not in input_signals:
                 continue
             if sig_type in type_loaded:
-                continue  # 같은 타입 중복 방지 (ECG 2ch → 첫 번째만)
+                continue
 
-            pt_path = data_path / sig_file
+            pt_path = data_path / sig_info.get("file", "")
             if not pt_path.exists():
                 continue
 
-            tensor = torch.load(pt_path, weights_only=True)  # (1, T)
-            signal = tensor.squeeze(0).numpy()  # (T,)
+            tensor = torch.load(pt_path, weights_only=True)
+            signal = tensor.squeeze(0).numpy()
 
-            # 알람 직전 window_sec 추출 (끝에서 자름)
             if len(signal) > win_samples:
                 signal = signal[-win_samples:]
 
@@ -165,7 +119,6 @@ def load_records(
         if not signals:
             continue
 
-        # 모든 채널 길이 통일 (짧은 쪽에 맞춤)
         min_len = min(len(s) for s in signals.values())
         signals = {k: v[-min_len:] for k, v in signals.items()}
 
@@ -179,11 +132,45 @@ def load_records(
     return records
 
 
+def load_from_pt(data_path: str) -> list[dict]:
+    """prepare_data.py로 생성한 .pt에서 전체 레코드를 로드한다.
+
+    Anomaly detection은 train/test split이 불필요하므로 train+test를 합친다.
+    """
+    data = torch.load(data_path, weights_only=False)
+    meta = data.get("metadata", {})
+    print(f"  Task: {meta.get('task', '?')}")
+    print(f"  Input signals: {meta.get('input_signals', '?')}")
+    print(f"  Window: {meta.get('window_sec', '?')}s")
+
+    records = []
+    for split_name in ["train", "test"]:
+        split_data = data.get(split_name, {})
+        labels = split_data.get("labels", torch.tensor([]))
+        alarm_types = split_data.get("alarm_types", ["unknown"] * len(labels))
+        rec_names = split_data.get("records", [f"r{i}" for i in range(len(labels))])
+        input_keys = list(split_data.get("signals", {}).keys())
+
+        for i in range(len(labels)):
+            signals = {
+                k: split_data["signals"][k][i].numpy()
+                for k in input_keys
+                if k in split_data["signals"]
+            }
+            records.append({
+                "signals": signals,
+                "label": int(labels[i].item()),
+                "alarm_type": alarm_types[i],
+                "record": rec_names[i],
+            })
+
+    return records
+
+
 # ── 배치 생성 ────────────────────────────────────────────────
 
 
 def _record_to_samples(rec: dict, idx: int) -> list[BiosignalSample]:
-    """레코드 → BiosignalSample 리스트 (collate 입력용)."""
     samples = []
     for ch, (sig_type, signal) in enumerate(rec["signals"].items()):
         stype_int = SIGNAL_TYPES.get(sig_type, 0)
@@ -205,177 +192,91 @@ def _record_to_samples(rec: dict, idx: int) -> list[BiosignalSample]:
     return samples
 
 
-def make_batches(
-    records: list[dict],
-    batch_size: int,
+def make_single_batch(
+    rec: dict,
+    idx: int,
     patch_size: int,
     max_length: int,
-) -> list[tuple[PackedBatch, torch.Tensor, list[str]]]:
-    """(batch, labels, alarm_types) 리스트 생성."""
-    multi = any(len(r["signals"]) > 1 for r in records)
+) -> PackedBatch:
+    """단일 레코드 → PackedBatch."""
+    multi = len(rec["signals"]) > 1
     collate_mode = "any_variate" if multi else "ci"
     collate = PackCollate(
         max_length=max_length, collate_mode=collate_mode, patch_size=patch_size
     )
-
-    batches = []
-    for i in range(0, len(records), batch_size):
-        chunk = records[i : i + batch_size]
-        all_samples = []
-        for j, rec in enumerate(chunk):
-            all_samples.extend(_record_to_samples(rec, idx=i + j))
-        labels = torch.tensor([r["label"] for r in chunk], dtype=torch.float32)
-        alarm_types = [r["alarm_type"] for r in chunk]
-        batch = collate(all_samples)
-        batches.append((batch, labels, alarm_types))
-    return batches
+    samples = _record_to_samples(rec, idx)
+    return collate(samples)
 
 
-# ── Mean Pooling ─────────────────────────────────────────────
-
-
-def _mean_pool(
-    encoded: torch.Tensor,  # (B, N, d_model)
-    patch_mask: torch.Tensor,  # (B, N)
-) -> torch.Tensor:  # (B, d_model)
-    mask_f = patch_mask.unsqueeze(-1).float()
-    return (encoded * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp(min=1.0)
-
-
-# ── Linear Probe ─────────────────────────────────────────────
-
-
-def train_linear_probe(
-    model,
-    probe: LinearProbe,
-    train_batches: list[tuple[PackedBatch, torch.Tensor, list[str]]],
-    epochs: int,
-    lr: float,
-    device: torch.device,
-) -> list[float]:
-    probe = probe.to(device)
-    probe.train()
-    optimizer = torch.optim.Adam(probe.parameters(), lr=lr)
-    criterion = nn.BCEWithLogitsLoss()
-    losses = []
-
-    for epoch in range(epochs):
-        epoch_loss, n = 0.0, 0
-        for batch, labels, _ in train_batches:
-            with torch.no_grad():
-                features = model.extract_features(batch, pool="mean").to(device)
-            logits = probe(features)
-            loss = criterion(logits, labels.to(device).unsqueeze(-1))
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            epoch_loss += loss.item()
-            n += 1
-        avg = epoch_loss / max(n, 1)
-        losses.append(avg)
-        if (epoch + 1) % 5 == 0 or epoch == 0:
-            print(f"  Epoch {epoch + 1}/{epochs}  loss={avg:.4f}")
-    return losses
+# ── Anomaly Scoring (Reconstruction Error) ───────────────────
 
 
 @torch.no_grad()
-def evaluate_linear_probe(
+def compute_reconstruction_scores(
     model,
-    probe: LinearProbe,
-    test_batches: list[tuple[PackedBatch, torch.Tensor, list[str]]],
-    device: torch.device,
-) -> dict:
-    probe.to(device).eval()
-    all_labels, all_scores, all_alarm_types = [], [], []
-    for batch, labels, atypes in test_batches:
-        features = model.extract_features(batch, pool="mean").to(device)
-        logits = probe(features)
-        probs = torch.sigmoid(logits).squeeze(-1).cpu().numpy()
-        all_labels.append(labels.numpy())
-        all_scores.append(probs)
-        all_alarm_types.extend(atypes)
-    return _compute_all_metrics(
-        np.concatenate(all_labels), np.concatenate(all_scores), all_alarm_types
-    )
-
-
-# ── LoRA Fine-tuning ─────────────────────────────────────────
-
-
-def train_lora(
-    model,
-    probe: LinearProbe,
-    train_batches: list[tuple[PackedBatch, torch.Tensor, list[str]]],
-    epochs: int,
-    lr: float,
-    device: torch.device,
-    gradient_clip: float = 1.0,
+    records: list[dict],
+    patch_size: int,
+    mask_ratio: float = 0.5,
+    n_trials: int = 5,
 ) -> list[float]:
-    model.model.train()
-    probe = probe.to(device)
-    probe.train()
+    """각 레코드의 masked reconstruction MSE를 anomaly score로 계산한다.
 
-    lora_params = model.lora_parameters()
-    optimizer = torch.optim.AdamW([
-        {"params": lora_params, "lr": lr},
-        {"params": probe.parameters(), "lr": lr},
-    ], weight_decay=0.01)
+    여러 번 랜덤 마스킹하여 평균 MSE를 사용한다 (안정적 scoring).
 
-    criterion = nn.BCEWithLogitsLoss()
-    losses = []
+    Parameters
+    ----------
+    model: DownstreamModelWrapper (frozen, eval mode).
+    records: 레코드 리스트.
+    patch_size: 패치 크기.
+    mask_ratio: 마스킹 비율 (0.5 = 50% 패치를 마스킹).
+    n_trials: 랜덤 마스킹 반복 횟수 (평균).
 
-    for epoch in range(epochs):
-        epoch_loss, n = 0.0, 0
-        for batch, labels, _ in train_batches:
-            batch = model.batch_to_device(batch)
-            out = model.model(batch, task="masked")
-            features = _mean_pool(out["encoded"], out["patch_mask"])
+    Returns
+    -------
+    각 레코드의 평균 reconstruction MSE (anomaly score).
+    """
+    from loss.masked_mse_loss import create_patch_mask
 
-            logits = probe(features)
-            loss = criterion(logits, labels.to(device).unsqueeze(-1))
-
-            optimizer.zero_grad()
-            loss.backward()
-            nn.utils.clip_grad_norm_(
-                lora_params + list(probe.parameters()), gradient_clip
-            )
-            optimizer.step()
-            epoch_loss += loss.item()
-            n += 1
-
-        avg = epoch_loss / max(n, 1)
-        losses.append(avg)
-        if (epoch + 1) % 5 == 0 or epoch == 0:
-            print(f"  Epoch {epoch + 1}/{epochs}  loss={avg:.4f}")
-
-    return losses
-
-
-@torch.no_grad()
-def evaluate_lora(
-    model,
-    probe: LinearProbe,
-    test_batches: list[tuple[PackedBatch, torch.Tensor, list[str]]],
-    device: torch.device,
-) -> dict:
     model.model.eval()
-    probe.to(device).eval()
-    all_labels, all_scores, all_alarm_types = [], [], []
+    scores: list[float] = []
+    first_sig = next(iter(records[0]["signals"].values()))
+    max_length = len(first_sig)
 
-    for batch, labels, atypes in test_batches:
-        batch = model.batch_to_device(batch)
-        out = model.model(batch, task="masked")
-        features = _mean_pool(out["encoded"], out["patch_mask"])
+    for i, rec in enumerate(records):
+        batch = make_single_batch(rec, i, patch_size, max_length)
+        out = model.forward_masked(batch)
 
-        logits = probe(features)
-        probs = torch.sigmoid(logits).squeeze(-1).cpu().numpy()
-        all_labels.append(labels.numpy())
-        all_scores.append(probs)
-        all_alarm_types.extend(atypes)
+        reconstructed = out["reconstructed"]  # (B, N, P)
+        patch_mask = out["patch_mask"]  # (B, N) bool
 
-    return _compute_all_metrics(
-        np.concatenate(all_labels), np.concatenate(all_scores), all_alarm_types
-    )
+        # 원본 패치 추출 (정규화된 값)
+        normalized = (
+            (batch.values.to(model.device).unsqueeze(-1) - out["loc"])
+            / out["scale"].clamp(min=1e-8)
+        ).squeeze(-1)  # (B, L)
+        B, L = normalized.shape
+        P = patch_size
+        N = L // P
+        original_patches = normalized[:, :N * P].reshape(B, N, P)
+
+        # 여러 번 랜덤 마스킹 → 평균 MSE
+        trial_mses = []
+        for _ in range(n_trials):
+            pred_mask = create_patch_mask(patch_mask, mask_ratio=mask_ratio)
+            if pred_mask.any():
+                mse = (
+                    (reconstructed[pred_mask] - original_patches[pred_mask]) ** 2
+                ).mean().item()
+            else:
+                mse = 0.0
+            trial_mses.append(mse)
+
+        scores.append(float(np.mean(trial_mses)))
+
+        if (i + 1) % 100 == 0 or i == 0:
+            print(f"  [{i + 1}/{len(records)}] score={scores[-1]:.6f}")
+
+    return scores
 
 
 # ── 메트릭 계산 ──────────────────────────────────────────────
@@ -386,37 +287,42 @@ def _compute_all_metrics(
     y_score: np.ndarray,
     alarm_types: list[str],
 ) -> dict:
-    """전체 + 알람 타입별 메트릭을 계산한다."""
-    # 전체 메트릭
+    """전체 + 알람 타입별 메트릭을 계산한다.
+
+    anomaly score가 높을수록 true alarm(anomaly)일 가능성이 높다고 가정.
+    """
     auroc = compute_auroc(y_true, y_score)
     auprc = compute_auprc(y_true, y_score)
 
     # Optimal threshold (Youden's J)
-    best_thresh, best_j = 0.5, -1.0
-    for thresh in np.linspace(0.01, 0.99, 99):
+    best_thresh, best_j = 0.0, -1.0
+    thresholds = np.percentile(y_score, np.linspace(1, 99, 99))
+    for thresh in thresholds:
         y_pred = (y_score >= thresh).astype(int)
         ss = compute_sensitivity_specificity(y_true, y_pred)
         j = ss["sensitivity"] + ss["specificity"] - 1.0
         if j > best_j:
             best_j = j
-            best_thresh = thresh
+            best_thresh = float(thresh)
 
     y_pred_opt = (y_score >= best_thresh).astype(int)
     ss_opt = compute_sensitivity_specificity(y_true, y_pred_opt)
     f1 = compute_f1(y_true, y_pred_opt, average="macro")
-    cscore = challenge_score(y_true, y_pred_opt)
 
     result = {
         "auroc": auroc,
         "auprc": auprc,
         "f1_macro": f1,
-        "challenge_score": cscore,
-        "optimal_threshold": float(best_thresh),
+        "optimal_threshold": best_thresh,
         "sensitivity": ss_opt["sensitivity"],
         "specificity": ss_opt["specificity"],
         "n_total": len(y_true),
-        "n_true_alarm": int(y_true.sum()),
-        "n_false_alarm": int((y_true == 0).sum()),
+        "n_anomaly": int(y_true.sum()),
+        "n_normal": int((y_true == 0).sum()),
+        "score_mean_normal": float(y_score[y_true == 0].mean()) if (y_true == 0).any() else 0.0,
+        "score_std_normal": float(y_score[y_true == 0].std()) if (y_true == 0).any() else 0.0,
+        "score_mean_anomaly": float(y_score[y_true == 1].mean()) if (y_true == 1).any() else 0.0,
+        "score_std_anomaly": float(y_score[y_true == 1].std()) if (y_true == 1).any() else 0.0,
         "y_true": y_true,
         "y_score": y_score,
     }
@@ -430,27 +336,65 @@ def _compute_all_metrics(
             continue
         yt = y_true[mask]
         ys = y_score[mask]
+        n_true = int(yt.sum())
+        n_false = int((yt == 0).sum())
+
         if len(np.unique(yt)) < 2:
-            per_alarm[atype] = {
-                "n": int(mask.sum()),
-                "n_true": int(yt.sum()),
-                "auroc": 0.0,
-            }
+            per_alarm[atype] = {"n": int(mask.sum()), "n_true": n_true, "auroc": 0.0}
             continue
 
-        yp = (ys >= best_thresh).astype(int)
         per_alarm[atype] = {
             "n": int(mask.sum()),
-            "n_true": int(yt.sum()),
-            "n_false": int((yt == 0).sum()),
+            "n_true": n_true,
+            "n_false": n_false,
             "auroc": compute_auroc(yt, ys),
-            "challenge_score": challenge_score(yt, yp),
-            "sensitivity": compute_sensitivity_specificity(yt, yp)["sensitivity"],
-            "specificity": compute_sensitivity_specificity(yt, yp)["specificity"],
+            "score_mean_true": float(ys[yt == 1].mean()),
+            "score_mean_false": float(ys[yt == 0].mean()),
         }
     result["per_alarm"] = per_alarm
 
     return result
+
+
+# ── 시각화 ───────────────────────────────────────────────────
+
+
+def plot_score_distribution(
+    y_true: np.ndarray,
+    y_score: np.ndarray,
+    threshold: float,
+    save_path: str | Path,
+    title: str = "Anomaly Score Distribution",
+) -> None:
+    """True/False alarm의 reconstruction MSE 분포 히스토그램."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    normal_scores = y_score[y_true == 0]
+    anomaly_scores = y_score[y_true == 1]
+
+    fig, ax = plt.subplots(1, 1, figsize=(8, 5))
+    bins = np.linspace(
+        min(y_score.min(), 0), y_score.max() * 1.05, 50
+    )
+
+    ax.hist(normal_scores, bins=bins, alpha=0.6, color="steelblue",
+            label=f"False Alarm (n={len(normal_scores)})", density=True)
+    ax.hist(anomaly_scores, bins=bins, alpha=0.6, color="salmon",
+            label=f"True Alarm (n={len(anomaly_scores)})", density=True)
+    ax.axvline(threshold, color="red", linestyle="--", linewidth=1.5,
+               label=f"Threshold = {threshold:.4f}")
+
+    ax.set_xlabel("Reconstruction MSE (anomaly score)")
+    ax.set_ylabel("Density")
+    ax.set_title(title)
+    ax.legend(loc="upper right")
+
+    save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
 
 
 # ── CLI 진입점 ───────────────────────────────────────────────
@@ -458,207 +402,147 @@ def _compute_all_metrics(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="ICU False Alarm Reduction (PhysioNet 2015)"
+        description="Anomaly Detection — Reconstruction Error Scoring"
     )
-    parser.add_argument("--checkpoint", type=str, default=None)
+    parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--model-version", type=str, default="v1", choices=["v1", "v2"])
     parser.add_argument(
-        "--mode", type=str, default="linear_probe",
-        choices=["linear_probe", "lora"],
-    )
-    parser.add_argument("--lora-rank", type=int, default=8)
-    parser.add_argument("--lora-alpha", type=float, default=16.0)
-    parser.add_argument(
         "--data-path", type=str, default=None,
-        help="prepare_data.py로 생성한 .pt 파일 경로 (이 옵션 사용 시 data-dir 무시)",
+        help="prepare_data.py로 생성한 .pt 파일 경로",
     )
     parser.add_argument(
-        "--data-dir", type=str, default="datasets/processed/anomaly_detection",
-        help="파싱된 데이터 디렉토리 (manifest.json + .pt). --data-path 없을 때 사용.",
+        "--data-dir", type=str, default=None,
+        help="파싱된 데이터 디렉토리 (manifest.json + .pt)",
     )
     parser.add_argument(
         "--input-signals", nargs="+", default=["ecg", "ppg", "abp"],
         choices=["ecg", "ppg", "abp"],
     )
+    parser.add_argument("--window-sec", type=float, default=10.0)
     parser.add_argument(
-        "--window-sec", type=float, default=60.0,
-        help="알람 직전 윈도우 길이 (초). --data-dir 모드에서만 사용.",
+        "--mask-ratio", type=float, default=0.5,
+        help="마스킹 비율 (높을수록 더 많은 패치를 마스킹하여 복원 난이도 증가)",
     )
-    parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument(
+        "--n-trials", type=int, default=5,
+        help="랜덤 마스킹 반복 횟수 (평균으로 안정적 scoring)",
+    )
     parser.add_argument("--patch-size", type=int, default=DEFAULT_PATCH_SIZE)
-    parser.add_argument("--train-ratio", type=float, default=0.7)
     parser.add_argument("--out-dir", type=str, default=".")
     parser.add_argument("--device", type=str, default="cpu")
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    device = torch.device(args.device)
 
     # ── 데이터 로드 ──
     if args.data_path and Path(args.data_path).exists():
-        # prepare_data.py로 생성한 .pt 로드
         print(f"\nLoading prepared data: {args.data_path}")
-        data = torch.load(args.data_path, weights_only=False)
-        meta = data.get("metadata", {})
-        print(f"  Task: {meta.get('task', '?')}")
-        print(f"  Input signals: {meta.get('input_signals', '?')}")
-        print(f"  Window: {meta.get('window_sec', '?')}s")
-
-        def _pt_to_records(split_data: dict) -> list[dict]:
-            records = []
-            labels = split_data["labels"]
-            alarm_types = split_data.get("alarm_types", ["unknown"] * len(labels))
-            rec_names = split_data.get("records", [f"r{i}" for i in range(len(labels))])
-            input_keys = list(split_data["signals"].keys())
-            for i in range(len(labels)):
-                signals = {
-                    k: split_data["signals"][k][i].numpy()
-                    for k in input_keys
-                    if k in split_data["signals"]
-                }
-                records.append({
-                    "signals": signals,
-                    "label": int(labels[i].item()),
-                    "alarm_type": alarm_types[i],
-                    "record": rec_names[i],
-                })
-            return records
-
-        train_records = _pt_to_records(data["train"])
-        test_records = _pt_to_records(data["test"])
-    else:
-        # manifest.json에서 직접 로드
+        records = load_from_pt(args.data_path)
+    elif args.data_dir:
         print(f"\nLoading data: {args.data_dir}")
         print(f"  Input signals: {args.input_signals}")
-        print(f"  Window: {args.window_sec}s (pre-alarm)")
-
-        all_records = load_records(args.data_dir, args.input_signals, args.window_sec)
-        if not all_records:
-            print("ERROR: No records loaded.", file=sys.stderr)
-            sys.exit(1)
-
-        rng = np.random.default_rng(42)
-        rng.shuffle(all_records)
-        n_train = max(1, int(len(all_records) * args.train_ratio))
-        train_records = all_records[:n_train]
-        test_records = all_records[n_train:]
-
-    n_true_train = sum(1 for r in train_records if r["label"] == 1)
-    n_true_test = sum(1 for r in test_records if r["label"] == 1)
-    print(f"  Train: {len(train_records)} ({n_true_train} true alarms)")
-    print(f"  Test:  {len(test_records)} ({n_true_test} true alarms)")
-
-    if not train_records or not test_records:
-        print("ERROR: Insufficient data.", file=sys.stderr)
+        print(f"  Window: {args.window_sec}s")
+        records = load_records(args.data_dir, args.input_signals, args.window_sec)
+    else:
+        print("ERROR: --data-path or --data-dir required.", file=sys.stderr)
         sys.exit(1)
 
-    # 배치 생성
-    first_sig = next(iter(train_records[0]["signals"].values()))
-    max_length = len(first_sig)
+    if not records:
+        print("ERROR: No records loaded.", file=sys.stderr)
+        sys.exit(1)
 
-    train_batches = make_batches(
-        train_records, args.batch_size, args.patch_size, max_length
-    )
-    test_batches = make_batches(
-        test_records, args.batch_size, args.patch_size, max_length
-    )
+    n_true = sum(1 for r in records if r["label"] == 1)
+    n_false = len(records) - n_true
+    print(f"  Total: {len(records)} (True alarm={n_true}, False alarm={n_false})")
 
     # ── 모델 로드 ──
-    if args.checkpoint:
-        from downstream.model_wrapper import DownstreamModelWrapper
+    from downstream.model_wrapper import DownstreamModelWrapper
 
-        print(f"\nLoading checkpoint: {args.checkpoint}")
-        model = DownstreamModelWrapper(args.checkpoint, args.model_version, args.device)
-        d_model = model.d_model
-
-        if args.mode == "lora":
-            model.inject_lora(rank=args.lora_rank, alpha=args.lora_alpha)
-    else:
-        print("ERROR: --checkpoint required.", file=sys.stderr)
-        sys.exit(1)
+    print(f"\nLoading checkpoint: {args.checkpoint}")
+    model = DownstreamModelWrapper(args.checkpoint, args.model_version, args.device)
+    patch_size = model.patch_size
+    print(f"  d_model={model.d_model}, patch_size={patch_size}")
 
     sig_str = " + ".join(s.upper() for s in args.input_signals)
-    print(f"Mode: {args.mode} | Input: {sig_str} | Window: {args.window_sec}s")
+    print(f"  Input: {sig_str} | Window: {args.window_sec}s")
+    print(f"  Mask ratio: {args.mask_ratio}, Trials: {args.n_trials}")
 
-    # ── 학습 ──
-    probe = LinearProbe(d_model, n_classes=1)
+    # ── Anomaly Scoring (zero-shot, 학습 없음) ──
+    print(f"\nComputing reconstruction error scores ({len(records)} records)...")
+    scores = compute_reconstruction_scores(
+        model, records, patch_size,
+        mask_ratio=args.mask_ratio,
+        n_trials=args.n_trials,
+    )
 
-    if args.mode == "linear_probe":
-        print(f"\nTraining LinearProbe (frozen encoder, d_model={d_model})...")
-        train_losses = train_linear_probe(
-            model, probe, train_batches, args.epochs, args.lr, device
-        )
-        print("\nEvaluating...")
-        metrics = evaluate_linear_probe(model, probe, test_batches, device)
-    elif args.mode == "lora":
-        n_lora = sum(p.numel() for p in model.lora_parameters())
-        n_probe = sum(p.numel() for p in probe.parameters())
-        print(f"\nTraining LoRA + Probe (rank={args.lora_rank}, "
-              f"LoRA={n_lora:,} + Probe={n_probe:,} params)...")
-        train_losses = train_lora(
-            model, probe, train_batches, args.epochs, args.lr, device
-        )
-        print("\nEvaluating...")
-        metrics = evaluate_lora(model, probe, test_batches, device)
+    # ── 메트릭 계산 ──
+    y_true = np.array([r["label"] for r in records])
+    y_score = np.array(scores)
+    alarm_types = [r["alarm_type"] for r in records]
+
+    metrics = _compute_all_metrics(y_true, y_score, alarm_types)
+    y_true_out = metrics.pop("y_true")
+    y_score_out = metrics.pop("y_score")
 
     # ── 결과 출력 ──
-    y_true = metrics.pop("y_true")
-    y_score = metrics.pop("y_score")
-
     print(f"\n{'=' * 60}")
-    print(f"  ICU False Alarm Reduction — {args.mode}")
+    print(f"  Anomaly Detection — Reconstruction Error (Zero-Shot)")
     print(f"{'=' * 60}")
-    print(f"  AUROC:            {metrics['auroc']:.4f}")
-    print(f"  AUPRC:            {metrics['auprc']:.4f}")
-    print(f"  F1 (macro):       {metrics['f1_macro']:.4f}")
-    print(f"  Challenge Score:  {metrics['challenge_score']:.2f}")
-    print(f"  Threshold:        {metrics['optimal_threshold']:.3f}")
-    print(f"  Sensitivity:      {metrics['sensitivity']:.4f}")
-    print(f"  Specificity:      {metrics['specificity']:.4f}")
-    print(f"  True/False alarm: {metrics['n_true_alarm']}/{metrics['n_false_alarm']}")
+    print(f"  AUROC:              {metrics['auroc']:.4f}")
+    print(f"  AUPRC:              {metrics['auprc']:.4f}")
+    print(f"  F1 (macro):         {metrics['f1_macro']:.4f}")
+    print(f"  Threshold:          {metrics['optimal_threshold']:.6f}")
+    print(f"  Sensitivity:        {metrics['sensitivity']:.4f}")
+    print(f"  Specificity:        {metrics['specificity']:.4f}")
+    print(f"  True/False alarm:   {metrics['n_anomaly']}/{metrics['n_normal']}")
+    print(f"  Score (True alarm):  {metrics['score_mean_anomaly']:.6f} "
+          f"+/- {metrics['score_std_anomaly']:.6f}")
+    print(f"  Score (False alarm): {metrics['score_mean_normal']:.6f} "
+          f"+/- {metrics['score_std_normal']:.6f}")
 
     per_alarm = metrics.get("per_alarm", {})
     if per_alarm:
-        print(f"\n  {'Alarm Type':<30s}  {'N':>4s}  {'AUROC':>6s}  {'CScore':>7s}  "
-              f"{'Sens':>5s}  {'Spec':>5s}")
+        print(f"\n  {'Alarm Type':<30s}  {'N':>4s}  {'AUROC':>6s}  "
+              f"{'True MSE':>10s}  {'False MSE':>10s}")
         print(f"  {'-' * 70}")
         for atype in ALARM_TYPES:
             if atype not in per_alarm:
                 continue
             pa = per_alarm[atype]
             auroc_s = f"{pa['auroc']:.3f}" if pa.get("auroc", 0) > 0 else "  N/A"
-            cs_s = f"{pa.get('challenge_score', 0):.1f}" if "challenge_score" in pa else "   N/A"
-            sens_s = f"{pa.get('sensitivity', 0):.3f}" if "sensitivity" in pa else "  N/A"
-            spec_s = f"{pa.get('specificity', 0):.3f}" if "specificity" in pa else "  N/A"
-            print(f"  {atype:<30s}  {pa['n']:>4d}  {auroc_s:>6s}  {cs_s:>7s}  "
-                  f"{sens_s:>5s}  {spec_s:>5s}")
+            true_s = f"{pa.get('score_mean_true', 0):.6f}" if "score_mean_true" in pa else "       N/A"
+            false_s = f"{pa.get('score_mean_false', 0):.6f}" if "score_mean_false" in pa else "       N/A"
+            print(f"  {atype:<30s}  {pa['n']:>4d}  {auroc_s:>6s}  "
+                  f"{true_s:>10s}  {false_s:>10s}")
     print(f"{'=' * 60}")
 
-    # ROC curve
-    roc_path = out_dir / f"roc_{args.mode}.png"
-    plot_roc_curve(y_true, y_score, roc_path,
-                   title=f"False Alarm Reduction — {args.mode} ROC")
+    # ── 시각화 ──
+    roc_path = out_dir / "roc_anomaly_detection.png"
+    plot_roc_curve(y_true_out, y_score_out, roc_path,
+                   title="Anomaly Detection — Reconstruction Error ROC")
     print(f"\nROC curve: {roc_path}")
 
-    # JSON 저장
+    dist_path = out_dir / "score_distribution.png"
+    plot_score_distribution(
+        y_true_out, y_score_out, metrics["optimal_threshold"],
+        dist_path, title="Reconstruction Error Distribution"
+    )
+    print(f"Score distribution: {dist_path}")
+
+    # ── JSON 저장 ──
     results = {
         **metrics,
-        "train_losses": train_losses,
         "config": {
-            "mode": args.mode,
+            "mode": "reconstruction_error",
             "input_signals": args.input_signals,
             "window_sec": args.window_sec,
-            "lora_rank": args.lora_rank if args.mode == "lora" else None,
-            "epochs": args.epochs,
-            "lr": args.lr,
-            "train_ratio": args.train_ratio,
-            "batch_size": args.batch_size,
+            "mask_ratio": args.mask_ratio,
+            "n_trials": args.n_trials,
+            "patch_size": patch_size,
         },
     }
-    results_path = out_dir / f"results_{args.mode}.json"
+    results_path = out_dir / "results_anomaly_detection.json"
     with open(results_path, "w") as f:
         json.dump(results, f, indent=2, default=str)
     print(f"Results: {results_path}")
