@@ -469,7 +469,12 @@ def main() -> None:
     parser.add_argument("--lora-rank", type=int, default=8)
     parser.add_argument("--lora-alpha", type=float, default=16.0)
     parser.add_argument(
+        "--data-path", type=str, default=None,
+        help="prepare_data.py로 생성한 .pt 파일 경로 (이 옵션 사용 시 data-dir 무시)",
+    )
+    parser.add_argument(
         "--data-dir", type=str, default="datasets/processed/anomaly_detection",
+        help="파싱된 데이터 디렉토리 (manifest.json + .pt). --data-path 없을 때 사용.",
     )
     parser.add_argument(
         "--input-signals", nargs="+", default=["ecg", "ppg", "abp"],
@@ -477,7 +482,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--window-sec", type=float, default=60.0,
-        help="알람 직전 윈도우 길이 (초). 기본 60초. 최대 300초(short) 또는 330초(long).",
+        help="알람 직전 윈도우 길이 (초). --data-dir 모드에서만 사용.",
     )
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -493,30 +498,61 @@ def main() -> None:
     device = torch.device(args.device)
 
     # ── 데이터 로드 ──
-    print(f"\nLoading data: {args.data_dir}")
-    print(f"  Input signals: {args.input_signals}")
-    print(f"  Window: {args.window_sec}s (pre-alarm)")
+    if args.data_path and Path(args.data_path).exists():
+        # prepare_data.py로 생성한 .pt 로드
+        print(f"\nLoading prepared data: {args.data_path}")
+        data = torch.load(args.data_path, weights_only=False)
+        meta = data.get("metadata", {})
+        print(f"  Task: {meta.get('task', '?')}")
+        print(f"  Input signals: {meta.get('input_signals', '?')}")
+        print(f"  Window: {meta.get('window_sec', '?')}s")
 
-    records = load_records(args.data_dir, args.input_signals, args.window_sec)
-    if not records:
-        print("ERROR: No records loaded.", file=sys.stderr)
-        sys.exit(1)
+        def _pt_to_records(split_data: dict) -> list[dict]:
+            records = []
+            labels = split_data["labels"]
+            alarm_types = split_data.get("alarm_types", ["unknown"] * len(labels))
+            rec_names = split_data.get("records", [f"r{i}" for i in range(len(labels))])
+            input_keys = list(split_data["signals"].keys())
+            for i in range(len(labels)):
+                signals = {
+                    k: split_data["signals"][k][i].numpy()
+                    for k in input_keys
+                    if k in split_data["signals"]
+                }
+                records.append({
+                    "signals": signals,
+                    "label": int(labels[i].item()),
+                    "alarm_type": alarm_types[i],
+                    "record": rec_names[i],
+                })
+            return records
 
-    # Train/Test split (record-level, stratified by alarm_type)
-    rng = np.random.default_rng(42)
-    rng.shuffle(records)
+        train_records = _pt_to_records(data["train"])
+        test_records = _pt_to_records(data["test"])
+    else:
+        # manifest.json에서 직접 로드
+        print(f"\nLoading data: {args.data_dir}")
+        print(f"  Input signals: {args.input_signals}")
+        print(f"  Window: {args.window_sec}s (pre-alarm)")
 
-    n_train = max(1, int(len(records) * args.train_ratio))
-    train_records = records[:n_train]
-    test_records = records[n_train:]
+        all_records = load_records(args.data_dir, args.input_signals, args.window_sec)
+        if not all_records:
+            print("ERROR: No records loaded.", file=sys.stderr)
+            sys.exit(1)
+
+        rng = np.random.default_rng(42)
+        rng.shuffle(all_records)
+        n_train = max(1, int(len(all_records) * args.train_ratio))
+        train_records = all_records[:n_train]
+        test_records = all_records[n_train:]
 
     n_true_train = sum(1 for r in train_records if r["label"] == 1)
     n_true_test = sum(1 for r in test_records if r["label"] == 1)
     print(f"  Train: {len(train_records)} ({n_true_train} true alarms)")
     print(f"  Test:  {len(test_records)} ({n_true_test} true alarms)")
 
-    if not test_records:
-        print("ERROR: No test records.", file=sys.stderr)
+    if not train_records or not test_records:
+        print("ERROR: Insufficient data.", file=sys.stderr)
         sys.exit(1)
 
     # 배치 생성
