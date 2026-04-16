@@ -804,6 +804,35 @@ def _worker_split(task_tuple: tuple) -> tuple | None:
     )
 
 
+def _write_manifest_full(out_dir: Path) -> None:
+    """모든 subject의 manifest.json 내용을 manifest_full.jsonl로 통합한다.
+
+    manifest.jsonl(경로 인덱스)를 읽고, 각 subject의 manifest.json 내용을
+    한 줄씩 기록하여 단일 파일로 합친다. 학습 시 파일 1개만 open하면 된다.
+    """
+    index_file = out_dir / "manifest.jsonl"
+    if not index_file.exists():
+        return
+
+    full_file = out_dir / "manifest_full.jsonl"
+    count = 0
+    with open(index_file, encoding="utf-8") as idx, \
+         open(full_file, "w", encoding="utf-8") as out:
+        for line in idx:
+            line = line.strip()
+            if not line:
+                continue
+            meta = json.loads(line)
+            mf_path = out_dir / meta["manifest"]
+            if not mf_path.exists():
+                continue
+            with open(mf_path, encoding="utf-8") as f:
+                manifest_data = json.load(f)
+            out.write(json.dumps(manifest_data, ensure_ascii=False) + "\n")
+            count += 1
+    print(f"  manifest_full.jsonl 생성: {full_file} ({count} subjects)")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="VitalDB (.vital) → .pt 변환 (100Hz 리샘플링, train/test 분할 지원)"
@@ -1017,6 +1046,11 @@ def main() -> None:
                 print("    [SKIP] 유효 레코딩 없음")
                 continue
             _handle_result(result, i)
+
+    # ── 통합 manifest 생성 (manifest_full.jsonl) ──
+    _write_manifest_full(out_dir)
+    if test_out_dir:
+        _write_manifest_full(test_out_dir)
 
     print(f"\n완료: train {counts['train']}명 → {out_dir}")
     if test_out_dir:

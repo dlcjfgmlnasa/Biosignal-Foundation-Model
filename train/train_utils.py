@@ -242,6 +242,60 @@ def _load_manifest_paths_from_jsonl(
     return paths
 
 
+def _parse_manifest_full_jsonl(
+    full_jsonl: Path,
+    signal_types: list[int] | None,
+    max_subjects: int | None = None,
+) -> list[RecordingManifest]:
+    """manifest_full.jsonl (통합 manifest)에서 RecordingManifest를 직접 생성한다.
+
+    파일 1개만 open하여 모든 subject의 manifest를 읽는다.
+    개별 manifest.json을 열 필요가 없으므로 파일시스템 latency 영향 없음.
+    """
+    entries: list[RecordingManifest] = []
+    base_dir = full_jsonl.parent
+    n_subjects = 0
+
+    with open(full_jsonl, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            if max_subjects is not None and n_subjects >= max_subjects:
+                break
+
+            meta = json.loads(line)
+            subject_id = meta.get("subject_id", "")
+            subject_dir = base_dir / subject_id if subject_id else base_dir
+
+            for session in meta.get("sessions", []):
+                session_id = session.get("session_id", "")
+                for rec in session.get("recordings", []):
+                    if signal_types is not None and rec["signal_type"] not in signal_types:
+                        continue
+                    file_ref = rec["file"]
+                    if "#" in file_ref:
+                        h5_file, ds_name = file_ref.split("#", 1)
+                        full_path = str(subject_dir / h5_file) + "#" + ds_name
+                    else:
+                        full_path = str(subject_dir / file_ref)
+                    entries.append(
+                        RecordingManifest(
+                            path=full_path,
+                            n_channels=rec["n_channels"],
+                            n_timesteps=rec["n_timesteps"],
+                            sampling_rate=rec["sampling_rate"],
+                            signal_type=rec["signal_type"],
+                            session_id=session_id,
+                            spatial_ids=rec.get("spatial_ids"),
+                            start_sample=rec.get("start_sample", 0),
+                        )
+                    )
+            n_subjects += 1
+
+    return entries
+
+
 def load_manifest_from_processed(
     data_dir: str | Path | list[str | Path],
     signal_types: list[int] | None = None,
@@ -253,32 +307,93 @@ def load_manifest_from_processed(
 
     로딩 우선순위:
       1. ``.manifest_cache/*.pkl`` — pickle 캐시 (즉시)
-      2. ``manifest.jsonl`` — 통합 manifest (디렉토리 스캔 불필요)
-      3. ``manifest_index.txt`` — 사전 빌드된 경로 목록
-      4. ``glob("*/manifest.json")`` — 폴백 (느림)
+      2. ``manifest_full.jsonl`` — 통합 manifest (파일 1개로 즉시 파싱)
+      3. ``manifest.jsonl`` + 개별 파일 — 경로 인덱스 + 개별 open (느림)
+      4. ``manifest_index.txt`` + 개별 파일
+      5. ``glob("*/manifest.json")`` — 폴백 (매우 느림)
     """
     if isinstance(data_dir, (str, Path)):
         data_dirs = [Path(data_dir)]
     else:
         data_dirs = [Path(d) for d in data_dir]
 
-    # ── manifest 경로 수집 (우선순위: jsonl > index.txt > glob) ──
+    # ── 1) 캐시 또는 manifest_full.jsonl 확인 ──
+    # fingerprint 소스 결정 (stat 1회로 충분한 파일)
+    fp_sources: list[Path] = []
+    use_full_jsonl = False
+    for d in data_dirs:
+        full_jsonl = d / "manifest_full.jsonl"
+        if full_jsonl.exists():
+            fp_sources.append(full_jsonl)
+            use_full_jsonl = True
+        else:
+            jsonl = d / "manifest.jsonl"
+            idx = d / "manifest_index.txt"
+            if jsonl.exists():
+                fp_sources.append(jsonl)
+            elif idx.exists():
+                fp_sources.append(idx)
+
+    # fingerprint 계산 (인덱스/통합 파일의 mtime만 사용)
+    if fp_sources:
+        h = hashlib.sha256()
+        for src in fp_sources:
+            h.update(str(src).encode())
+            try:
+                h.update(str(src.stat().st_mtime_ns).encode())
+            except OSError:
+                h.update(b"missing")
+        if signal_types is not None:
+            h.update(json.dumps(sorted(signal_types)).encode())
+        if max_subjects is not None:
+            h.update(str(max_subjects).encode())
+        fp = h.hexdigest()[:16]
+        cache_dir = data_dirs[0] / ".manifest_cache"
+        cache_path = cache_dir / f"{fp}.pkl"
+
+        # 캐시 히트
+        if cache_path.exists():
+            try:
+                with open(cache_path, "rb") as cf:
+                    entries = pickle.load(cf)
+                print(f"  Manifest cache hit: {cache_path.name} ({len(entries)} recordings)")
+                return entries
+            except Exception:
+                pass
+
+        # manifest_full.jsonl에서 직접 파싱 (파일 1개 open으로 완료)
+        if use_full_jsonl:
+            entries: list[RecordingManifest] = []
+            for d in data_dirs:
+                full_jsonl = d / "manifest_full.jsonl"
+                if full_jsonl.exists():
+                    parsed = _parse_manifest_full_jsonl(full_jsonl, signal_types, max_subjects)
+                    entries.extend(parsed)
+                    print(f"  Using manifest_full.jsonl: {full_jsonl} ({len(parsed)} recordings)")
+            # 캐시 저장
+            try:
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                with open(cache_path, "wb") as cf:
+                    pickle.dump(entries, cf, protocol=pickle.HIGHEST_PROTOCOL)
+                print(f"  Manifest cache saved: {cache_path.name} ({len(entries)} recordings)")
+            except OSError:
+                pass
+            return entries
+
+    # ── 2) 폴백: manifest.jsonl/index.txt/glob → 개별 파일 파싱 ──
     manifest_files: list[Path] = []
-    index_sources: list[Path] = []  # fingerprint용 인덱스 파일 목록
     for d in data_dirs:
         jsonl_file = d / "manifest.jsonl"
         index_file = d / "manifest_index.txt"
         if jsonl_file.exists():
             paths = _load_manifest_paths_from_jsonl(jsonl_file, max_subjects)
             manifest_files.extend(paths)
-            index_sources.append(jsonl_file)
             print(f"  Using manifest.jsonl: {jsonl_file} ({len(paths)} subjects)")
         elif index_file.exists():
             with open(index_file) as f:
                 manifest_files.extend(
                     Path(line.strip()) for line in f if line.strip()
                 )
-            index_sources.append(index_file)
             print(f"  Using manifest index: {index_file} ({len(manifest_files)} files)")
         else:
             manifest_files.extend(sorted(d.glob("*/manifest.json")))
@@ -288,29 +403,11 @@ def load_manifest_from_processed(
     if not manifest_files:
         return []
 
-    # ── 캐시 핑거프린트 ──
-    # 인덱스 파일이 있으면 인덱스 mtime + 파일 수로 빠르게 fingerprint 생성
-    # (개별 manifest.json에 stat() 호출하지 않음)
-    if index_sources:
-        h = hashlib.sha256()
-        for src in index_sources:
-            h.update(str(src).encode())
-            try:
-                h.update(str(src.stat().st_mtime_ns).encode())
-            except OSError:
-                h.update(b"missing")
-        h.update(str(len(manifest_files)).encode())
-        if signal_types is not None:
-            h.update(json.dumps(sorted(signal_types)).encode())
-        if max_subjects is not None:
-            h.update(str(max_subjects).encode())
-        fp = h.hexdigest()[:16]
-    else:
-        fp = _manifest_cache_fingerprint(manifest_files, signal_types)
+    # 캐시 핑거프린트 (폴백용)
+    fp = _manifest_cache_fingerprint(manifest_files, signal_types)
     cache_dir = data_dirs[0] / ".manifest_cache"
     cache_path = cache_dir / f"{fp}.pkl"
 
-    # 캐시 히트
     if cache_path.exists():
         try:
             with open(cache_path, "rb") as cf:
@@ -320,10 +417,8 @@ def load_manifest_from_processed(
         except Exception:
             pass
 
-    # 캐시 미스 — 전체 파싱
     entries = _parse_manifest_files(manifest_files, signal_types)
 
-    # 캐시 저장
     try:
         cache_dir.mkdir(parents=True, exist_ok=True)
         with open(cache_path, "wb") as cf:
