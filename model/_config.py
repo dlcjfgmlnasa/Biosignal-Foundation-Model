@@ -67,7 +67,7 @@ class ModelConfig:
     dropout_p: float = 0.0
 
     # Signal types
-    num_signal_types: int = 7
+    num_signal_types: int = 8  # ECG(0)~ICP(7)
     num_spatial_ids: int = 12
 
     # Task
