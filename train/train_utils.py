@@ -183,7 +183,10 @@ def _parse_manifest_files(
 ) -> list[RecordingManifest]:
     """manifest.json 파일들을 파싱하여 RecordingManifest 목록을 반환한다."""
     entries: list[RecordingManifest] = []
-    for mf in manifest_files:
+    total = len(manifest_files)
+    for idx, mf in enumerate(manifest_files):
+        if total > 100 and (idx + 1) % 500 == 0:
+            print(f"  Parsing manifests: {idx + 1}/{total} ({100*(idx+1)//total}%)", flush=True)
         subject_dir = mf.parent
         with open(mf, encoding="utf-8") as f:
             meta = json.load(f)
