@@ -234,7 +234,16 @@ def load_manifest_from_processed(
 
     manifest_files: list[Path] = []
     for d in data_dirs:
-        manifest_files.extend(sorted(d.glob("*/manifest.json")))
+        index_file = d / "manifest_index.txt"
+        if index_file.exists():
+            # manifest_index.txt가 있으면 glob 대신 인덱스 사용 (대규모 디렉토리 최적화)
+            with open(index_file) as f:
+                manifest_files.extend(
+                    Path(line.strip()) for line in f if line.strip()
+                )
+            print(f"  Using manifest index: {index_file} ({len(manifest_files)} files)")
+        else:
+            manifest_files.extend(sorted(d.glob("*/manifest.json")))
     if max_subjects is not None:
         manifest_files = manifest_files[:max_subjects]
 
