@@ -37,7 +37,7 @@ signal_types: [0, 1, 2, 3, 4, 5, 6, 7]  # ECG, ABP, PPG, CVP, CO2, AWP, PAP, ICP
 max_subjects: null              # 전체 ~9,500 subjects
 window_seconds: 600.0          # 10분 윈도우 (300 patches) — 장기 temporal dependency 학습
 max_length: 64000              # CI: 10분 윈도우(60000) + patch 정렬 여유
-cache_size: 24                 # 192GB RAM → 캐시 확대
+cache_size: 64                 # 192GB RAM → 캐시 극대화, .pt 재로드 최소화
 crop_ratio_min: 0.01           # 최소 6초 (600s × 0.01)
 crop_ratio_max: 1.0            # 최대 전체 윈도우 (600s)
 

@@ -334,7 +334,8 @@ def main():
         collate_mode=config.collate_mode,
         patch_size=config.model_config.patch_size,
         pin_memory=True,
-        prefetch_factor=4,
+        prefetch_factor=8,
+        persistent_workers=True,
         sampler=sampler,
     )
     if rank0:
@@ -364,6 +365,8 @@ def main():
             collate_mode=config.collate_mode,
             patch_size=config.model_config.patch_size,
             pin_memory=True,
+            prefetch_factor=8,
+            persistent_workers=True,
             sampler=val_sampler,
         )
         if rank0:
