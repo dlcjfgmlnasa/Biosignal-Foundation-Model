@@ -214,29 +214,62 @@ def _parse_manifest_files(
     return entries
 
 
+def _load_manifest_paths_from_jsonl(
+    jsonl_path: Path,
+    max_subjects: int | None = None,
+) -> list[Path]:
+    """manifest.jsonl에서 개별 manifest.json 경로 목록을 추출한다.
+
+    manifest.jsonl 형식: 한 줄에 ``{"subject_id": "...", "manifest": "상대경로"}``
+    디렉토리 스캔(glob/find) 없이 경로만 읽으므로 대규모 데이터셋에서 빠르다.
+    """
+    base_dir = jsonl_path.parent
+    paths: list[Path] = []
+    with open(jsonl_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            if max_subjects is not None and len(paths) >= max_subjects:
+                break
+            meta = json.loads(line)
+            rel_path = meta.get("manifest", "")
+            if rel_path:
+                paths.append(base_dir / rel_path)
+    return paths
+
+
 def load_manifest_from_processed(
     data_dir: str | Path | list[str | Path],
     signal_types: list[int] | None = None,
     max_subjects: int | None = None,
 ) -> list[RecordingManifest]:
-    """processed 디렉토리에서 manifest.json을 읽어 RecordingManifest 목록을 반환한다.
+    """processed 디렉토리에서 manifest를 읽어 RecordingManifest 목록을 반환한다.
 
     ``data_dir``이 리스트이면 여러 디렉토리의 manifest를 합산한다.
 
-    핑거프린트 기반 캐시를 사용하여, manifest 파일이 변경되지 않았으면
-    이전에 파싱한 결과를 즉시 반환한다. 캐시 파일은 첫 번째 data_dir의
-    ``.manifest_cache/`` 하위에 저장된다.
+    로딩 우선순위:
+      1. ``.manifest_cache/*.pkl`` — pickle 캐시 (즉시)
+      2. ``manifest.jsonl`` — 통합 manifest (디렉토리 스캔 불필요)
+      3. ``manifest_index.txt`` — 사전 빌드된 경로 목록
+      4. ``glob("*/manifest.json")`` — 폴백 (느림)
     """
     if isinstance(data_dir, (str, Path)):
         data_dirs = [Path(data_dir)]
     else:
         data_dirs = [Path(d) for d in data_dir]
 
+    # ── manifest 경로 수집 (우선순위: jsonl > index.txt > glob) ──
     manifest_files: list[Path] = []
     for d in data_dirs:
+        jsonl_file = d / "manifest.jsonl"
         index_file = d / "manifest_index.txt"
-        if index_file.exists():
-            # manifest_index.txt가 있으면 glob 대신 인덱스 사용 (대규모 디렉토리 최적화)
+        if jsonl_file.exists():
+            # manifest.jsonl: 경로 인덱스 파일 (디렉토리 스캔 불필요)
+            paths = _load_manifest_paths_from_jsonl(jsonl_file, max_subjects)
+            manifest_files.extend(paths)
+            print(f"  Using manifest.jsonl: {jsonl_file} ({len(paths)} subjects)")
+        elif index_file.exists():
             with open(index_file) as f:
                 manifest_files.extend(
                     Path(line.strip()) for line in f if line.strip()
@@ -263,7 +296,6 @@ def load_manifest_from_processed(
             print(f"  Manifest cache hit: {cache_path.name} ({len(entries)} recordings)")
             return entries
         except Exception:
-            # 캐시 파일 손상 시 무시하고 재파싱
             pass
 
     # 캐시 미스 — 전체 파싱
@@ -276,7 +308,7 @@ def load_manifest_from_processed(
             pickle.dump(entries, cf, protocol=pickle.HIGHEST_PROTOCOL)
         print(f"  Manifest cache saved: {cache_path.name} ({len(entries)} recordings)")
     except OSError:
-        pass  # 쓰기 실패 시 무시 (read-only 파일시스템 등)
+        pass
 
     return entries
 
