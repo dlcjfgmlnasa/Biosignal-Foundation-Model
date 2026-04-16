@@ -68,7 +68,7 @@ class ModelConfig:
 
     # Signal types
     num_signal_types: int = 8  # ECG(0)~ICP(7)
-    num_spatial_ids: int = 12
+    num_spatial_ids: int = 13  # TOTAL_SPATIAL_IDS (spatial_map.py)
 
     # Task
     max_horizon: int = 1
