@@ -79,7 +79,7 @@ patience: 15                   # early stopping patience
 
 # ── 시스템 ──
 device: auto
-num_workers: 12                # 32vCPU → 12 workers
+num_workers: 8                 # 32vCPU → 8 workers
 output_dir: outputs/phase1
 checkpoint_every: 5
 viz_every: 1
