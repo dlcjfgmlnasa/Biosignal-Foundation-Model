@@ -264,19 +264,21 @@ def load_manifest_from_processed(
 
     # ── manifest 경로 수집 (우선순위: jsonl > index.txt > glob) ──
     manifest_files: list[Path] = []
+    index_sources: list[Path] = []  # fingerprint용 인덱스 파일 목록
     for d in data_dirs:
         jsonl_file = d / "manifest.jsonl"
         index_file = d / "manifest_index.txt"
         if jsonl_file.exists():
-            # manifest.jsonl: 경로 인덱스 파일 (디렉토리 스캔 불필요)
             paths = _load_manifest_paths_from_jsonl(jsonl_file, max_subjects)
             manifest_files.extend(paths)
+            index_sources.append(jsonl_file)
             print(f"  Using manifest.jsonl: {jsonl_file} ({len(paths)} subjects)")
         elif index_file.exists():
             with open(index_file) as f:
                 manifest_files.extend(
                     Path(line.strip()) for line in f if line.strip()
                 )
+            index_sources.append(index_file)
             print(f"  Using manifest index: {index_file} ({len(manifest_files)} files)")
         else:
             manifest_files.extend(sorted(d.glob("*/manifest.json")))
@@ -287,7 +289,24 @@ def load_manifest_from_processed(
         return []
 
     # ── 캐시 핑거프린트 ──
-    fp = _manifest_cache_fingerprint(manifest_files, signal_types)
+    # 인덱스 파일이 있으면 인덱스 mtime + 파일 수로 빠르게 fingerprint 생성
+    # (개별 manifest.json에 stat() 호출하지 않음)
+    if index_sources:
+        h = hashlib.sha256()
+        for src in index_sources:
+            h.update(str(src).encode())
+            try:
+                h.update(str(src.stat().st_mtime_ns).encode())
+            except OSError:
+                h.update(b"missing")
+        h.update(str(len(manifest_files)).encode())
+        if signal_types is not None:
+            h.update(json.dumps(sorted(signal_types)).encode())
+        if max_subjects is not None:
+            h.update(str(max_subjects).encode())
+        fp = h.hexdigest()[:16]
+    else:
+        fp = _manifest_cache_fingerprint(manifest_files, signal_types)
     cache_dir = data_dirs[0] / ".manifest_cache"
     cache_path = cache_dir / f"{fp}.pkl"
 
