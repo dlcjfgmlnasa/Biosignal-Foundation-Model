@@ -7,9 +7,11 @@ from __future__ import annotations
 데이터 로딩, 학습 루프, 체크포인트 함수를 정의한다.
 """
 import csv
+import hashlib
 import json
 import math
 import os
+import pickle
 import random
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
@@ -156,26 +158,30 @@ class TrainConfig:
 # ── 데이터 로딩 ─────────────────────────────────────────────────
 
 
-def load_manifest_from_processed(
-    data_dir: str | Path | list[str | Path],
-    signal_types: list[int] | None = None,
-    max_subjects: int | None = None,
-) -> list[RecordingManifest]:
-    """processed 디렉토리에서 manifest.json을 읽어 RecordingManifest 목록을 반환한다.
-
-    ``data_dir``이 리스트이면 여러 디렉토리의 manifest를 합산한다.
-    """
-    if isinstance(data_dir, (str, Path)):
-        data_dirs = [Path(data_dir)]
+def _manifest_cache_fingerprint(
+    manifest_files: list[Path],
+    signal_types: list[int] | None,
+) -> str:
+    """manifest 파일 경로 + mtime + signal_types로 캐시 핑거프린트를 생성한다."""
+    h = hashlib.sha256()
+    for mf in manifest_files:
+        h.update(str(mf).encode())
+        try:
+            h.update(str(mf.stat().st_mtime_ns).encode())
+        except OSError:
+            h.update(b"missing")
+    if signal_types is not None:
+        h.update(json.dumps(sorted(signal_types)).encode())
     else:
-        data_dirs = [Path(d) for d in data_dir]
+        h.update(b"all")
+    return h.hexdigest()[:16]
 
-    manifest_files: list[Path] = []
-    for d in data_dirs:
-        manifest_files.extend(sorted(d.glob("*/manifest.json")))
-    if max_subjects is not None:
-        manifest_files = manifest_files[:max_subjects]
 
+def _parse_manifest_files(
+    manifest_files: list[Path],
+    signal_types: list[int] | None,
+) -> list[RecordingManifest]:
+    """manifest.json 파일들을 파싱하여 RecordingManifest 목록을 반환한다."""
     entries: list[RecordingManifest] = []
     for mf in manifest_files:
         subject_dir = mf.parent
@@ -187,7 +193,6 @@ def load_manifest_from_processed(
             for rec in session["recordings"]:
                 if signal_types is not None and rec["signal_type"] not in signal_types:
                     continue
-                # HDF5: "subject.h5#dataset" → subject_dir/subject.h5#dataset
                 file_ref = rec["file"]
                 if "#" in file_ref:
                     h5_file, ds_name = file_ref.split("#", 1)
@@ -206,6 +211,64 @@ def load_manifest_from_processed(
                         start_sample=rec.get("start_sample", 0),
                     )
                 )
+    return entries
+
+
+def load_manifest_from_processed(
+    data_dir: str | Path | list[str | Path],
+    signal_types: list[int] | None = None,
+    max_subjects: int | None = None,
+) -> list[RecordingManifest]:
+    """processed 디렉토리에서 manifest.json을 읽어 RecordingManifest 목록을 반환한다.
+
+    ``data_dir``이 리스트이면 여러 디렉토리의 manifest를 합산한다.
+
+    핑거프린트 기반 캐시를 사용하여, manifest 파일이 변경되지 않았으면
+    이전에 파싱한 결과를 즉시 반환한다. 캐시 파일은 첫 번째 data_dir의
+    ``.manifest_cache/`` 하위에 저장된다.
+    """
+    if isinstance(data_dir, (str, Path)):
+        data_dirs = [Path(data_dir)]
+    else:
+        data_dirs = [Path(d) for d in data_dir]
+
+    manifest_files: list[Path] = []
+    for d in data_dirs:
+        manifest_files.extend(sorted(d.glob("*/manifest.json")))
+    if max_subjects is not None:
+        manifest_files = manifest_files[:max_subjects]
+
+    if not manifest_files:
+        return []
+
+    # ── 캐시 핑거프린트 ──
+    fp = _manifest_cache_fingerprint(manifest_files, signal_types)
+    cache_dir = data_dirs[0] / ".manifest_cache"
+    cache_path = cache_dir / f"{fp}.pkl"
+
+    # 캐시 히트
+    if cache_path.exists():
+        try:
+            with open(cache_path, "rb") as cf:
+                entries = pickle.load(cf)
+            print(f"  Manifest cache hit: {cache_path.name} ({len(entries)} recordings)")
+            return entries
+        except Exception:
+            # 캐시 파일 손상 시 무시하고 재파싱
+            pass
+
+    # 캐시 미스 — 전체 파싱
+    entries = _parse_manifest_files(manifest_files, signal_types)
+
+    # 캐시 저장
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        with open(cache_path, "wb") as cf:
+            pickle.dump(entries, cf, protocol=pickle.HIGHEST_PROTOCOL)
+        print(f"  Manifest cache saved: {cache_path.name} ({len(entries)} recordings)")
+    except OSError:
+        pass  # 쓰기 실패 시 무시 (read-only 파일시스템 등)
+
     return entries
 
 

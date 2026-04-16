@@ -169,26 +169,18 @@ def save_cross_modal_figure(
         empty = output_dir / f"cross_modal_epoch{epoch:03d}.png"
         return empty
 
-    # whitelist 쌍만 필터 + 그룹별 분리
+    # whitelist 쌍만 필터 (현재 모든 allowed pair는 Cardiovascular 그룹)
     allowed = {(min(a, b), max(a, b)) for a, b in CROSS_PRED_ALLOWED_PAIRS}
     cardio_pairs = []
-    resp_pairs = []
     for p in all_pairs:
         tp = (min(p["sig_type_a"], p["sig_type_b"]), max(p["sig_type_a"], p["sig_type_b"]))
         if tp not in allowed:
             continue
-        group_a = MECHANISM_GROUP.get(p["sig_type_a"], -1)
-        group_b = MECHANISM_GROUP.get(p["sig_type_b"], -1)
-        if group_a == 0 and group_b == 0:
-            if len(cardio_pairs) < max_pairs:
-                cardio_pairs.append(p)
-        elif group_a == 1 and group_b == 1:
-            if len(resp_pairs) < max_pairs:
-                resp_pairs.append(p)
+        if len(cardio_pairs) < max_pairs:
+            cardio_pairs.append(p)
 
-    path = _plot_cross_modal_grouped(
+    path = _plot_cross_modal_figure(
         cardio_pairs,
-        resp_pairs,
         epoch,
         output_dir,
         max_duration_s,
@@ -448,25 +440,19 @@ def _plot_pair_rows(
                 ax.set_xlabel("Time (s)", fontsize=9)
 
 
-def _plot_cross_modal_grouped(
-    cardio_pairs: list[dict],
-    resp_pairs: list[dict],
+def _plot_cross_modal_figure(
+    pairs: list[dict],
     epoch: int,
     output_dir: Path,
     max_duration_s: float,
     sampling_rate: float,
 ) -> Path:
-    """Cardiovascular / Respiratory 그룹별로 분리하여 시각화한다.
+    """Cross-modal prediction 쌍을 시각화한다.
 
-    상단: Cardiovascular 그룹 (ECG, ABP, PPG, CVP, PAP, ICP)
-    하단: Respiratory 그룹 (CO2, AWP)
-    각 쌍마다 2행 (variate A, variate B).
+    허용된 pair: ECG↔ABP, ECG↔PPG, ABP↔PPG, ABP↔PAP, CVP↔PAP, ABP↔ICP
+    각 쌍마다 2행 (source→target, target→source).
     """
-    n_cardio_rows = len(cardio_pairs) * 2
-    n_resp_rows = len(resp_pairs) * 2
-    # 그룹 헤더 행 추가 (있는 그룹만)
-    n_sections = (1 if cardio_pairs else 0) + (1 if resp_pairs else 0)
-    n_rows = n_cardio_rows + n_resp_rows + n_sections
+    n_rows = len(pairs) * 2
 
     if n_rows == 0:
         empty = output_dir / f"cross_modal_epoch{epoch:03d}.png"
@@ -477,55 +463,12 @@ def _plot_cross_modal_grouped(
         1,
         figsize=(14, 3 * n_rows),
         squeeze=False,
-        gridspec_kw={"height_ratios": _build_height_ratios(
-            n_cardio_rows, n_resp_rows, cardio_pairs, resp_pairs
-        )},
     )
 
-    row = 0
-
-    # ── Cardiovascular section ──
-    if cardio_pairs:
-        ax_header = axes[row, 0]
-        ax_header.set_facecolor(MECHANISM_GROUP_COLORS[0] + "15")
-        ax_header.text(
-            0.5, 0.5,
-            "[Cardiovascular] ECG, ABP, PPG, CVP, PAP, ICP",
-            transform=ax_header.transAxes,
-            ha="center", va="center",
-            fontsize=12, fontweight="bold",
-            color=MECHANISM_GROUP_COLORS[0],
-        )
-        ax_header.set_xlim(0, 1)
-        ax_header.set_ylim(0, 1)
-        ax_header.axis("off")
-        row += 1
-
-        _plot_pair_rows(axes, cardio_pairs, row, max_duration_s, sampling_rate)
-        row += n_cardio_rows
-
-    # ── Respiratory section ──
-    if resp_pairs:
-        ax_header = axes[row, 0]
-        ax_header.set_facecolor(MECHANISM_GROUP_COLORS[1] + "15")
-        ax_header.text(
-            0.5, 0.5,
-            "[Respiratory] CO2, AWP",
-            transform=ax_header.transAxes,
-            ha="center", va="center",
-            fontsize=12, fontweight="bold",
-            color=MECHANISM_GROUP_COLORS[1],
-        )
-        ax_header.set_xlim(0, 1)
-        ax_header.set_ylim(0, 1)
-        ax_header.axis("off")
-        row += 1
-
-        _plot_pair_rows(axes, resp_pairs, row, max_duration_s, sampling_rate)
+    _plot_pair_rows(axes, pairs, 0, max_duration_s, sampling_rate)
 
     fig.suptitle(
-        f"Cross-Modal Prediction — Epoch {epoch}  "
-        f"[Cardio: {len(cardio_pairs)} pairs, Resp: {len(resp_pairs)} pairs]",
+        f"Cross-Modal Prediction — Epoch {epoch}  [{len(pairs)} pairs]",
         fontsize=13, y=1.01,
     )
     fig.tight_layout()
@@ -534,20 +477,3 @@ def _plot_cross_modal_grouped(
     fig.savefig(path, dpi=120, bbox_inches="tight")
     plt.close(fig)
     return path
-
-
-def _build_height_ratios(
-    n_cardio_rows: int,
-    n_resp_rows: int,
-    cardio_pairs: list,
-    resp_pairs: list,
-) -> list[float]:
-    """그룹 헤더(작은 높이)와 데이터 행(표준 높이)의 height_ratios."""
-    ratios: list[float] = []
-    if cardio_pairs:
-        ratios.append(0.3)  # 헤더
-        ratios.extend([1.0] * n_cardio_rows)
-    if resp_pairs:
-        ratios.append(0.3)  # 헤더
-        ratios.extend([1.0] * n_resp_rows)
-    return ratios

@@ -40,8 +40,8 @@ from data.parser._common import resample_to_target
 TARGET_SR: float = 100.0
 NATIVE_SR: float = 500.0
 
-# 12-lead ECG 채널 — 전부 signal_type "ecg"
-ECG_LEADS = {"I", "II", "III", "aVR", "aVL", "aVF", "V1", "V2", "V3", "V4", "V5", "V6"}
+# Pretraining에서 학습한 ECG lead만 파싱
+ECG_LEADS = {"II", "V5"}
 SIGNAL_TYPE_INT: int = 0  # ecg
 
 
@@ -94,9 +94,10 @@ def load_labels(raw_dir: Path) -> dict[str, int]:
     """라벨 파일에서 레코드별 품질 라벨을 로드한다.
 
     여러 가능한 라벨 파일 형식을 시도:
-    1. REFERENCE.csv: record,label
-    2. ANSWERS: record,label
-    3. .hea 파일 내 주석에서 추출
+    1. RECORDS-acceptable / RECORDS-unacceptable (레코드명 리스트)
+    2. REFERENCE.csv: record,label
+    3. ANSWERS: record,label
+    4. .hea 파일 내 주석에서 추출
 
     Returns
     -------
@@ -104,30 +105,44 @@ def load_labels(raw_dir: Path) -> dict[str, int]:
     """
     labels: dict[str, int] = {}
 
-    # 1. REFERENCE.csv 또는 ANSWERS 파일 탐색
-    for label_file_name in ["REFERENCE.csv", "ANSWERS", "REFERENCE", "answers.txt"]:
-        for label_path in raw_dir.rglob(label_file_name):
-            with open(label_path, "r") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-                    parts = line.split(",")
-                    if len(parts) >= 2:
-                        name = parts[0].strip()
-                        try:
-                            labels[name] = int(parts[1].strip())
-                        except ValueError:
-                            # "acceptable" / "unacceptable" 문자열 처리
-                            val = parts[1].strip().lower()
-                            if val in ("acceptable", "accept", "1", "true"):
-                                labels[name] = 1
-                            elif val in ("unacceptable", "unaccept", "3", "false"):
-                                labels[name] = 3
-                            else:
-                                labels[name] = 2  # indeterminate
+    # 1. RECORDS-acceptable / RECORDS-unacceptable 파일 탐색
+    for rec_file in raw_dir.rglob("RECORDS-acceptable"):
+        with open(rec_file, "r") as f:
+            for line in f:
+                name = line.strip()
+                if name:
+                    labels[name] = 1  # acceptable
+    for rec_file in raw_dir.rglob("RECORDS-unacceptable"):
+        with open(rec_file, "r") as f:
+            for line in f:
+                name = line.strip()
+                if name:
+                    labels[name] = 3  # unacceptable
 
-    # 2. .hea 파일 주석에서 추출
+    # 2. REFERENCE.csv 또는 ANSWERS 파일 탐색
+    if not labels:
+        for label_file_name in ["REFERENCE.csv", "ANSWERS", "REFERENCE", "answers.txt"]:
+            for label_path in raw_dir.rglob(label_file_name):
+                with open(label_path, "r") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#"):
+                            continue
+                        parts = line.split(",")
+                        if len(parts) >= 2:
+                            name = parts[0].strip()
+                            try:
+                                labels[name] = int(parts[1].strip())
+                            except ValueError:
+                                val = parts[1].strip().lower()
+                                if val in ("acceptable", "accept", "1", "true"):
+                                    labels[name] = 1
+                                elif val in ("unacceptable", "unaccept", "3", "false"):
+                                    labels[name] = 3
+                                else:
+                                    labels[name] = 2  # indeterminate
+
+    # 3. .hea 파일 주석에서 추출
     if not labels:
         for hea_path in raw_dir.rglob("*.hea"):
             with open(hea_path, "r") as f:

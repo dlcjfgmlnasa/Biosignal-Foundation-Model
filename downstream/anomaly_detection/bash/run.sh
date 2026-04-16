@@ -17,8 +17,8 @@ DEVICE=cuda
 MASK_RATIO=0.5
 N_TRIALS=5
 
-# Lead II를 기본으로 사용 (우리 pretraining ECG와 동일)
-LEADS=("II" "V1" "aVR")
+# Pretraining에서 학습한 ECG lead만 사용
+LEADS=("II" "V5")
 
 echo "============================================================"
 echo "  Anomaly Detection — ECG Signal Quality (Zero-Shot)"

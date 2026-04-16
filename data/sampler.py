@@ -12,7 +12,6 @@ from __future__ import annotations
   같은 (session_id, physical_time_ms)의 채널들을 항상 같은 배치에 넣어서
   PackCollate의 any_variate 그루핑이 제대로 동작하도록 보장한다.
 """
-import bisect
 import math
 from collections import defaultdict
 from collections.abc import Iterator
@@ -175,33 +174,31 @@ class GroupedBatchSampler(Sampler[list[int]]):
 
         # 그룹 빌딩: (session_id, time_slot) 기반
         # collate와 동일한 키 → 같은 그룹이 같은 배치 + 같은 sample_id
+        # recording 단위로 순회하여 O(M×W) — bisect 없이 직접 인덱스 계산
         groups: dict[tuple, list[int]] = defaultdict(list)
         group_to_rec: dict[tuple, int] = {}
 
-        for idx in range(len(dataset)):
-            rec_idx = (
-                bisect.bisect_right(
-                    dataset._rec_offsets, idx, hi=len(dataset._rec_offsets) - 1
-                )
-                - 1
-            )
-            local = idx - dataset._rec_offsets[rec_idx]
+        for rec_idx, entry in enumerate(dataset._manifest):
+            n_ch = entry.n_channels
             n_win = dataset._n_windows_per_rec[rec_idx]
-            win_idx = local % n_win
+            if n_win == 0:
+                continue
             stride = dataset._strides_per_rec[rec_idx]
-            win_start = win_idx * stride
+            base = dataset._rec_offsets[rec_idx]
+            has_session = bool(entry.session_id)
 
-            entry = dataset._manifest[rec_idx]
+            for w in range(n_win):
+                win_start = w * stride
 
-            if entry.session_id:
-                abs_sample = entry.start_sample + win_start
-                slot = abs_sample // slot_size
-                key = (entry.session_id, slot)
-            else:
-                key = (rec_idx, win_start)
+                if has_session:
+                    slot = (entry.start_sample + win_start) // slot_size
+                    key = (entry.session_id, slot)
+                else:
+                    key = (rec_idx, win_start)
 
-            groups[key].append(idx)
-            group_to_rec[key] = rec_idx
+                # flat index = base + ch * n_win + w (dataset 인덱싱과 동일)
+                groups[key].extend(base + ch * n_win + w for ch in range(n_ch))
+                group_to_rec[key] = rec_idx
 
         self._groups: list[list[int]] = list(groups.values())
         keys = list(groups.keys())

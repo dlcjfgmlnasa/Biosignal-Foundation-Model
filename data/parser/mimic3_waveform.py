@@ -59,6 +59,15 @@ ECG_CHANNEL_NAMES = {"II", "I", "III", "V", "aVR", "aVL", "aVF", "MCL1"}
 # PPG 채널명 후보
 PPG_CHANNEL_NAMES = {"PLETH"}
 
+# CVP 채널명 후보
+CVP_CHANNEL_NAMES = {"CVP"}
+
+# PAP 채널명 후보
+PAP_CHANNEL_NAMES = {"PAP"}
+
+# ICP 채널명 후보
+ICP_CHANNEL_NAMES = {"ICP"}
+
 
 # ── 데이터 구조 ──────────────────────────────────────────────────
 
