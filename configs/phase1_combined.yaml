@@ -60,6 +60,7 @@ beta: 0.5                      # next-pred (non-EEG raw + EEG spectral)
 gamma: 0.0                     # cross-modal (Phase 2에서 활성)
 delta: 0.0                     # contrastive (Phase 2에서 활성)
 lambda_spec: 0.2               # Multi-Resolution STFT Loss — 전체 신호 주파수 구조 보존
+peak_alpha: 1.0                # Peak-Weighted MSE — R-peak, systolic peak 복원 강화
 aux_loss_weight: 0.01
 contrastive_temperature: 0.07
 learnable_temperature: true
