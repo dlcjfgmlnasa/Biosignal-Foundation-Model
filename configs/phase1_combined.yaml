@@ -67,8 +67,8 @@ learnable_temperature: true
 # ── Masking ──
 variate_mask_prob: 0.0         # Phase 1은 비활성 (Phase 2에서 0.3)
 block_mask: true               # 연속 블록 단위 마스킹 (보간 방지)
-block_size_min: 3              # 최소 3패치(6초) — beat-level 복원
-block_size_max: 15             # 최대 15패치(30초) — 시퀀스의 5%
+block_size_min: 3              # 최소 3패치(6초) — 호흡계(CO2/AWP/CVP) 1 cycle 보장
+block_size_max: 8              # 최대 8패치(16초) — 호흡계 2–3 cycle, 준주기 16–24 beat
 
 # ── Mixed Precision ──
 use_amp: true                  # L40S BF16/FP16 tensor cores
