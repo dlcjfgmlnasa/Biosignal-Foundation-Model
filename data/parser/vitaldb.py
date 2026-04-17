@@ -953,7 +953,34 @@ def main() -> None:
             "--subject-from-parent 3 → subject='VDB_0398'."
         ),
     )
+    parser.add_argument(
+        "--skip-manifest-full",
+        action="store_true",
+        help=(
+            "manifest_full.jsonl 재생성을 건너뛴다. "
+            "분할 실행(subject 디렉토리 루프)에서 매번 재생성되는 O(N²) 비용 회피용. "
+            "최종적으로 'python -m data.parser.vitaldb --rebuild-manifest-full --out ...'으로 한 번만 생성."
+        ),
+    )
+    parser.add_argument(
+        "--rebuild-manifest-full",
+        action="store_true",
+        help="parsing 없이 manifest_full.jsonl만 재생성 (--out 필요). --skip-manifest-full 후 마지막 단계.",
+    )
     args = parser.parse_args()
+
+    # ── Manifest-full rebuild-only 모드 ──
+    if args.rebuild_manifest_full:
+        if args.out is None:
+            print("ERROR: --rebuild-manifest-full은 --out이 필요합니다.", file=sys.stderr)
+            sys.exit(1)
+        out_dir = Path(args.out)
+        if not out_dir.exists():
+            print(f"ERROR: {out_dir} 없음.", file=sys.stderr)
+            sys.exit(1)
+        print(f"manifest_full.jsonl 재생성 시작: {out_dir}")
+        _write_manifest_full(out_dir)
+        return
 
     raw_dir = Path(args.raw)
     # 재귀 검색: 중첩 디렉토리 구조 지원 (K-MIMIC-MORTAL 등)
@@ -1109,9 +1136,15 @@ def main() -> None:
             _handle_result(result, i)
 
     # ── 통합 manifest 생성 (manifest_full.jsonl) ──
-    _write_manifest_full(out_dir)
-    if test_out_dir:
-        _write_manifest_full(test_out_dir)
+    if not args.skip_manifest_full:
+        _write_manifest_full(out_dir)
+        if test_out_dir:
+            _write_manifest_full(test_out_dir)
+    else:
+        print(
+            "  manifest_full.jsonl 재생성 건너뜀 (--skip-manifest-full). "
+            "최종 단계에서 '--rebuild-manifest-full --out <dir>' 1회 실행하세요."
+        )
 
     print(f"\n완료: train {counts['train']}명 → {out_dir}")
     if test_out_dir:
