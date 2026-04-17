@@ -21,7 +21,9 @@ model_config:
   use_var_attn_bias: true
   use_spatial_embed: true
   dropout_p: 0.1
-  next_block_size: 5
+
+  # ── Task heads ──
+  next_block_size: 5  # Block Next Prediction (block_size_* 대칭)
   contrastive_proj_dim: 0
 
 # ── 데이터 ──
@@ -56,7 +58,8 @@ aux_loss_weight: 0.01           # MoE load balancing
 contrastive_temperature: 0.07
 learnable_temperature: true
 
-# ── Masking ──
+# ── Masking (Block MPM) ──
+# 대칭: 미래 방향 예측 블록 크기는 model_config.next_block_size
 variate_mask_prob: 0.0
 block_mask: true
 block_size_min: 3

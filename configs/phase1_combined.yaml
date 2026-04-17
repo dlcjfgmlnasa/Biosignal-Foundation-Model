@@ -27,8 +27,10 @@ model_config:
   use_var_attn_bias: true
   use_spatial_embed: true
   dropout_p: 0.1
-  next_block_size: 5          # Block Next Prediction: 각 position에서 미래 5 patches 동시 예측
-  contrastive_proj_dim: 0     # Phase 1에서는 비활성
+
+  # ── Task heads ──
+  next_block_size: 5          # Block Next Prediction — 미래 K patches 동시 예측 (block_size_* 대칭)
+  contrastive_proj_dim: 0     # Contrastive projection head (Phase 1에서는 비활성)
 
 # ── 데이터 (VitalDB + K-MIMIC 통합) ──
 data_dir:
@@ -56,7 +58,7 @@ max_batches: 10000
 
 # ── Loss 가중치 (Phase 1: MPM + Next-Pred) ──
 alpha: 1.0                     # masked reconstruction (non-EEG raw + EEG spectral)
-beta: 0.5                      # next-pred (non-EEG raw + EEG spectral)
+beta: 0.8                      # next-pred (non-EEG raw + EEG spectral) — Block Next Pred 비중 상향
 gamma: 0.0                     # cross-modal (Phase 2에서 활성)
 delta: 0.0                     # contrastive (Phase 2에서 활성)
 lambda_spec: 0.2               # Multi-Resolution STFT Loss — 전체 신호 주파수 구조 보존
@@ -65,7 +67,8 @@ aux_loss_weight: 0.01
 contrastive_temperature: 0.07
 learnable_temperature: true
 
-# ── Masking ──
+# ── Masking (Block MPM) ──
+# 대칭: 미래 방향 예측 블록 크기는 model_config.next_block_size
 variate_mask_prob: 0.0         # Phase 1은 비활성 (Phase 2에서 0.3)
 block_mask: true               # 연속 블록 단위 마스킹 (보간 방지)
 block_size_min: 3              # 최소 3패치(6초) — 호흡계(CO2/AWP/CVP) 1 cycle 보장

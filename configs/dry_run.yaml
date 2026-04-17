@@ -14,7 +14,9 @@ model_config:
   use_var_attn_bias: true
   use_spatial_embed: true
   dropout_p: 0.0
-  next_block_size: 5
+
+  # ── Task heads ──
+  next_block_size: 5  # Block Next Prediction (block_size_* 대칭)
   contrastive_proj_dim: 0
 
 processed_dir: datasets/processed
