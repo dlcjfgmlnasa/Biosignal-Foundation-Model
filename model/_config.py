@@ -44,8 +44,8 @@ class ModelConfig:
         신호 타입 수 (ECG, ABP, PPG, CVP, CO2, AWP, PAP, ICP).
     num_spatial_ids:
         글로벌 spatial ID 수.
-    max_horizon:
-        Next-patch prediction 최대 예측 거리.
+    next_block_size:
+        Block Next Prediction에서 각 position이 병렬 예측하는 future patch 수 (K).
     """
 
     # Architecture
@@ -71,7 +71,7 @@ class ModelConfig:
     num_spatial_ids: int = 13  # TOTAL_SPATIAL_IDS (spatial_map.py)
 
     # Task
-    max_horizon: int = 1
+    next_block_size: int = 5  # Block Next Prediction (K future patches per position)
 
     # Contrastive
     contrastive_proj_dim: int = 0  # 0=비활성, >0=projection head 출력 차원

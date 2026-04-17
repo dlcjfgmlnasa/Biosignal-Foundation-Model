@@ -74,9 +74,6 @@ class TrainConfig:
     contrastive_temperature: float = 0.07
     learnable_temperature: bool = True
 
-    # Horizon
-    horizon_curriculum: bool = True  # False면 항상 h=1 고정 (max_horizon 무시)
-
     # Masking 전략
     variate_mask_prob: float = 0.0  # Phase 2: variate-level 마스킹 확률
     variate_drop_prob: float = 0.0  # Phase 2: variate를 attention에서 완전 제거 (zero-shot용)
@@ -470,33 +467,6 @@ def split_manifest_by_subject(
 # ── 학습 루프 ───────────────────────────────────────────────────
 
 
-def get_max_horizon(config: TrainConfig, epoch: int) -> int:
-    """현재 epoch에 해당하는 max_horizon을 반환한다.
-
-    horizon_curriculum=False이면 항상 1 반환.
-    max_horizon <= 1이면 항상 1 반환 (curriculum 비활성).
-    max_horizon > 1이면 n_epochs를 3등분하여 자동 curriculum:
-      → 전반 40%: H=1, 중반 30%: H=ceil(max_horizon*0.6), 후반 30%: H=max_horizon
-    """
-    if not config.horizon_curriculum:
-        return 1
-
-    max_h = config.model_config.max_horizon
-    if max_h <= 1:
-        return 1
-
-    n = config.n_epochs
-    phase1_end = int(n * 0.4)  # 40%
-    phase2_end = int(n * 0.7)  # 70%
-
-    if epoch < phase1_end:
-        return 1
-    elif epoch < phase2_end:
-        return max(1, -(-max_h * 3 // 5))  # ceil(max_h * 0.6)
-    else:
-        return max_h
-
-
 def train_one_epoch(
     model: nn.Module,
     dataloader,
@@ -533,11 +503,6 @@ def train_one_epoch(
         batch.variate_id = batch.variate_id.to(device)
 
         # ── Forward (single call: task="both" for DDP compatibility) ──
-        # DDP: 모든 rank가 동일한 horizon을 사용해야 gradient sync 일치
-        h = 1
-        if enable_next:
-            h = (n_batches % get_max_horizon(config, epoch)) + 1
-
         with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
             raw_model = model.module if isinstance(model, DDP) else model
             task = "both" if enable_next else "masked"
@@ -545,7 +510,6 @@ def train_one_epoch(
             out = model(
                 batch,
                 task=task,
-                horizon=h,
                 mask_ratio=config.mask_ratio,
                 block_mask=config.block_mask,
                 block_size_min=config.block_size_min,
@@ -589,7 +553,6 @@ def train_one_epoch(
                 patch_mask=patch_mask,
                 patch_sample_id=out["patch_sample_id"],
                 patch_variate_id=out["patch_variate_id"],
-                horizon=h,
                 cross_pred_per_type=cross_pred_per_type if config.gamma > 0 else None,
                 time_id=time_id if needs_time_id else None,
                 contrastive_z=contrastive_z if config.delta > 0 else None,
@@ -755,16 +718,11 @@ def validate(
         batch.sample_id = batch.sample_id.to(device)
         batch.variate_id = batch.variate_id.to(device)
 
-        h = 1
-        if enable_next:
-            h = random.randint(1, get_max_horizon(config, epoch))
-
         with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
             task = "both" if enable_next else "masked"
             out = raw_model(
                 batch,
                 task=task,
-                horizon=h,
                 mask_ratio=config.mask_ratio,
                 block_mask=config.block_mask,
                 block_size_min=config.block_size_min,
@@ -805,7 +763,6 @@ def validate(
                 patch_mask=patch_mask,
                 patch_sample_id=out["patch_sample_id"],
                 patch_variate_id=out["patch_variate_id"],
-                horizon=h,
                 cross_pred_per_type=cross_pred_per_type if config.gamma > 0 else None,
                 time_id=time_id if needs_time_id else None,
                 contrastive_z=contrastive_z if config.delta > 0 else None,
@@ -1072,7 +1029,7 @@ def save_experiment_info(
         f"use_glu        = {mc.use_glu}",
         f"use_moe        = {mc.use_moe}",
         f"use_rope       = {mc.use_rope}",
-        f"max_horizon    = {mc.max_horizon}",
+        f"next_block_size = {mc.next_block_size}",
         "",
         "[Training]",
         f"batch_size     = {config.batch_size}",

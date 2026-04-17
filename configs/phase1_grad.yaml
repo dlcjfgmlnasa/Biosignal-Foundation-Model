@@ -27,7 +27,7 @@ model_config:
   use_var_attn_bias: true
   use_spatial_embed: true
   dropout_p: 0.1
-  max_horizon: 5
+  next_block_size: 5
   contrastive_proj_dim: 0
 
 # ── 데이터 (baseline과 동일) ──

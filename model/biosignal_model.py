@@ -61,8 +61,10 @@ class BiosignalFoundationModel(nn.Module):
         글로벌 spatial ID 수.
     use_spatial_embed:
         signal_type + spatial_id 이중 임베딩 사용 여부.
-    max_horizon:
-        Next-patch prediction 최대 예측 거리.
+    next_block_size:
+        Block Next Prediction에서 각 position이 병렬 예측하는 future patch 수 (K).
+        각 position n에서 encoded_causal[n]으로부터 n+1, n+2, ..., n+K 시점의 raw patch를
+        non-autoregressive하게 동시 예측한다.
     contrastive_proj_dim:
         Contrastive projection head 출력 차원. 0이면 비활성.
     """
@@ -86,7 +88,7 @@ class BiosignalFoundationModel(nn.Module):
         num_signal_types: int = 8,  # ECG(0),ABP(1),PPG(2),CVP(3),CO2(4),AWP(5),PAP(6),ICP(7)
         num_spatial_ids: int = 13,  # TOTAL_SPATIAL_IDS (8 types × 가변 spatial IDs)
         use_spatial_embed: bool = True,
-        max_horizon: int = 1,
+        next_block_size: int = 5,
         contrastive_proj_dim: int = 0,
     ) -> None:
         super().__init__()
@@ -145,8 +147,10 @@ class BiosignalFoundationModel(nn.Module):
         # 6. Reconstruction Head (자기 variate 복원)
         self.head = nn.Linear(d_model, patch_size)
 
-        # 7. Next-Patch Prediction Head
-        self.next_head = nn.Linear(d_model, patch_size)
+        # 7. Block Next-Patch Prediction Head
+        # 각 position에서 K개의 future patches를 병렬 예측 (non-autoregressive).
+        self.next_block_size = next_block_size
+        self.next_head = nn.Linear(d_model, next_block_size * patch_size)
 
         # 8. Cross-Modal Prediction Heads (target signal type별 독립 Linear)
         self.cross_heads = nn.ModuleDict({
@@ -154,11 +158,7 @@ class BiosignalFoundationModel(nn.Module):
             for st in range(num_signal_types)
         })
 
-        # 9. Horizon Embedding (random horizon next-patch prediction)
-        self.max_horizon = max_horizon
-        self.horizon_embed = nn.Embedding(max_horizon, d_model)
-
-        # 10. Contrastive Projection Head (SimCLR-style 2-layer MLP)
+        # 9. Contrastive Projection Head (SimCLR-style 2-layer MLP)
         self.contrastive_proj_dim = contrastive_proj_dim
         if contrastive_proj_dim > 0:
             self.contrastive_proj = nn.Sequential(
@@ -167,7 +167,7 @@ class BiosignalFoundationModel(nn.Module):
                 nn.Linear(d_model, contrastive_proj_dim),
             )
 
-        # 11. Learnable [MASK] Token
+        # 10. Learnable [MASK] Token
         self.mask_token = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
 
     @staticmethod
@@ -429,7 +429,6 @@ class BiosignalFoundationModel(nn.Module):
         self,
         batch: PackedBatch,
         task: str = "masked",  # "masked" 또는 "next_pred"
-        horizon: int = 1,
         mask_ratio: float = 0.0,
         block_mask: bool = False,
         block_size_min: int = 3,
@@ -478,16 +477,16 @@ class BiosignalFoundationModel(nn.Module):
                     encoded
                 )  # (B, N, proj_dim)
 
-        # ── Next-Patch Prediction ──
+        # ── Block Next-Patch Prediction ──
+        # encoded_causal[n] → K개의 future raw patches (n+1, ..., n+K) 병렬 예측.
         if task in ("next_pred", "both"):
             encoded_for_next = enc.get("encoded_causal", encoded)  # (B, N, d_model)
-            h_emb = self.horizon_embed(
-                torch.tensor(horizon - 1, device=encoded_for_next.device)
-            )  # (d_model,)
-            encoded_h = encoded_for_next + h_emb.unsqueeze(0).unsqueeze(
-                0
-            )  # (B, N, d_model)
-            out_dict["next_pred"] = self.next_head(encoded_h)  # (B, N, patch_size)
+            b, n = encoded_for_next.shape[:2]
+            k = self.next_block_size
+            next_out = self.next_head(encoded_for_next)  # (B, N, K*P)
+            out_dict["next_pred"] = next_out.reshape(
+                b, n, k, self.patch_size
+            )  # (B, N, K, P)
 
         return out_dict
 
@@ -571,28 +570,27 @@ class BiosignalFoundationModel(nn.Module):
     def forecast(
         self,
         batch: PackedBatch,
-        horizon: int = 1,
         denormalize: bool = True,
     ) -> torch.Tensor:
-        """단일-step 예측 (next-patch prediction).
+        """Block next-patch 예측 (non-autoregressive).
+
+        각 position n에서 미래 K개 패치를 동시에 예측한다.
 
         Parameters
         ----------
         batch:
             PackCollate로 생성된 PackedBatch.
-        horizon:
-            예측 거리 (패치 단위).
         denormalize:
             ``True``이면 scaler의 loc/scale로 원본 스케일 복원.
 
         Returns
         -------
         torch.Tensor
-            ``(B, N, patch_size)`` 전체 prediction map.
+            ``(B, N, K, patch_size)`` block prediction map.
         """
         self.eval()
-        out = self.forward(batch, task="next_pred", horizon=horizon)
-        pred = out["next_pred"]  # (B, N, patch_size)
+        out = self.forward(batch, task="next_pred")
+        pred = out["next_pred"]  # (B, N, K, patch_size)
 
         if denormalize:
             loc = out["loc"]  # (B, L, 1)
@@ -603,7 +601,8 @@ class BiosignalFoundationModel(nn.Module):
             n = pred.shape[1]
             patch_loc = patch_loc[:, :n, :]  # (B, N, 1)
             patch_scale = patch_scale[:, :n, :]  # (B, N, 1)
-            pred = pred * patch_scale + patch_loc
+            # Broadcast over K dimension
+            pred = pred * patch_scale.unsqueeze(2) + patch_loc.unsqueeze(2)
 
         return pred
 
@@ -614,10 +613,11 @@ class BiosignalFoundationModel(nn.Module):
         n_steps: int,
         denormalize: bool = True,
     ) -> torch.Tensor:
-        """Autoregressive 다단계 생성.
+        """Block-autoregressive 다단계 생성.
 
-        항상 ``horizon=1``로 1-step 예측 → 예측값을 입력에 append → 반복.
-        ``collate_mode="ci"`` (single-variate-per-row) 전제.
+        Block Next Prediction head가 1-shot에 K개 패치를 내놓으므로, 매 forward마다
+        K개를 모두 취해 입력에 append → 다시 forward → 반복. ``collate_mode="ci"``
+        (single-variate-per-row) 전제.
 
         Parameters
         ----------
@@ -635,36 +635,46 @@ class BiosignalFoundationModel(nn.Module):
         """
         self.eval()
         p = self.patch_size
+        k = self.next_block_size
 
-        out = self.forward(batch, task="next_pred", horizon=1)
+        out = self.forward(batch, task="next_pred")
         loc = out["loc"]  # (B, L, 1)
         scale = out["scale"]  # (B, L, 1)
         cached_loc = loc[:, 0:1, :]  # (B, 1, 1)
         cached_scale = scale[:, 0:1, :]  # (B, 1, 1)
 
-        generated = []
-        pred = out["next_pred"]  # (B, N, patch_size)
+        generated: list[torch.Tensor] = []
+        pred = out["next_pred"]  # (B, N, K, patch_size)
         patch_mask = out["patch_mask"]  # (B, N)
+        b = pred.shape[0]
         last_valid_idx = patch_mask.sum(dim=-1) - 1  # (B,)
         last_valid_idx = last_valid_idx.clamp(min=0)
-        new_patch = pred[
-            torch.arange(pred.shape[0], device=pred.device), last_valid_idx
-        ]  # (B, patch_size)
-        generated.append(new_patch)
+        arange_b = torch.arange(b, device=pred.device)
+        block = pred[arange_b, last_valid_idx]  # (B, K, patch_size)
 
-        for _ in range(n_steps - 1):
-            batch = _append_patch_to_batch(batch, new_patch, p)
-            out = self.forward(batch, task="next_pred", horizon=1)
-            pred = out["next_pred"]
+        # 한 번의 forward에서 나오는 K patches를 순서대로 append.
+        for j in range(k):
+            if len(generated) >= n_steps:
+                break
+            generated.append(block[:, j, :])  # (B, patch_size)
+
+        while len(generated) < n_steps:
+            # block의 K patches를 모두 입력에 append — 다음 forward에서 새 예측.
+            for j in range(k):
+                batch = _append_patch_to_batch(batch, block[:, j, :], p)
+
+            out = self.forward(batch, task="next_pred")
+            pred = out["next_pred"]  # (B, N, K, patch_size)
             patch_mask = out["patch_mask"]
             last_valid_idx = patch_mask.sum(dim=-1) - 1
             last_valid_idx = last_valid_idx.clamp(min=0)
-            new_patch = pred[
-                torch.arange(pred.shape[0], device=pred.device), last_valid_idx
-            ]
-            generated.append(new_patch)
+            block = pred[arange_b, last_valid_idx]  # (B, K, patch_size)
+            for j in range(k):
+                if len(generated) >= n_steps:
+                    break
+                generated.append(block[:, j, :])
 
-        result = torch.stack(generated, dim=0)  # (n_steps, B, patch_size)
+        result = torch.stack(generated[:n_steps], dim=0)  # (n_steps, B, patch_size)
 
         if denormalize:
             dl = cached_loc.squeeze(-1).permute(1, 0)  # (1, B)

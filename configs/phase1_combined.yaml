@@ -27,7 +27,7 @@ model_config:
   use_var_attn_bias: true
   use_spatial_embed: true
   dropout_p: 0.1
-  max_horizon: 1              # H=1 고정 (H>1은 학습 불안정, 커리큘럼 전략 보류)
+  next_block_size: 5          # Block Next Prediction: 각 position에서 미래 5 patches 동시 예측
   contrastive_proj_dim: 0     # Phase 1에서는 비활성
 
 # ── 데이터 (VitalDB + K-MIMIC 통합) ──

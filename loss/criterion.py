@@ -66,13 +66,12 @@ class CombinedLoss(nn.Module):
     def forward(
         self,
         reconstructed: torch.Tensor,  # (B, N, patch_size)
-        next_pred: torch.Tensor | None,  # (B, N, patch_size) or None
+        next_pred: torch.Tensor | None,  # (B, N, K, patch_size) or None — Block Next Prediction
         original_patches: torch.Tensor,  # (B, N, patch_size)
         pred_mask: torch.Tensor,  # (B, N) bool — 마스킹된 패치
         patch_mask: torch.Tensor,  # (B, N) bool — 유효 패치
         patch_sample_id: torch.Tensor,  # (B, N) long — 패치별 sample_id
         patch_variate_id: torch.Tensor,  # (B, N) long — 패치별 variate_id
-        horizon: int = 1,
         cross_pred_per_type: torch.Tensor | None = None,  # (B, N, T, patch_size) — per-target-type cross-modal 예측
         time_id: torch.Tensor | None = None,  # (B, N) long — cross-modal 페어링용
         contrastive_z: torch.Tensor
@@ -84,7 +83,7 @@ class CombinedLoss(nn.Module):
         masked_dict = self.masked_loss_fn(reconstructed, original_patches, pred_mask)
         masked_loss = masked_dict["total"]
 
-        # ── Next-Patch Prediction Loss ──
+        # ── Block Next-Patch Prediction Loss ──
         if self.beta > 0 and next_pred is not None:
             next_dict = self.next_loss_fn(
                 next_pred,
@@ -95,7 +94,6 @@ class CombinedLoss(nn.Module):
                 patch_variate_id,
                 time_id=time_id,
                 patch_signal_types=patch_signal_types,
-                horizon=horizon,
             )
             next_loss = next_dict["next_loss"]
             next_spec = next_dict["next_spec"]

@@ -131,8 +131,9 @@ def _plot_figure_grid(
     max_duration_s: float,
     sampling_rate: float,
     mode: str,  # "masked" or "next_pred"
-    horizon: int = 1,
+    next_block_size: int = 1,
     next_pred_ratio: float = 0.3,
+    context_patches: int = 10,
 ) -> Path:
     """행=신호 타입, 열=샘플로 grid figure를 그려 저장한다."""
     types = sorted(grid.keys())
@@ -155,10 +156,10 @@ def _plot_figure_grid(
         pred_label = "Reconstructed"
         highlight_label = "Masked region"
     else:
-        pred_color = "seagreen"
-        highlight_color = "green"
-        pred_label = f"Predicted (H={horizon})"
-        highlight_label = "Prediction region"
+        pred_color = "crimson"
+        highlight_color = "red"
+        pred_label = f"Predicted block (K={next_block_size})"
+        highlight_label = "Prediction block"
 
     for row, sig_type in enumerate(types):
         cands = grid[sig_type]
@@ -169,53 +170,95 @@ def _plot_figure_grid(
                 continue
 
             cand = cands[col]
-            n_show = min(cand.n_valid, max_patches)
-            orig_wave = cand.orig_patches[:n_show].reshape(-1)
-            pred_patches_cropped = cand.pred_patches[:n_show].copy()
 
-            # next_pred: crop 후 범위에서 균등 샘플링
             if mode == "next_pred":
-                valid_pred_indices = [
-                    p_idx
-                    for p_idx in range(n_show)
-                    if not np.isnan(pred_patches_cropped[p_idx, 0])
-                ]
-                n_to_show = max(1, int(len(valid_pred_indices) * next_pred_ratio))
-                if len(valid_pred_indices) > n_to_show:
-                    sampled = np.linspace(
-                        0, len(valid_pred_indices) - 1, n_to_show, dtype=int
-                    )
-                    keep = set(valid_pred_indices[s] for s in sampled)
-                else:
-                    keep = set(valid_pred_indices)
-                for p_idx in valid_pred_indices:
-                    if p_idx not in keep:
-                        pred_patches_cropped[p_idx] = np.nan
+                # Block Next Prediction 시각화:
+                # 1) "예측 패치" 위치(=NaN이 아닌 패치)가 있는 연속 블록을 찾는다.
+                # 2) 그 블록 바로 앞 ~context_patches만큼 context를 함께 그린다.
+                pred_valid = ~np.isnan(cand.pred_patches[:, 0])
+                block_indices = np.nonzero(pred_valid)[0]
+                if len(block_indices) == 0:
+                    ax.axis("off")
+                    continue
 
-            pred_wave = pred_patches_cropped.reshape(-1)
-            t = np.arange(len(orig_wave)) / sampling_rate
+                block_start = int(block_indices.min())
+                block_end = int(block_indices.max()) + 1  # exclusive
+                ctx_start = max(0, block_start - context_patches)
+                view_end = min(cand.n_valid, block_end)
 
-            ax.plot(t, orig_wave, color="steelblue", linewidth=0.8, alpha=0.9)
+                orig_view = cand.orig_patches[ctx_start:view_end].reshape(-1)
+                pred_view_patches = cand.pred_patches[ctx_start:view_end]
+                pred_view = pred_view_patches.reshape(-1)
+                t_offset = ctx_start * p / sampling_rate
+                t = np.arange(len(orig_view)) / sampling_rate + t_offset
 
-            n_pred = 0
-            for patch_idx in range(n_show):
-                start = patch_idx * p
-                end = start + p
-                patch_pred = pred_wave[start:end]
-                if not np.isnan(patch_pred[0]):
+                # Context + ground-truth(예측 구간) 전체를 steelblue로, 예측 구간은
+                # 점선으로 덧씌워 GT임을 강조.
+                ax.plot(t, orig_view, color="steelblue", linewidth=0.9, alpha=0.8)
+
+                # Predicted block: K patches를 빨간색 실선으로
+                ctx_len_patches = block_start - ctx_start
+                for j in range(block_end - block_start):
+                    patch_idx_local = ctx_len_patches + j
+                    start = patch_idx_local * p
+                    end = start + p
                     ax.axvspan(
-                        start / sampling_rate,
-                        end / sampling_rate,
+                        t[start],
+                        t[end - 1] + 1.0 / sampling_rate,
                         alpha=0.12,
                         color=highlight_color,
                     )
-                    ax.plot(t[start:end], patch_pred, color=pred_color, linewidth=1.2)
-                    n_pred += 1
+                    ax.plot(
+                        t[start:end],
+                        pred_view[start:end],
+                        color=pred_color,
+                        linewidth=1.4,
+                    )
+                    # GT 점선 overlay (같은 구간)
+                    ax.plot(
+                        t[start:end],
+                        orig_view[start:end],
+                        color="gray",
+                        linewidth=1.0,
+                        linestyle=":",
+                        alpha=0.9,
+                    )
+
+                n_pred = block_end - block_start
+                n_show = view_end - ctx_start
+                duration_shown = n_show * p / sampling_rate
+            else:
+                # Masked reconstruction: 기존 로직 유지
+                n_show = min(cand.n_valid, max_patches)
+                orig_wave = cand.orig_patches[:n_show].reshape(-1)
+                pred_patches_cropped = cand.pred_patches[:n_show].copy()
+
+                pred_wave = pred_patches_cropped.reshape(-1)
+                t = np.arange(len(orig_wave)) / sampling_rate
+
+                ax.plot(t, orig_wave, color="steelblue", linewidth=0.8, alpha=0.9)
+
+                n_pred = 0
+                for patch_idx in range(n_show):
+                    start = patch_idx * p
+                    end = start + p
+                    patch_pred = pred_wave[start:end]
+                    if not np.isnan(patch_pred[0]):
+                        ax.axvspan(
+                            start / sampling_rate,
+                            end / sampling_rate,
+                            alpha=0.12,
+                            color=highlight_color,
+                        )
+                        ax.plot(
+                            t[start:end], patch_pred, color=pred_color, linewidth=1.2
+                        )
+                        n_pred += 1
+                duration_shown = n_show * p / sampling_rate
 
             if col == 0:
                 ax.set_ylabel(cand.signal_name, fontsize=10)
 
-            duration_shown = n_show * p / sampling_rate
             ax.set_title(
                 f"{n_pred}/{n_show} patches | {duration_shown:.0f}s",
                 fontsize=8,
@@ -225,18 +268,30 @@ def _plot_figure_grid(
             if row == n_rows - 1:
                 ax.set_xlabel("Time (s)", fontsize=8)
 
-    legend_elements = [
-        Line2D([0], [0], color="steelblue", linewidth=1, label="Original"),
-        Line2D([0], [0], color=pred_color, linewidth=1.2, label=pred_label),
-        Patch(facecolor=highlight_color, alpha=0.12, label=highlight_label),
-    ]
+    if mode == "next_pred":
+        legend_elements = [
+            Line2D(
+                [0], [0], color="steelblue", linewidth=1, label="Context / Ground truth"
+            ),
+            Line2D([0], [0], color=pred_color, linewidth=1.4, label=pred_label),
+            Line2D(
+                [0], [0], color="gray", linewidth=1.0, linestyle=":", label="GT overlay"
+            ),
+            Patch(facecolor=highlight_color, alpha=0.12, label=highlight_label),
+        ]
+    else:
+        legend_elements = [
+            Line2D([0], [0], color="steelblue", linewidth=1, label="Original"),
+            Line2D([0], [0], color=pred_color, linewidth=1.2, label=pred_label),
+            Patch(facecolor=highlight_color, alpha=0.12, label=highlight_label),
+        ]
     axes[0, 0].legend(handles=legend_elements, loc="upper right", fontsize=7)
 
     if mode == "masked":
         title = f"Masked Reconstruction - Epoch {epoch}"
         fname = f"recon_epoch{epoch:03d}.png"
     else:
-        title = f"Next-Patch Prediction (H={horizon}) - Epoch {epoch}"
+        title = f"Block Next Prediction (K={next_block_size}) - Epoch {epoch}"
         fname = f"next_pred_epoch{epoch:03d}.png"
 
     fig.suptitle(title, fontsize=13, y=1.01)
@@ -445,20 +500,25 @@ def _process_recon_batch(
 def _process_next_pred_batch(
     model: BiosignalFoundationModel,
     batch: PackedBatch,
-    horizon: int,
     device: torch.device | None,
 ) -> list[RowCandidate]:
-    """Next-patch prediction 후보를 추출한다."""
+    """Block Next Prediction 후보를 추출한다.
+
+    각 (sample_id, variate_id) 세그먼트에서 context 끝 위치를 ``n_seg - K``로 두고,
+    그 위치에서 예측된 K개 future patches를 그 이후 K개 자리에 배치한다. 해당 위치에는
+    ground truth가 함께 존재하므로 시각적으로 비교 가능하다.
+    """
     if device is not None:
         _batch_to_device(batch, device)
 
-    out = model(batch, task="next_pred", horizon=horizon)
+    out = model(batch, task="next_pred")
     original_patches, patch_loc, patch_scale, n = _extract_patches_and_scales(
         model, batch, out
     )
     p = model.patch_size
+    k = model.next_block_size
 
-    next_pred = out["next_pred"]
+    next_pred = out["next_pred"]  # (B, N, K, P)
     patch_mask = out["patch_mask"]
     p_sid = out["patch_sample_id"]
     p_vid = out["patch_variate_id"]
@@ -478,18 +538,31 @@ def _process_next_pred_batch(
             vid = int(c) % 10000
             seg_mask = valid & (combo == c)
             seg_indices = seg_mask.nonzero(as_tuple=True)[0]
-            n_seg = len(seg_indices)
-            if n_seg <= horizon:
+            n_seg = int(len(seg_indices))
+            # 최소 context 1 + 예측 K 필요.
+            if n_seg <= k:
                 continue
 
-            seg_orig = original_patches[bi, seg_indices].cpu().numpy()
+            seg_orig = original_patches[bi, seg_indices].cpu().numpy()  # (n_seg, P)
 
-            seg_next_norm = next_pred[bi, seg_indices]
-            seg_loc = patch_loc[bi, seg_indices].unsqueeze(-1)
-            seg_scale = patch_scale[bi, seg_indices].unsqueeze(-1)
-            seg_next = (seg_next_norm * seg_scale + seg_loc).cpu().numpy()
+            # context 끝 패치 = n_seg - K - 1 (그 다음 K개 자리에 GT가 존재)
+            ctx_end_local = n_seg - k - 1
+            ctx_end_global = int(seg_indices[ctx_end_local].item())
+
+            seg_loc = patch_loc[bi, seg_indices]  # (n_seg,)
+            seg_scale = patch_scale[bi, seg_indices]  # (n_seg,)
+
+            # ctx_end 위치의 K-block 예측을 ctx_end의 loc/scale로 denormalize
+            block_norm = next_pred[bi, ctx_end_global]  # (K, P)
+            ctx_loc = seg_loc[ctx_end_local]  # scalar
+            ctx_scale = seg_scale[ctx_end_local]  # scalar
+            block_denorm = (block_norm * ctx_scale + ctx_loc).cpu().numpy()  # (K, P)
+
             pred = np.full((n_seg, p), np.nan)
-            pred[horizon:n_seg] = seg_next[: n_seg - horizon]
+            # 예측 블록: ctx_end_local + 1 .. ctx_end_local + K
+            pred_start = ctx_end_local + 1
+            pred_end = pred_start + k
+            pred[pred_start:pred_end] = block_denorm
 
             sig_type = sig_map.get((bi, sid, vid), -1)
             sig_name = SIGNAL_TYPE_NAMES.get(sig_type, "?")
@@ -579,14 +652,16 @@ def save_next_pred_figure(
     batch: PackedBatch | list[PackedBatch],
     epoch: int,
     output_dir: str | Path,
-    horizon: int = 1,
     max_rows: int = 4,
     samples_per_type: int = 3,
     max_duration_s: float = 60.0,
     sampling_rate: float = 100.0,
     device: torch.device | None = None,
 ) -> Path:
-    """Next-patch prediction의 원본 vs 예측 비교 figure를 저장한다.
+    """Block Next Prediction 시각화 figure를 저장한다.
+
+    각 세그먼트에서 context 마지막 위치의 K-block 예측을 그 이후 K개 자리에 그려,
+    context(파란색) + 예측 블록(빨간색) + 점선 GT overlay로 비교한다.
 
     Parameters
     ----------
@@ -601,7 +676,7 @@ def save_next_pred_figure(
 
     all_candidates: list[RowCandidate] = []
     for b in batches:
-        all_candidates.extend(_process_next_pred_batch(model, b, horizon, device))
+        all_candidates.extend(_process_next_pred_batch(model, b, device))
 
     grid = _select_diverse_grid(all_candidates, samples_per_type=samples_per_type)
 
@@ -616,7 +691,7 @@ def save_next_pred_figure(
         max_duration_s,
         sampling_rate,
         mode="next_pred",
-        horizon=horizon,
+        next_block_size=model.next_block_size,
     )
     model.train()
     return path

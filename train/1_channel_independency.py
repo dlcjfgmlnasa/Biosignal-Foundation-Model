@@ -42,7 +42,6 @@ from .train_utils import (
     set_seed,
     setup_ddp,
     split_manifest_by_subject,
-    get_max_horizon,
     train_one_epoch,
     validate,
 )
@@ -81,7 +80,7 @@ def parse_args() -> argparse.Namespace:
         "--use_var_attn_bias", action=argparse.BooleanOptionalAction, default=True
     )
     g.add_argument("--dropout_p", type=float, default=0.0)
-    g.add_argument("--max_horizon", type=int, default=5)
+    g.add_argument("--next_block_size", type=int, default=5)
 
     # Data
     g = p.add_argument_group("Data")
@@ -205,7 +204,7 @@ def main():
             use_rope=args.use_rope,
             use_var_attn_bias=args.use_var_attn_bias,
             dropout_p=args.dropout_p,
-            max_horizon=args.max_horizon,
+            next_block_size=args.next_block_size,
             contrastive_proj_dim=0,
         )
 
@@ -488,43 +487,14 @@ def main():
         print(f"\nStarting training: {config.n_epochs} epochs")
         print(f"  alpha={config.alpha}, beta={config.beta}, gamma={config.gamma}")
         print(
-            f"  max_horizon={config.model_config.max_horizon}, mask_ratio={config.mask_ratio}"
+            f"  next_block_size={config.model_config.next_block_size}, mask_ratio={config.mask_ratio}"
         )
-        if config.model_config.max_horizon > 1:
-            n = config.n_epochs
-            print(
-                f"  horizon_curriculum: epoch 0~{int(n * 0.4) - 1}→H=1, "
-                f"{int(n * 0.4)}~{int(n * 0.7) - 1}→H≤{max(1, -(-config.model_config.max_horizon * 3 // 5))}, "
-                f"{int(n * 0.7)}~{n - 1}→H≤{config.model_config.max_horizon}"
-            )
         print(f"  warmup_epochs={config.warmup_epochs}")
         if val_dataloader is not None:
             print(f"  val_ratio={config.val_ratio}, patience={config.patience}")
         print(f"{'=' * 60}")
 
-    prev_max_h = None
     for epoch in range(start_epoch, config.n_epochs):
-        # Horizon curriculum 로깅 + embed 복사
-        cur_max_h = get_max_horizon(config, epoch)
-        if cur_max_h != prev_max_h:
-            if rank0:
-                print(
-                    f"  [Horizon] epoch {epoch}: max_horizon {prev_max_h} -> {cur_max_h}"
-                )
-            # 새 horizon embed를 이전 최고 horizon embed로 초기화
-            if prev_max_h is not None and cur_max_h > prev_max_h:
-                raw = model.module if use_ddp else model
-                with torch.no_grad():
-                    for h in range(prev_max_h, cur_max_h):
-                        raw.horizon_embed.weight.data[h] = (
-                            raw.horizon_embed.weight.data[prev_max_h - 1].clone()
-                        )
-                        if rank0:
-                            print(
-                                f"    → horizon_embed[{h}] initialized from embed[{prev_max_h - 1}]"
-                            )
-            prev_max_h = cur_max_h
-
         # DDP: sampler 에폭 설정 (셔플링 동기화)
         if sampler is not None:
             sampler.set_epoch(epoch)
@@ -598,7 +568,6 @@ def main():
                     viz_batches,
                     epoch=epoch,
                     output_dir=viz_np_dir,
-                    horizon=1,
                     device=device,
                 )
                 print(f"  -> Next-pred figure saved: {np_path}")

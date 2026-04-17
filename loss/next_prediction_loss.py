@@ -56,7 +56,7 @@ class NextPredictionLoss(nn.Module):
 
     def forward(
         self,
-        next_pred: torch.Tensor,  # (B, N, P) — same-variate 예측
+        next_pred: torch.Tensor,  # (B, N, K, P) — block next-patch 예측
         cross_pred_per_type: torch.Tensor
         | None,  # (B, N, T, P) — per-target-type cross-modal 예측
         original_patches: torch.Tensor,  # (B, N, P)
@@ -66,24 +66,25 @@ class NextPredictionLoss(nn.Module):
         time_id: torch.Tensor | None = None,  # (B, N) long — cross-modal 페어링용
         patch_signal_types: torch.Tensor
         | None = None,  # (B, N) long — mechanism group 필터용
-        horizon: int = 1,
     ) -> dict[str, torch.Tensor]:
-        """Next-patch prediction loss 계산.
+        """Block Next Prediction loss 계산.
+
+        각 position n에서 next_pred[:, n, k-1, :]가 n+k 시점 raw patch를 예측하도록
+        학습한다 (k=1..K). K step별 loss를 균등 평균한다.
 
         Returns
         -------
         dict with keys:
-            ``next_loss``: same-variate next-patch prediction MSE.
+            ``next_loss``: same-variate block next-patch prediction MSE.
             ``cross_modal_loss``: cross-modal prediction MSE (0 if disabled).
         """
-        # ── Same-variate next-patch loss ──
+        # ── Same-variate block next-patch loss ──
         next_dict = self._same_variate_loss(
             next_pred,
             original_patches,
             patch_mask,
             patch_sample_id,
             patch_variate_id,
-            horizon,
         )
 
         # ── Cross-modal loss ──
@@ -113,47 +114,68 @@ class NextPredictionLoss(nn.Module):
 
     def _same_variate_loss(
         self,
-        next_pred: torch.Tensor,  # (B, N, P)
+        next_pred: torch.Tensor,  # (B, N, K, P)
         original_patches: torch.Tensor,  # (B, N, P)
         patch_mask: torch.Tensor,  # (B, N) bool
         patch_sample_id: torch.Tensor,  # (B, N) long
         patch_variate_id: torch.Tensor,  # (B, N) long
-        horizon: int,
     ) -> dict[str, torch.Tensor]:
-        """Same-variate next-patch prediction loss.
+        """Same-variate Block Next Prediction loss.
+
+        각 k ∈ [1..K]에 대해:
+          target = ``original_patches[:, k:N]``
+          pred   = ``next_pred[:, :N-k, k-1, :]``
+        같은 (sample_id, variate_id) 쌍에서만 valid. K step loss를 균등 평균.
 
         Returns
         -------
         dict with keys: ``mse``, ``spec``, ``total``.
         """
-        target_next = original_patches[:, horizon:, :]  # (B, N-H, P)
-        pred_next = next_pred[:, :-horizon, :]  # (B, N-H, P)
+        b, n, k, p = next_pred.shape
 
-        valid = (
-            patch_mask[:, :-horizon]
-            & patch_mask[:, horizon:]
-            & (patch_sample_id[:, :-horizon] == patch_sample_id[:, horizon:])
-            & (patch_variate_id[:, :-horizon] == patch_variate_id[:, horizon:])
-        )  # (B, N-H)
+        mse_sum = next_pred.new_tensor(0.0)
+        spec_sum = next_pred.new_tensor(0.0)
+        total_sum = next_pred.new_tensor(0.0)
+        valid_steps = 0
 
-        n_valid = valid.float().sum()
-        if n_valid > 0:
-            horizon_weight = 1.0 / horizon
+        for step in range(1, k + 1):
+            if n <= step:
+                continue
+            target_step = original_patches[:, step:, :]  # (B, N-step, P)
+            pred_step = next_pred[:, : n - step, step - 1, :]  # (B, N-step, P)
+
+            valid = (
+                patch_mask[:, : n - step]
+                & patch_mask[:, step:]
+                & (patch_sample_id[:, : n - step] == patch_sample_id[:, step:])
+                & (patch_variate_id[:, : n - step] == patch_variate_id[:, step:])
+            )  # (B, N-step)
+
+            if not bool(valid.any()):
+                continue
+
             loss_dict = compute_patch_loss(
-                pred_next[valid],
-                target_next[valid],
+                pred_step[valid],
+                target_step[valid],
                 peak_alpha=self.peak_alpha,
                 lambda_spec=self.lambda_spec,
                 spec_n_ffts=self.spec_n_ffts,
             )
-            return {
-                "mse": loss_dict["mse"] * horizon_weight,
-                "spec": loss_dict["spec"] * horizon_weight,
-                "total": loss_dict["total"] * horizon_weight,
-            }
+            mse_sum = mse_sum + loss_dict["mse"]
+            spec_sum = spec_sum + loss_dict["spec"]
+            total_sum = total_sum + loss_dict["total"]
+            valid_steps += 1
 
-        zero = next_pred.new_tensor(0.0)
-        return {"mse": zero, "spec": zero, "total": zero}
+        if valid_steps == 0:
+            zero = next_pred.new_tensor(0.0)
+            return {"mse": zero, "spec": zero, "total": zero}
+
+        denom = float(valid_steps)
+        return {
+            "mse": mse_sum / denom,
+            "spec": spec_sum / denom,
+            "total": total_sum / denom,
+        }
 
     def _cross_modal_loss(
         self,

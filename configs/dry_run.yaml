@@ -14,7 +14,7 @@ model_config:
   use_var_attn_bias: true
   use_spatial_embed: true
   dropout_p: 0.0
-  max_horizon: 2
+  next_block_size: 5
   contrastive_proj_dim: 0
 
 processed_dir: datasets/processed
