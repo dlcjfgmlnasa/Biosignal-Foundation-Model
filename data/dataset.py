@@ -87,7 +87,7 @@ class BiosignalDataset(Dataset[BiosignalSample]):
         window_seconds: float | None = None,
         stride_seconds: float | None = None,
         cache_size: int = 8,
-        use_mmap: bool = True,
+        use_mmap: bool = False,
         crop_ratio_range: tuple[float, float] | None = None,
         patch_size: int | None = None,
         preload: bool = False,  # deprecated, 무시됨
