@@ -431,14 +431,34 @@ def discover_tracks(vital_path: Path) -> list[str]:
     return tracks
 
 
-def _parse_subject_id(vital_path: Path) -> tuple[str, str]:
-    """파일명에서 (subject_id, session_id)를 추출한다."""
-    stem = vital_path.stem
-    digits = "".join(c for c in stem if c.isdigit())
-    if not digits:
-        digits = stem
-    subject_id = f"VDB_{int(digits):04d}"
-    session_id = f"{subject_id}_S0"
+def _parse_subject_id(
+    vital_path: Path,
+    subject_from_parent: int = 0,
+) -> tuple[str, str]:
+    """(subject_id, session_id)를 추출한다.
+
+    ``subject_from_parent=0``이면 파일명에서 digit을 뽑아 subject_id를 생성한다
+    (VitalDB OR 기본). ``>0``이면 해당 깊이의 부모 디렉토리명을 subject_id로 사용하고
+    (예: K-MIMIC의 ``.../VITALDB/398/3986/SICU.../file.vital``에서 ``--subject-from-parent 3``
+    → subject ``VDB_0398``), session_id는 파일 stem에서 파생한다.
+    """
+    if subject_from_parent > 0:
+        parent_name = vital_path.parents[subject_from_parent - 1].name
+        digits = "".join(c for c in parent_name if c.isdigit())
+        if not digits:
+            digits = parent_name
+        subject_id = f"VDB_{int(digits):04d}"
+        # 같은 subject 내 여러 파일을 구분하기 위해 file stem의 digit을 session에 포함
+        stem_digits = "".join(c for c in vital_path.stem if c.isdigit())
+        session_tag = stem_digits if stem_digits else vital_path.stem
+        session_id = f"{subject_id}_S_{session_tag}"
+    else:
+        stem = vital_path.stem
+        digits = "".join(c for c in stem if c.isdigit())
+        if not digits:
+            digits = stem
+        subject_id = f"VDB_{int(digits):04d}"
+        session_id = f"{subject_id}_S0"
     return subject_id, session_id
 
 
@@ -453,36 +473,56 @@ def _save_subject_manifest(
     기존 manifest가 있으면 세션/레코딩을 병합하고,
     없으면 새로 생성한다. zarr 저장 직후 호출하여
     중단 시에도 manifest 유실을 방지한다.
+
+    K-MIMIC처럼 같은 subject에 여러 .vital 파일이 있는 경우, 워커끼리
+    동시에 manifest에 write하는 race가 발생할 수 있으므로 file lock으로 보호한다.
     """
     manifest_path = subj_dir / "manifest.json"
+    lock_path = subj_dir / ".manifest.lock"
+    subj_dir.mkdir(parents=True, exist_ok=True)
 
-    if manifest_path.exists():
-        with open(manifest_path, encoding="utf-8") as f:
-            manifest = json.load(f)
-        # 같은 session_id가 있으면 recordings 병합, 없으면 세션 추가
-        existing_session = None
-        for s in manifest["sessions"]:
-            if s["session_id"] == session_id:
-                existing_session = s
-                break
-        if existing_session is not None:
-            existing_files = {r["file"] for r in existing_session["recordings"]}
-            for rec in recordings:
-                if rec["file"] not in existing_files:
-                    existing_session["recordings"].append(rec)
+    # POSIX fcntl.flock (Linux 서버 환경 가정). Windows에서는 no-op fallback.
+    try:
+        import fcntl
+        _has_flock = True
+    except ImportError:
+        _has_flock = False
+
+    lock_fp = open(lock_path, "a+")
+    try:
+        if _has_flock:
+            fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX)
+        if manifest_path.exists():
+            with open(manifest_path, encoding="utf-8") as f:
+                manifest = json.load(f)
+            # 같은 session_id가 있으면 recordings 병합, 없으면 세션 추가
+            existing_session = None
+            for s in manifest["sessions"]:
+                if s["session_id"] == session_id:
+                    existing_session = s
+                    break
+            if existing_session is not None:
+                existing_files = {r["file"] for r in existing_session["recordings"]}
+                for rec in recordings:
+                    if rec["file"] not in existing_files:
+                        existing_session["recordings"].append(rec)
+            else:
+                manifest["sessions"].append(
+                    {"session_id": session_id, "recordings": recordings}
+                )
         else:
-            manifest["sessions"].append(
-                {"session_id": session_id, "recordings": recordings}
-            )
-    else:
-        manifest = {
-            "subject_id": subject_id,
-            "source": "vitaldb",
-            "sessions": [{"session_id": session_id, "recordings": recordings}],
-        }
+            manifest = {
+                "subject_id": subject_id,
+                "source": "vitaldb",
+                "sessions": [{"session_id": session_id, "recordings": recordings}],
+            }
 
-    with open(manifest_path, "w", encoding="utf-8") as f:
-        json.dump(manifest, f, indent=2, ensure_ascii=False)
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2, ensure_ascii=False)
+    finally:
+        if _has_flock:
+            fcntl.flock(lock_fp.fileno(), fcntl.LOCK_UN)
+        lock_fp.close()
 
 
 def process_vital(
@@ -490,6 +530,7 @@ def process_vital(
     out_dir: Path,
     min_duration_s: float = 60.0,
     signal_types: set[int] | None = None,
+    subject_from_parent: int = 0,
 ) -> tuple[str, str, list[dict]]:
     """단일 .vital 파일을 처리하여 zarr 파일들을 저장한다.
 
@@ -502,27 +543,30 @@ def process_vital(
     """
     import vitaldb
 
-    subject_id, session_id = _parse_subject_id(vital_path)
+    subject_id, session_id = _parse_subject_id(vital_path, subject_from_parent)
     subj_out = out_dir / subject_id
 
-    # ── Skip 체크: 이미 파싱 완료된 subject는 건너뜀 ──
+    # ── Skip 체크: 이 파일의 session이 이미 저장되어 있으면 건너뜀 ──
+    # 같은 subject에 여러 .vital 파일이 있는 경우(K-MIMIC) session 단위로 판단해야
+    # 첫 파일 처리 후 두 번째 파일이 잘못 skip되는 것을 방지.
     manifest_path = subj_out / "manifest.json"
     if manifest_path.exists():
         try:
             with open(manifest_path, encoding="utf-8") as f:
                 existing = json.load(f)
-            # sessions[].recordings[] 구조에서 전체 recording 수집
-            all_recs = []
             for sess in existing.get("sessions", []):
-                all_recs.extend(sess.get("recordings", []))
-            if all_recs:
-                # manifest에 기록된 .pt 파일이 모두 존재하는지 확인
-                all_exist = all(
-                    (subj_out / r["file"]).exists() for r in all_recs
-                )
-                if all_exist:
-                    print(f"    [SKIP] {subject_id}: 이미 파싱됨 ({len(all_recs)} recordings)")
-                    return subject_id, session_id, all_recs
+                if sess.get("session_id") != session_id:
+                    continue
+                sess_recs = sess.get("recordings", [])
+                if sess_recs and all(
+                    (subj_out / r["file"]).exists() for r in sess_recs
+                ):
+                    print(
+                        f"    [SKIP] {subject_id}/{session_id}: 이미 파싱됨 "
+                        f"({len(sess_recs)} recordings)"
+                    )
+                    return subject_id, session_id, sess_recs
+                break
         except (json.JSONDecodeError, KeyError):
             pass  # manifest 손상 → 재파싱
 
@@ -774,6 +818,7 @@ def _process_one_worker(
     out_dir: Path,
     min_duration_s: float,
     signal_types: set[int] | None,
+    subject_from_parent: int = 0,
 ) -> tuple[str, str, list[dict]] | None:
     """단일 vital 파일 처리 (multiprocessing worker 호환)."""
     try:
@@ -782,6 +827,7 @@ def _process_one_worker(
             out_dir,
             min_duration_s=min_duration_s,
             signal_types=signal_types,
+            subject_from_parent=subject_from_parent,
         )
     except Exception as exc:
         print(f"    [{vf_path.name}] [ERROR] {exc}", file=sys.stderr)
@@ -791,6 +837,7 @@ def _process_one_worker(
 # multiprocessing용 모듈 레벨 worker (pickle 가능)
 _mp_min_dur: float = 60.0
 _mp_sig_filter: set[int] | None = None
+_mp_subj_depth: int = 0
 
 
 def _worker_split(task_tuple: tuple) -> tuple | None:
@@ -801,6 +848,7 @@ def _worker_split(task_tuple: tuple) -> tuple | None:
         out_dir=target_dir,
         min_duration_s=_mp_min_dur,
         signal_types=_mp_sig_filter,
+        subject_from_parent=_mp_subj_depth,
     )
 
 
@@ -893,6 +941,17 @@ def main() -> None:
         type=int,
         default=42,
         help="Train/test 분할 랜덤 시드 (기본 42)",
+    )
+    parser.add_argument(
+        "--subject-from-parent",
+        type=int,
+        default=0,
+        help=(
+            "0이면 파일명에서 subject_id 추출(VitalDB OR 기본). "
+            ">0이면 해당 깊이의 부모 디렉토리명을 subject_id로 사용. "
+            "예: K-MIMIC '.../VITALDB/398/3986/SICU.../file.vital'에서 "
+            "--subject-from-parent 3 → subject='VDB_0398'."
+        ),
     )
     args = parser.parse_args()
 
@@ -1015,9 +1074,10 @@ def main() -> None:
         print(f"병렬 처리: {args.workers} workers\n")
 
         # 모듈 레벨 변수 설정 (worker가 참조)
-        global _mp_min_dur, _mp_sig_filter
+        global _mp_min_dur, _mp_sig_filter, _mp_subj_depth
         _mp_min_dur = min_dur
         _mp_sig_filter = sig_filter
+        _mp_subj_depth = args.subject_from_parent
 
         # 파일별로 출력 디렉토리 결정하여 worker에 전달
         tasks = []
@@ -1038,6 +1098,7 @@ def main() -> None:
                 out_dir=target_dir,
                 min_duration_s=min_dur,
                 signal_types=sig_filter,
+                subject_from_parent=args.subject_from_parent,
             )
             if result is None:
                 continue
