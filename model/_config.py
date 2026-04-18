@@ -71,7 +71,7 @@ class ModelConfig:
     num_spatial_ids: int = 13  # TOTAL_SPATIAL_IDS (spatial_map.py)
 
     # Task
-    next_block_size: int = 5  # Block Next Prediction (K future patches per position)
+    next_block_size: int = 4  # Block Next Prediction (K future patches per position)
     next_head_d_inner: int | None = None  # BlockNextHead 내부 차원. None이면 d_model 사용
 
     # Contrastive

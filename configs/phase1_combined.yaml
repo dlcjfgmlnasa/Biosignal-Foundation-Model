@@ -29,7 +29,7 @@ model_config:
   dropout_p: 0.1
 
   # ── Task heads ──
-  next_block_size: 5          # Block Next Prediction — 미래 K patches 동시 예측 (block_size_* 대칭)
+  next_block_size: 4          # Block Next Prediction — 미래 K patches 동시 예측 (block_size_* 대칭)
   contrastive_proj_dim: 0     # Contrastive projection head (Phase 1에서는 비활성)
 
 # ── 데이터 (VitalDB + K-MIMIC 통합) ──

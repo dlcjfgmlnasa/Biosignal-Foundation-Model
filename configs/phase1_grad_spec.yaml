@@ -30,7 +30,7 @@ model_config:
   dropout_p: 0.1
 
   # ── Task heads ──
-  next_block_size: 5  # Block Next Prediction (block_size_* 대칭)
+  next_block_size: 4  # Block Next Prediction (block_size_* 대칭)
   contrastive_proj_dim: 0
 
 # ── 데이터 (baseline과 동일) ──

@@ -136,7 +136,7 @@ class BiosignalFoundationModel(nn.Module):
         num_signal_types: int = 8,  # ECG(0),ABP(1),PPG(2),CVP(3),CO2(4),AWP(5),PAP(6),ICP(7)
         num_spatial_ids: int = 13,  # TOTAL_SPATIAL_IDS (8 types × 가변 spatial IDs)
         use_spatial_embed: bool = True,
-        next_block_size: int = 5,
+        next_block_size: int = 4,
         next_head_d_inner: int | None = None,
         contrastive_proj_dim: int = 0,
     ) -> None:
