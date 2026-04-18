@@ -90,6 +90,7 @@ class BiosignalDataset(Dataset[BiosignalSample]):
         use_mmap: bool = False,
         crop_ratio_range: tuple[float, float] | None = None,
         patch_size: int | None = None,
+        min_patches: int = 5,  # random crop 최소 patch 수 (임상: 10s floor @ patch_size=200,100Hz)
         preload: bool = False,  # deprecated, 무시됨
     ) -> None:
         super().__init__()
@@ -98,6 +99,7 @@ class BiosignalDataset(Dataset[BiosignalSample]):
         self.stride_seconds = stride_seconds
         self.crop_ratio_range = crop_ratio_range  # e.g. (0.5, 1.0)
         self._patch_size = patch_size  # crop 시 patch 배수 정렬용
+        self._min_patches = min_patches
         self._manifest = list(manifest)
         self._use_mmap = use_mmap
         self._cache_size = cache_size
@@ -119,7 +121,15 @@ class BiosignalDataset(Dataset[BiosignalSample]):
                     (stride_seconds if stride_seconds is not None else window_seconds)
                     * entry.sampling_rate
                 )
-                n_win = max(0, (entry.n_timesteps - wl) // st + 1)
+                if entry.n_timesteps >= wl:
+                    # 긴 recording: sliding window
+                    n_win = (entry.n_timesteps - wl) // st + 1
+                else:
+                    # 짧은 recording: 전체를 1 window로 사용 (variable length)
+                    # random crop이 추가로 짧게 만들 수 있음 (min_patches 보장)
+                    wl = entry.n_timesteps
+                    st = entry.n_timesteps
+                    n_win = 1
             else:
                 wl = None
                 st = 0
@@ -185,14 +195,20 @@ class BiosignalDataset(Dataset[BiosignalSample]):
                 values = values[: self.max_length]
 
         # Random crop: 윈도우 내에서 랜덤 비율로 잘라냄 (patch_size 배수 정렬)
+        # min_patches 보장 — 너무 짧은 crop 방지 (임상 최소 context 확보)
         if self.crop_ratio_range is not None and len(values) > 0:
             lo, hi = self.crop_ratio_range
             ratio = random.uniform(lo, hi)
             crop_len = max(1, int(len(values) * ratio))
-            # patch_size 배수로 정렬 — 마지막 패치의 zero-padding 방지
             if hasattr(self, "_patch_size") and self._patch_size is not None:
+                # 최소 crop 길이: min_patches × patch_size (단, recording보다 짧아야)
+                min_crop_len = min(
+                    self._min_patches * self._patch_size, len(values)
+                )
+                # patch_size 배수 정렬 + 최소 보장
                 crop_len = max(
-                    self._patch_size, (crop_len // self._patch_size) * self._patch_size
+                    min_crop_len,
+                    (crop_len // self._patch_size) * self._patch_size,
                 )
             if crop_len < len(values):
                 start = random.randint(0, len(values) - crop_len)
