@@ -1,8 +1,8 @@
 # Phase 2: Any-Variate Cross-Modal Training — Base (~10M params)
 # ──────────────────────────────────────────────────────────────
 # Server: 2×L40S 48GB, KHDP 분석환경
-# Dataset: VitalDB ~5,111 subjects (80% train split)
-# Phase 1 checkpoint에서 resume → cross-modal 학습
+# Dataset: VitalDB OR + K-MIMIC-MORTAL (ICU) 통합
+# Phase 1 combined checkpoint에서 resume → cross-modal 학습
 # Estimated: ~4,000 batches/epoch × 50 epochs
 #
 # Usage (2-GPU DDP):
@@ -34,9 +34,11 @@ model_config:
   next_block_size: 4          # Block Next Prediction — 미래 K patches 동시 예측 (block_size_* 대칭)
   contrastive_proj_dim: 128   # Contrastive projection head (Phase 2 활성)
 
-# ── 데이터 ──
-data_dir: /home/coder/workspace/updown/bio_fm/data/train/vitaldb
-signal_types: [0, 1, 2, 3, 4, 5]  # ECG, ABP, PPG, CVP, CO2, AWP
+# ── 데이터 (VitalDB OR + K-MIMIC 통합) ──
+data_dir:
+  - /home/coder/workspace/updown/bio_fm/data/train/vitaldb/
+  - /home/coder/workspace/updown/bio_fm/data/train/k-mimic/
+signal_types: [0, 1, 2, 3, 4, 5, 6, 7]  # ECG, ABP, PPG, CVP, CO2, AWP, PAP, ICP
 max_subjects: null
 window_seconds: 600.0             # 600초 (10분) 윈도우 — 다변량 세션
 max_length: 120000                # 600s × 100Hz × 2 (multi-variate packing)
