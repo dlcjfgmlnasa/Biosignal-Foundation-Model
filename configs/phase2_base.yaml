@@ -45,6 +45,7 @@ max_length: 120000                # 600s × 100Hz × 2 (multi-variate packing)
 cache_size: 16
 crop_ratio_min: 0.01
 crop_ratio_max: 1.0
+min_patches: 5                     # 10s floor — multi-tier truncate 기준 (cross-modal)
 
 # ── 학습 ──
 batch_size: 64                 # any_variate multi-channel packing

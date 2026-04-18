@@ -391,6 +391,7 @@ def main():
         cache_size=config.cache_size,
         crop_ratio_range=crop_range,
         patch_size=config.model_config.patch_size,
+        min_patches=config.min_patches,
     )
     if rank0:
         print(f"Train dataset: {len(dataset)} windows")
@@ -404,6 +405,7 @@ def main():
         pin_memory=True,
         collate_mode=config.collate_mode,
         patch_size=config.model_config.patch_size,
+        min_patches=config.min_patches,
     )
     sampler = None  # any_variate 모드: GroupedBatchSampler가 셔플 담당
     if rank0:
@@ -415,6 +417,7 @@ def main():
             window_seconds=config.window_seconds,
             cache_size=config.cache_size,
             patch_size=config.model_config.patch_size,
+            min_patches=config.min_patches,
         )
         val_dataloader = create_dataloader(
             val_dataset,
@@ -424,6 +427,7 @@ def main():
             num_workers=config.num_workers,
             collate_mode=config.collate_mode,
             patch_size=config.model_config.patch_size,
+            min_patches=config.min_patches,
         )
         if rank0:
             print(

@@ -22,6 +22,7 @@ def create_dataloader(
     patch_size: int | None = None,
     stride: int | None = None,
     sampler: Sampler | None = None,
+    min_patches: int = 5,
 ) -> DataLoader:
     """PackCollate가 적용된 DataLoader를 생성한다."""
     # slot_size: cross-modal 그루핑 단위 (같은 슬롯 = 같은 sample_id)
@@ -33,6 +34,7 @@ def create_dataloader(
         patch_size=patch_size,
         stride=stride,
         slot_size=slot_size,
+        min_patches=min_patches,
     )
 
     # any_variate 모드: GroupedBatchSampler로 같은 (session, time) 채널들을 같은 배치에 넣기

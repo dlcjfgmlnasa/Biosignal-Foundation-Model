@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import heapq
+import random
 from collections import defaultdict
 from dataclasses import dataclass
 
@@ -95,10 +96,14 @@ class PackCollate:
         patch_size: int | None = None,
         stride: int | None = None,
         slot_size: int = 60000,
+        min_patches: int = 5,
     ) -> None:
         self.patch_size = patch_size
         # cross-modal 그루핑 슬롯 크기 (같은 슬롯 = 같은 sample_id)
         self._slot_size = slot_size
+        # any_variate 모드에서 cross-modal 매칭을 위한 variate 최소 길이 (patch 단위)
+        # 임상 기준 10s (patch_size=200 × 5 / 100Hz)
+        self._min_patches = min_patches
 
         if patch_size is not None:
             self.stride = stride if stride is not None else patch_size
@@ -133,6 +138,57 @@ class PackCollate:
         for _key, group_samples in groups.items():
             group_samples.sort(key=lambda s: (s.signal_type, s.channel_idx))
 
+            # Any-Variate 모드: Multi-tier length truncate
+            # - 10s 미만 variate는 임상적 무의미 → 그룹에서 제거
+            # - 남은 variate 중 valid tier(≥2 variate 유지) 랜덤 선택
+            # - 선택된 tier 이상 길이의 variate만 유지하고 tier 길이로 truncate
+            # - 결과: row 내 모든 variate가 같은 길이 → cross-modal pair 완벽 매칭
+            # CI 모드는 영향 없음 (각 그룹이 1 variate라 조건에 안 걸림)
+            group_limit: int | None = None
+            if (
+                self.collate_mode == "any_variate"
+                and self.patch_size is not None
+                and len(group_samples) >= 2
+            ):
+                ps = self.patch_size
+                min_required = self._min_patches * ps
+
+                # 각 variate의 post-trim effective 길이 계산
+                sample_effs: list[tuple[BiosignalSample, int]] = []
+                for s in group_samples:
+                    abs_start = s.start_sample + s.win_start
+                    remainder = abs_start % ps
+                    trim = (ps - remainder) if remainder > 0 else 0
+                    eff_len = s.values.shape[0] - trim
+                    if eff_len >= min_required:
+                        sample_effs.append((s, eff_len))
+
+                if len(sample_effs) >= 2:
+                    # patch 배수로 정렬된 unique 길이들
+                    candidate_lengths = sorted(
+                        {(eff // ps) * ps for _, eff in sample_effs}
+                    )
+                    # Valid tier: 해당 길이 이상 variate가 ≥2개인 tier
+                    valid_tiers = [
+                        L
+                        for L in candidate_lengths
+                        if sum(1 for _, eff in sample_effs if eff >= L) >= 2
+                    ]
+                    if valid_tiers:
+                        chosen = random.choice(valid_tiers)
+                        group_samples = [
+                            s for s, eff in sample_effs if eff >= chosen
+                        ]
+                        group_limit = chosen
+                    else:
+                        group_samples = [s for s, _ in sample_effs]
+                elif len(sample_effs) == 1:
+                    # 1개만 남으면 cross-modal 불가, 그대로 단일 variate packing
+                    group_samples = [s for s, _ in sample_effs]
+                else:
+                    # 모두 10s 미만 → 그룹 완전 제외
+                    continue
+
             channel_values: list[torch.Tensor] = []  # each (time,)
             channel_spans: list[tuple[int, int, int]] = []
             variate_rates: list[float] = []
@@ -163,6 +219,9 @@ class PackCollate:
 
                 values = s.values[trim:]  # 앞부분 잘라냄
                 seg_len = min(values.shape[0], remaining)
+                # Multi-tier truncate: any_variate 모드에서 tier 길이로 제한
+                if group_limit is not None:
+                    seg_len = min(seg_len, group_limit)
 
                 if seg_len <= 0:
                     continue
