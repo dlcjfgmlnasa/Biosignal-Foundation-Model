@@ -243,16 +243,21 @@ class PackCollate:
                     var_s = self.stride
 
                 if var_p is not None:
-                    # 통합 패딩: P + ceil(max(0, seg_len - P) / S) * S
-                    excess = max(0, seg_len - var_p)
-                    padded_seg_len = var_p + -(-excess // var_s) * var_s
-                    if padded_seg_len > remaining:
-                        if remaining < var_p:
-                            break
-                        padded_seg_len = var_p + ((remaining - var_p) // var_s) * var_s
-                        seg_len = min(seg_len, padded_seg_len)
-                    v = torch.zeros(padded_seg_len)
-                    v[:seg_len] = values[:seg_len]
+                    # 1 patch도 못 들어가면 이 variate 포기
+                    if remaining < var_p:
+                        break
+                    if seg_len < var_p:
+                        continue
+
+                    # seg_len을 valid patch 길이(var_p + k*var_s)로 FLOOR
+                    # — partial patch의 zero-padding 방지 (시각화/학습 아티팩트 제거)
+                    seg_len = var_p + ((seg_len - var_p) // var_s) * var_s
+                    # remaining에 의한 상한도 floor로 (remaining은 이미 stride-aligned)
+                    remaining_valid = var_p + ((remaining - var_p) // var_s) * var_s
+                    seg_len = min(seg_len, remaining_valid)
+
+                    padded_seg_len = seg_len       # 더 이상 zero-padding 없음
+                    v = values[:seg_len]           # 순수 real signal
                     effective_len = padded_seg_len
                 else:
                     v = values[:seg_len]
