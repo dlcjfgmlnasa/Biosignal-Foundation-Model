@@ -122,14 +122,21 @@ class BiosignalDataset(Dataset[BiosignalSample]):
                     * entry.sampling_rate
                 )
                 if entry.n_timesteps >= wl:
-                    # 긴 recording: sliding window
+                    # 긴 recording: sliding window + random crop 적용 (augmentation)
                     n_win = (entry.n_timesteps - wl) // st + 1
                 else:
-                    # 짧은 recording: 전체를 1 window로 사용 (variable length)
-                    # random crop이 추가로 짧게 만들 수 있음 (min_patches 보장)
-                    wl = entry.n_timesteps
-                    st = entry.n_timesteps
-                    n_win = 1
+                    # 짧은 recording: 전체를 1 window로 그대로 사용 (NO crop, 정보 보존)
+                    # patch_size 배수로 floor (collate silent drop 방지)
+                    ps = self._patch_size if self._patch_size is not None else 1
+                    wl = (entry.n_timesteps // ps) * ps
+                    if wl < ps:
+                        # patch 1개도 못 만들 정도로 짧음 → skip
+                        n_win = 0
+                        wl = 0
+                        st = 0
+                    else:
+                        st = wl
+                        n_win = 1
             else:
                 wl = None
                 st = 0
@@ -194,14 +201,26 @@ class BiosignalDataset(Dataset[BiosignalSample]):
             if self.max_length is not None:
                 values = values[: self.max_length]
 
-        # Random crop: 윈도우 내에서 랜덤 비율로 잘라냄 (patch_size 배수 정렬)
+        # Random crop: 긴 recording(full window_seconds)에만 적용 (augmentation)
+        # 짧은 recording은 이미 제한된 정보 → crop 생략하여 전체 정보 보존
         # min_patches 보장 — 너무 짧은 crop 방지 (임상 최소 context 확보)
-        if self.crop_ratio_range is not None and len(values) > 0:
+        full_window_len: int | None = None
+        if self.window_seconds is not None:
+            full_window_len = round(self.window_seconds * entry.sampling_rate)
+        is_long_recording = (
+            full_window_len is not None and win_length == full_window_len
+        )
+
+        if (
+            is_long_recording
+            and self.crop_ratio_range is not None
+            and len(values) > 0
+        ):
             lo, hi = self.crop_ratio_range
             ratio = random.uniform(lo, hi)
             crop_len = max(1, int(len(values) * ratio))
             if hasattr(self, "_patch_size") and self._patch_size is not None:
-                # 최소 crop 길이: min_patches × patch_size (단, recording보다 짧아야)
+                # 최소 crop 길이: min_patches × patch_size
                 min_crop_len = min(
                     self._min_patches * self._patch_size, len(values)
                 )
