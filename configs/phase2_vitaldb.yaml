@@ -1,0 +1,96 @@
+# Phase 2: Any-Variate Cross-Modal Training — VitalDB OR only (K-MIMIC 제외)
+# ──────────────────────────────────────────────────────────────
+# Server: Biosignal-FM2 — 2xL40S 48GB, 32vCPU, 192GB RAM
+# Dataset: VitalDB ~5,111 subjects (OR 수술 중 데이터만)
+# Phase 1 vitaldb checkpoint에서 resume → cross-modal 학습
+#
+# 목적: 새 Phase 2 로직(Multi-tier truncate, sqrt-weighted, crop ON)을
+#       VitalDB만으로 먼저 검증. phase2_base(Combined) 비교군으로 활용.
+#
+# Usage (2-GPU DDP):
+#   torchrun --nproc_per_node=2 -m train.2_any_variate \
+#       --config configs/phase2_vitaldb.yaml
+
+# ── Phase 1 checkpoint (vitaldb only run의 best) ──
+resume: outputs/phase1/vitaldb_only_d256_L12_10min_p200/checkpoints/best.pt
+
+# ── 모델 (Phase 1과 동일 — checkpoint에서 로드) ──
+model_config:
+  d_model: 256
+  num_layers: 12
+  patch_size: 200              # 100Hz × 2초 = 200 samples/patch
+  stride: null                 # non-overlapping (= patch_size)
+  num_heads: 8                 # head_dim = 256/8 = 32
+  num_groups: null             # MHA (= num_heads)
+  num_signal_types: 8          # ECG(0)~ICP(7) — Phase 1과 호환
+  num_spatial_ids: 13          # TOTAL_SPATIAL_IDS
+  use_glu: true
+  use_moe: false
+  use_rope: true
+  use_var_attn_bias: true
+  use_spatial_embed: true
+  dropout_p: 0.1
+
+  # ── Task heads ──
+  next_block_size: 4           # Block Next Prediction — Phase 1과 일치
+  contrastive_proj_dim: 128    # Contrastive projection head (Phase 2 활성)
+
+# ── 데이터 (VitalDB OR 전용) ──
+data_dir:
+  - /home/coder/workspace/updown/bio_fm/data/train/vitaldb/
+signal_types: [0, 1, 2, 3, 4, 5, 6]  # ECG, ABP, PPG, CVP, CO2, AWP, PAP (ICP 없음)
+max_subjects: null               # 전체 ~5,111 subjects
+window_seconds: 600.0            # 10분 윈도우 — 다변량 세션
+max_length: 120000               # 600s × 100Hz × 2 (multi-variate packing)
+cache_size: 64                   # 192GB RAM → 캐시 극대화
+crop_ratio_min: 0.01             # Long recording(≥600s)만 crop — short는 영향 없음
+crop_ratio_max: 1.0
+min_patches: 5                   # 10s floor — multi-tier truncate 기준 (cross-modal)
+
+# ── 학습 ──
+batch_size: 64                 # any_variate multi-channel packing
+lr: 2.0e-4                     # Phase 1(8e-4) 대비 낮은 LR (fine-tuning)
+n_epochs: 50
+warmup_epochs: 3
+min_lr_ratio: 0.1              # 최종 LR = 2e-5
+mask_ratio: 0.4
+gradient_clip: 1.0
+seed: 42
+collate_mode: any_variate      # Phase 2 핵심: 다변량 collate
+max_batches: 4000
+
+# ── Loss 가중치 (Phase 2: MPM + Next-Pred + Cross-Modal + Contrastive) ──
+alpha: 0.7                     # masked reconstruction (Phase 1 대비 낮춤)
+beta: 0.3                      # next-patch prediction (Phase 1 대비 낮춤)
+gamma: 0.5                     # cross-modal prediction (Phase 2 활성)
+delta: 0.5                     # cross-modal contrastive (InfoNCE)
+peak_alpha: 1.0                # Peak-Weighted MSE
+lambda_spec: 0.2               # Multi-Resolution STFT Loss
+spec_n_ffts: [32, 64, 128]
+aux_loss_weight: 0.01
+contrastive_temperature: 0.07
+learnable_temperature: true
+
+# ── Masking (Block MPM) ──
+# 대칭: 미래 방향 예측 블록 크기는 model_config.next_block_size
+variate_mask_prob: 0.3         # 30% 확률로 전체 variate 마스킹 (virtual sensing)
+variate_drop_prob: 0.1         # 10% 확률로 variate를 attention에서 완전 제거 (zero-shot용)
+block_mask: true
+block_size_min: 2
+block_size_max: 3
+
+# ── Mixed Precision ──
+use_amp: true                  # L40S BF16/FP16 tensor cores
+
+# ── Validation & Early Stopping ──
+val_ratio: 0.05                # subject 단위 5% validation
+val_max_batches: 500
+patience: 15
+
+# ── 시스템 ──
+device: auto
+num_workers: 8
+output_dir: outputs/phase2
+checkpoint_every: 5
+viz_every: 1
+exp_name: vitaldb_only_d256_L12_10min_p200
