@@ -110,7 +110,7 @@ def parse_args() -> argparse.Namespace:
         "--use_var_attn_bias", action=argparse.BooleanOptionalAction, default=True
     )
     g.add_argument("--dropout_p", type=float, default=0.0)
-    g.add_argument("--next_block_size", type=int, default=5)
+    g.add_argument("--next_block_size", type=int, default=4)
 
     # Data
     g = p.add_argument_group("Data")
@@ -298,15 +298,36 @@ def main():
     ckpt_state = torch.load(ckpt_path, map_location=device, weights_only=False)
     if "config" in ckpt_state:
         ckpt_model_config = ModelConfig.from_dict(ckpt_state["config"])
-        # Phase 2에서 추가/변경되는 파라미터만 덮어쓰기
+
+        # contrastive_proj_dim: 덮어쓰기 안전 (Phase 1: 0 → Phase 2: 128, 새 모듈 random init)
         ckpt_model_config.contrastive_proj_dim = (
             config.model_config.contrastive_proj_dim
         )
-        ckpt_model_config.next_block_size = config.model_config.next_block_size
+
+        # next_block_size: K가 다르면 BlockNextHead.heads shape mismatch 발생 →
+        # strict=False로 로드 시 일부 heads만 로드되고 나머지는 random init (silent).
+        # 안전을 위해 값이 다르면 경고, 같으면 no-op(ckpt 값 유지).
+        if (
+            ckpt_model_config.next_block_size
+            != config.model_config.next_block_size
+        ):
+            if rank0:
+                print(
+                    f"  ⚠️  next_block_size override: ckpt="
+                    f"{ckpt_model_config.next_block_size} → "
+                    f"config={config.model_config.next_block_size} "
+                    "(일부 BlockNextHead.heads가 재초기화됩니다)"
+                )
+            ckpt_model_config.next_block_size = (
+                config.model_config.next_block_size
+            )
+
         config.model_config = ckpt_model_config
         if rank0:
             print(
-                f"  Model config loaded from checkpoint (patch_size={ckpt_model_config.patch_size})"
+                f"  Model config loaded from checkpoint (patch_size="
+                f"{ckpt_model_config.patch_size}, "
+                f"next_block_size K={ckpt_model_config.next_block_size})"
             )
 
     model = BiosignalFoundationModel.from_config(config.model_config)
@@ -328,6 +349,7 @@ def main():
                 "phase1_ckpt": ckpt_path,
                 "phase1_epoch": str(phase1_epoch),
                 "phase1_loss": str(phase1_loss),
+                "next_block_size": str(config.model_config.next_block_size),
             },
         )
 
