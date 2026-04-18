@@ -175,7 +175,11 @@ class PackCollate:
                         if sum(1 for _, eff in sample_effs if eff >= L) >= 2
                     ]
                     if valid_tiers:
-                        chosen = random.choice(valid_tiers)
+                        # Length-weighted 선택 — 긴 tier 선호하여 짧은 편향 방지
+                        # (random crop + random tier 이중 랜덤의 short-bias 상쇄)
+                        chosen = random.choices(
+                            valid_tiers, weights=valid_tiers, k=1
+                        )[0]
                         group_samples = [
                             s for s, eff in sample_effs if eff >= chosen
                         ]
