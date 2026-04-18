@@ -40,8 +40,9 @@ max_subjects: null              # 전체 ~5,111 subjects
 window_seconds: 600.0          # 10분 윈도우 — 최대값
 max_length: 64000              # CI: 10분 윈도우(60000) + patch 정렬 여유
 cache_size: 64                 # 192GB RAM → 캐시 극대화
-crop_ratio_min: 0.01           # 실효 10s floor (min_patches=5 × patch_size=200 / 100Hz)
+crop_ratio_min: 0.01           # 이론상 6s (실효는 min_patches floor에 의해 10s)
 crop_ratio_max: 1.0            # 전체 600s window
+min_patches: 5                 # 임상 최소 입력 — 10s floor (patch_size=200 × 5 / 100Hz)
 
 # ── 학습 ──
 batch_size: 128                # L40S 48GB×2
