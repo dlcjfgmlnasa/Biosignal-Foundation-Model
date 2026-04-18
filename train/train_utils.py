@@ -50,6 +50,7 @@ class TrainConfig:
     cache_size: int = 16
     crop_ratio_min: float = 0.0  # >0이면 random crop 활성 (min ratio)
     crop_ratio_max: float = 0.0  # >0이면 random crop 활성 (max ratio)
+    min_patches: int = 5  # random crop 최소 patch 수 (임상 10s floor @ patch_size=200, 100Hz)
 
     # 학습
     batch_size: int = 16
