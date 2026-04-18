@@ -22,6 +22,54 @@ from module.position import BinaryAttentionBias, QueryKeyProjection, RotaryProje
 from module.transformer import TransformerEncoder
 
 
+class BlockNextHead(nn.Module):
+    """Shared trunk + K horizon-specific heads for Block Next Prediction.
+
+    각 position의 encoded vector를 공유 non-linear trunk로 변환한 뒤,
+    K개 독립 Linear head가 horizon별 미래 patch를 예측한다.
+
+    입력:  ``(B, N, d_model)``
+    출력:  ``(B, N, K, patch_size)`` — k번째 head가 t+k 패치 예측
+
+    Parameters
+    ----------
+    d_model:
+        입력 차원.
+    patch_size:
+        출력 patch 크기 (샘플 수).
+    block_size:
+        K — 예측할 future patch 수.
+    d_inner:
+        trunk 내부 차원. ``None``이면 ``d_model``.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        patch_size: int,
+        block_size: int,
+        d_inner: int | None = None,
+    ) -> None:
+        super().__init__()
+        d_inner = d_inner if d_inner is not None else d_model
+        self.block_size = block_size
+        self.patch_size = patch_size
+
+        self.trunk = nn.Sequential(
+            nn.Linear(d_model, d_inner),
+            nn.GELU(),
+        )
+        self.heads = nn.ModuleList([
+            nn.Linear(d_inner, patch_size) for _ in range(block_size)
+        ])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, N, d_model)
+        h = self.trunk(x)  # (B, N, d_inner)
+        outs = [head(h) for head in self.heads]  # list of (B, N, patch_size)
+        return torch.stack(outs, dim=2)  # (B, N, K, patch_size)
+
+
 class BiosignalFoundationModel(nn.Module):
     """생체신호 파운데이션 모델 — 모든 신호를 raw patch reconstruction.
 
@@ -89,6 +137,7 @@ class BiosignalFoundationModel(nn.Module):
         num_spatial_ids: int = 13,  # TOTAL_SPATIAL_IDS (8 types × 가변 spatial IDs)
         use_spatial_embed: bool = True,
         next_block_size: int = 5,
+        next_head_d_inner: int | None = None,
         contrastive_proj_dim: int = 0,
     ) -> None:
         super().__init__()
@@ -147,10 +196,17 @@ class BiosignalFoundationModel(nn.Module):
         # 6. Reconstruction Head (자기 variate 복원)
         self.head = nn.Linear(d_model, patch_size)
 
-        # 7. Block Next-Patch Prediction Head
-        # 각 position에서 K개의 future patches를 병렬 예측 (non-autoregressive).
+        # 7. Block Next-Patch Prediction Head (공유 trunk + K개 horizon-specific head)
+        # - trunk: 모든 horizon 공통 non-linear 변환 (Linear+GELU)
+        # - heads: K개 독립 Linear projection (각 horizon 전용)
+        # 한 Linear(d, K*P)보다 non-linearity + horizon 분업으로 장거리 예측 품질 향상.
         self.next_block_size = next_block_size
-        self.next_head = nn.Linear(d_model, next_block_size * patch_size)
+        self.next_head = BlockNextHead(
+            d_model=d_model,
+            patch_size=patch_size,
+            block_size=next_block_size,
+            d_inner=next_head_d_inner,
+        )
 
         # 8. Cross-Modal Prediction Heads (target signal type별 독립 Linear)
         self.cross_heads = nn.ModuleDict({
@@ -479,14 +535,10 @@ class BiosignalFoundationModel(nn.Module):
 
         # ── Block Next-Patch Prediction ──
         # encoded_causal[n] → K개의 future raw patches (n+1, ..., n+K) 병렬 예측.
+        # BlockNextHead (shared trunk + K heads)가 바로 (B, N, K, P) 반환.
         if task in ("next_pred", "both"):
             encoded_for_next = enc.get("encoded_causal", encoded)  # (B, N, d_model)
-            b, n = encoded_for_next.shape[:2]
-            k = self.next_block_size
-            next_out = self.next_head(encoded_for_next)  # (B, N, K*P)
-            out_dict["next_pred"] = next_out.reshape(
-                b, n, k, self.patch_size
-            )  # (B, N, K, P)
+            out_dict["next_pred"] = self.next_head(encoded_for_next)  # (B, N, K, P)
 
         return out_dict
 

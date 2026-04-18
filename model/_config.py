@@ -72,6 +72,7 @@ class ModelConfig:
 
     # Task
     next_block_size: int = 5  # Block Next Prediction (K future patches per position)
+    next_head_d_inner: int | None = None  # BlockNextHead 내부 차원. None이면 d_model 사용
 
     # Contrastive
     contrastive_proj_dim: int = 0  # 0=비활성, >0=projection head 출력 차원
