@@ -1,0 +1,90 @@
+# Phase 1: Channel-Independent Pre-training — VitalDB OR only (K-MIMIC 제외)
+# ──────────────────────────────────────────────────────────────
+# Server: Biosignal-FM2 — 2xL40S 48GB, 32vCPU, 192GB RAM
+# Dataset: VitalDB ~5,111 subjects (OR 수술 중 데이터만)
+# Window: 10분 (600초, 300 patches @patch_size=200)
+#
+# 목적: 새 dataset 로직(short recording 보존, K=4, BlockNextHead)을
+#       VitalDB만으로 먼저 검증. phase1_combined 비교군으로 활용.
+#
+# Usage (2-GPU DDP):
+#   torchrun --nproc_per_node=2 -m train.1_channel_independency \
+#       --config configs/phase1_vitaldb.yaml
+
+# ── 모델 (Base: d=256, L=12, ~10M params) ──
+model_config:
+  d_model: 256
+  num_layers: 12
+  patch_size: 200            # 100Hz × 2초 = 200 samples/patch (300 patches/10min)
+  stride: null               # non-overlapping (= patch_size)
+  num_heads: 8               # head_dim = 256/8 = 32
+  num_groups: null            # MHA (= num_heads)
+  num_signal_types: 8         # ECG(0)~ICP(7) — K-MIMIC ICP 포함 유지 (향후 호환)
+  num_spatial_ids: 13          # TOTAL_SPATIAL_IDS (spatial_map.py 기준)
+  use_glu: true
+  use_moe: false              # Phase 1 CI에서는 off
+  use_rope: true
+  use_var_attn_bias: true
+  use_spatial_embed: true
+  dropout_p: 0.1
+
+  # ── Task heads ──
+  next_block_size: 4          # Block Next Prediction — 미래 K patches 동시 예측
+  contrastive_proj_dim: 0     # Contrastive projection head (Phase 1에서는 비활성)
+
+# ── 데이터 (VitalDB OR 전용) ──
+data_dir:
+  - /home/coder/workspace/updown/bio_fm/data/train/vitaldb/
+signal_types: [0, 1, 2, 3, 4, 5, 6]  # ECG, ABP, PPG, CVP, CO2, AWP, PAP (ICP 없음)
+max_subjects: null              # 전체 ~5,111 subjects
+window_seconds: 600.0          # 10분 윈도우 — 최대값
+max_length: 64000              # CI: 10분 윈도우(60000) + patch 정렬 여유
+cache_size: 64                 # 192GB RAM → 캐시 극대화
+crop_ratio_min: 0.01           # 실효 10s floor (min_patches=5 × patch_size=200 / 100Hz)
+crop_ratio_max: 1.0            # 전체 600s window
+
+# ── 학습 ──
+batch_size: 128                # L40S 48GB×2
+lr: 8.0e-4
+n_epochs: 80
+warmup_epochs: 8               # 10% 비율 유지
+min_lr_ratio: 0.1              # 최종 LR = 8e-5
+mask_ratio: 0.4                # 40% 패치 마스킹
+gradient_clip: 1.0
+seed: 42
+collate_mode: ci
+max_batches: 10000
+
+# ── Loss 가중치 (Phase 1: MPM + Next-Pred) ──
+alpha: 1.0                     # masked reconstruction
+beta: 0.8                      # next-pred (Block Next Pred 비중)
+gamma: 0.0                     # cross-modal (Phase 2에서 활성)
+delta: 0.0                     # contrastive (Phase 2에서 활성)
+lambda_spec: 0.2               # Multi-Resolution STFT Loss
+peak_alpha: 1.0                # Peak-Weighted MSE — R-peak 강화
+aux_loss_weight: 0.01
+contrastive_temperature: 0.07
+learnable_temperature: true
+
+# ── Masking (Block MPM) ──
+# 대칭: 미래 방향 예측 블록 크기는 model_config.next_block_size
+variate_mask_prob: 0.0         # Phase 1은 비활성
+block_mask: true               # 연속 블록 단위 마스킹 (보간 방지)
+block_size_min: 3              # 최소 3패치(6초) — 호흡계 1 cycle 보장
+block_size_max: 8              # 최대 8패치(16초)
+
+# ── Mixed Precision ──
+use_amp: true                  # L40S BF16/FP16 tensor cores
+
+# ── Validation & Early Stopping ──
+val_ratio: 0.05                # subject 단위 5% validation
+val_max_batches: 500
+patience: 15
+
+# ── 시스템 ──
+device: auto
+num_workers: 8
+output_dir: outputs/phase1
+checkpoint_every: 5
+viz_every: 1
+exp_name: vitaldb_only_d256_L12_10min_p200
