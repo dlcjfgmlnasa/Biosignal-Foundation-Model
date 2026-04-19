@@ -41,7 +41,7 @@ data_dir:
 signal_types: [0, 1, 2, 3, 4, 5, 6]  # ECG, ABP, PPG, CVP, CO2, AWP, PAP (ICP 없음)
 max_subjects: null               # 전체 ~5,111 subjects
 window_seconds: 600.0            # 10분 윈도우 — 다변량 세션
-max_length: 120000               # 600s × 100Hz × 2 (multi-variate packing)
+max_length: 180000               # row당 다수 unit packing 지원 (cross-session neg 풍부)
 cache_size: 64                   # 192GB RAM → 캐시 극대화
 crop_ratio_min: 0.01             # Long recording(≥600s)만 crop — short는 영향 없음
 crop_ratio_max: 1.0

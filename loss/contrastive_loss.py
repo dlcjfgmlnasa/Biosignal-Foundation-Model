@@ -88,8 +88,18 @@ class CrossModalContrastiveLoss(nn.Module):
         if not has_pos.any():
             return z.new_tensor(0.0)
 
-        # Denominator: 자기 자신 제외, 유효 패치만
-        denom_mask = valid_pair & ~self_mask  # (B, N, N)
+        # Within-slot pseudo-negative 제거:
+        # 같은 sample_id 내의 non-positive pair는 "같은 환자 같은 10분 slot"으로
+        # 생리학적으로 너무 유사 → InfoNCE negative로 쓰면 학습 왜곡.
+        # denominator에서 제외하여 cross-session(다른 slot/session) negative만 사용.
+        # Cross-session neg가 0개인 anchor는 자동 skip (denom=num → loss=0).
+        same_sample_id = patch_sample_id.unsqueeze(-1) == patch_sample_id.unsqueeze(
+            -2
+        )  # (B, N, N)
+        within_slot_pseudo = same_sample_id & ~pos_mask  # (B, N, N)
+
+        # Denominator: 자기 자신 제외 + within-slot pseudo 제외 + 유효 패치만
+        denom_mask = valid_pair & ~self_mask & ~within_slot_pseudo  # (B, N, N)
         log_denom = torch.logsumexp(
             sim.masked_fill(~denom_mask, float("-inf")),
             dim=-1,
