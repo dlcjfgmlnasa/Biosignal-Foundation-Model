@@ -32,14 +32,14 @@ from data.collate import PackCollate, PackedBatch
 from data.dataset import BiosignalSample
 from data.spatial_map import get_global_spatial_id
 
-from downstream.shared.metrics import (
+from downstream.metrics import (
     compute_auroc,
     compute_auprc,
     compute_f1,
     compute_sensitivity_specificity,
 )
-from downstream.shared.viz import plot_roc_curve
-from downstream.shared.model_wrapper import LinearProbe
+from downstream.viz import plot_roc_curve
+from downstream.model_wrapper import LinearProbe
 
 
 DEFAULT_PATCH_SIZE = 100
@@ -302,7 +302,7 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device(args.device)
 
-    from downstream.shared.model_wrapper import DownstreamModelWrapper
+    from downstream.model_wrapper import DownstreamModelWrapper
 
     print(f"Loading checkpoint: {args.checkpoint}")
     model = DownstreamModelWrapper(args.checkpoint, args.model_version, args.device)

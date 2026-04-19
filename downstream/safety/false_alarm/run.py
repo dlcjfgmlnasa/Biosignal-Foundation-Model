@@ -31,13 +31,13 @@ from data.collate import PackCollate, PackedBatch
 from data.dataset import BiosignalSample
 from data.spatial_map import get_global_spatial_id
 
-from downstream.shared.metrics import (
+from downstream.metrics import (
     compute_auroc,
     compute_auprc,
     compute_f1,
     compute_sensitivity_specificity,
 )
-from downstream.shared.viz import plot_roc_curve
+from downstream.viz import plot_roc_curve
 
 
 # ── 설정 ──────────────────────────────────────────────────────
@@ -346,7 +346,7 @@ def main() -> None:
         sys.exit(1)
 
     # ── 모델 로드 ──
-    from downstream.shared.model_wrapper import DownstreamModelWrapper
+    from downstream.model_wrapper import DownstreamModelWrapper
 
     print(f"\nLoading checkpoint: {args.checkpoint}")
     model = DownstreamModelWrapper(args.checkpoint, args.model_version, args.device)

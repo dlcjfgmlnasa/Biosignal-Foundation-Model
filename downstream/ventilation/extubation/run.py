@@ -38,21 +38,21 @@ import numpy as np
 import torch
 from torch import nn
 
-from downstream.shared.aggregator import (
+from downstream.aggregator import (
     SIGNAL_TYPE_INT,
     TransformerAggregator,
     collate_patients,
     encode_patient_windows,
 )
-from downstream.shared.metrics import (
+from downstream.metrics import (
     compute_auroc,
     compute_auprc,
     compute_f1,
     compute_sensitivity_specificity,
 )
-from downstream.shared.model_wrapper import LinearProbe
-from downstream.shared.viz import plot_roc_curve
-from downstream.shared.window_task import compute_binary_metrics
+from downstream.model_wrapper import LinearProbe
+from downstream.viz import plot_roc_curve
+from downstream.window_task import compute_binary_metrics
 
 
 DEFAULT_PATCH_SIZE = 100
@@ -228,7 +228,7 @@ def main() -> None:
     # ── 모델 ──
     if args.dummy:
         print("Using dummy feature extractor")
-        from downstream.shared.window_task import DummyFeatureExtractor
+        from downstream.window_task import DummyFeatureExtractor
 
         model = DummyFeatureExtractor(d_model=128)
         d_model = 128
@@ -238,7 +238,7 @@ def main() -> None:
             8, win_samples, args.max_windows, seed=7
         )
     elif args.checkpoint:
-        from downstream.shared.model_wrapper import DownstreamModelWrapper
+        from downstream.model_wrapper import DownstreamModelWrapper
 
         print(f"Loading: {args.checkpoint}")
         model = DownstreamModelWrapper(

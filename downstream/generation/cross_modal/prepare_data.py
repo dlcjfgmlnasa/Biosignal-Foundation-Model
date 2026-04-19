@@ -217,7 +217,7 @@ def _load_vitaldb_cases(
     -------
     list of {"case_id": str, "patient_id": str, "signals": {stype: array}}
     """
-    from downstream.shared.data_utils import load_pilot_cases
+    from downstream.data_utils import load_pilot_cases
 
     print(f"  Loading {n_cases} VitalDB cases (signals={signal_types})...")
     raw_cases = load_pilot_cases(

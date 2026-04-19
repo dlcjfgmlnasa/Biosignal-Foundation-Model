@@ -714,7 +714,7 @@ def run_checkpoint_eval(
     device_str: str = "cpu",
 ) -> list[AnyToAnyResult]:
     """Evaluate scenarios with a pretrained checkpoint (zero-shot)."""
-    from downstream.shared.model_wrapper import DownstreamModelWrapper
+    from downstream.model_wrapper import DownstreamModelWrapper
 
     print("=" * 70)
     print("Task 8: Any-to-Any Prediction — Zero-shot")
@@ -765,7 +765,7 @@ def run_checkpoint_eval(
                 print(f"  SKIP: {sc.name} (no valid windows)")
     else:
         # Evaluate from VitalDB pilot cases
-        from downstream.shared.data_utils import load_pilot_cases
+        from downstream.data_utils import load_pilot_cases
 
         all_needed = set()
         for sc in scenarios:
@@ -886,7 +886,7 @@ def run_lora_regression(
     -------
     dict with metrics and config.
     """
-    from downstream.shared.model_wrapper import DownstreamModelWrapper
+    from downstream.model_wrapper import DownstreamModelWrapper
 
     inputs_str = " + ".join(s.upper() for s in scenario.inputs)
     target_str = scenario.target.upper()

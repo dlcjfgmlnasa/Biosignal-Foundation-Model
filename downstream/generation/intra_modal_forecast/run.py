@@ -148,7 +148,7 @@ def main() -> None:
         model = DummyModel()
         device = "cpu"
     elif args.checkpoint:
-        from downstream.shared.model_wrapper import DownstreamModelWrapper
+        from downstream.model_wrapper import DownstreamModelWrapper
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
         wrapper = DownstreamModelWrapper(args.checkpoint, args.model_version, device)

@@ -26,15 +26,15 @@ import numpy as np
 import torch
 from torch import nn
 
-from downstream.shared.metrics import (
+from downstream.metrics import (
     compute_auroc,
     compute_auprc,
     compute_f1,
     compute_sensitivity_specificity,
 )
-from downstream.shared.viz import plot_roc_curve
-from downstream.shared.model_wrapper import LinearProbe
-from downstream.shared.aggregator import (
+from downstream.viz import plot_roc_curve
+from downstream.model_wrapper import LinearProbe
+from downstream.aggregator import (
     SIGNAL_TYPE_INT,
     TransformerAggregator,
     collate_patients,
@@ -229,7 +229,7 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device(args.device)
 
-    from downstream.shared.model_wrapper import DownstreamModelWrapper
+    from downstream.model_wrapper import DownstreamModelWrapper
 
     print(f"Loading checkpoint: {args.checkpoint}")
     model = DownstreamModelWrapper(args.checkpoint, args.model_version, args.device)

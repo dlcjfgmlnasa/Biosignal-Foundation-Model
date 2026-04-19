@@ -31,9 +31,9 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from downstream.shared.model_wrapper import LinearProbe
-from downstream.shared.viz import plot_roc_curve
-from downstream.shared.window_task import (
+from downstream.model_wrapper import LinearProbe
+from downstream.viz import plot_roc_curve
+from downstream.window_task import (
     DEFAULT_PATCH_SIZE,
     DummyFeatureExtractor,
     MultiSignalWindow,
@@ -132,7 +132,7 @@ def main() -> None:
             32, args.input_signals, win_samples=int(args.window_sec * 100), seed=7
         )
     elif args.checkpoint:
-        from downstream.shared.model_wrapper import DownstreamModelWrapper
+        from downstream.model_wrapper import DownstreamModelWrapper
 
         print(f"Loading checkpoint: {args.checkpoint}")
         model = DownstreamModelWrapper(

@@ -5,7 +5,7 @@ VitalDB 뒤쪽 케이스를 pilot test 전용으로 사용한다.
 기존 data/parser/ 파이프라인을 재사용하여 필터링/리샘플링을 수행한다.
 
 사용법:
-    from downstream.shared.data_utils import (
+    from downstream.data_utils import (
         load_pilot_cases, extract_windows, apply_pipeline,
         split_by_subject, create_labeled_dataset_hypotension,
         create_labeled_dataset_bradytachy,
