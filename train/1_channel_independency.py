@@ -501,6 +501,12 @@ def main():
         if sampler is not None:
             sampler.set_epoch(epoch)
 
+        # 에폭 경계 메모리 정리: val/viz 잔여 + fragmentation 해소
+        if epoch > start_epoch:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
         epoch_start = time.time()
         losses = train_one_epoch(
             model,
