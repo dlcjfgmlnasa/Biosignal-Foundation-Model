@@ -1,0 +1,92 @@
+# Phase 1: Channel-Independent Pre-training — Large (~77M params, VitalDB + K-MIMIC)
+# ──────────────────────────────────────────────────────────────
+# Server: Biosignal-FM2 — 2xL40S 48GB, 32vCPU, 192GB RAM
+# Dataset: VitalDB ~6,000 + K-MIMIC ~3,500 = ~9,500 subjects
+# Window: 10분 (600초, 300 patches @patch_size=200) — 장기 맥락 학습
+# Memory target: ~10GB per GPU (fp16, DDP, flash attention)
+# FLOPs vs Base(10M): ~8× → wall time ~4-5× Combined base
+#
+# Usage (2-GPU DDP):
+#   torchrun --nproc_per_node=2 -m train.1_channel_independency \
+#       --config configs/phase1_large.yaml
+#
+# Smoke test:
+#   python -m train.1_channel_independency --config configs/phase1_large.yaml --dry-run
+
+# ── 모델 (Large: d=512, L=24, ~77M params) ──
+model_config:
+  d_model: 512
+  num_layers: 24
+  patch_size: 200            # 100Hz × 2초 = 200 samples/patch (300 patches/10min)
+  stride: null               # non-overlapping (= patch_size)
+  num_heads: 16              # head_dim = 512/16 = 32 (Base와 동일)
+  num_groups: null           # MHA (= num_heads)
+  num_signal_types: 8        # ECG(0)~ICP(7) — K-MIMIC ICP 포함
+  num_spatial_ids: 13        # TOTAL_SPATIAL_IDS (spatial_map.py 기준)
+  use_glu: true
+  use_moe: false             # Phase 1 CI에서는 off
+  use_rope: true
+  use_var_attn_bias: true
+  use_spatial_embed: true
+  dropout_p: 0.1
+
+  # ── Task heads ──
+  next_block_size: 4         # Block Next Prediction — 미래 K patches 동시 예측
+  contrastive_proj_dim: 0    # Phase 1에서는 비활성
+
+# ── 데이터 (VitalDB + K-MIMIC 통합) ──
+data_dir:
+  - /home/coder/workspace/updown/bio_fm/data/train/vitaldb/
+  - /home/coder/workspace/updown/bio_fm/data/train/k-mimic/
+signal_types: [0, 1, 2, 3, 4, 5, 6, 7]  # ECG, ABP, PPG, CVP, CO2, AWP, PAP, ICP
+max_subjects: null              # 전체 ~9,500 subjects
+window_seconds: 600.0          # 10분 윈도우 (300 patches) — 장기 temporal dependency 학습
+max_length: 64000              # CI: 10분 윈도우(60000) + patch 정렬 여유
+cache_size: 64                 # 192GB RAM → 캐시 극대화, .pt 재로드 최소화
+crop_ratio_min: 0.01           # 최소 6초 (600s × 0.01)
+crop_ratio_max: 1.0            # 최대 전체 윈도우 (600s)
+
+# ── 학습 ──
+batch_size: 64                 # Combined base(128)의 절반 — Large 모델 activation 4× 고려
+lr: 5.0e-4                     # Large 안정성: Base 8e-4 → 5e-4 하향
+n_epochs: 80
+warmup_epochs: 8               # 10% warmup
+min_lr_ratio: 0.1              # 최종 LR = 5e-5
+mask_ratio: 0.4                # 40% 패치 마스킹
+gradient_clip: 1.0
+seed: 42
+collate_mode: ci
+max_batches: 10000             # Combined base와 동일 effective steps
+
+# ── Loss 가중치 (Phase 1: MPM + Next-Pred) ──
+alpha: 1.0                     # masked reconstruction
+beta: 0.8                      # next-pred — Block Next Pred 비중 상향
+gamma: 0.0                     # cross-modal (Phase 2에서 활성)
+delta: 0.0                     # contrastive (Phase 2에서 활성)
+lambda_spec: 0.2               # Multi-Resolution STFT Loss
+peak_alpha: 1.0                # Peak-Weighted MSE — R-peak, systolic peak 복원 강화
+aux_loss_weight: 0.01
+contrastive_temperature: 0.07
+learnable_temperature: true
+
+# ── Masking (Block MPM) ──
+variate_mask_prob: 0.0         # Phase 1은 비활성 (Phase 2에서 0.3)
+block_mask: true               # 연속 블록 단위 마스킹 (보간 방지)
+block_size_min: 3              # 최소 3패치(6초) — 호흡계 1 cycle 보장
+block_size_max: 8              # 최대 8패치(16초) — 호흡계 2-3 cycle
+
+# ── Mixed Precision ──
+use_amp: true                  # L40S BF16/FP16 tensor cores
+
+# ── Validation & Early Stopping ──
+val_ratio: 0.05
+val_max_batches: 500
+patience: 15
+
+# ── 시스템 ──
+device: auto
+num_workers: 8                 # 32vCPU → 8 workers
+output_dir: outputs/phase1_large
+checkpoint_every: 5
+viz_every: 1
+exp_name: large_vitaldb_kmimic_d512_L24_10min_p200
