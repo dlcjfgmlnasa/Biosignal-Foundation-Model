@@ -10,11 +10,11 @@ MIMIC-III에서 ICP는 매우 드물므로 (주로 신경외과/TBI 환자),
 사용법:
     # Step 1: ICP 레코드 스캔 (헤더만 읽어 목록 생성)
     python -m downstream.acute_event.intracranial_hypertension.download_waveforms \
-        scan --records-file downstream/classification/sepsis/RECORDS-waveforms
+        scan --records-file downstream/organ_dysfunction/sepsis/RECORDS-waveforms
 
     # Step 2: 다운로드
     python -m downstream.acute_event.intracranial_hypertension.download_waveforms \
-        download --icp-records-file downstream/classification/intracranial_hypertension/ICP-RECORDS \
+        download --icp-records-file downstream/acute_event/intracranial_hypertension/ICP-RECORDS \
         --out-dir datasets/raw/mimic3-waveform-ich
 """
 
@@ -23,23 +23,87 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 
 PHYSIONET_BASE = "https://physionet.org/files/mimic3wdb-matched/1.0"
 
 
+def get_all_channels(hdr, pn_dir: str) -> set:
+    """Multi-segment record에서 모든 signal channel 이름 수집.
+
+    MIMIC-III Waveform은 multi-segment 구조:
+        - Master .hea: sig_name=None, seg_name에 하위 segments 목록
+        - *_layout segment: 전체 channel list 포함
+        - 개별 segment: 실제 데이터
+
+    Layout segment가 있으면 거기서 채널 이름 추출.
+    """
+    import wfdb
+
+    channels: set = set()
+
+    # Master header 자체에 sig_name 있으면 우선 추가
+    if hdr.sig_name:
+        channels.update(hdr.sig_name)
+
+    # Multi-segment인 경우 layout 읽기
+    seg_names = getattr(hdr, "seg_name", None)
+    if seg_names:
+        for seg in seg_names:
+            if seg.endswith("_layout"):
+                try:
+                    seg_hdr = wfdb.rdheader(seg, pn_dir=pn_dir)
+                    if seg_hdr.sig_name:
+                        channels.update(seg_hdr.sig_name)
+                except Exception:
+                    pass
+                # Layout만 확인해도 전체 채널 커버 (MIMIC-III 관례)
+                break
+
+    return channels
+
+
+def _scan_one_record(
+    record_path: str,
+    target_channel: str,
+) -> tuple[str, bool, object]:
+    """단일 레코드 스캔 worker. (record_path, has_target, channels_or_error) 반환.
+
+    channels_or_error는 성공 시 sorted channel list, 실패 시 Exception.
+    """
+    import wfdb
+
+    parts = record_path.split("/")
+    if len(parts) < 3:
+        return record_path, False, ValueError("invalid record path")
+
+    db_name = f"mimic3wdb-matched/{parts[0]}/{parts[1]}"
+    rec_name = parts[-1]
+
+    try:
+        hdr = wfdb.rdheader(rec_name, pn_dir=db_name)
+        channels = get_all_channels(hdr, db_name)
+        return record_path, target_channel in channels, sorted(channels)
+    except Exception as e:
+        return record_path, False, e
+
+
 def scan_icp_records(
     records_file: str,
-    out_file: str = "downstream/classification/intracranial_hypertension/ICP-RECORDS",
+    out_file: str = "downstream/acute_event/intracranial_hypertension/ICP-RECORDS",
     max_scan: int | None = None,
+    target_channel: str = "ICP",
+    workers: int = 16,
 ) -> None:
-    """RECORDS-waveforms에서 ICP 채널이 있는 레코드를 찾는다.
+    """RECORDS-waveforms에서 target_channel이 있는 레코드를 병렬 스캔한다.
 
-    각 레코드의 .hea 파일을 원격으로 읽어 채널 목록을 확인한다.
+    MIMIC-III multi-segment record 구조를 고려하여
+    master header + layout segment 모두 확인.
     """
     try:
-        import wfdb
+        import wfdb  # noqa: F401
     except ImportError:
         print("ERROR: wfdb 패키지 필요. pip install wfdb", file=sys.stderr)
         sys.exit(1)
@@ -50,38 +114,51 @@ def scan_icp_records(
     if max_scan is not None:
         all_records = all_records[:max_scan]
 
-    print(f"Scanning {len(all_records)} records for ICP channels...")
+    total = len(all_records)
+    print(
+        f"Scanning {total} records for '{target_channel}' channel "
+        f"with {workers} workers..."
+    )
 
     icp_records: list[str] = []
     n_scanned = 0
     n_errors = 0
 
-    for i, record_path in enumerate(all_records):
-        parts = record_path.split("/")
-        if len(parts) < 3:
-            continue
+    executor = ThreadPoolExecutor(max_workers=workers)
+    try:
+        futures = {
+            executor.submit(_scan_one_record, rec, target_channel): rec
+            for rec in all_records
+        }
 
-        # 헤더만 읽어서 채널 확인
-        db_name = f"mimic3wdb-matched/{parts[0]}/{parts[1]}"
-        rec_name = parts[-1]
+        for fut in as_completed(futures):
+            record_path, has_target, payload = fut.result()
 
-        try:
-            # rdheader로 헤더만 읽기 (데이터 다운로드 없음)
-            hdr = wfdb.rdheader(rec_name, pn_dir=db_name)
-            sig_names = hdr.sig_name if hdr.sig_name else []
-
-            if "ICP" in sig_names:
+            if isinstance(payload, Exception):
+                n_errors += 1
+            elif has_target:
                 icp_records.append(record_path)
-                print(f"  [{i + 1}] ICP found: {record_path} "
-                      f"(signals: {sig_names})")
+                print(
+                    f"  [{n_scanned + 1}] {target_channel} found: "
+                    f"{record_path} (channels: {payload})"
+                )
 
-        except Exception:
-            n_errors += 1
+            n_scanned += 1
+            if n_scanned % 500 == 0:
+                print(
+                    f"  Completed {n_scanned}/{total}, "
+                    f"{target_channel} found: {len(icp_records)}, "
+                    f"errors: {n_errors}"
+                )
+    except KeyboardInterrupt:
+        print("\nInterrupted — shutting down workers...", file=sys.stderr)
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise
+    finally:
+        executor.shutdown(wait=True)
 
-        n_scanned += 1
-        if (i + 1) % 500 == 0:
-            print(f"  Scanned {i + 1}/{len(all_records)}, "
-                  f"ICP found: {len(icp_records)}, errors: {n_errors}")
+    # 순서 보존 불필요 — 저장 시 정렬
+    icp_records.sort()
 
     # 저장
     out_path = Path(out_file)
@@ -91,9 +168,9 @@ def scan_icp_records(
             f.write(rec + "\n")
 
     print(f"\n{'=' * 60}")
-    print(f"  ICP Record Scan Complete")
+    print(f"  {target_channel} Record Scan Complete")
     print(f"  Scanned: {n_scanned}")
-    print(f"  ICP records: {len(icp_records)}")
+    print(f"  {target_channel} records: {len(icp_records)}")
     print(f"  Errors: {n_errors}")
     print(f"  Output: {out_path}")
     print(f"{'=' * 60}")
@@ -174,9 +251,13 @@ def main() -> None:
     )
     scan_parser.add_argument(
         "--out-file", type=str,
-        default="downstream/classification/intracranial_hypertension/ICP-RECORDS",
+        default="downstream/acute_event/intracranial_hypertension/ICP-RECORDS",
     )
     scan_parser.add_argument("--max-scan", type=int, default=None)
+    scan_parser.add_argument(
+        "--workers", type=int, default=16,
+        help="병렬 스캔 worker 수 (기본 16, 최대 32 권장)",
+    )
 
     # download
     dl_parser = subparsers.add_parser("download", help="Download ICP records")
@@ -197,6 +278,7 @@ def main() -> None:
             records_file=args.records_file,
             out_file=args.out_file,
             max_scan=args.max_scan,
+            workers=args.workers,
         )
     elif args.command == "download":
         download_icp_records(
