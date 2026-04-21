@@ -1,7 +1,7 @@
 # -*- coding:utf-8 -*-
 """환자 단위 cohort CSV 로더.
 
-Mortality / Sepsis / ICH / Shock / Extubation 등에서 공통으로 쓰는
+Mortality / Sepsis / ICH 등에서 공통으로 쓰는
 cohort CSV → {subject_id: {label, metadata}} 변환.
 
 각 task는 BigQuery / 자체 script로 생성된 CSV를 가지며, 다음 포맷을 공유한다:

@@ -2,7 +2,7 @@
 """Patient-level Transformer Aggregator + 윈도우 인코딩 헬퍼.
 
 여러 10분 윈도우의 representation을 [CLS] + self-attention으로 aggregate하여
-환자 단위 예측에 사용된다 (Mortality / Sepsis / Extubation / Cardiac Arrest 등).
+환자 단위 예측에 사용된다 (Mortality / Sepsis / Cardiac Arrest 등).
 
 구조:
     ICU Stay / Patient

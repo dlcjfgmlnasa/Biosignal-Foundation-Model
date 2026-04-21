@@ -8,7 +8,7 @@ Hypotension / Shock / Hypoxemia 같이 '윈도우 → binary label' 형식의 ta
 - DummyFeatureExtractor (smoke test용)
 - _compute_metrics
 
-Patient-level aggregation task (Mortality / Sepsis / Extubation)는 별도 경로
+Patient-level aggregation task (Mortality / Sepsis)는 별도 경로
 (shared/aggregator.py) 사용.
 """
 from __future__ import annotations
