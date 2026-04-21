@@ -49,3 +49,14 @@ docs/
 # Claude Code
 .claude/
 .plans/
+ㅂ# BigQuery cohort exports (may contain PHI)
+bquxjob_*.csv
+
+# Generated download record lists (per-task, regenerable via build_records_to_download.py)
+downstream/**/RECORDS-to-download
+
+# Raw cohort RECORDS — ignore by default, whitelist ICH for reproducibility
+downstream/**/RECORDS-ich-cohort
+downstream/**/ICP-RECORDS
+!downstream/acute_event/intracranial_hypertension/RECORDS-ich-cohort
+!downstream/acute_event/intracranial_hypertension/ICP-RECORDS
