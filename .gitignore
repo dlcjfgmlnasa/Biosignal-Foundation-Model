@@ -49,8 +49,11 @@ docs/
 # Claude Code
 .claude/
 .plans/
-ㅂ# BigQuery cohort exports (may contain PHI)
+# BigQuery cohort exports (may contain PHI)
 bquxjob_*.csv
+
+# MIMIC-III derived queries and exports (PHI / DUA risk)
+downstream/**/sql/
 
 # Generated download record lists (per-task, regenerable via build_records_to_download.py)
 downstream/**/RECORDS-to-download
