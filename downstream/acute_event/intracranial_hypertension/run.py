@@ -20,6 +20,7 @@ MIMIC-III ICP 기반 두개내 고혈압 탐지 — Foundation model representat
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import sys
 from pathlib import Path
@@ -264,16 +265,260 @@ def _load_data(args):
         windows = []
         labels = split_data["labels"]
         sig_types = list(split_data["signals"].keys())
+        subject_ids = split_data.get("subject_ids", None)
+        case_ids = split_data.get("case_ids", None)
         for i in range(len(labels)):
             signals = {st: split_data["signals"][st][i].numpy() for st in sig_types}
             windows.append({
                 "signals": signals,
                 "label": int(labels[i].item()),
-                "case_id": split_data["case_ids"][i] if "case_ids" in split_data else 0,
+                "case_id": case_ids[i] if case_ids is not None else 0,
+                "subject_id": subject_ids[i] if subject_ids is not None else "unknown",
             })
         return windows
 
     return _to_windows(data["train"]), _to_windows(data["test"])
+
+
+# ── LOSO (Leave-One-Subject-Out) ─────────────────────────────
+
+
+@torch.no_grad()
+def _extract_all_embeddings(
+    model,
+    windows: list[dict],
+    batch_size: int,
+    patch_size: int,
+    max_length: int,
+    device: torch.device,
+) -> torch.Tensor:  # (N_windows, d_model)
+    """전체 window에 대해 encoder mean-pool feature를 한 번에 추출한다."""
+    batches = _make_batches(windows, batch_size, patch_size, max_length)
+    feats = []
+    for batch, _ in batches:
+        f = model.extract_features(batch, pool="mean").to(device)
+        feats.append(f.cpu())
+    return torch.cat(feats, dim=0)  # (N, d_model)
+
+
+def _train_probe_on_features(
+    features: torch.Tensor,  # (N, d_model)
+    labels: torch.Tensor,  # (N,) float
+    d_model: int,
+    epochs: int,
+    lr: float,
+    batch_size: int,
+    device: torch.device,
+) -> LinearProbe:
+    probe = LinearProbe(d_model, n_classes=1).to(device)
+    probe.train()
+    optimizer = torch.optim.Adam(probe.parameters(), lr=lr)
+    criterion = nn.BCEWithLogitsLoss()
+    n = features.size(0)
+    features = features.to(device)
+    labels = labels.to(device)
+    for _ in range(epochs):
+        perm = torch.randperm(n, device=device)
+        for i in range(0, n, batch_size):
+            idx = perm[i: i + batch_size]
+            logits = probe(features[idx])
+            loss = criterion(logits, labels[idx].unsqueeze(-1))
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+    return probe
+
+
+@torch.no_grad()
+def _predict_on_features(
+    probe: LinearProbe,
+    features: torch.Tensor,
+    device: torch.device,
+) -> np.ndarray:
+    probe.eval()
+    logits = probe(features.to(device))
+    return torch.sigmoid(logits).squeeze(-1).cpu().numpy()
+
+
+def _bootstrap_auroc_ci(
+    y_true: np.ndarray,
+    y_score: np.ndarray,
+    n_iter: int = 1000,
+    seed: int = 42,
+) -> tuple[float, float]:
+    rng = np.random.default_rng(seed)
+    n = len(y_true)
+    scores = []
+    for _ in range(n_iter):
+        idx = rng.integers(0, n, n)
+        yt = y_true[idx]
+        ys = y_score[idx]
+        if yt.sum() == 0 or yt.sum() == len(yt):
+            continue
+        scores.append(compute_auroc(yt, ys))
+    if not scores:
+        return (float("nan"), float("nan"))
+    scores = np.array(scores)
+    return (float(np.percentile(scores, 2.5)), float(np.percentile(scores, 97.5)))
+
+
+def run_loso(
+    model,
+    d_model: int,
+    windows: list[dict],
+    args,
+    out_dir: Path,
+    device: torch.device,
+) -> None:
+    """LOSO 평가: encoder embedding 캐싱 → per-patient fold 학습/평가 → aggregate."""
+    first_sig = next(iter(windows[0]["signals"].values()))
+    max_length = len(first_sig)
+
+    # ── Embedding 캐시 ──
+    cache_path = out_dir / "embeddings.pt"
+    if cache_path.exists():
+        print(f"\nLoading cached embeddings: {cache_path}")
+        cache = torch.load(cache_path, weights_only=False)
+        features = cache["features"]  # (N, d_model)
+        subject_ids = cache["subject_ids"]
+        labels = cache["labels"]
+    else:
+        print(f"\nExtracting embeddings for {len(windows)} windows "
+              f"(one-time cache)...")
+        features = _extract_all_embeddings(
+            model, windows, args.batch_size, args.patch_size, max_length, device,
+        )
+        subject_ids = [w["subject_id"] for w in windows]
+        labels = torch.tensor([w["label"] for w in windows], dtype=torch.float32)
+        torch.save(
+            {"features": features, "subject_ids": subject_ids, "labels": labels},
+            cache_path,
+        )
+        print(f"  Saved embeddings cache: {cache_path} "
+              f"(shape={tuple(features.shape)})")
+
+    unique_subjects = sorted(set(subject_ids))
+    print(f"\nLOSO: {len(unique_subjects)} patients, {len(windows)} windows")
+
+    sid_arr = np.array(subject_ids)
+    y_arr = labels.numpy().astype(int)
+
+    per_fold = []
+    all_y_true = []
+    all_y_score = []
+    all_sid = []
+    all_widx = []
+
+    for fi, test_sid in enumerate(unique_subjects):
+        test_mask = sid_arr == test_sid
+        train_mask = ~test_mask
+        n_test = int(test_mask.sum())
+        n_train_pos = int(y_arr[train_mask].sum())
+        n_test_pos = int(y_arr[test_mask].sum())
+
+        # Train set에 양/음 모두 필요
+        if y_arr[train_mask].sum() == 0 or y_arr[train_mask].sum() == train_mask.sum():
+            print(f"  [fold {fi + 1}/{len(unique_subjects)}] {test_sid} "
+                  f"skip (train imbalance)")
+            continue
+
+        train_feats = features[torch.from_numpy(train_mask)]
+        train_labels = labels[torch.from_numpy(train_mask)]
+        test_feats = features[torch.from_numpy(test_mask)]
+        test_labels = labels[torch.from_numpy(test_mask)]
+
+        probe = _train_probe_on_features(
+            train_feats, train_labels, d_model,
+            epochs=args.epochs, lr=args.lr,
+            batch_size=args.batch_size, device=device,
+        )
+        y_score_fold = _predict_on_features(probe, test_feats, device)
+        y_true_fold = test_labels.numpy().astype(int)
+
+        fold_auroc = float("nan")
+        if n_test_pos > 0 and n_test_pos < n_test:
+            fold_auroc = compute_auroc(y_true_fold, y_score_fold)
+
+        per_fold.append({
+            "test_patient": test_sid,
+            "auroc": fold_auroc,
+            "n_windows": n_test,
+            "n_positive": n_test_pos,
+            "n_train": int(train_mask.sum()),
+            "n_train_positive": n_train_pos,
+        })
+
+        all_y_true.append(y_true_fold)
+        all_y_score.append(y_score_fold)
+        all_sid.extend([test_sid] * n_test)
+        all_widx.extend(list(np.where(test_mask)[0]))
+
+        if (fi + 1) % 10 == 0 or fi == 0:
+            print(f"  [fold {fi + 1}/{len(unique_subjects)}] {test_sid} "
+                  f"n={n_test} pos={n_test_pos} auroc={fold_auroc:.4f}")
+
+    y_true = np.concatenate(all_y_true)
+    y_score = np.concatenate(all_y_score)
+
+    agg = _compute_metrics(y_true, y_score)
+    auroc_lo, auroc_hi = _bootstrap_auroc_ci(y_true, y_score, n_iter=1000)
+
+    aggregate = {
+        "auroc": agg["auroc"],
+        "auprc": agg["auprc"],
+        "f1_macro": agg["f1_macro"],
+        "sensitivity": agg["sensitivity"],
+        "specificity": agg["specificity"],
+        "optimal_threshold": agg["optimal_threshold"],
+        "n_total": agg["n_total"],
+        "n_positive": agg["n_positive"],
+        "prevalence": agg["prevalence"],
+        "auroc_95ci": [auroc_lo, auroc_hi],
+    }
+
+    print(f"\n{'=' * 60}")
+    print(f"  LOSO Aggregate ({len(per_fold)} folds)")
+    print(f"{'=' * 60}")
+    print(f"  AUROC:       {aggregate['auroc']:.4f} "
+          f"[{auroc_lo:.4f}, {auroc_hi:.4f}]")
+    print(f"  AUPRC:       {aggregate['auprc']:.4f}")
+    print(f"  F1 (macro):  {aggregate['f1_macro']:.4f}")
+    print(f"  Sensitivity: {aggregate['sensitivity']:.4f}")
+    print(f"  Specificity: {aggregate['specificity']:.4f}")
+    print(f"{'=' * 60}")
+
+    # ── 저장 ──
+    results = {
+        "per_fold": per_fold,
+        "aggregate": aggregate,
+        "config": {
+            "task": "intracranial_hypertension_detection",
+            "mode": args.mode,
+            "eval_mode": "loso",
+            "data_path": args.data_path,
+            "epochs": args.epochs,
+            "lr": args.lr,
+            "batch_size": args.batch_size,
+            "n_patients": len(unique_subjects),
+            "n_folds": len(per_fold),
+        },
+    }
+    results_path = out_dir / "loso_results.json"
+    with open(results_path, "w") as f:
+        json.dump(results, f, indent=2, default=str)
+    print(f"Results: {results_path}")
+
+    pred_path = out_dir / "loso_predictions.csv"
+    with open(pred_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["subject_id", "window_id", "label", "score"])
+        for sid, widx, lab, sc in zip(all_sid, all_widx, y_true, y_score):
+            w.writerow([sid, int(widx), int(lab), float(sc)])
+    print(f"Predictions: {pred_path}")
+
+    roc_path = out_dir / "loso_roc.png"
+    plot_roc_curve(y_true, y_score, roc_path, title="ICH LOSO ROC")
+    print(f"ROC curve: {roc_path}")
 
 
 # ── CLI ──────────────────────────────────────────────────────
@@ -296,6 +541,9 @@ def main() -> None:
     parser.add_argument("--patch-size", type=int, default=DEFAULT_PATCH_SIZE)
     parser.add_argument("--out-dir", type=str, default=".")
     parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--eval-mode", type=str, default="standard",
+                        choices=["standard", "loso"],
+                        help="standard: train/test split; loso: leave-one-subject-out CV")
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -319,6 +567,15 @@ def main() -> None:
           f"{n_pos_train / max(len(train_windows), 1) * 100:.1f}%)")
     print(f"  Test:  {len(test_windows)} ({n_pos_test} ICH, "
           f"{n_pos_test / max(len(test_windows), 1) * 100:.1f}%)")
+
+    # ── LOSO 모드 분기 ──
+    if args.eval_mode == "loso":
+        if args.mode != "linear_probe":
+            print("ERROR: LOSO mode only supports --mode linear_probe", file=sys.stderr)
+            sys.exit(1)
+        all_windows = train_windows + test_windows
+        run_loso(model, d_model, all_windows, args, out_dir, device)
+        return
 
     first_sig = next(iter(train_windows[0]["signals"].values()))
     max_length = len(first_sig)

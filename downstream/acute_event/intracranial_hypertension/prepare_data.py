@@ -59,6 +59,7 @@ class ICHSample:
     label: int  # 0=normal, 1=intracranial hypertension
     label_value: float  # future max ICP (mmHg)
     case_id: str
+    patient_id: str  # LOSO grouping 필수
     win_start_sec: float
     horizon_sec: float
 
@@ -256,6 +257,7 @@ def extract_forecast_samples(
                     label=label,
                     label_value=max(future_icps),
                     case_id=case["case_id"],
+                    patient_id=case["patient_id"],
                     win_start_sec=start / TARGET_SR,
                     horizon_sec=horizon_sec,
                 )
@@ -298,6 +300,7 @@ def save_dataset(
                 [s.label_value for s in samples], dtype=torch.float32
             ),
             "case_ids": [s.case_id for s in samples],
+            "subject_ids": [s.patient_id for s in samples],
         }
 
     save_dict = {
@@ -362,8 +365,15 @@ def prepare_ich_sweep(
     stride_sec: float = 30.0,
     train_ratio: float = 0.7,
     out_dir: str = "outputs/downstream/intracranial_hypertension",
+    split_mode: str = "random",
 ) -> list[Path]:
-    """(window, horizon) 조합을 sweep하여 데이터셋을 생성한다."""
+    """(window, horizon) 조합을 sweep하여 데이터셋을 생성한다.
+
+    split_mode:
+        "random"       : train_ratio 비율로 환자 단위 random split.
+        "loso_export"  : 모든 샘플을 train에 저장(test 비움) — subject_ids로
+                         외부에서 LeaveOneSubjectOut CV 수행용.
+    """
     mode_str = " + ".join(s.upper() for s in input_signals)
     print(f"\n{'=' * 60}")
     print(f"  Intracranial Hypertension Detection - MIMIC-III")
@@ -381,19 +391,25 @@ def prepare_ich_sweep(
         print("ERROR: No ICP records found.", file=sys.stderr)
         sys.exit(1)
 
-    # 2. Patient-level train/test split
-    print(f"\n[2/3] Splitting by patient (ratio={train_ratio})...")
-    rng = np.random.default_rng(42)
+    # 2. Patient-level split
     patient_ids = list({c["patient_id"] for c in cases})
-    rng.shuffle(patient_ids)
-    n_train = max(1, int(len(patient_ids) * train_ratio))
-    train_patients = set(patient_ids[:n_train])
+    if split_mode == "loso_export":
+        print(f"\n[2/3] LOSO export mode: all {len(patient_ids)} patients in train "
+              "(test empty; subject_ids for external LOSO CV).")
+        train_cases = list(cases)
+        test_cases = []
+    else:
+        print(f"\n[2/3] Splitting by patient (ratio={train_ratio})...")
+        rng = np.random.default_rng(42)
+        rng.shuffle(patient_ids)
+        n_train = max(1, int(len(patient_ids) * train_ratio))
+        train_patients = set(patient_ids[:n_train])
 
-    train_cases = [c for c in cases if c["patient_id"] in train_patients]
-    test_cases = [c for c in cases if c["patient_id"] not in train_patients]
-    print(f"  Train: {len(train_cases)} records ({len(train_patients)} patients)")
-    print(f"  Test:  {len(test_cases)} records "
-          f"({len(patient_ids) - n_train} patients)")
+        train_cases = [c for c in cases if c["patient_id"] in train_patients]
+        test_cases = [c for c in cases if c["patient_id"] not in train_patients]
+        print(f"  Train: {len(train_cases)} records ({len(train_patients)} patients)")
+        print(f"  Test:  {len(test_cases)} records "
+              f"({len(patient_ids) - n_train} patients)")
 
     # 3. 조합별 윈도우 추출 + 저장
     combos = [(w, h) for w in window_secs for h in horizon_mins]
@@ -438,22 +454,31 @@ def main() -> None:
         description="Intracranial Hypertension Detection - Data Preparation (MIMIC-III)",
     )
     parser.add_argument(
-        "--waveform-dir", type=str, required=True,
+        "--waveform-dir", type=str,
+        default="datasets/raw/mimic3-waveform-ich",
         help="MIMIC-III waveform directory (ICP 포함 레코드)",
     )
     parser.add_argument(
-        "--input-signals", nargs="+", default=["icp"],
+        "--input-signals", nargs="+",
+        default=["icp", "abp", "ecg", "ppg"],
         choices=["icp", "ecg", "abp", "ppg", "cvp", "pap"],
-        help="Input signal types (label always from ICP)",
+        help="Input signal types (label always from ICP). "
+             "Default: ICP + ABP + ECG + PPG (4ch).",
     )
     parser.add_argument(
-        "--horizon-mins", nargs="+", type=float, default=[5.0],
+        "--horizon-mins", nargs="+", type=float, default=[10.0],
     )
     parser.add_argument(
         "--window-secs", nargs="+", type=float, default=[30.0],
     )
     parser.add_argument("--stride-sec", type=float, default=30.0)
     parser.add_argument("--train-ratio", type=float, default=0.7)
+    parser.add_argument(
+        "--split-mode", type=str, default="random",
+        choices=["random", "loso_export"],
+        help="'random': patient-level random split. "
+             "'loso_export': all in train, external LOSO CV via subject_ids.",
+    )
     parser.add_argument(
         "--out-dir", type=str,
         default="outputs/downstream/intracranial_hypertension",
@@ -468,6 +493,7 @@ def main() -> None:
         stride_sec=args.stride_sec,
         train_ratio=args.train_ratio,
         out_dir=args.out_dir,
+        split_mode=args.split_mode,
     )
 
 

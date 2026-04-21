@@ -176,14 +176,47 @@ def scan_icp_records(
     print(f"{'=' * 60}")
 
 
+def _download_one_record(
+    record_path: str,
+    out_path: Path,
+) -> tuple[str, str, str]:
+    """단일 레코드 다운로드 worker.
+    반환: (record_path, status, message). status ∈ {"downloaded","skipped","failed"}.
+    """
+    import wfdb
+
+    parts = record_path.split("/")
+    if len(parts) < 3:
+        return record_path, "failed", "invalid record path"
+
+    db_subdir = f"mimic3wdb-matched/{parts[0]}/{parts[1]}"
+    rec_name = parts[-1]
+    patient_dir = out_path / parts[0] / parts[1]
+
+    if (patient_dir / f"{rec_name}.hea").exists():
+        return record_path, "skipped", ""
+
+    try:
+        wfdb.dl_database(
+            db_subdir,
+            dl_dir=str(out_path),
+            records=[rec_name],
+            overwrite=False,
+        )
+        return record_path, "downloaded", ""
+    except Exception as e:
+        return record_path, "failed", str(e)
+
+
 def download_icp_records(
     icp_records_file: str,
     out_dir: str = "datasets/raw/mimic3-waveform-ich",
     max_records: int | None = None,
+    workers: int = 8,
 ) -> None:
-    """ICP 레코드 목록에서 waveform을 다운로드한다."""
+    """ICP 레코드 목록에서 waveform을 병렬로 다운로드한다."""
     try:
-        import wfdb
+        import wfdb  # noqa: F401
     except ImportError:
         print("ERROR: wfdb 패키지 필요. pip install wfdb", file=sys.stderr)
         sys.exit(1)
@@ -197,38 +230,46 @@ def download_icp_records(
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
-    print(f"Downloading {len(records)} ICP records to {out_dir}...")
+    total = len(records)
+    print(
+        f"Downloading {total} ICP records to {out_dir} "
+        f"with {workers} workers..."
+    )
 
     downloaded = 0
     failed = 0
     skipped = 0
+    n_done = 0
 
-    for i, record_path in enumerate(records):
-        parts = record_path.split("/")
-        db_subdir = f"mimic3wdb-matched/{parts[0]}/{parts[1]}"
-        rec_name = parts[-1]
-        patient_dir = out_path / parts[0] / parts[1]
+    executor = ThreadPoolExecutor(max_workers=workers)
+    try:
+        futures = {
+            executor.submit(_download_one_record, rec, out_path): rec
+            for rec in records
+        }
 
-        # 이미 다운된 경우 스킵
-        if (patient_dir / f"{rec_name}.hea").exists():
-            skipped += 1
-            continue
+        for fut in as_completed(futures):
+            record_path, status, msg = fut.result()
+            if status == "downloaded":
+                downloaded += 1
+            elif status == "skipped":
+                skipped += 1
+            else:
+                failed += 1
+                print(f"  FAIL {record_path}: {msg}")
 
-        try:
-            wfdb.dl_database(
-                db_subdir,
-                dl_dir=str(out_path),
-                records=[rec_name],
-                overwrite=False,
-            )
-            downloaded += 1
-        except Exception as e:
-            print(f"  FAIL {record_path}: {e}")
-            failed += 1
-
-        if (i + 1) % 10 == 0 or i == 0:
-            print(f"  [{i + 1}/{len(records)}] downloaded={downloaded}, "
-                  f"skipped={skipped}, failed={failed}")
+            n_done += 1
+            if n_done % 10 == 0 or n_done == 1:
+                print(
+                    f"  [{n_done}/{total}] downloaded={downloaded}, "
+                    f"skipped={skipped}, failed={failed}"
+                )
+    except KeyboardInterrupt:
+        print("\nInterrupted — shutting down workers...", file=sys.stderr)
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise
+    finally:
+        executor.shutdown(wait=True)
 
     print(f"\n{'=' * 60}")
     print(f"  Download Complete")
@@ -270,6 +311,10 @@ def main() -> None:
         default="datasets/raw/mimic3-waveform-ich",
     )
     dl_parser.add_argument("--max-records", type=int, default=None)
+    dl_parser.add_argument(
+        "--workers", type=int, default=8,
+        help="병렬 다운로드 worker 수 (기본 8). bandwidth 한계로 16 이상은 비추천.",
+    )
 
     args = parser.parse_args()
 
@@ -285,6 +330,7 @@ def main() -> None:
             icp_records_file=args.icp_records_file,
             out_dir=args.out_dir,
             max_records=args.max_records,
+            workers=args.workers,
         )
 
 
