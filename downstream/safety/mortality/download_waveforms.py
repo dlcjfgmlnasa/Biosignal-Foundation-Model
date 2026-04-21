@@ -30,6 +30,7 @@ import csv
 import json
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -203,6 +204,10 @@ def main() -> None:
         "--max-alive", type=int, default=None,
         help="최대 생존 환자 수",
     )
+    parser.add_argument(
+        "--workers", type=int, default=8,
+        help="병렬 다운로드 worker 수 (기본 8). bandwidth 한계로 16 이상은 비추천.",
+    )
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -229,42 +234,76 @@ def main() -> None:
     print(f"\nTarget: {len(dead)} dead + {len(alive)} alive "
           f"= {len(all_patients)} patients")
 
-    # 4. 레코드 선택 + 다운로드
+    # 4. 환자별 레코드 선택 → 평탄화하여 병렬 다운로드
     total_records = 0
-    downloaded = 0
-    skipped = 0
-    failed = 0
-    manifest = []
+    skipped_patients = 0
+    patient_to_selected: dict[int, list[str]] = {}
+    patient_meta: dict[int, dict] = {}
 
-    for i, patient in enumerate(all_patients):
+    for patient in all_patients:
         sid = patient["subject_id"]
         wf_records = wf_index.get(sid, [])
-
         selected = select_records_for_patient(patient, wf_records)
-
         if not selected:
-            skipped += 1
+            skipped_patients += 1
             continue
-
         total_records += len(selected)
+        patient_to_selected[sid] = selected
+        patient_meta[sid] = patient
 
-        if (i + 1) % 10 == 0 or i == 0:
-            print(f"  [{i + 1}/{len(all_patients)}] subject={sid}, "
-                  f"mortality={patient['mortality']}, records={len(selected)}")
+    pending = [
+        (sid, rec) for sid, recs in patient_to_selected.items() for rec in recs
+    ]
+    print(
+        f"\nDownloading {len(pending)} records for {len(patient_to_selected)} "
+        f"patients with {args.workers} workers (skipped {skipped_patients} "
+        f"patients with no records in window)..."
+    )
 
-        patient_records = []
-        for rec_path in selected:
-            ok = download_record(rec_path, out_dir)
+    downloaded = 0
+    failed = 0
+    n_done = 0
+    success_by_patient: dict[int, list[str]] = {sid: [] for sid in patient_to_selected}
+
+    executor = ThreadPoolExecutor(max_workers=args.workers)
+    try:
+        futures = {
+            executor.submit(download_record, rec, out_dir): (sid, rec)
+            for sid, rec in pending
+        }
+        for fut in as_completed(futures):
+            sid, rec = futures[fut]
+            try:
+                ok = fut.result()
+            except Exception as e:
+                ok = False
+                print(f"  FAIL {rec}: {e}")
             if ok:
                 downloaded += 1
-                patient_records.append(rec_path)
+                success_by_patient[sid].append(rec)
             else:
                 failed += 1
+            n_done += 1
+            if n_done % 10 == 0 or n_done == 1:
+                print(
+                    f"  [{n_done}/{len(pending)}] downloaded={downloaded}, "
+                    f"failed={failed}"
+                )
+    except KeyboardInterrupt:
+        print("\nInterrupted — shutting down workers...", file=sys.stderr)
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise
+    finally:
+        executor.shutdown(wait=True)
 
+    skipped = skipped_patients
+    manifest = []
+    for sid, patient in patient_meta.items():
+        recs = success_by_patient[sid]
         manifest.append({
             **patient,
-            "waveform_records": patient_records,
-            "n_records": len(patient_records),
+            "waveform_records": recs,
+            "n_records": len(recs),
         })
 
     # 5. Manifest 저장
