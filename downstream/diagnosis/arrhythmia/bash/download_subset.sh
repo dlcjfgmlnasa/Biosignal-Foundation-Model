@@ -51,17 +51,22 @@ echo "Downloading $N patient folders to $OUT_DIR with $PARALLEL workers..."
 download_one() {
   local folder="$1"
   local out="$2"
+  # 이미 .dat 파일 많은 환자는 전체 skip (HEAD 체크 비용 회피)
+  local existing=$(find "$out/$folder" -name "*.dat" 2>/dev/null | wc -l)
+  if [[ "$existing" -gt 0 ]]; then
+    echo "  SKIP $folder ($existing .dat files already present)"
+    return 0
+  fi
   # 환경변수 PHYSIONET_USER / PHYSIONET_PASS 있으면 사용, 없으면 .netrc 폴백
   local auth_args=()
   if [[ -n "${PHYSIONET_USER:-}" && -n "${PHYSIONET_PASS:-}" ]]; then
     auth_args=(--user="$PHYSIONET_USER" --password="$PHYSIONET_PASS")
   fi
-  # wget 실행 (일부 404 무시). -c -N로 기존 파일 skip, 부분 파일 resume
-  wget -q -c -N -r -np -nH --cut-dirs=4 \
+  # 신규 환자만 wget (-nc: no-clobber, 기존 부분 파일은 resume 대신 skip)
+  wget -q -c -r -np -nH --cut-dirs=4 \
     "${auth_args[@]}" \
     -P "$out" \
     "$BASE_URL/$folder/" 2>/dev/null || true
-  # 실제 .dat 파일 존재로 성공 판단
   local dat_count=$(find "$out/$folder" -name "*.dat" 2>/dev/null | wc -l)
   if [[ "$dat_count" -gt 0 ]]; then
     echo "  OK   $folder ($dat_count .dat files)"
@@ -75,10 +80,12 @@ export BASE_URL
 
 # GNU parallel 있으면 병렬, 없으면 순차
 if command -v parallel >/dev/null 2>&1; then
-  cat "$RECORDS_FILE" | parallel -j "$PARALLEL" download_one {} "$OUT_DIR"
+  # CRLF 제거 후 parallel로 전달
+  tr -d '\r' < "$RECORDS_FILE" | parallel -j "$PARALLEL" download_one {} "$OUT_DIR"
 else
   echo "WARN: GNU parallel not found, using sequential download." >&2
   while IFS= read -r folder; do
+    folder="${folder%$'\r'}"  # CRLF 대응: trailing \r 제거
     [[ -z "$folder" ]] && continue
     download_one "$folder" "$OUT_DIR"
   done < "$RECORDS_FILE"
