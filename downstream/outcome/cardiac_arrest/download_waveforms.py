@@ -1,40 +1,40 @@
 # -*- coding:utf-8 -*-
-"""MIMIC-III Waveform 선택적 다운로드 — Sepsis onset 주변만.
+"""MIMIC-III Waveform 선택적 다운로드 — Cardiac Arrest onset 주변만.
 
-sepsis3_cohort CSV + RECORDS-waveforms → prediction horizon union window 다운로드.
+cardiac_arrest_cohort CSV + RECORDS-waveforms → prediction horizon union window 다운로드.
 
 각 환자에 대해:
-  - Sepsis+: horizons의 union window — [onset - pre - max(h), onset - min(h) + post]
+  - Cardiac Arrest+: horizons의 union window — [onset - pre - max(h), onset - min(h) + post]
     → 한 번 다운로드로 여러 horizon downstream 평가 가능 (multi-horizon reporting).
-  - Sepsis-: ICU intime 기준 [intime, intime + pre + post] 구간.
+  - Cardiac Arrest-: ICU intime 기준 [intime, intime + pre + post] 구간.
 
 Cohort 로드:
   - Subject-level dedup (multi-stay → 1명)
   - Seeded shuffle (top-N slice bias 제거)
 
 Paper 1 Outcome Prediction 통일 horizon: **T-4/6/12/24h**
-  (Sepsis/Cardiac Arrest/Mortality 동일; PhysioNet 2019 + Nemati 2018 + Futoma 2017
-   + Yun 2022 계보 모두 커버)
+  (Sepsis/Cardiac Arrest/Mortality 동일; Yun 2022 + Nemati 2018 + Futoma 2017 계보 모두 커버)
 
 사용법:
-    # Multi-horizon (4h, 6h, 12h, 24h — paper 1 표준, 권장)
-    python -m downstream.outcome.sepsis.download_waveforms \\
-        --cohort-csv downstream/outcome/sepsis/bquxjob_93e3c7c_19d8f609070.csv \\
-        --records-file downstream/outcome/sepsis/RECORDS-waveforms \\
-        --out-dir datasets/raw/mimic3-waveform-sepsis \\
-        --max-sepsis 2500 --max-nonsepsis 2500 \\
+    # Multi-horizon (4h, 6h, 12h, 24h — paper 1 표준)
+    python -m downstream.outcome.cardiac_arrest.download_waveforms \\
+        --cohort-csv downstream/outcome/cardiac_arrest/bquxjob_cardiac_arrest_TODO.csv \\
+        --records-file downstream/outcome/cardiac_arrest/RECORDS-waveforms \\
+        --out-dir datasets/raw/mimic3-waveform-cardiac-arrest \\
+        --max-arrest-pos 500 --max-arrest-neg 2500 \\
         --horizons 4 6 12 24 --seed 42
 
-    # 단일 horizon fallback
-    python -m downstream.outcome.sepsis.download_waveforms \\
-        --cohort-csv downstream/outcome/sepsis/bquxjob_93e3c7c_19d8f609070.csv \\
-        --records-file downstream/outcome/sepsis/RECORDS-waveforms \\
-        --out-dir datasets/raw/mimic3-waveform-sepsis \\
-        --max-sepsis 2500 --max-nonsepsis 2500 \\
-        --prediction-horizon-h 6 --seed 42
+    # 단일 horizon fallback (e.g., T-12h만)
+    python -m downstream.outcome.cardiac_arrest.download_waveforms \\
+        --cohort-csv downstream/outcome/cardiac_arrest/bquxjob_cardiac_arrest_TODO.csv \\
+        --records-file downstream/outcome/cardiac_arrest/RECORDS-waveforms \\
+        --out-dir datasets/raw/mimic3-waveform-cardiac-arrest \\
+        --prediction-horizon-h 12 --seed 42
 
-Note: 기존 [4 6 12] 다운로드 이력이 있으면, [4 6 12 24] 재실행 시 이미 받은 파일
-      자동 skip + 24h 추가 구간만 다운로드됨 (onset-36h ~ onset-48h).
+Cohort 크기 권고:
+    - arrest+ (positive): ~500-1500 (MIMIC-III waveform 교집합 기준, rare event)
+    - arrest- (negative): ~2500 (natural prevalence ~1:5) 또는 balanced 500:500
+    - Yun 2022 MIMIC-IV와 유사 scale
 """
 
 from __future__ import annotations
@@ -112,10 +112,10 @@ def load_cohort(
     wf_index: dict[int, list],
     seed: int = 42,
 ) -> tuple[list[dict], list[dict]]:
-    """cohort CSV에서 waveform이 있는 sepsis+/sepsis- 환자를 분리한다.
+    """cohort CSV에서 waveform이 있는 arrest+/arrest- 환자를 분리한다.
 
     - Subject-level dedup: 같은 subject_id의 여러 ICU stay는 1명으로 집계.
-      한 번이라도 sepsis+면 sepsis+로 분류.
+      한 번이라도 arrest+면 arrest+로 분류.
     - Seeded shuffle: CSV 정렬 순서(subject_id ASC)로 인한 selection bias 제거.
     """
     subj_rows: dict[int, list[dict]] = {}
@@ -128,11 +128,11 @@ def load_cohort(
                 continue
             subj_rows.setdefault(sid, []).append(row)
 
-    sepsis_pos: list[dict] = []
-    sepsis_neg: list[dict] = []
+    arrest_pos: list[dict] = []
+    arrest_neg: list[dict] = []
 
     for sid, rows in subj_rows.items():
-        pos_stays = [r for r in rows if int(r["sepsis3"]) == 1]
+        pos_stays = [r for r in rows if int(r["cardiac_arrest"]) == 1]
         if pos_stays:
             row = pos_stays[0]
             label = 1
@@ -143,10 +143,10 @@ def load_cohort(
         rec = {
             "subject_id": sid,
             "icustay_id": row["icustay_id"],
-            "sepsis3": label,
+            "cardiac_arrest": label,
             "icu_intime": row["icu_intime"],
             "icu_outtime": row["icu_outtime"],
-            "suspected_infection_time": row.get("suspected_infection_time", ""),
+            "first_arrest_time": row.get("first_arrest_time", ""),
             "sofa_total": row.get("sofa_total", ""),
             "hospital_expire_flag": row.get("hospital_expire_flag", "0"),
             "age": row.get("age", ""),
@@ -154,15 +154,15 @@ def load_cohort(
         }
 
         if label == 1:
-            sepsis_pos.append(rec)
+            arrest_pos.append(rec)
         else:
-            sepsis_neg.append(rec)
+            arrest_neg.append(rec)
 
     rng = random.Random(seed)
-    rng.shuffle(sepsis_pos)
-    rng.shuffle(sepsis_neg)
+    rng.shuffle(arrest_pos)
+    rng.shuffle(arrest_neg)
 
-    return sepsis_pos, sepsis_neg
+    return arrest_pos, arrest_neg
 
 
 def parse_datetime_str(s: str) -> datetime | None:
@@ -187,21 +187,21 @@ def select_records_for_patient(
 ) -> list[str]:
     """환자의 관심 시간 윈도우에 해당하는 waveform 레코드를 선택한다.
 
-    Sepsis+ window (horizons의 union):
+    Cardiac Arrest+ window (horizons의 union):
       주어진 horizons = [h_1, ..., h_n]에 대해, 각 horizon의
       [onset - pre_hours - h_i, onset - h_i + post_hours]의 union을 계산:
           [onset - pre_hours - max(h), onset - min(h) + post_hours]
       → 한 번 다운로드로 여러 horizon downstream 평가 가능.
       → horizons=[0]이면 legacy 동작 ([onset - pre, onset + post]).
 
-    Sepsis- window (horizon 무관):
+    Cardiac Arrest- window (horizon 무관):
       [icu_intime, icu_intime + pre_hours + post_hours]
     """
     if horizons is None or len(horizons) == 0:
         horizons = [0.0]
 
-    if patient["sepsis3"] == 1:
-        center = parse_datetime_str(patient["suspected_infection_time"])
+    if patient["cardiac_arrest"] == 1:
+        center = parse_datetime_str(patient["first_arrest_time"])
         if center is None:
             return []
         max_h = max(horizons)
@@ -224,29 +224,28 @@ def select_records_for_patient(
     return selected
 
 
-def download_record(record_path: str, out_dir: Path) -> str:
+def download_record(record_path: str, out_dir: Path) -> bool:
     """wfdb.dl_database로 multi-segment 레코드를 다운로드한다.
 
     MIMIC-III Waveform은 MultiRecord 포맷이라 세그먼트별 .hea/.dat가 있음.
     wfdb.dl_database가 자동으로 모든 세그먼트를 받아줌.
-
-    반환: "downloaded" | "skipped" | "failed".
     """
     try:
         import wfdb
     except ImportError:
         print("ERROR: wfdb 패키지 필요. pip install wfdb", file=sys.stderr)
-        return "failed"
+        return False
 
     # record_path: p00/p000052/p000052-2191-01-10-02-21
     parts = record_path.split("/")
     # wfdb.dl_database의 db 인자는 버전 없이: mimic3wdb-matched/p00/p000052
     db_subdir = f"mimic3wdb-matched/{parts[0]}/{parts[1]}"
-    rec_name = parts[-1]
+    patient_dir = out_dir / parts[0] / parts[1]
 
-    # wfdb.dl_database(records=[...])는 flat layout으로 파일을 떨어뜨린다.
-    if (out_dir / f"{rec_name}.hea").exists():
-        return "skipped"
+    # 이미 다운된 경우 스킵
+    rec_name = parts[-1]
+    if (patient_dir / f"{rec_name}.hea").exists():
+        return True
 
     try:
         wfdb.dl_database(
@@ -255,38 +254,38 @@ def download_record(record_path: str, out_dir: Path) -> str:
             records=[rec_name],
             overwrite=False,
         )
-        return "downloaded"
+        return True
     except Exception as e:
         print(f"  FAIL {record_path}: {e}")
-        return "failed"
+        return False
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="MIMIC-III Waveform selective download for sepsis prediction"
+        description="MIMIC-III Waveform selective download for cardiac arrest prediction"
     )
     parser.add_argument(
         "--cohort-csv", type=str, required=True,
-        help="sepsis3_cohort CSV (BigQuery 결과)",
+        help="cardiac_arrest_cohort CSV (BigQuery 결과)",
     )
     parser.add_argument(
         "--records-file", type=str, required=True,
         help="RECORDS-waveforms file",
     )
     parser.add_argument(
-        "--out-dir", type=str, default="datasets/raw/mimic3-waveform-sepsis",
+        "--out-dir", type=str, default="datasets/raw/mimic3-waveform-cardiac-arrest",
     )
     parser.add_argument(
-        "--max-sepsis", type=int, default=None,
-        help="최대 sepsis+ 환자 수 (None=전부)",
+        "--max-arrest-pos", type=int, default=None,
+        help="최대 arrest+ 환자 수 (None=전부)",
     )
     parser.add_argument(
-        "--max-nonsepsis", type=int, default=None,
-        help="최대 sepsis- 환자 수 (None=전부)",
+        "--max-arrest-neg", type=int, default=None,
+        help="최대 arrest- 환자 수 (None=전부)",
     )
     parser.add_argument(
         "--pre-hours", type=float, default=24.0,
-        help="윈도우 duration 전반부 (sepsis+: anchor 전, sepsis-: intime 후)",
+        help="윈도우 duration 전반부 (arrest+: anchor 전, arrest-: intime 후)",
     )
     parser.add_argument(
         "--post-hours", type=float, default=0.0,
@@ -330,20 +329,20 @@ def main() -> None:
 
     # 2. Cohort 로드 + 매칭 (subject-level dedup + seeded shuffle)
     print(f"Loading cohort (seed={args.seed})...")
-    sepsis_pos, sepsis_neg = load_cohort(
+    arrest_pos, arrest_neg = load_cohort(
         args.cohort_csv, wf_index, seed=args.seed,
     )
-    print(f"  Sepsis+ with waveform: {len(sepsis_pos)} (unique subjects)")
-    print(f"  Sepsis- with waveform: {len(sepsis_neg)} (unique subjects)")
+    print(f"  Cardiac Arrest+ with waveform: {len(arrest_pos)} (unique subjects)")
+    print(f"  Cardiac Arrest- with waveform: {len(arrest_neg)} (unique subjects)")
 
     # 3. 샘플 제한
-    if args.max_sepsis is not None:
-        sepsis_pos = sepsis_pos[: args.max_sepsis]
-    if args.max_nonsepsis is not None:
-        sepsis_neg = sepsis_neg[: args.max_nonsepsis]
+    if args.max_arrest_pos is not None:
+        arrest_pos = arrest_pos[: args.max_arrest_pos]
+    if args.max_arrest_neg is not None:
+        arrest_neg = arrest_neg[: args.max_arrest_neg]
 
-    all_patients = sepsis_pos + sepsis_neg
-    print(f"\nTarget: {len(sepsis_pos)} sepsis+ + {len(sepsis_neg)} sepsis- "
+    all_patients = arrest_pos + arrest_neg
+    print(f"\nTarget: {len(arrest_pos)} arrest+ + {len(arrest_neg)} arrest- "
           f"= {len(all_patients)} patients")
 
     # 4. 환자별 레코드 선택 → 모든 (patient, rec_path) 쌍 평탄화
@@ -379,7 +378,6 @@ def main() -> None:
     )
 
     downloaded = 0
-    skipped_records = 0
     failed = 0
     n_done = 0
     success_by_patient: dict[int, list[str]] = {sid: [] for sid in patient_to_selected}
@@ -393,24 +391,20 @@ def main() -> None:
         for fut in as_completed(futures):
             sid, rec = futures[fut]
             try:
-                status = fut.result()
+                ok = fut.result()
             except Exception as e:
-                status = "failed"
+                ok = False
                 print(f"  FAIL {rec}: {e}")
-            if status == "downloaded":
+            if ok:
                 downloaded += 1
                 success_by_patient[sid].append(rec)
-            elif status == "skipped":
-                skipped_records += 1
-                success_by_patient[sid].append(rec)
-                print(f"  SKIP {rec}")
             else:
                 failed += 1
             n_done += 1
             if n_done % 10 == 0 or n_done == 1:
                 print(
                     f"  [{n_done}/{len(pending)}] downloaded={downloaded}, "
-                    f"skipped={skipped_records}, failed={failed}"
+                    f"failed={failed}"
                 )
     except KeyboardInterrupt:
         print("\nInterrupted — shutting down workers...", file=sys.stderr)
@@ -434,8 +428,8 @@ def main() -> None:
     with open(manifest_path, "w") as f:
         json.dump({
             "n_patients": len(manifest),
-            "n_sepsis_pos": sum(1 for m in manifest if m["sepsis3"] == 1),
-            "n_sepsis_neg": sum(1 for m in manifest if m["sepsis3"] == 0),
+            "n_arrest_pos": sum(1 for m in manifest if m["cardiac_arrest"] == 1),
+            "n_arrest_neg": sum(1 for m in manifest if m["cardiac_arrest"] == 0),
             "total_records": total_records,
             "downloaded": downloaded,
             "failed": failed,
@@ -449,7 +443,7 @@ def main() -> None:
 
     print(f"\n{'=' * 60}")
     print(f"  Download Complete")
-    print(f"  Patients: {len(manifest)} ({sum(1 for m in manifest if m['sepsis3']==1)} sepsis+)")
+    print(f"  Patients: {len(manifest)} ({sum(1 for m in manifest if m['cardiac_arrest']==1)} arrest+)")
     print(f"  Records: {downloaded} downloaded, {failed} failed, {skipped} skipped")
     print(f"  Manifest: {manifest_path}")
     print(f"{'=' * 60}")
