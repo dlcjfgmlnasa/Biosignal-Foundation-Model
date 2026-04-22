@@ -1,25 +1,33 @@
 # -*- coding:utf-8 -*-
 """MIMIC-III Waveform 선택적 다운로드 — Sepsis onset 주변만.
 
-sepsis3_cohort CSV + RECORDS-waveforms → onset 주변 레코드만 다운로드.
+sepsis3_cohort CSV + RECORDS-waveforms → prediction horizon union window 다운로드.
 
 각 환자에 대해:
-  - Sepsis+: onset 전 24시간 ~ onset 후 6시간 범위의 레코드
-  - Sepsis-: ICU stay 중 랜덤 24시간 구간의 레코드
+  - Sepsis+: horizons의 union window — [onset - pre - max(h), onset - min(h) + post]
+    → 한 번 다운로드로 여러 horizon downstream 평가 가능 (multi-horizon reporting).
+  - Sepsis-: ICU intime 기준 [intime, intime + pre + post] 구간.
+
+Cohort 로드:
+  - Subject-level dedup (multi-stay → 1명)
+  - Seeded shuffle (top-N slice bias 제거)
 
 사용법:
-    # 파일럿 (sepsis+ 50명 + sepsis- 50명)
-    python -m downstream.organ_dysfunction.sepsis.download_waveforms \
-        --cohort-csv downstream/classification/sepsis/sepsis3_cohort.csv \
-        --records-file downstream/classification/sepsis/RECORDS-waveforms \
-        --out-dir datasets/raw/mimic3-waveform-sepsis \
-        --max-sepsis 50 --max-nonsepsis 50
+    # 단일 horizon (6h 전 예측)
+    python -m downstream.outcome.sepsis.download_waveforms \\
+        --cohort-csv downstream/outcome/sepsis/bquxjob_93e3c7c_19d8f609070.csv \\
+        --records-file downstream/outcome/sepsis/RECORDS-waveforms \\
+        --out-dir datasets/raw/mimic3-waveform-sepsis \\
+        --max-sepsis 2500 --max-nonsepsis 2500 \\
+        --prediction-horizon-h 6 --seed 42
 
-    # 전체 다운로드
-    python -m downstream.organ_dysfunction.sepsis.download_waveforms \
-        --cohort-csv downstream/classification/sepsis/sepsis3_cohort.csv \
-        --records-file downstream/classification/sepsis/RECORDS-waveforms \
-        --out-dir datasets/raw/mimic3-waveform-sepsis
+    # Multi-horizon (3h, 6h, 12h 모두 평가 가능하도록 union window 다운로드)
+    python -m downstream.outcome.sepsis.download_waveforms \\
+        --cohort-csv downstream/outcome/sepsis/bquxjob_93e3c7c_19d8f609070.csv \\
+        --records-file downstream/outcome/sepsis/RECORDS-waveforms \\
+        --out-dir datasets/raw/mimic3-waveform-sepsis \\
+        --max-sepsis 2500 --max-nonsepsis 2500 \\
+        --horizons 4 6 12 --seed 42
 """
 
 from __future__ import annotations
@@ -27,6 +35,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import random
 import re
 import subprocess
 import sys
@@ -94,10 +103,15 @@ def load_waveform_index(records_file: str) -> dict[int, list[tuple[str, datetime
 def load_cohort(
     cohort_csv: str,
     wf_index: dict[int, list],
+    seed: int = 42,
 ) -> tuple[list[dict], list[dict]]:
-    """cohort CSV에서 waveform이 있는 sepsis+/sepsis- 환자를 분리한다."""
-    sepsis_pos = []
-    sepsis_neg = []
+    """cohort CSV에서 waveform이 있는 sepsis+/sepsis- 환자를 분리한다.
+
+    - Subject-level dedup: 같은 subject_id의 여러 ICU stay는 1명으로 집계.
+      한 번이라도 sepsis+면 sepsis+로 분류.
+    - Seeded shuffle: CSV 정렬 순서(subject_id ASC)로 인한 selection bias 제거.
+    """
+    subj_rows: dict[int, list[dict]] = {}
 
     with open(cohort_csv, "r") as f:
         reader = csv.DictReader(f)
@@ -105,24 +119,41 @@ def load_cohort(
             sid = int(row["subject_id"])
             if sid not in wf_index:
                 continue
+            subj_rows.setdefault(sid, []).append(row)
 
-            rec = {
-                "subject_id": sid,
-                "icustay_id": row["icustay_id"],
-                "sepsis3": int(row["sepsis3"]),
-                "icu_intime": row["icu_intime"],
-                "icu_outtime": row["icu_outtime"],
-                "suspected_infection_time": row.get("suspected_infection_time", ""),
-                "sofa_total": row.get("sofa_total", ""),
-                "hospital_expire_flag": row.get("hospital_expire_flag", "0"),
-                "age": row.get("age", ""),
-                "gender": row.get("gender", ""),
-            }
+    sepsis_pos: list[dict] = []
+    sepsis_neg: list[dict] = []
 
-            if rec["sepsis3"] == 1:
-                sepsis_pos.append(rec)
-            else:
-                sepsis_neg.append(rec)
+    for sid, rows in subj_rows.items():
+        pos_stays = [r for r in rows if int(r["sepsis3"]) == 1]
+        if pos_stays:
+            row = pos_stays[0]
+            label = 1
+        else:
+            row = rows[0]
+            label = 0
+
+        rec = {
+            "subject_id": sid,
+            "icustay_id": row["icustay_id"],
+            "sepsis3": label,
+            "icu_intime": row["icu_intime"],
+            "icu_outtime": row["icu_outtime"],
+            "suspected_infection_time": row.get("suspected_infection_time", ""),
+            "sofa_total": row.get("sofa_total", ""),
+            "hospital_expire_flag": row.get("hospital_expire_flag", "0"),
+            "age": row.get("age", ""),
+            "gender": row.get("gender", ""),
+        }
+
+        if label == 1:
+            sepsis_pos.append(rec)
+        else:
+            sepsis_neg.append(rec)
+
+    rng = random.Random(seed)
+    rng.shuffle(sepsis_pos)
+    rng.shuffle(sepsis_neg)
 
     return sepsis_pos, sepsis_neg
 
@@ -144,23 +175,39 @@ def select_records_for_patient(
     patient: dict,
     wf_records: list[tuple[str, datetime]],
     pre_hours: float = 24.0,
-    post_hours: float = 6.0,
+    post_hours: float = 0.0,
+    horizons: list[float] | None = None,
 ) -> list[str]:
     """환자의 관심 시간 윈도우에 해당하는 waveform 레코드를 선택한다.
 
-    Sepsis+: onset 전 pre_hours ~ onset 후 post_hours
-    Sepsis-: ICU intime 기준 첫 24+6시간
+    Sepsis+ window (horizons의 union):
+      주어진 horizons = [h_1, ..., h_n]에 대해, 각 horizon의
+      [onset - pre_hours - h_i, onset - h_i + post_hours]의 union을 계산:
+          [onset - pre_hours - max(h), onset - min(h) + post_hours]
+      → 한 번 다운로드로 여러 horizon downstream 평가 가능.
+      → horizons=[0]이면 legacy 동작 ([onset - pre, onset + post]).
+
+    Sepsis- window (horizon 무관):
+      [icu_intime, icu_intime + pre_hours + post_hours]
     """
+    if horizons is None or len(horizons) == 0:
+        horizons = [0.0]
+
     if patient["sepsis3"] == 1:
         center = parse_datetime_str(patient["suspected_infection_time"])
+        if center is None:
+            return []
+        max_h = max(horizons)
+        min_h = min(horizons)
+        window_start = center - timedelta(hours=pre_hours + max_h)
+        window_end = center - timedelta(hours=min_h) + timedelta(hours=post_hours)
     else:
         center = parse_datetime_str(patient["icu_intime"])
-
-    if center is None:
-        return []
-
-    window_start = center - timedelta(hours=pre_hours)
-    window_end = center + timedelta(hours=post_hours)
+        if center is None:
+            return []
+        duration = pre_hours + post_hours
+        window_start = center
+        window_end = center + timedelta(hours=duration)
 
     selected = []
     for rec_path, rec_dt in wf_records:
@@ -231,11 +278,26 @@ def main() -> None:
     )
     parser.add_argument(
         "--pre-hours", type=float, default=24.0,
-        help="관심 윈도우: center 전 N시간",
+        help="윈도우 duration 전반부 (sepsis+: anchor 전, sepsis-: intime 후)",
     )
     parser.add_argument(
-        "--post-hours", type=float, default=6.0,
-        help="관심 윈도우: center 후 N시간",
+        "--post-hours", type=float, default=0.0,
+        help="윈도우 duration 후반부 (기본 0 — onset 이후 구간 제외).",
+    )
+    parser.add_argument(
+        "--prediction-horizon-h", type=float, default=0.0,
+        help="단일 prediction horizon(시간). --horizons가 지정되면 무시됨. "
+             "> 0이면 onset-horizon 이전 신호만 사용 (label leakage 완화).",
+    )
+    parser.add_argument(
+        "--horizons", type=float, nargs="+", default=None,
+        help="여러 prediction horizon (시간) 다중 채택. 지정 시 모든 horizon을 "
+             "커버하는 union window 한 번에 다운로드 → prepare_data.py에서 "
+             "horizon별로 cut 가능. 예: --horizons 4 6 12",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42,
+        help="cohort random sampling seed (top-N slice bias 제거용)",
     )
     parser.add_argument(
         "--workers", type=int, default=8,
@@ -246,16 +308,25 @@ def main() -> None:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Resolve horizons: --horizons가 있으면 그것 사용, 없으면 단일값 fallback
+    if args.horizons:
+        horizons = sorted(set(args.horizons))
+    else:
+        horizons = [args.prediction_horizon_h]
+    print(f"Prediction horizons: {horizons}")
+
     # 1. Waveform 인덱스 로드
     print("Loading waveform index...")
     wf_index = load_waveform_index(args.records_file)
     print(f"  {len(wf_index)} subjects with waveforms")
 
-    # 2. Cohort 로드 + 매칭
-    print("Loading cohort...")
-    sepsis_pos, sepsis_neg = load_cohort(args.cohort_csv, wf_index)
-    print(f"  Sepsis+ with waveform: {len(sepsis_pos)}")
-    print(f"  Sepsis- with waveform: {len(sepsis_neg)}")
+    # 2. Cohort 로드 + 매칭 (subject-level dedup + seeded shuffle)
+    print(f"Loading cohort (seed={args.seed})...")
+    sepsis_pos, sepsis_neg = load_cohort(
+        args.cohort_csv, wf_index, seed=args.seed,
+    )
+    print(f"  Sepsis+ with waveform: {len(sepsis_pos)} (unique subjects)")
+    print(f"  Sepsis- with waveform: {len(sepsis_neg)} (unique subjects)")
 
     # 3. 샘플 제한
     if args.max_sepsis is not None:
@@ -280,6 +351,7 @@ def main() -> None:
             patient, wf_records,
             pre_hours=args.pre_hours,
             post_hours=args.post_hours,
+            horizons=horizons,
         )
         if not selected:
             skipped_patients += 1
@@ -357,6 +429,8 @@ def main() -> None:
             "skipped_no_records": skipped,
             "pre_hours": args.pre_hours,
             "post_hours": args.post_hours,
+            "horizons": horizons,
+            "seed": args.seed,
             "patients": manifest,
         }, f, indent=2, default=str)
 
