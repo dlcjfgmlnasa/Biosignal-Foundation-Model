@@ -10,7 +10,7 @@ MIMIC-III에서 ICP는 매우 드물므로 (주로 신경외과/TBI 환자),
 사용법:
     # Step 1: ICP 레코드 스캔 (헤더만 읽어 목록 생성)
     python -m downstream.acute_event.intracranial_hypertension.download_waveforms \
-        scan --records-file downstream/organ_dysfunction/sepsis/RECORDS-waveforms
+        scan --records-file downstream/outcome/sepsis/RECORDS-waveforms
 
     # Step 2: 다운로드
     python -m downstream.acute_event.intracranial_hypertension.download_waveforms \
