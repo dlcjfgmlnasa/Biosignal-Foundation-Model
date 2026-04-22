@@ -10,13 +10,13 @@
 #     또는 --user/--password 인자 사용
 #
 # 사용법:
-#   bash downstream/diagnosis/arrhythmia/bash/download_subset.sh \
+#   bash downstream/acute_event/arrhythmia/bash/download_subset.sh \
 #       [OUT_DIR] [RECORDS_FILE] [PARALLEL]
 #
 # 예시:
-#   bash downstream/diagnosis/arrhythmia/bash/download_subset.sh \
+#   bash downstream/acute_event/arrhythmia/bash/download_subset.sh \
 #       datasets/raw/mimic3-ext-ppg-arrhythmia \
-#       downstream/diagnosis/arrhythmia/RECORDS-arrhythmia-subset \
+#       downstream/acute_event/arrhythmia/RECORDS-arrhythmia-subset \
 #       4
 
 set -euo pipefail
@@ -28,7 +28,7 @@ if [[ -f "$WGET_WINGET/wget.exe" ]]; then
 fi
 
 OUT_DIR="${1:-datasets/raw/mimic3-ext-ppg-arrhythmia}"
-RECORDS_FILE="${2:-downstream/diagnosis/arrhythmia/RECORDS-arrhythmia-subset}"
+RECORDS_FILE="${2:-downstream/acute_event/arrhythmia/RECORDS-arrhythmia-subset}"
 PARALLEL="${3:-4}"
 
 # wget 존재 확인
@@ -62,8 +62,10 @@ download_one() {
   if [[ -n "${PHYSIONET_USER:-}" && -n "${PHYSIONET_PASS:-}" ]]; then
     auth_args=(--user="$PHYSIONET_USER" --password="$PHYSIONET_PASS")
   fi
-  # 신규 환자만 wget (-nc: no-clobber, 기존 부분 파일은 resume 대신 skip)
-  wget -q -c -r -np -nH --cut-dirs=4 \
+  # 신규 환자만 wget
+  # --cut-dirs=3: /files/mimic-iii-ext-ppg/1.1.0/ 3단계 제거 → p00/pXXXXXX/ 보존
+  # -e robots=off: robots.txt 요청 skip (잡파일 방지)
+  wget -q -c -r -np -nH --cut-dirs=3 -e robots=off \
     "${auth_args[@]}" \
     -P "$out" \
     "$BASE_URL/$folder/" 2>/dev/null || true
@@ -77,13 +79,18 @@ download_one() {
 
 export -f download_one
 export BASE_URL
+export PHYSIONET_USER PHYSIONET_PASS
 
-# GNU parallel 있으면 병렬, 없으면 순차
+# 우선순위: GNU parallel → xargs -P (Git Bash 기본) → sequential
 if command -v parallel >/dev/null 2>&1; then
   # CRLF 제거 후 parallel로 전달
   tr -d '\r' < "$RECORDS_FILE" | parallel -j "$PARALLEL" download_one {} "$OUT_DIR"
+elif command -v xargs >/dev/null 2>&1; then
+  echo "INFO: Using xargs -P $PARALLEL (GNU parallel not installed)." >&2
+  tr -d '\r' < "$RECORDS_FILE" \
+    | xargs -I {} -P "$PARALLEL" bash -c 'download_one "$1" "$2"' _ {} "$OUT_DIR"
 else
-  echo "WARN: GNU parallel not found, using sequential download." >&2
+  echo "WARN: Neither parallel nor xargs found, using sequential download." >&2
   while IFS= read -r folder; do
     folder="${folder%$'\r'}"  # CRLF 대응: trailing \r 제거
     [[ -z "$folder" ]] && continue
