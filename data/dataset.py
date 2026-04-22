@@ -148,19 +148,46 @@ class BiosignalDataset(Dataset[BiosignalSample]):
 
     def _load_recording_impl(self, rec_idx: int) -> torch.Tensor:  # (channels, time)
         path = self._manifest[rec_idx].path
-        if "#" in path:
-            # HDF5: "subject.h5#dataset_name"
-            import h5py
 
-            h5_path, ds_name = path.split("#", 1)
-            with h5py.File(h5_path, "r") as hf:
-                return torch.from_numpy(hf[ds_name][:]).float()
-        if path.endswith(".zarr"):
-            import zarr
+        # Transient I/O 에러 방어: 최대 3회 retry (exponential backoff)
+        # 지속 실패 시 다른 recording으로 fallback (pretrain에선 수천-수만 recording 중
+        # 1개 누락은 무시 가능 수준)
+        last_err: Exception | None = None
+        for attempt in range(3):
+            try:
+                if "#" in path:
+                    import h5py
 
-            arr = zarr.open(path, mode="r")
-            return torch.from_numpy(arr[:]).float()  # float16 zarr → float32
-        return torch.load(path, weights_only=True, mmap=self._use_mmap)
+                    h5_path, ds_name = path.split("#", 1)
+                    with h5py.File(h5_path, "r") as hf:
+                        return torch.from_numpy(hf[ds_name][:]).float()
+                if path.endswith(".zarr"):
+                    import zarr
+
+                    arr = zarr.open(path, mode="r")
+                    return torch.from_numpy(arr[:]).float()
+                return torch.load(path, weights_only=True, mmap=self._use_mmap)
+            except (OSError, RuntimeError) as e:
+                last_err = e
+                if attempt < 2:
+                    import time
+
+                    time.sleep(0.1 * (2 ** attempt))  # 0.1s, 0.2s, 0.4s
+                    continue
+
+        # 3회 실패 → fallback: 다른 random recording
+        import sys
+
+        print(
+            f"WARN: persistent I/O error on '{path}' after 3 retries ({last_err}). "
+            f"Falling back to next recording.",
+            file=sys.stderr,
+        )
+        fallback_idx = (rec_idx + 1) % len(self._manifest)
+        # 무한 재귀 방지: fallback도 실패하면 예외 발생
+        if fallback_idx == rec_idx:
+            raise last_err  # type: ignore[misc]
+        return self._load_recording_impl(fallback_idx)
 
     def __getstate__(self) -> dict:
         """Pickle 직렬화: lru_cache wrapper는 pickle 불가이므로 제외."""
