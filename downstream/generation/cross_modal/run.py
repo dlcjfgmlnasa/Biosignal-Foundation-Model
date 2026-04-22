@@ -10,9 +10,21 @@ Usage
 # Dummy test (no checkpoint):
 python -m downstream.generation.cross_modal.run --dummy
 
-# Zero-shot evaluation:
+# Zero-shot evaluation (default scenarios):
 python -m downstream.generation.cross_modal.run \
     --checkpoint path/to/best.pt --mode zero_shot
+
+# Zero-shot with specific fixed scenario:
+python -m downstream.generation.cross_modal.run \
+    --checkpoint path/to/best.pt --mode zero_shot \
+    --scenario "ECG+PPG->ABP"
+
+# Zero-shot generalized (random subset → full recovery):
+python -m downstream.generation.cross_modal.run \
+    --checkpoint path/to/best.pt --mode zero_shot \
+    --scenario random_subset \
+    --mask-ratio 0.25 0.5 0.75 \
+    --n-iterations 3
 
 # LoRA regression:
 python -m downstream.generation.cross_modal.run \
@@ -703,6 +715,243 @@ def run_dummy_test() -> list[AnyToAnyResult]:
 # ── Real evaluation (zero-shot) ─────────────────────────────
 
 
+# ── Generalized Random-Subset Recovery ─────────────────────
+
+
+def _select_random_subset(
+    signal_keys: list[str],
+    mask_ratio: float,
+    seed: int,
+) -> tuple[set[str], set[str]]:
+    """Mask ratio에 따라 visible / hidden subset을 무작위로 분할.
+
+    - visible: 모델 입력으로 제공되는 signal keys
+    - hidden: 가려져서 예측 target이 되는 signal keys
+    - 항상 최소 1개 visible, 최소 1개 hidden (예측할 게 있어야 함)
+    """
+    import random
+
+    rng = random.Random(seed)
+    keys_sorted = sorted(signal_keys)
+    n = len(keys_sorted)
+    if n < 2:
+        return set(keys_sorted), set()
+
+    n_hidden = max(1, min(n - 1, int(round(n * mask_ratio))))
+    hidden = set(rng.sample(keys_sorted, n_hidden))
+    visible = set(keys_sorted) - hidden
+    return visible, hidden
+
+
+@torch.no_grad()
+def evaluate_random_subset_window(
+    model: torch.nn.Module,
+    all_signals: dict[str, np.ndarray],
+    mask_ratio: float,
+    patch_size: int,
+    device: torch.device,
+    seed: int = 42,
+) -> dict[str, dict[str, float]]:
+    """Random visible subset → hidden recovery 평가 (single window).
+
+    Parameters
+    ----------
+    all_signals:
+        윈도우 내 사용 가능한 모든 signal 파형 (numpy).
+    mask_ratio:
+        Hidden signal 비율 (0-1). 0.5면 절반 hidden.
+
+    Returns
+    -------
+    {signal_key: {"mae", "mse", "pearson_r"}} — hidden 각 signal별 metric.
+    """
+    visible, hidden = _select_random_subset(
+        list(all_signals.keys()), mask_ratio, seed=seed,
+    )
+    if not hidden or not visible:
+        return {}
+
+    # Visible signal만으로 batch 구성 → cross_pred_per_type 또는 generate_cross_modal로 hidden 예측
+    visible_signals = {k: all_signals[k] for k in visible}
+    batch = build_multivariate_batch(visible_signals, patch_size=patch_size)
+    batch.values = batch.values.to(device)
+    batch.sample_id = batch.sample_id.to(device)
+    batch.variate_id = batch.variate_id.to(device)
+
+    results: dict[str, dict[str, float]] = {}
+    for target_key in hidden:
+        target_type_id = SIGNAL_TYPE_IDS[target_key]
+
+        try:
+            out = model.generate_cross_modal(
+                batch, target_signal_type=target_type_id, denormalize=True,
+            )
+        except Exception:
+            continue
+
+        pred_waveform = out["waveform"]  # (B, N, patch_size)
+        if pred_waveform.numel() == 0:
+            continue
+        pred_flat = pred_waveform[0].reshape(-1).cpu().numpy()
+
+        # GT: flatten ground-truth signal to matching length
+        gt_full = all_signals[target_key]
+        min_len = min(len(pred_flat), len(gt_full))
+        if min_len < patch_size:
+            continue
+        pred_flat = pred_flat[:min_len]
+        gt_flat = gt_full[:min_len]
+
+        mae = float(np.mean(np.abs(pred_flat - gt_flat)))
+        mse = float(np.mean((pred_flat - gt_flat) ** 2))
+        if np.std(pred_flat) > 1e-8 and np.std(gt_flat) > 1e-8:
+            r = float(np.corrcoef(pred_flat, gt_flat)[0, 1])
+        else:
+            r = 0.0
+
+        results[target_key] = {"mae": mae, "mse": mse, "pearson_r": r}
+
+    return results
+
+
+def run_random_subset_eval(
+    checkpoint_path: str,
+    model_version: str = "v1",
+    n_cases: int = 20,
+    window_sec: float = 30.0,
+    stride_sec: float = 15.0,
+    data_path: str | None = None,
+    mask_ratios: list[float] | None = None,
+    n_iterations: int = 3,
+    device_str: str = "cpu",
+) -> dict:
+    """Random-subset → full recovery zero-shot 평가.
+
+    Paper 1 Physiological Generation 4.2.3 확장:
+    고정 시나리오 대비 Any-Variate capability를 random mask로 검증.
+
+    Parameters
+    ----------
+    mask_ratios:
+        평가할 mask 비율 리스트 (e.g., [0.25, 0.5, 0.75]).
+    n_iterations:
+        각 mask_ratio별 random seed 반복 수 (분산 감소).
+
+    Returns
+    -------
+    {mask_ratio: {signal: {mae, mse, pearson_r, n_windows}}}
+    """
+    from downstream.model_wrapper import DownstreamModelWrapper
+
+    if mask_ratios is None:
+        mask_ratios = [0.25, 0.50, 0.75]
+
+    print("=" * 70)
+    print("Cross-Modal Generalized — Random-Subset → Full Recovery")
+    print(f"  checkpoint: {checkpoint_path}")
+    print(f"  mask_ratios: {mask_ratios}, n_iterations: {n_iterations}")
+    print("=" * 70)
+
+    device = torch.device(device_str)
+    wrapper = DownstreamModelWrapper(checkpoint_path, model_version, device)
+    model = wrapper.model
+    patch_size = wrapper.patch_size
+
+    # 데이터 소스 준비: data_path 우선, 없으면 pilot cases
+    windows: list[dict[str, np.ndarray]] = []
+    if data_path and Path(data_path).exists():
+        data = _load_prepared_data(data_path)
+        test_data = data["test"]
+        available_sigs = list(test_data["signals"].keys())
+        n_samples = test_data["signals"][available_sigs[0]].shape[0]
+        for i in range(n_samples):
+            w = {s: test_data["signals"][s][i].numpy() for s in available_sigs}
+            windows.append(w)
+    else:
+        from downstream.data_utils import load_pilot_cases
+
+        cases = load_pilot_cases(
+            n_cases=n_cases, signal_types=list(SIGNAL_TYPE_IDS.keys()),
+        )
+        win_samples = int(window_sec * 100.0)
+        stride_samples = int(stride_sec * 100.0)
+        for case in cases:
+            available = [k for k in SIGNAL_TYPE_IDS if k in case.tracks]
+            if len(available) < 2:
+                continue
+            min_len = min(len(case.tracks[t]) for t in available)
+            for start in range(0, min_len - win_samples + 1, stride_samples):
+                w = {t: case.tracks[t][start:start + win_samples] for t in available}
+                windows.append(w)
+
+    if not windows:
+        print("  No valid windows. Aborting.")
+        return {}
+
+    print(f"  Total windows: {len(windows)}")
+
+    # mask_ratio별로 평가
+    all_results: dict[float, dict] = {}
+    for mr in mask_ratios:
+        per_signal: dict[str, list[dict[str, float]]] = {}
+        for it in range(n_iterations):
+            seed = 1000 + it  # 반복별 다른 seed
+            for w in windows:
+                if len(w) < 2:
+                    continue
+                r = evaluate_random_subset_window(
+                    model, w, mr, patch_size, device, seed=seed,
+                )
+                for sig, m in r.items():
+                    per_signal.setdefault(sig, []).append(m)
+
+        # signal별 aggregation
+        agg: dict[str, dict[str, float]] = {}
+        for sig, metrics_list in per_signal.items():
+            if not metrics_list:
+                continue
+            agg[sig] = {
+                "mae": round(float(np.mean([m["mae"] for m in metrics_list])), 6),
+                "mse": round(float(np.mean([m["mse"] for m in metrics_list])), 6),
+                "pearson_r": round(
+                    float(np.mean([m["pearson_r"] for m in metrics_list])), 4,
+                ),
+                "n_windows": len(metrics_list),
+            }
+        all_results[mr] = agg
+
+        # 중간 출력
+        print(f"\n  [mask_ratio={mr}]")
+        print(f"    {'Signal':<6s} {'MAE':>10s} {'MSE':>10s} {'Pearson r':>10s} {'N':>8s}")
+        for sig in sorted(agg.keys()):
+            m = agg[sig]
+            print(
+                f"    {sig.upper():<6s} {m['mae']:>10.4f} {m['mse']:>10.4f} "
+                f"{m['pearson_r']:>10.4f} {m['n_windows']:>8d}"
+            )
+
+    # Overall summary
+    print(f"\n{'=' * 70}")
+    print("  Summary — MAE as f(mask_ratio)")
+    print("=" * 70)
+    header = f"  {'Signal':<6s} " + " ".join(
+        f"{f'mr={mr:.2f}':>10s}" for mr in mask_ratios
+    )
+    print(header)
+    all_signals_seen = set()
+    for agg in all_results.values():
+        all_signals_seen.update(agg.keys())
+    for sig in sorted(all_signals_seen):
+        row = f"  {sig.upper():<6s} "
+        for mr in mask_ratios:
+            m = all_results[mr].get(sig)
+            val = f"{m['mae']:.4f}" if m else "-"
+            row += f"{val:>10s} "
+        print(row)
+
+    return all_results
+
+
 def run_checkpoint_eval(
     checkpoint_path: str,
     model_version: str = "v1",
@@ -1065,7 +1314,17 @@ def main() -> None:
         "--scenario",
         type=str,
         default=None,
-        help="Scenario string, e.g. 'ECG->ABP' or 'ECG+PPG->ABP'",
+        help="Scenario string. Fixed: 'ECG->ABP', 'ECG+PPG->ABP'. "
+             "Generalized: 'random_subset' (+ --mask-ratio, --n-iterations).",
+    )
+    parser.add_argument(
+        "--mask-ratio", type=float, nargs="+", default=[0.25, 0.50, 0.75],
+        help="'random_subset' 시 hidden 비율 리스트 (e.g., 0.25 0.5 0.75). "
+             "각 비율마다 전체 signal 대비 얼마나 가리고 나머지로 예측하는지.",
+    )
+    parser.add_argument(
+        "--n-iterations", type=int, default=3,
+        help="'random_subset' 시 mask_ratio별 random seed 반복 수 (분산 감소).",
     )
     parser.add_argument("--n-cases", type=int, default=20)
     parser.add_argument("--window-sec", type=float, default=30.0)
@@ -1096,7 +1355,22 @@ def main() -> None:
         sys.exit(1)
 
     if args.mode == "zero_shot":
-        # Parse scenarios
+        # Random subset (generalized) scenario
+        if args.scenario and args.scenario.lower() == "random_subset":
+            run_random_subset_eval(
+                checkpoint_path=args.checkpoint,
+                model_version=args.model_version,
+                n_cases=args.n_cases,
+                window_sec=args.window_sec,
+                stride_sec=args.stride_sec,
+                data_path=args.data_path,
+                mask_ratios=args.mask_ratio,
+                n_iterations=args.n_iterations,
+                device_str=args.device,
+            )
+            return
+
+        # Fixed-scenario path (기존)
         scenarios = None
         if args.scenario:
             scenarios = [parse_scenario(args.scenario)]
