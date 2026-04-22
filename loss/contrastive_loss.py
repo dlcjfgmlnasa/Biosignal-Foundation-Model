@@ -49,10 +49,18 @@ class CrossModalContrastiveLoss(nn.Module):
         patch_sample_id: torch.Tensor,  # (B, N) long
         patch_variate_id: torch.Tensor,  # (B, N) long
         time_id: torch.Tensor,  # (B, N) long
-    ) -> torch.Tensor:  # scalar
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """InfoNCE contrastive loss를 계산한다.
 
         단일 variate만 존재하는 batch row는 positive pair가 없으므로 스킵한다.
+
+        Returns
+        -------
+        loss : scalar tensor
+            Per-anchor averaged InfoNCE loss. 유효 anchor가 없으면 0.
+        n_valid_anchors : scalar long tensor
+            이번 배치에서 positive pair를 가진 유효 anchor의 개수.
+            상위 aggregator에서 weighted mean에 사용.
         """
         b, n, d = z.shape
 
@@ -86,7 +94,7 @@ class CrossModalContrastiveLoss(nn.Module):
         # has_pos: positive pair가 있는 유효 anchor
         has_pos = pos_mask.any(dim=-1) & valid  # (B, N)
         if not has_pos.any():
-            return z.new_tensor(0.0)
+            return z.new_tensor(0.0), z.new_zeros((), dtype=torch.long)
 
         # Within-slot pseudo-negative 제거:
         # 같은 sample_id 내의 non-positive pair는 "같은 환자 같은 10분 slot"으로
@@ -117,4 +125,4 @@ class CrossModalContrastiveLoss(nn.Module):
         total_loss = per_anchor_loss[has_pos].sum()
         n_valid_anchors = has_pos.sum()
 
-        return total_loss / n_valid_anchors
+        return total_loss / n_valid_anchors, n_valid_anchors

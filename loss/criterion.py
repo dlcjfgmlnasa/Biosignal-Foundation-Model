@@ -105,7 +105,7 @@ class CombinedLoss(nn.Module):
 
         # ── Cross-Modal Contrastive Loss ──
         if self.delta > 0 and contrastive_z is not None and time_id is not None:
-            contrastive_loss = self.contrastive_loss_fn(
+            contrastive_loss, contrastive_n_anchors = self.contrastive_loss_fn(
                 contrastive_z,
                 patch_mask,
                 patch_sample_id,
@@ -114,6 +114,7 @@ class CombinedLoss(nn.Module):
             )
         else:
             contrastive_loss = reconstructed.new_tensor(0.0)
+            contrastive_n_anchors = reconstructed.new_zeros((), dtype=torch.long)
 
         total = (
             self.alpha * masked_loss
@@ -130,4 +131,6 @@ class CombinedLoss(nn.Module):
             "next_spec": next_spec,
             "cross_modal_loss": cross_modal_loss,
             "contrastive_loss": contrastive_loss,
+            # Per-batch valid-anchor count (for weighted aggregation across batches)
+            "contrastive_n_anchors": contrastive_n_anchors,
         }

@@ -486,7 +486,12 @@ def train_one_epoch(
     epoch_masked = torch.zeros(1, device=device)
     epoch_next = torch.zeros(1, device=device)
     epoch_cross = torch.zeros(1, device=device)
-    epoch_contrastive = torch.zeros(1, device=device)
+    # Contrastive: weighted-mean aggregation
+    # (per-batch loss was already per-anchor-mean; we multiply by anchor count
+    # to get batch-sum, then divide by total anchors across epoch to get
+    # global per-anchor mean. Zero-anchor batches contribute 0/0, ignored.)
+    epoch_contrastive_weighted = torch.zeros(1, device=device)
+    epoch_contrastive_anchors = torch.zeros(1, device=device)
     epoch_spec = torch.zeros(1, device=device)
     epoch_aux = torch.zeros(1, device=device)
     n_batches = 0
@@ -629,7 +634,16 @@ def train_one_epoch(
         epoch_masked += losses["masked_loss"].detach()
         epoch_next += losses["next_loss"].detach()
         epoch_cross += losses["cross_modal_loss"].detach()
-        epoch_contrastive += losses["contrastive_loss"].detach()
+        # Contrastive: loss * n_anchors 누적 + anchor count 누적
+        # (zero-anchor 배치는 loss=0 & count=0으로 자동 제외됨)
+        _contrastive_anchors = losses.get(
+            "contrastive_n_anchors",
+            losses["contrastive_loss"].new_zeros((), dtype=torch.long),
+        ).detach().to(epoch_contrastive_anchors.dtype)
+        epoch_contrastive_weighted += (
+            losses["contrastive_loss"].detach() * _contrastive_anchors
+        )
+        epoch_contrastive_anchors += _contrastive_anchors
         epoch_spec += losses["masked_spec"].detach()
         epoch_aux += aux_loss.detach()
         n_batches += 1
@@ -671,13 +685,18 @@ def train_one_epoch(
             break
 
     denom = max(n_batches, 1)
+    contrastive_denom = epoch_contrastive_anchors.clamp(min=1.0)
     return {
         "total": (epoch_total / denom).item(),
         "masked_loss": (epoch_masked / denom).item(),
         "masked_spec": (epoch_spec / denom).item(),
         "next_loss": (epoch_next / denom).item(),
         "cross_modal_loss": (epoch_cross / denom).item(),
-        "contrastive_loss": (epoch_contrastive / denom).item(),
+        # Weighted per-anchor mean (zero-anchor batches excluded)
+        "contrastive_loss": (
+            epoch_contrastive_weighted / contrastive_denom
+        ).item(),
+        "contrastive_n_anchors": epoch_contrastive_anchors.item(),
         "aux_loss": (epoch_aux / denom).item(),
     }
 
@@ -705,7 +724,9 @@ def validate(
     epoch_masked = 0.0
     epoch_next = 0.0
     epoch_cross = 0.0
-    epoch_contrastive = 0.0
+    # Contrastive: weighted-mean aggregation (동일 설계, train_one_epoch 참조)
+    epoch_contrastive_weighted = 0.0
+    epoch_contrastive_anchors = 0.0
     epoch_spec = 0.0
     epoch_aux = 0.0
     n_batches = 0
@@ -779,7 +800,17 @@ def validate(
         epoch_masked += losses["masked_loss"].item()
         epoch_next += losses["next_loss"].item()
         epoch_cross += losses["cross_modal_loss"].item()
-        epoch_contrastive += losses["contrastive_loss"].item()
+        # Contrastive: loss * n_anchors 누적
+        _val_contrastive_anchors = float(
+            losses.get(
+                "contrastive_n_anchors",
+                torch.zeros((), dtype=torch.long),
+            ).item()
+        )
+        epoch_contrastive_weighted += (
+            losses["contrastive_loss"].item() * _val_contrastive_anchors
+        )
+        epoch_contrastive_anchors += _val_contrastive_anchors
         epoch_spec += losses["masked_spec"].item()
         epoch_aux += aux_loss
         n_batches += 1
@@ -792,13 +823,15 @@ def validate(
 
     model.train()
     denom = max(n_batches, 1)
+    contrastive_denom = max(epoch_contrastive_anchors, 1.0)
     return {
         "total": epoch_total / denom,
         "masked_loss": epoch_masked / denom,
         "masked_spec": epoch_spec / denom,
         "next_loss": epoch_next / denom,
         "cross_modal_loss": epoch_cross / denom,
-        "contrastive_loss": epoch_contrastive / denom,
+        "contrastive_loss": epoch_contrastive_weighted / contrastive_denom,
+        "contrastive_n_anchors": epoch_contrastive_anchors,
         "aux_loss": epoch_aux / denom,
     }
 
