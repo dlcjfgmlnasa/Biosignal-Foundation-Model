@@ -150,10 +150,37 @@ class BiosignalDataset(Dataset[BiosignalSample]):
                     candidates.append(self._shard_index_path.parent.parent.parent / src_str)
                     # 3) shard 디렉토리 자체 기준
                     candidates.append(self._shard_index_path.parent / src_str)
+
+                # 디스크 캐시: source_manifest 옆에 .shard_path_map.pkl 저장.
+                # 첫 실행만 느리고, 이후 257K entry를 즉시 로드.
                 for cand in candidates:
-                    if cand.exists():
-                        self._path_to_shard_key = self._build_path_to_shard_key(cand)
-                        break
+                    if not cand.exists():
+                        continue
+                    cache_path = cand.parent / f".shard_path_map_{self._shard_index_path.parent.name}.pkl"
+                    # mtime 기반 무효화
+                    manifest_mtime = cand.stat().st_mtime_ns
+                    if cache_path.exists():
+                        try:
+                            import pickle
+                            with open(cache_path, "rb") as f:
+                                cached = pickle.load(f)
+                            if cached.get("mtime") == manifest_mtime:
+                                self._path_to_shard_key = cached["map"]
+                                break
+                        except Exception:
+                            pass
+                    # 캐시 없음 → 재파싱 후 저장
+                    self._path_to_shard_key = self._build_path_to_shard_key(cand)
+                    try:
+                        import pickle
+                        with open(cache_path, "wb") as f:
+                            pickle.dump(
+                                {"mtime": manifest_mtime, "map": self._path_to_shard_key},
+                                f, protocol=pickle.HIGHEST_PROTOCOL,
+                            )
+                    except OSError:
+                        pass  # 디스크 쓰기 실패는 무시
+                    break
 
         # LRU 캐시를 인스턴스별로 생성 (lru_cache는 함수 레벨이므로 래핑)
         self._load_recording = lru_cache(maxsize=cache_size)(self._load_recording_impl)
