@@ -141,15 +141,36 @@ def main() -> None:
             print(f"  ... ({len(shards) - 5} more)")
         return
 
-    # 실제 빌드
+    # 실제 빌드 — tqdm 있으면 사용, 없으면 print fallback
+    try:
+        from tqdm import tqdm
+        _have_tqdm = True
+    except ImportError:
+        _have_tqdm = False
+
     rec_to_shard: dict[str, int] = {}
     shard_meta: list[dict] = []
     rec_global_idx = 0
     t_start = time.time()
 
+    shard_pbar = (
+        tqdm(total=len(shards), desc="Shards", unit="shard", position=0)
+        if _have_tqdm else None
+    )
+
     for shard_id, shard in enumerate(shards):
         shard_dict: dict[str, dict] = {}
-        for rec in shard:
+        rec_iter = (
+            tqdm(
+                shard,
+                desc=f"  shard {shard_id+1}/{len(shards)} read",
+                unit="rec",
+                leave=False,
+                position=1,
+            )
+            if _have_tqdm else shard
+        )
+        for rec in rec_iter:
             tensor = torch.load(rec["abs_path"], weights_only=True)
             # rec_global_idx를 key로 사용 (문자열, JSON 호환)
             key = str(rec_global_idx)
@@ -168,6 +189,8 @@ def main() -> None:
             rec_global_idx += 1
 
         shard_path = out_dir / f"shard_{shard_id:05d}.pt"
+        if _have_tqdm:
+            shard_pbar.set_postfix_str(f"writing {shard_path.name}")
         torch.save(shard_dict, shard_path)
         actual_size_mb = shard_path.stat().st_size / 1024**2
         shard_meta.append({
@@ -176,11 +199,24 @@ def main() -> None:
             "size_mb": round(actual_size_mb, 2),
         })
         elapsed = time.time() - t_start
-        print(
-            f"  shard {shard_id+1}/{len(shards)}: "
-            f"{len(shard)} recordings, {actual_size_mb:.1f} MB "
-            f"[total elapsed {elapsed:.1f}s]"
-        )
+        avg_per_shard = elapsed / (shard_id + 1)
+        eta_seconds = avg_per_shard * (len(shards) - shard_id - 1)
+        if _have_tqdm:
+            shard_pbar.set_postfix_str(
+                f"{actual_size_mb:.0f}MB | avg {avg_per_shard:.0f}s/shard | "
+                f"ETA {eta_seconds/60:.1f}min"
+            )
+            shard_pbar.update(1)
+        else:
+            print(
+                f"  shard {shard_id+1}/{len(shards)}: "
+                f"{len(shard)} recordings, {actual_size_mb:.1f} MB "
+                f"[elapsed {elapsed:.1f}s, ETA {eta_seconds/60:.1f}min]",
+                flush=True,
+            )
+
+    if shard_pbar is not None:
+        shard_pbar.close()
 
     # 인덱스 저장
     index = {
