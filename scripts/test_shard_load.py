@@ -121,43 +121,74 @@ def test_sequential_loads(shard_dir: Path, n: int) -> None:
               f"= {total_size / total_time:.0f} MB/s sustained")
 
 
-def test_integration(data_dir: str, shard_index: str) -> None:
-    """BiosignalDataset + sampler 통합 테스트."""
+def test_integration(
+    data_dir: str,
+    shard_index: str,
+    n_samples: int = 10000,
+    shard_cache_size: int = 8,
+) -> None:
+    """BiosignalDataset + sampler 통합 테스트.
+
+    n_samples는 충분히 커야 의미 있음 (shard cold load 비용 분산되는 단위).
+    1 shard ≈ 100K sample window 보유. 권장 최소 5000+, 가능하면 50000+.
+    """
     from data.dataset import BiosignalDataset
     from data.sampler import RecordingLocalitySampler
     from train.train_utils import load_manifest_from_processed
 
-    print(f"\n=== Integration test ===")
+    print(f"\n=== Integration test (n_samples={n_samples}) ===")
     print(f"  Loading manifest from {data_dir}")
     manifest = load_manifest_from_processed(data_dir)
     print(f"  Manifest: {len(manifest)} recordings")
 
-    print(f"  Creating shard-backed BiosignalDataset")
+    print(f"  Creating shard-backed BiosignalDataset (cache_size={shard_cache_size})")
     ds = BiosignalDataset(
         manifest,
         window_seconds=30.0,
         patch_size=200,
         cache_size=16,
         shard_index_path=shard_index,
-        shard_cache_size=4,
+        shard_cache_size=shard_cache_size,
     )
     print(f"  Dataset: {len(ds)} windows")
 
     sampler = RecordingLocalitySampler(ds, shuffle=True, seed=0)
     sampler.set_epoch(0)
 
-    print(f"  Iterating first 200 samples via sampler...")
+    print(f"  Iterating first {n_samples} samples via sampler...")
+    try:
+        from tqdm import tqdm
+        progress = tqdm(total=n_samples, desc="  samples", unit="sample")
+    except ImportError:
+        progress = None
+
     t0 = time.time()
+    t_first_batch = None
     n = 0
     for idx in sampler:
         s = ds[idx]
         n += 1
-        if n >= 200:
+        if t_first_batch is None and n >= 100:
+            t_first_batch = time.time() - t0
+        if progress:
+            progress.update(1)
+        if n >= n_samples:
             break
     t = time.time() - t0
-    print(f"  {n} samples in {t:.2f}s = {n/t:.0f} samples/sec")
-    print(f"  Sample[0]: length={s.length}, signal_type={s.signal_type}, "
-          f"channels={s.values.shape}")
+    if progress:
+        progress.close()
+    print(f"\n  Total: {n} samples in {t:.2f}s = {n/t:.0f} samples/sec")
+    if t_first_batch:
+        print(f"  First 100 samples (cold cache): {t_first_batch:.2f}s "
+              f"= {100/t_first_batch:.0f} sps  (이후 cache warm)")
+        if n > 100:
+            warm_samples = n - 100
+            warm_time = t - t_first_batch
+            if warm_time > 0:
+                print(f"  Remaining {warm_samples} samples (warm): "
+                      f"{warm_time:.2f}s = {warm_samples/warm_time:.0f} sps")
+    print(f"  Sample[last]: length={s.length}, signal_type={s.signal_type}, "
+          f"shape={tuple(s.values.shape)}")
 
 
 def main() -> None:
@@ -172,6 +203,19 @@ def main() -> None:
         action="store_true",
         help="BiosignalDataset+sampler 통합 테스트",
     )
+    p.add_argument(
+        "--n-samples",
+        type=int,
+        default=10000,
+        help="--integration 시 측정 샘플 수 (기본 10000). "
+             "5000 미만이면 shard cold load 비용 미분산 → 잘못된 결론 가능.",
+    )
+    p.add_argument(
+        "--shard-cache-size",
+        type=int,
+        default=8,
+        help="--integration 시 shard LRU cache 크기 (기본 8 = 8GB)",
+    )
     args = p.parse_args()
 
     if args.shard:
@@ -184,7 +228,12 @@ def main() -> None:
         if not (args.data_dir and args.shard_index):
             print("--integration requires --data-dir and --shard-index")
             sys.exit(1)
-        test_integration(args.data_dir, args.shard_index)
+        test_integration(
+            args.data_dir,
+            args.shard_index,
+            n_samples=args.n_samples,
+            shard_cache_size=args.shard_cache_size,
+        )
 
     if not (args.shard or args.shard_dir or args.integration):
         print("아무 옵션도 안 줬음. --shard / --shard-dir / --integration 중 하나 사용.")
