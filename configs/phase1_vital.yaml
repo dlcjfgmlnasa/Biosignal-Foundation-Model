@@ -49,9 +49,13 @@ crop_ratio_max: 1.0            # 전체 600s window
 min_patches: 5                 # 임상 최소 입력 — 10s floor (patch_size=200 × 5 / 100Hz)
 
 # ── Shard backend (IO interrupt 회피) ──
+# ⚠️ shard_cache_size는 PER WORKER 값임. 총 RAM 사용 ≈
+#     num_workers × shard_cache_size × shard_size_GB × num_ranks (DDP)
+#   예: 4 workers × 2 cache × 1GB × 2 ranks = 16GB
+#   12 처럼 크게 잡으면 8 workers × 12 × 1GB × 2 = 192GB → OOM kill 위험.
+# Locality sampler가 sequential read 보장 → 2면 (current + 1 prefetch) 충분.
 shard_index_path: /home/coder/workspace/updown/bio_fm/data/train/vitaldb/vitaldb_wbs/shard_index.json
-shard_cache_size: 12           # 12GB cache (100 shards × 1GB 중 12%)
-                               # locality sampler가 sequential read 보장 → hit ~100%
+shard_cache_size: 2            # per worker (안전)
 
 # ── 학습 ──
 batch_size: 128                # L40S 48GB×2
@@ -93,7 +97,9 @@ patience: 15
 
 # ── 시스템 ──
 device: auto
-num_workers: 8                 # 32 vCPU 중 8개 — shard prefetch 충분
+num_workers: 4                 # 32 vCPU 중 4개 — shard cache OOM 회피 (8 → 4)
+                               # Total RAM = 4 workers × 2 shards × 1GB × 2 ranks = 16GB
+                               # 192GB 서버 안전 (8% 사용)
 output_dir: outputs/phase1
 checkpoint_every: 5
 viz_every: 1
