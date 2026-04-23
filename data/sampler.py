@@ -136,12 +136,26 @@ class RecordingLocalitySampler(Sampler[int]):
 
         결과: 같은 shard recording들이 연속으로 yield → 한 번 로드한 shard에서
         모든 recording 처리 후 다음 shard로 → cache eviction storm 방지.
+
+        train/val split 등으로 dataset이 manifest의 부분집합인 경우, 로컬 rec_i
+        는 원본 rec_global_idx와 다르므로 path → 원본 rec_idx 매핑(dataset의
+        _path_to_shard_key)을 우회해서 정확한 shard 분류를 한다.
         """
         from collections import defaultdict
 
+        # 부분집합 manifest 대응 — dataset의 path map 사용
+        path_map = getattr(self.dataset, "_path_to_shard_key", None)
+
         shard_to_recs: dict[int, list[int]] = defaultdict(list)
         for rec_i in range(self._n_recs):
-            sid = rec_to_shard.get(str(rec_i), 0)
+            shard_key: str
+            if path_map is not None:
+                # path → 원본 rec_global_idx (= shard 내 key)
+                entry_path = self.dataset._manifest[rec_i].path
+                shard_key = path_map.get(entry_path, str(rec_i))
+            else:
+                shard_key = str(rec_i)
+            sid = rec_to_shard.get(shard_key, 0)
             shard_to_recs[sid].append(rec_i)
 
         shard_ids = list(shard_to_recs.keys())
@@ -241,13 +255,24 @@ class GroupedBatchSampler(Sampler[list[int]]):
         self._groups: list[list[int]] = list(groups.values())
         keys = list(groups.keys())
         self._group_rec_ids: list[int] = [group_to_rec[k] for k in keys]
-        # Shard backend 지원 — recording → shard 매핑 보존 (있을 때만)
+        # Shard backend 지원 — recording → shard 매핑 보존 (있을 때만).
+        # 부분집합 manifest(train/val split 등)에서는 로컬 r_id ≠ 원본 rec_global_idx
+        # 이므로 path map 통해 정확한 shard로 매핑.
         rec_to_shard = getattr(dataset, "_rec_to_shard", None)
-        self._rec_to_shard: dict[int, int] | None = (
-            {int(k): v for k, v in rec_to_shard.items()}
-            if rec_to_shard is not None
-            else None
-        )
+        if rec_to_shard is not None:
+            path_map = getattr(dataset, "_path_to_shard_key", None)
+            self._rec_to_shard: dict[int, int] | None = {}
+            unique_local_recs = set(self._group_rec_ids)
+            for r_id in unique_local_recs:
+                if path_map is not None:
+                    entry_path = dataset._manifest[r_id].path
+                    shard_key = path_map.get(entry_path, str(r_id))
+                else:
+                    shard_key = str(r_id)
+                sid = rec_to_shard.get(shard_key, 0)
+                self._rec_to_shard[r_id] = sid
+        else:
+            self._rec_to_shard = None
 
     def set_epoch(self, epoch: int) -> None:
         """에폭마다 셔플 시드를 변경한다. DDP에서 모든 rank가 동일 호출 필수."""
