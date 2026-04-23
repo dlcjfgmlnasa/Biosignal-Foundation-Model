@@ -14,6 +14,15 @@ A biosignal foundation model built with PyTorch. Early-stage research project ta
 
 No `requirements.txt` exists yet — installed packages are in `.venv/`.
 
+## Storage Layout
+
+데이터는 두 디렉토리로 분리 (자세한 내용: `docs/data_pipeline.md` 의 "Storage Strategy"):
+- `processed/<dataset>/` — `manifest_full.jsonl` + per-recording `.pt` (옵션)
+- `sharded/<dataset>/` — `shard_index.json` + `shard_*.pt` (학습 시 핵심)
+
+신규 데이터셋 추가는 **`scripts/parse_to_shard.py`** 단일 명령 권장 (parse → shard → cleanup 1-pass).
+기존 코드 (`data/parser/vitaldb.py` + `scripts/build_shards.py`)는 점진적 진화 결과로 2-step.
+
 ## Architecture
 
 ```
