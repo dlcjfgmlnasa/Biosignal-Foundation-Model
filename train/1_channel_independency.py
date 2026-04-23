@@ -566,12 +566,14 @@ def main():
                 epoch % viz_every == 0 or epoch == config.n_epochs - 1
             ):
                 viz_model = model.module if use_ddp else model
+                # 시각화는 작은 mask_ratio로 (학습용 0.4는 panel의 40%+가 빨간색
+                # 이 되어 raw 신호 가시성 저하). 0.15면 raw + model pred 둘 다 잘 보임.
                 fig_path = save_reconstruction_figure(
                     viz_model,
                     viz_batches,
                     epoch=epoch,
                     output_dir=viz_recon_dir,
-                    mask_ratio=config.mask_ratio,
+                    mask_ratio=min(0.15, config.mask_ratio),
                     device=device,
                     block_mask=config.block_mask,
                     block_size_min=config.block_size_min,
