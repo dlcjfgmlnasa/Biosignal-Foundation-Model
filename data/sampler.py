@@ -86,7 +86,14 @@ class RecordingLocalitySampler(Sampler[int]):
         g.manual_seed(self.seed + self.epoch)
 
         if self.shuffle:
-            rec_order = torch.randperm(self._n_recs, generator=g).tolist()
+            # Shard-aware shuffling: dataset이 shard backend를 쓰면 같은 shard
+            # recordings를 묶어서 셔플 → shard LRU cache hit율 ~100% 보장.
+            # 미사용 시 (file backend) 기존 random 셔플로 fallback.
+            rec_to_shard = getattr(self.dataset, "_rec_to_shard", None)
+            if rec_to_shard is not None:
+                rec_order = self._shard_aware_shuffle(rec_to_shard, g)
+            else:
+                rec_order = torch.randperm(self._n_recs, generator=g).tolist()
         else:
             rec_order = list(range(self._n_recs))
 
@@ -115,6 +122,37 @@ class RecordingLocalitySampler(Sampler[int]):
             indices.extend(local_indices)
 
         return iter(indices)
+
+    def _shard_aware_shuffle(
+        self,
+        rec_to_shard: dict[str, int],
+        generator: torch.Generator,
+    ) -> list[int]:
+        """Shard 단위로 묶어서 셔플 — shard cache hit율 ~100% 보장.
+
+        1. (rec_idx → shard_id) 매핑으로 recording을 shard별로 그루핑
+        2. shard 순서 셔플 (외부)
+        3. 각 shard 내 recording 순서 셔플 (내부)
+
+        결과: 같은 shard recording들이 연속으로 yield → 한 번 로드한 shard에서
+        모든 recording 처리 후 다음 shard로 → cache eviction storm 방지.
+        """
+        from collections import defaultdict
+
+        shard_to_recs: dict[int, list[int]] = defaultdict(list)
+        for rec_i in range(self._n_recs):
+            sid = rec_to_shard.get(str(rec_i), 0)
+            shard_to_recs[sid].append(rec_i)
+
+        shard_ids = list(shard_to_recs.keys())
+        shard_perm = torch.randperm(len(shard_ids), generator=generator).tolist()
+        rec_order: list[int] = []
+        for sp in shard_perm:
+            sid = shard_ids[sp]
+            recs = shard_to_recs[sid]
+            inner_perm = torch.randperm(len(recs), generator=generator).tolist()
+            rec_order.extend(recs[i] for i in inner_perm)
+        return rec_order
 
     def __len__(self) -> int:
         # 현재 rank에 할당된 총 샘플 수 (근사치)
@@ -203,29 +241,64 @@ class GroupedBatchSampler(Sampler[list[int]]):
         self._groups: list[list[int]] = list(groups.values())
         keys = list(groups.keys())
         self._group_rec_ids: list[int] = [group_to_rec[k] for k in keys]
+        # Shard backend 지원 — recording → shard 매핑 보존 (있을 때만)
+        rec_to_shard = getattr(dataset, "_rec_to_shard", None)
+        self._rec_to_shard: dict[int, int] | None = (
+            {int(k): v for k, v in rec_to_shard.items()}
+            if rec_to_shard is not None
+            else None
+        )
 
     def set_epoch(self, epoch: int) -> None:
         """에폭마다 셔플 시드를 변경한다. DDP에서 모든 rank가 동일 호출 필수."""
         self.epoch = epoch
 
     def _shuffle_groups(self) -> list[int]:
-        """Recording-locality를 보존하면서 그룹 순서를 셔플한다.
+        """Shard 우선 → recording → group 순서로 셔플한다.
 
-        모든 rank가 동일한 시드 → 동일한 순서를 생성한다.
+        Shard-aware (dataset이 shard backend 사용 시):
+            shard 셔플 → 각 shard 내 recording 셔플 → 각 recording 내 group 셔플
+            → 같은 shard recordings가 연속 yield → cache hit ~100%
+        Shard 미사용 시:
+            recording 셔플 → recording 내 group 셔플 (기존 동작)
+
+        모든 rank가 동일한 시드 → 동일한 순서.
         """
         group_indices = list(range(len(self._groups)))
         if not self.shuffle:
             return group_indices
 
-        unique_recs = sorted(set(self._group_rec_ids))
-        rec_perm = torch.randperm(
-            len(unique_recs), generator=self.generator
-        ).tolist()
-        rec_order = [unique_recs[i] for i in rec_perm]
-
         rec_to_groups: dict[int, list[int]] = defaultdict(list)
         for g_idx, r_id in enumerate(self._group_rec_ids):
             rec_to_groups[r_id].append(g_idx)
+
+        unique_recs = sorted(set(self._group_rec_ids))
+
+        # ── Shard-aware 경로 ──
+        if self._rec_to_shard is not None:
+            shard_to_recs: dict[int, list[int]] = defaultdict(list)
+            for r_id in unique_recs:
+                sid = self._rec_to_shard.get(r_id, 0)
+                shard_to_recs[sid].append(r_id)
+
+            shard_ids = list(shard_to_recs.keys())
+            shard_perm = torch.randperm(
+                len(shard_ids), generator=self.generator
+            ).tolist()
+            rec_order: list[int] = []
+            for sp in shard_perm:
+                sid = shard_ids[sp]
+                recs = shard_to_recs[sid]
+                inner = torch.randperm(
+                    len(recs), generator=self.generator
+                ).tolist()
+                rec_order.extend(recs[i] for i in inner)
+        else:
+            # ── 기존 random recording 셔플 ──
+            rec_perm = torch.randperm(
+                len(unique_recs), generator=self.generator
+            ).tolist()
+            rec_order = [unique_recs[i] for i in rec_perm]
 
         group_indices = []
         for r_id in rec_order:

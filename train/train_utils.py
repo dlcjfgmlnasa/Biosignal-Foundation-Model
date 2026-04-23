@@ -52,6 +52,10 @@ class TrainConfig:
     crop_ratio_max: float = 0.0  # >0이면 random crop 활성 (max ratio)
     min_patches: int = 5  # random crop 최소 patch 수 (임상 10s floor @ patch_size=200, 100Hz)
 
+    # Shard backend (file open() 폭증 방지) — None이면 file backend
+    shard_index_path: str | None = None  # build_shards.py가 만든 shard_index.json 경로
+    shard_cache_size: int = 4  # shard LRU 크기 (한 shard ~수백 MB)
+
     # 학습
     batch_size: int = 16
     lr: float = 1e-3

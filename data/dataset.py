@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import bisect
+import json
 import random
 import tempfile
 from collections.abc import Sequence
@@ -93,6 +94,8 @@ class BiosignalDataset(Dataset[BiosignalSample]):
         patch_size: int | None = None,
         min_patches: int = 5,  # random crop 최소 patch 수 (임상: 10s floor @ patch_size=200,100Hz)
         preload: bool = False,  # deprecated, 무시됨
+        shard_index_path: str | Path | None = None,  # shard backend 활성화
+        shard_cache_size: int = 4,  # shard LRU 크기 (recording cache_size와 별도)
     ) -> None:
         super().__init__()
         self.max_length = max_length
@@ -113,8 +116,25 @@ class BiosignalDataset(Dataset[BiosignalSample]):
             Value("q", 0) if crop_ratio_range is not None else None
         )
 
+        # ── Shard backend (Option D) — file open() 폭증 방지 ──
+        # shard_index.json이 주어지면 파일 단위가 아닌 shard 단위로 LRU 캐싱.
+        # 한 shard는 수백 recording을 dict로 묶고 있어 한 번 로드로 다수 처리 가능.
+        self._shard_index_path: Path | None = (
+            Path(shard_index_path) if shard_index_path else None
+        )
+        self._shard_dir: Path | None = None
+        self._rec_to_shard: dict[str, int] | None = None
+        if self._shard_index_path is not None:
+            with open(self._shard_index_path, encoding="utf-8") as f:
+                idx = json.load(f)
+            self._shard_dir = self._shard_index_path.parent
+            # JSON key는 str — 내부에서도 str로 통일
+            self._rec_to_shard = {str(k): int(v) for k, v in idx["rec_to_shard"].items()}
+
         # LRU 캐시를 인스턴스별로 생성 (lru_cache는 함수 레벨이므로 래핑)
         self._load_recording = lru_cache(maxsize=cache_size)(self._load_recording_impl)
+        self._shard_cache_size_attr = shard_cache_size
+        self._load_shard = lru_cache(maxsize=shard_cache_size)(self._load_shard_impl)
 
         # 레코딩별 window/stride (샘플 단위로 변환)
         self._window_lengths_per_rec: list[int | None] = []
@@ -155,7 +175,29 @@ class BiosignalDataset(Dataset[BiosignalSample]):
             self._n_windows_per_rec.append(n_win)
             self._rec_offsets.append(self._rec_offsets[-1] + entry.n_channels * n_win)
 
+    def _load_shard_impl(self, shard_id: int) -> dict:
+        """Shard 파일 로드 (LRU 캐시 대상). 한 번 로드로 수백 recording 처리."""
+        shard_path = self._shard_dir / f"shard_{shard_id:05d}.pt"
+        return torch.load(shard_path, weights_only=True, mmap=self._use_mmap)
+
     def _load_recording_impl(self, rec_idx: int) -> torch.Tensor:  # (channels, time)
+        # ── Shard backend 경로 ──
+        # 주어진 manifest entry의 "global rec_idx"가 shard_index의 키와 매칭됨.
+        # path 대신 shard_id로 dispatch하여 file open() 폭증 회피.
+        if self._rec_to_shard is not None:
+            key = str(rec_idx)
+            if key in self._rec_to_shard:
+                shard = self._load_shard(self._rec_to_shard[key])
+                rec = shard[key]
+                values = rec["values"]
+                if not torch.is_tensor(values):
+                    values = torch.from_numpy(values).float()
+                # (channels, time) 보장 — 1D면 unsqueeze
+                if values.ndim == 1:
+                    values = values.unsqueeze(0)
+                return values
+            # shard에 없으면 file fallback (혼합 manifest 대응)
+
         path = self._manifest[rec_idx].path
 
         # Transient I/O 에러 방어: 최대 3회 retry (exponential backoff)
@@ -201,7 +243,9 @@ class BiosignalDataset(Dataset[BiosignalSample]):
     def __getstate__(self) -> dict:
         """Pickle 직렬화: lru_cache wrapper는 pickle 불가이므로 제외."""
         state = self.__dict__.copy()
-        del state["_load_recording"]
+        state.pop("_load_recording", None)
+        state.pop("_load_shard", None)
+        # _shard_cache_size 누락 방지 (older state 호환)
         return state
 
     def __setstate__(self, state: dict) -> None:
@@ -210,6 +254,9 @@ class BiosignalDataset(Dataset[BiosignalSample]):
         self._load_recording = lru_cache(maxsize=self._cache_size)(
             self._load_recording_impl
         )
+        # shard cache (없으면 기본 4)
+        shard_cache_size = getattr(self, "_shard_cache_size_attr", 4)
+        self._load_shard = lru_cache(maxsize=shard_cache_size)(self._load_shard_impl)
 
     def __len__(self) -> int:
         return self._rec_offsets[-1]

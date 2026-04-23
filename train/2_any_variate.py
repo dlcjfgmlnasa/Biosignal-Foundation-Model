@@ -438,8 +438,13 @@ def main():
         crop_ratio_range=crop_range,
         patch_size=config.model_config.patch_size,
         min_patches=config.min_patches,
+        shard_index_path=config.shard_index_path,
+        shard_cache_size=config.shard_cache_size,
     )
     if rank0:
+        if config.shard_index_path:
+            print(f"  Shard backend ON: {config.shard_index_path} "
+                  f"(shard_cache_size={config.shard_cache_size})")
         print(f"Train dataset: {len(dataset)} windows")
 
     dataloader = create_dataloader(
@@ -464,6 +469,8 @@ def main():
             cache_size=config.cache_size,
             patch_size=config.model_config.patch_size,
             min_patches=config.min_patches,
+            shard_index_path=config.shard_index_path,
+            shard_cache_size=config.shard_cache_size,
         )
         val_dataloader = create_dataloader(
             val_dataset,

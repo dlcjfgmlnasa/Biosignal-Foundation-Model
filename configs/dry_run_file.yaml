@@ -1,0 +1,51 @@
+# 동일 dry-run, file backend (shard 없음) — 비교용
+model_config:
+  d_model: 64
+  num_layers: 1
+  patch_size: 100
+  stride: null
+  num_heads: null
+  num_groups: null
+  use_glu: true
+  use_moe: false
+  use_rope: true
+  use_var_attn_bias: true
+  use_spatial_embed: true
+  dropout_p: 0.0
+  next_block_size: 4
+  contrastive_proj_dim: 0
+
+data_dir: datasets/processed/vitaldb
+signal_types: [0, 1, 2, 3, 4, 5, 6]
+window_seconds: 10.0
+max_length: 5000
+cache_size: 4
+
+# Shard backend OFF — file 모드
+shard_index_path: null
+
+batch_size: 2
+lr: 1.0e-3
+n_epochs: 1
+warmup_epochs: 0
+min_lr_ratio: 0.1
+mask_ratio: 0.15
+gradient_clip: 1.0
+seed: 42
+collate_mode: ci
+
+alpha: 1.0
+beta: 1.0
+gamma: 0.0
+delta: 0.0
+
+variate_mask_prob: 0.0
+
+device: cpu
+num_workers: 0
+output_dir: outputs/dry_run_file
+checkpoint_every: 1
+dry_run: false       # 1 epoch 전체
+n_epochs: 1
+max_batches: 50      # 50 batch만 비교
+val_ratio: 0.0
