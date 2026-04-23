@@ -19,6 +19,7 @@ import time
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from data import BiosignalDataset, create_dataloader
@@ -548,6 +549,11 @@ def main():
             f"Visualization every {viz_every} epochs -> {viz_dir}"
             f"  ({len(viz_batches)} batches, {n_types} signal types)"
         )
+
+    # DDP 동기화 — viz_batches는 rank 0만 fetch. barrier로 다른 rank가
+    # 학습 loop 진입 → 첫 backward all_reduce에서 deadlock 되는 것 방지.
+    if use_ddp:
+        dist.barrier()
 
     # ── Training loop ──
     best_loss = float("inf")
