@@ -124,12 +124,36 @@ class BiosignalDataset(Dataset[BiosignalSample]):
         )
         self._shard_dir: Path | None = None
         self._rec_to_shard: dict[str, int] | None = None
+        # path → original_rec_idx (= shard 내 key) — STABLE KEY.
+        # train/val split, signal_types 필터링 등으로 manifest가 부분집합/재정렬되어도
+        # path는 변하지 않으므로 정확히 같은 recording을 shard에서 가져올 수 있다.
+        self._path_to_shard_key: dict[str, str] | None = None
         if self._shard_index_path is not None:
             with open(self._shard_index_path, encoding="utf-8") as f:
                 idx = json.load(f)
             self._shard_dir = self._shard_index_path.parent
             # JSON key는 str — 내부에서도 str로 통일
             self._rec_to_shard = {str(k): int(v) for k, v in idx["rec_to_shard"].items()}
+
+            # source_manifest를 다시 파싱하여 path → shard rec_idx 매핑 빌드.
+            # build_shards.py가 파일에 entry를 추가한 순서가 곧 rec_global_idx.
+            # source_manifest는 상대/절대 경로 둘 다 가능 — 여러 base 시도.
+            source_manifest = idx.get("source_manifest")
+            if source_manifest:
+                # path separator 정규화 (Windows ↔ Linux)
+                src_str = source_manifest.replace("\\", "/")
+                candidates = [Path(src_str)]
+                if not candidates[0].is_absolute():
+                    # 1) CWD 기준
+                    candidates.append(Path.cwd() / src_str)
+                    # 2) shard 디렉토리의 parent의 parent (보통 project root)
+                    candidates.append(self._shard_index_path.parent.parent.parent / src_str)
+                    # 3) shard 디렉토리 자체 기준
+                    candidates.append(self._shard_index_path.parent / src_str)
+                for cand in candidates:
+                    if cand.exists():
+                        self._path_to_shard_key = self._build_path_to_shard_key(cand)
+                        break
 
         # LRU 캐시를 인스턴스별로 생성 (lru_cache는 함수 레벨이므로 래핑)
         self._load_recording = lru_cache(maxsize=cache_size)(self._load_recording_impl)
@@ -180,15 +204,53 @@ class BiosignalDataset(Dataset[BiosignalSample]):
         shard_path = self._shard_dir / f"shard_{shard_id:05d}.pt"
         return torch.load(shard_path, weights_only=True, mmap=self._use_mmap)
 
+    def _build_path_to_shard_key(self, source_manifest: Path) -> dict[str, str]:
+        """source_manifest를 build_shards.py와 동일 순서로 파싱하여 path → 원본
+        rec_global_idx (= shard 내 key) 매핑을 만든다.
+
+        train/val split이나 signal_types 필터로 manifest가 부분집합/재정렬되어도
+        경로(path)는 변하지 않으므로 stable lookup이 보장된다.
+        """
+        mapping: dict[str, str] = {}
+        rec_global_idx = 0
+        base_dir = source_manifest.parent
+        with open(source_manifest, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                meta = json.loads(line)
+                subject_id = meta.get("subject_id", "")
+                subject_dir = base_dir / subject_id if subject_id else base_dir
+                for session in meta.get("sessions", []):
+                    for rec in session.get("recordings", []):
+                        file_ref = rec["file"]
+                        if "#" in file_ref:
+                            h5_file, ds_name = file_ref.split("#", 1)
+                            full_path = str(subject_dir / h5_file) + "#" + ds_name
+                        else:
+                            full_path = str(subject_dir / file_ref)
+                        mapping[full_path] = str(rec_global_idx)
+                        rec_global_idx += 1
+        return mapping
+
     def _load_recording_impl(self, rec_idx: int) -> torch.Tensor:  # (channels, time)
         # ── Shard backend 경로 ──
-        # 주어진 manifest entry의 "global rec_idx"가 shard_index의 키와 매칭됨.
-        # path 대신 shard_id로 dispatch하여 file open() 폭증 회피.
+        # train/val split이나 signal_types 필터로 self._manifest는 원본 manifest의
+        # SUBSET일 수 있다. 그래서 rec_idx를 그대로 shard key로 쓰면 잘못된
+        # recording을 가져옴. PATH(stable)로 lookup하여 정확한 shard entry 가져옴.
         if self._rec_to_shard is not None:
-            key = str(rec_idx)
-            if key in self._rec_to_shard:
-                shard = self._load_shard(self._rec_to_shard[key])
-                rec = shard[key]
+            shard_key: str | None = None
+            if self._path_to_shard_key is not None:
+                # 1) path → 원본 rec_global_idx → shard
+                entry_path = self._manifest[rec_idx].path
+                shard_key = self._path_to_shard_key.get(entry_path)
+            if shard_key is None:
+                # 2) Fallback: rec_idx 자체를 key로 (subset 안 한 경우 정상 동작)
+                shard_key = str(rec_idx)
+            if shard_key in self._rec_to_shard:
+                shard = self._load_shard(self._rec_to_shard[shard_key])
+                rec = shard[shard_key]
                 values = rec["values"]
                 if not torch.is_tensor(values):
                     values = torch.from_numpy(values).float()
