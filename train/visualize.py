@@ -46,6 +46,10 @@ class RowCandidate:
     signal_name: str
     n_valid: int
     patch_size: int
+    # 디버그용 — 어느 batch row / sample / variate에서 왔는지 추적
+    batch_idx: int = -1
+    sample_id: int = -1
+    variate_id: int = -1
 
 
 # ── 공통 유틸 ─────────────────────────────────────────────────
@@ -259,9 +263,14 @@ def _plot_figure_grid(
             if col == 0:
                 ax.set_ylabel(cand.signal_name, fontsize=10)
 
+            # 디버그 라벨 — 실제로 어느 batch row / sample / variate에서 왔는지
+            # 명시. 같은 row(=signal_type) 안 패널이 다른 신호처럼 보이면 여기서
+            # bi/sid가 다른지 확인 → 데이터 매핑 추적 가능.
             ax.set_title(
-                f"{n_pred}/{n_show} patches | {duration_shown:.0f}s",
-                fontsize=8,
+                f"{cand.signal_name} | bi={cand.batch_idx} sid={cand.sample_id} "
+                f"vid={cand.variate_id} | {n_pred}/{n_show} patches | "
+                f"{duration_shown:.0f}s",
+                fontsize=7,
                 loc="right",
             )
             ax.tick_params(labelsize=7)
@@ -394,6 +403,9 @@ def _extract_candidates(
                     signal_name=sig_name,
                     n_valid=n_seg,
                     patch_size=patch_size,
+                    batch_idx=bi,
+                    sample_id=sid,
+                    variate_id=vid,
                 )
             )
 
@@ -488,6 +500,9 @@ def _process_recon_batch(
                     signal_name=sig_name,
                     n_valid=n_seg,
                     patch_size=p,
+                    batch_idx=bi,
+                    sample_id=sid,
+                    variate_id=vid,
                 )
             )
 
@@ -575,6 +590,9 @@ def _process_next_pred_batch(
                     signal_name=sig_name,
                     n_valid=n_seg,
                     patch_size=p,
+                    batch_idx=bi,
+                    sample_id=sid,
+                    variate_id=vid,
                 )
             )
 
