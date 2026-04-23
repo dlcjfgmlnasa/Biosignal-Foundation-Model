@@ -102,8 +102,21 @@ def _build_signal_map(
 def _select_diverse_grid(
     candidates: list[RowCandidate],
     samples_per_type: int = 3,
+    min_n_valid: int = 5,
 ) -> dict[int, list[RowCandidate]]:
     """신호 타입별 여러 샘플을 선택한다.
+
+    매우 짧은 candidate (예: n_valid=1)는 mask 시 모든 patch가 가려져
+    실제 신호가 거의 안 보이고, 모델의 random 예측이 panel을 차지해
+    "다른 신호"처럼 오인됨. min_n_valid로 필터링.
+
+    Parameters
+    ----------
+    samples_per_type:
+        signal type별 표시할 panel 수.
+    min_n_valid:
+        candidate 최소 patch 수. 이보다 짧은 segment는 시각화에서 제외.
+        기본 5 = 10초 (patch_size=200, 100Hz 기준).
 
     Returns
     -------
@@ -111,6 +124,9 @@ def _select_diverse_grid(
     """
     by_type: dict[int, list[RowCandidate]] = {}
     for c in candidates:
+        # 너무 짧은 segment 필터링
+        if c.n_valid < min_n_valid:
+            continue
         by_type.setdefault(c.signal_type, []).append(c)
 
     for t in by_type:
