@@ -1,7 +1,12 @@
 # -*- coding:utf-8 -*-
 from __future__ import annotations
 
-"""α * MPM + β * NextPred (same-variate + γ * cross-modal) + δ * Contrastive 복합 손실 함수."""
+"""α * MPM + β * NextPred + γ * CrossModal + δ * Contrastive 복합 손실 함수.
+
+각 손실 항은 독립 가중치를 가진다. β=0이면 next-pred만 비활성, γ=0이면
+cross-modal만 비활성 — 이전 버전처럼 β=0이 cross-modal까지 silent 0으로
+만들지 않는다.
+"""
 import torch
 from torch import nn
 
@@ -11,16 +16,18 @@ from loss.next_prediction_loss import NextPredictionLoss
 
 
 class CombinedLoss(nn.Module):
-    """α * MPM + β * NextPred (same-variate + γ * cross-modal) + δ * Contrastive 하이브리드 손실 함수.
+    """α * MPM + β * NextPred + γ * CrossModal + δ * Contrastive 하이브리드 손실 함수.
+
+    각 항은 독립 가중치. β=0은 next-pred만 비활성, γ=0은 cross-modal만 비활성.
 
     Parameters
     ----------
     alpha:
-        Masked reconstruction loss 가중치.
+        Masked reconstruction loss 가중치. 0이면 비활성.
     beta:
-        Next-patch prediction loss 가중치. 0이면 next-patch 계산 스킵.
+        Same-variate next-patch prediction loss 가중치. 0이면 next-patch 비활성.
     gamma:
-        Cross-modal prediction loss 가중치 (beta 내부 가중). 0이면 비활성.
+        Cross-modal prediction loss 가중치. 0이면 cross-modal 비활성.
     delta:
         Cross-modal contrastive loss 가중치. 0이면 비활성.
     contrastive_temperature:
@@ -52,7 +59,6 @@ class CombinedLoss(nn.Module):
             spec_n_ffts=spec_n_ffts,
         )
         self.next_loss_fn = NextPredictionLoss(
-            cross_modal_weight=gamma,
             peak_alpha=peak_alpha,
             lambda_spec=lambda_spec,
             spec_n_ffts=spec_n_ffts,
@@ -83,8 +89,14 @@ class CombinedLoss(nn.Module):
         masked_dict = self.masked_loss_fn(reconstructed, original_patches, pred_mask)
         masked_loss = masked_dict["total"]
 
-        # ── Block Next-Patch Prediction Loss ──
-        if self.beta > 0 and next_pred is not None:
+        # ── Block Next-Patch + Cross-Modal Prediction Loss (β / γ 독립) ──
+        compute_next = self.beta > 0 and next_pred is not None
+        compute_cross = (
+            self.gamma > 0
+            and cross_pred_per_type is not None
+            and time_id is not None
+        )
+        if compute_next or compute_cross:
             next_dict = self.next_loss_fn(
                 next_pred,
                 cross_pred_per_type,
@@ -94,6 +106,8 @@ class CombinedLoss(nn.Module):
                 patch_variate_id,
                 time_id=time_id,
                 patch_signal_types=patch_signal_types,
+                compute_next=compute_next,
+                compute_cross=compute_cross,
             )
             next_loss = next_dict["next_loss"]
             next_spec = next_dict["next_spec"]
@@ -118,7 +132,8 @@ class CombinedLoss(nn.Module):
 
         total = (
             self.alpha * masked_loss
-            + self.beta * (next_loss + cross_modal_loss)
+            + self.beta * next_loss
+            + self.gamma * cross_modal_loss
             + self.delta * contrastive_loss
         )
 

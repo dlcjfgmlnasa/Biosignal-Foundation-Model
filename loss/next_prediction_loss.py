@@ -29,10 +29,12 @@ for _a, _b in CROSS_PRED_ALLOWED_PAIRS:
 class NextPredictionLoss(nn.Module):
     """Next-Patch Prediction Loss (same-variate + cross-modal).
 
+    Same-variate / cross-modal 두 항의 raw loss를 반환한다. 가중(β, γ)은
+    호출자(예: ``CombinedLoss``)에서 곱한다. 비활성화는 ``compute_next``/
+    ``compute_cross`` 플래그로 제어 — 가중치를 통한 silent skip을 방지.
+
     Parameters
     ----------
-    cross_modal_weight:
-        γ 가중치. 0이면 cross-modal loss 비활성 (Phase 1 동작).
     peak_alpha:
         Peak 가중치 강도. 0이면 일반 MSE.
     lambda_spec:
@@ -43,20 +45,18 @@ class NextPredictionLoss(nn.Module):
 
     def __init__(
         self,
-        cross_modal_weight: float = 0.0,
         peak_alpha: float = 0.0,
         lambda_spec: float = 0.0,
         spec_n_ffts: tuple[int, ...] = (16, 32, 64),
     ) -> None:
         super().__init__()
-        self.cross_modal_weight = cross_modal_weight
         self.peak_alpha = peak_alpha
         self.lambda_spec = lambda_spec
         self.spec_n_ffts = spec_n_ffts
 
     def forward(
         self,
-        next_pred: torch.Tensor,  # (B, N, K, P) — block next-patch 예측
+        next_pred: torch.Tensor | None,  # (B, N, K, P) — block next-patch 예측
         cross_pred_per_type: torch.Tensor
         | None,  # (B, N, T, P) — per-target-type cross-modal 예측
         original_patches: torch.Tensor,  # (B, N, P)
@@ -66,6 +66,8 @@ class NextPredictionLoss(nn.Module):
         time_id: torch.Tensor | None = None,  # (B, N) long — cross-modal 페어링용
         patch_signal_types: torch.Tensor
         | None = None,  # (B, N) long — mechanism group 필터용
+        compute_next: bool = True,
+        compute_cross: bool = True,
     ) -> dict[str, torch.Tensor]:
         """Block Next Prediction loss 계산.
 
@@ -75,21 +77,33 @@ class NextPredictionLoss(nn.Module):
         Returns
         -------
         dict with keys:
-            ``next_loss``: same-variate block next-patch prediction MSE.
-            ``cross_modal_loss``: cross-modal prediction MSE (0 if disabled).
+            ``next_loss``: same-variate block next-patch raw MSE (가중 없음).
+            ``next_spec``: same-variate spectral loss.
+            ``cross_modal_loss``: cross-modal raw MSE (가중 없음).
         """
+        ref = (
+            next_pred if next_pred is not None else original_patches
+        )  # 텐서 device/dtype 참조용
+        zero = ref.new_tensor(0.0)
+
         # ── Same-variate block next-patch loss ──
-        next_dict = self._same_variate_loss(
-            next_pred,
-            original_patches,
-            patch_mask,
-            patch_sample_id,
-            patch_variate_id,
-        )
+        if compute_next and next_pred is not None:
+            next_dict = self._same_variate_loss(
+                next_pred,
+                original_patches,
+                patch_mask,
+                patch_sample_id,
+                patch_variate_id,
+            )
+            next_loss = next_dict["total"]
+            next_spec = next_dict["spec"]
+        else:
+            next_loss = zero
+            next_spec = zero
 
         # ── Cross-modal loss ──
         if (
-            self.cross_modal_weight > 0
+            compute_cross
             and cross_pred_per_type is not None
             and time_id is not None
         ):
@@ -102,13 +116,13 @@ class NextPredictionLoss(nn.Module):
                 time_id,
                 patch_signal_types,
             )
-            cross_modal_loss = self.cross_modal_weight * cross_dict["total"]
+            cross_modal_loss = cross_dict["total"]
         else:
-            cross_modal_loss = next_pred.new_tensor(0.0)
+            cross_modal_loss = zero
 
         return {
-            "next_loss": next_dict["total"],
-            "next_spec": next_dict["spec"],
+            "next_loss": next_loss,
+            "next_spec": next_spec,
             "cross_modal_loss": cross_modal_loss,
         }
 
@@ -192,8 +206,9 @@ class NextPredictionLoss(nn.Module):
         같은 (sample_id, time_id)에서 서로 다른 variate_id를 가진 패치 쌍을 매칭하고,
         target의 signal type에 해당하는 cross_pred를 선택하여 MSE를 계산한다.
 
-        ``CROSS_PRED_ALLOWED_PAIRS``에 정의된 생리학적으로 타당한 쌍만 허용.
-        (ECG↔ABP, ECG↔PPG, ABP↔PPG, CO2↔AWP)
+        ``CROSS_PRED_ALLOWED_PAIRS``(data/spatial_map.py)에 정의된 생리학적으로
+        타당한 쌍만 허용. 현재: ECG↔ABP, ECG↔PPG, ABP↔PPG, ABP↔PAP, CVP↔PAP,
+        ABP↔ICP. (CO2↔AWP, ABP↔CVP 등은 명시적으로 기각.)
         """
         # group_key: (batch, sample_id, time_id)가 같은 패치를 그룹핑
         b, n = time_id.shape

@@ -63,10 +63,10 @@ class TrainConfig:
     seed: int = 42
     collate_mode: str = "ci"
 
-    # Loss 가중치
+    # Loss 가중치 (각 항 독립 가중)
     alpha: float = 1.0  # masked reconstruction
-    beta: float = 0.0  # next-patch prediction
-    gamma: float = 0.0  # cross-modal (beta 내부 가중)
+    beta: float = 0.0  # next-patch prediction (β=0이면 next-pred만 비활성)
+    gamma: float = 0.0  # cross-modal prediction (γ=0이면 cross-modal만 비활성)
     delta: float = 0.0  # cross-modal contrastive
     peak_alpha: float = 0.0  # Peak-Weighted MSE 강도 (0=일반 MSE)
     lambda_spec: float = 0.0  # Spectral Loss 가중치 (하위 호환)
