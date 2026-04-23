@@ -502,6 +502,22 @@ def train_one_epoch(
     use_amp = scaler is not None
     amp_dtype = torch.float16 if device.type == "cuda" else torch.bfloat16
 
+    def _sync_criterion_grads() -> None:
+        """Criterion 파라미터(예: log_temperature) gradient를 rank 간 동기화.
+
+        DDP는 모델만 자동 sync. 또한 zero-anchor batch에서 grad=None이 되어
+        rank마다 collective 호출 패턴이 달라질 수 있으므로 zero-init으로
+        대칭성 보장. NaN-skip 경로에서도 동일하게 호출해야 데드락 방지.
+        """
+        if not (dist.is_available() and dist.is_initialized()):
+            return
+        for p in criterion.parameters():
+            if not p.requires_grad:
+                continue
+            if p.grad is None:
+                p.grad = torch.zeros_like(p)
+            dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+
     for batch in dataloader:
         # GPU로 이동
         batch.values = batch.values.to(device)
@@ -593,6 +609,8 @@ def train_one_epoch(
                 scaler.update()
             else:
                 zero_loss.backward()
+            # Criterion grad sync도 normal path와 동일 횟수 호출 — 데드락 방지
+            _sync_criterion_grads()
             optimizer.zero_grad(set_to_none=True)
             n_batches += 1
             continue
@@ -606,9 +624,13 @@ def train_one_epoch(
         else:
             loss.backward()
 
-        # Gradient NaN/Inf 감지
+        # Criterion 파라미터(예: log_temperature) DDP 동기화 — 자세한 설명은
+        # _sync_criterion_grads docstring 참조.
+        _sync_criterion_grads()
+
+        # Gradient NaN/Inf 감지 — model + criterion 모두 클리핑
         grad_norm = nn.utils.clip_grad_norm_(
-            raw_model.parameters(),
+            list(raw_model.parameters()) + list(criterion.parameters()),
             max_norm=config.gradient_clip,
         )
         if not torch.isfinite(grad_norm):
