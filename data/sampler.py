@@ -85,17 +85,24 @@ class RecordingLocalitySampler(Sampler[int]):
         g = torch.Generator()
         g.manual_seed(self.seed + self.epoch)
 
+        rec_to_shard = getattr(self.dataset, "_rec_to_shard", None)
+
         if self.shuffle:
             # Shard-aware shuffling: dataset이 shard backend를 쓰면 같은 shard
             # recordings를 묶어서 셔플 → shard LRU cache hit율 ~100% 보장.
             # 미사용 시 (file backend) 기존 random 셔플로 fallback.
-            rec_to_shard = getattr(self.dataset, "_rec_to_shard", None)
             if rec_to_shard is not None:
                 rec_order = self._shard_aware_shuffle(rec_to_shard, g)
             else:
                 rec_order = torch.randperm(self._n_recs, generator=g).tolist()
         else:
-            rec_order = list(range(self._n_recs))
+            # shuffle=False (val) — shard backend라면 deterministic shard 순서로
+            # recording 그루핑하여 cache hit 보장. 매 epoch 동일 순서 유지하면서
+            # locality도 챙김. file backend면 단순 sequential.
+            if rec_to_shard is not None:
+                rec_order = self._shard_grouped_order(rec_to_shard)
+            else:
+                rec_order = list(range(self._n_recs))
 
         # 패딩: 부족분은 앞에서 반복 (DistributedSampler와 동일 전략)
         if self._n_recs_padded > self._n_recs:
@@ -122,6 +129,30 @@ class RecordingLocalitySampler(Sampler[int]):
             indices.extend(local_indices)
 
         return iter(indices)
+
+    def _shard_grouped_order(self, rec_to_shard: dict[str, int]) -> list[int]:
+        """Deterministic shard-grouped 순서 (shuffle 없이).
+
+        shard_id 오름차순으로 그루핑하여 같은 shard recordings가 연속 yield.
+        매 epoch 동일 순서 → val에서 EarlyStopping 통계 안정.
+        """
+        from collections import defaultdict
+
+        path_map = getattr(self.dataset, "_path_to_shard_key", None)
+        shard_to_recs: dict[int, list[int]] = defaultdict(list)
+        for rec_i in range(self._n_recs):
+            if path_map is not None:
+                entry_path = self.dataset._manifest[rec_i].path
+                shard_key = path_map.get(entry_path, str(rec_i))
+            else:
+                shard_key = str(rec_i)
+            sid = rec_to_shard.get(shard_key, 0)
+            shard_to_recs[sid].append(rec_i)
+
+        rec_order: list[int] = []
+        for sid in sorted(shard_to_recs.keys()):
+            rec_order.extend(shard_to_recs[sid])  # 내부 순서도 고정
+        return rec_order
 
     def _shard_aware_shuffle(
         self,
