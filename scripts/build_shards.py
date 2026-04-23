@@ -16,9 +16,15 @@ from __future__ import annotations
 import argparse
 import json
 import time
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import torch
+
+
+def _load_one_tensor(path: str) -> torch.Tensor:
+    """Worker: 한 recording 파일을 로드. 별도 프로세스에서 실행됨."""
+    return torch.load(path, weights_only=True)
 
 
 def _load_manifest_paths_from_jsonl(jsonl_path: Path) -> list[dict]:
@@ -111,6 +117,13 @@ def main() -> None:
         action="store_true",
         help="shard 그룹핑만 보고 실제 변환은 안 함.",
     )
+    p.add_argument(
+        "--workers",
+        type=int,
+        default=8,
+        help="병렬 torch.load worker 수 (기본 8). 0=직렬. "
+             "디스크 IO bound면 4-16이 sweet spot, CPU 코어 수보다 더 안 빠름.",
+    )
     args = p.parse_args()
 
     manifest_path = Path(args.manifest)
@@ -158,21 +171,37 @@ def main() -> None:
         if _have_tqdm else None
     )
 
-    for shard_id, shard in enumerate(shards):
+    # workers > 0이면 ProcessPoolExecutor를 단일 pool로 유지 (shard마다
+    # fork 오버헤드 회피). 단일 pool이 모든 shard에서 재사용됨.
+    use_parallel = args.workers > 0
+    pool: ProcessPoolExecutor | None = None
+    if use_parallel:
+        pool = ProcessPoolExecutor(max_workers=args.workers)
+        print(
+            f"  Using {args.workers} parallel workers for torch.load (single pool)"
+        )
+
+    def _build_one_shard(shard_id: int, shard: list[dict]) -> None:
+        nonlocal rec_global_idx
         shard_dict: dict[str, dict] = {}
-        rec_iter = (
-            tqdm(
-                shard,
+        paths = [rec["abs_path"] for rec in shard]
+
+        if use_parallel:
+            tensor_iter = pool.map(_load_one_tensor, paths, chunksize=4)
+        else:
+            tensor_iter = (torch.load(p, weights_only=True) for p in paths)
+
+        if _have_tqdm:
+            tensor_iter = tqdm(
+                tensor_iter,
+                total=len(shard),
                 desc=f"  shard {shard_id+1}/{len(shards)} read",
                 unit="rec",
                 leave=False,
                 position=1,
             )
-            if _have_tqdm else shard
-        )
-        for rec in rec_iter:
-            tensor = torch.load(rec["abs_path"], weights_only=True)
-            # rec_global_idx를 key로 사용 (문자열, JSON 호환)
+
+        for rec, tensor in zip(shard, tensor_iter):
             key = str(rec_global_idx)
             shard_dict[key] = {
                 "values": tensor,
@@ -215,8 +244,14 @@ def main() -> None:
                 flush=True,
             )
 
-    if shard_pbar is not None:
-        shard_pbar.close()
+    try:
+        for shard_id, shard in enumerate(shards):
+            _build_one_shard(shard_id, shard)
+    finally:
+        if pool is not None:
+            pool.shutdown(wait=True)
+        if shard_pbar is not None:
+            shard_pbar.close()
 
     # 인덱스 저장
     index = {
