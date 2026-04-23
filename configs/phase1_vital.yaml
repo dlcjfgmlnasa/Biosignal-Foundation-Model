@@ -55,7 +55,7 @@ min_patches: 5                 # 임상 최소 입력 — 10s floor (patch_size=
 #   12 처럼 크게 잡으면 8 workers × 12 × 1GB × 2 = 192GB → OOM kill 위험.
 # Locality sampler가 sequential read 보장 → 2면 (current + 1 prefetch) 충분.
 shard_index_path: /home/coder/workspace/updown/bio_fm/data/train/vitaldb/vitaldb_wbs/shard_index.json
-shard_cache_size: 2            # per worker (안전)
+shard_cache_size: 1            # 2 → 1 (OOM 회피, cache miss는 sampler로 보상)
 
 # ── 학습 ──
 batch_size: 128                # L40S 48GB×2
@@ -97,9 +97,9 @@ patience: 15
 
 # ── 시스템 ──
 device: auto
-num_workers: 4                 # 32 vCPU 중 4개 — shard cache OOM 회피 (8 → 4)
-                               # Total RAM = 4 workers × 2 shards × 1GB × 2 ranks = 16GB
-                               # 192GB 서버 안전 (8% 사용)
+num_workers: 2                 # 4 → 2 (보수적, OOM 회피 후 안정 확인되면 다시 올림)
+                               # Total RAM = 2 workers × 1 shard × 1GB × 2 ranks = 4GB
+                               # + viz_batches pre-fetch spike 고려 여유
 output_dir: outputs/phase1
 checkpoint_every: 5
 viz_every: 1
