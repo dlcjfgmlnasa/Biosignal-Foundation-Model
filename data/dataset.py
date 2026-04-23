@@ -153,33 +153,63 @@ class BiosignalDataset(Dataset[BiosignalSample]):
 
                 # 디스크 캐시: source_manifest 옆에 .shard_path_map.pkl 저장.
                 # 첫 실행만 느리고, 이후 257K entry를 즉시 로드.
+                # DDP: 여러 rank가 동시에 재파싱 + 쓰기 하면 race condition →
+                # OOM spike 또는 pickle corruption 발생 가능.
+                # → rank 0만 빌드/쓰고, 다른 rank는 파일이 나타날 때까지 대기 후 읽음.
+                # atomic write (.tmp → rename) 로 partial read 방지.
+                import os as _os
+                rank = int(_os.environ.get("RANK", 0)) if "RANK" in _os.environ else 0
                 for cand in candidates:
                     if not cand.exists():
                         continue
                     cache_path = cand.parent / f".shard_path_map_{self._shard_index_path.parent.name}.pkl"
-                    # mtime 기반 무효화
                     manifest_mtime = cand.stat().st_mtime_ns
-                    if cache_path.exists():
+
+                    def _try_load_cache() -> dict | None:
+                        if not cache_path.exists():
+                            return None
                         try:
                             import pickle
                             with open(cache_path, "rb") as f:
                                 cached = pickle.load(f)
                             if cached.get("mtime") == manifest_mtime:
-                                self._path_to_shard_key = cached["map"]
-                                break
+                                return cached["map"]
                         except Exception:
+                            return None
+                        return None
+
+                    cached_map = _try_load_cache()
+                    if cached_map is not None:
+                        self._path_to_shard_key = cached_map
+                        break
+
+                    if rank == 0:
+                        # rank 0만 빌드 + 원자적으로 저장
+                        built = self._build_path_to_shard_key(cand)
+                        self._path_to_shard_key = built
+                        try:
+                            import pickle
+                            tmp_path = cache_path.with_suffix(".pkl.tmp")
+                            with open(tmp_path, "wb") as f:
+                                pickle.dump(
+                                    {"mtime": manifest_mtime, "map": built},
+                                    f, protocol=pickle.HIGHEST_PROTOCOL,
+                                )
+                            _os.replace(tmp_path, cache_path)  # atomic rename
+                        except OSError:
                             pass
-                    # 캐시 없음 → 재파싱 후 저장
-                    self._path_to_shard_key = self._build_path_to_shard_key(cand)
-                    try:
-                        import pickle
-                        with open(cache_path, "wb") as f:
-                            pickle.dump(
-                                {"mtime": manifest_mtime, "map": self._path_to_shard_key},
-                                f, protocol=pickle.HIGHEST_PROTOCOL,
-                            )
-                    except OSError:
-                        pass  # 디스크 쓰기 실패는 무시
+                    else:
+                        # 다른 rank: cache 파일 나타날 때까지 대기 (최대 5분)
+                        import time as _time
+                        for _ in range(300):  # 300 × 1s = 5 min
+                            cached_map = _try_load_cache()
+                            if cached_map is not None:
+                                self._path_to_shard_key = cached_map
+                                break
+                            _time.sleep(1.0)
+                        if self._path_to_shard_key is None:
+                            # 대기 시간 초과 — 자체 빌드 (fallback)
+                            self._path_to_shard_key = self._build_path_to_shard_key(cand)
                     break
 
         # LRU 캐시를 인스턴스별로 생성 (lru_cache는 함수 레벨이므로 래핑)
