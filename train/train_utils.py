@@ -480,6 +480,11 @@ def train_one_epoch(
     scaler: torch.amp.GradScaler | None = None,
 ) -> dict[str, float]:
     """1에폭 학습을 수행하고 평균 loss를 반환한다."""
+    # 데이터셋에 epoch 전파 — 같은 (rec, win) 샘플도 epoch마다 다른 random crop을
+    # 받음. mp.Value 기반이라 fork된 worker도 즉시 보임 (persistent_workers와 호환).
+    if hasattr(dataloader.dataset, "set_epoch"):
+        dataloader.dataset.set_epoch(epoch)
+
     model.train()
     # GPU 텐서로 누적하여 배치마다 .item() CUDA sync 방지
     epoch_total = torch.zeros(1, device=device)

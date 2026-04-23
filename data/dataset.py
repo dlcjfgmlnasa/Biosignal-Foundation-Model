@@ -7,6 +7,7 @@ import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import lru_cache
+from multiprocessing import Value
 from pathlib import Path
 
 import torch
@@ -103,6 +104,14 @@ class BiosignalDataset(Dataset[BiosignalSample]):
         self._manifest = list(manifest)
         self._use_mmap = use_mmap
         self._cache_size = cache_size
+
+        # 공유 epoch counter — DataLoader worker(자식 프로세스)에서도 보임
+        # train loop의 set_epoch(epoch)으로 갱신 → __getitem__의 crop seed에
+        # 섞여 동일 (rec, win) 샘플도 epoch마다 다른 crop을 받게 한다.
+        # mp.Value는 shared memory라 persistent_workers와도 호환.
+        self._epoch_value: Value | None = (
+            Value("q", 0) if crop_ratio_range is not None else None
+        )
 
         # LRU 캐시를 인스턴스별로 생성 (lru_cache는 함수 레벨이므로 래핑)
         self._load_recording = lru_cache(maxsize=cache_size)(self._load_recording_impl)
@@ -205,6 +214,22 @@ class BiosignalDataset(Dataset[BiosignalSample]):
     def __len__(self) -> int:
         return self._rec_offsets[-1]
 
+    def set_epoch(self, epoch: int) -> None:
+        """Random crop seed에 epoch을 섞어 epoch마다 다른 crop이 나오게 한다.
+
+        DataLoader worker가 fork되기 전에 호출해야 효과 있음 (mp.Value는
+        shared memory라 fork 후에도 보이지만, 보다 안전한 호출 시점은 epoch
+        시작 전이다). crop_ratio_range가 None이면 no-op.
+        """
+        if self._epoch_value is not None:
+            self._epoch_value.value = int(epoch)
+
+    def _current_epoch(self) -> int:
+        """현재 epoch 값 (worker에서도 안전하게 읽힘)."""
+        if self._epoch_value is None:
+            return 0
+        return int(self._epoch_value.value)
+
     def __getitem__(self, idx: int) -> BiosignalSample:
         rec_idx = (
             bisect.bisect_right(self._rec_offsets, idx, hi=len(self._rec_offsets) - 1)
@@ -243,14 +268,17 @@ class BiosignalDataset(Dataset[BiosignalSample]):
             and self.crop_ratio_range is not None
             and len(values) > 0
         ):
-            # 결정적 seed: 같은 (recording, window)의 모든 채널이 동일한 crop을
-            # 받도록 한다. any_variate 모드에서 sibling 채널마다 독립 crop이면
-            # 같은 recording에서 온 variate들이 시간적으로 어긋나 cross-modal
+            # 결정적 seed: 같은 (recording, window, epoch)의 모든 채널이 동일한
+            # crop을 받도록 한다. any_variate 모드에서 sibling 채널마다 독립 crop
+            # 이면 같은 recording에서 온 variate들이 시간적으로 어긋나 cross-modal
             # pair가 실제로는 다른 시간 구간을 비교하게 되는 버그 방지.
-            # (rec_idx, win_start)는 같은 recording-window의 모든 채널이 공유.
-            # int seed (Python 3.11+ tuple seed 거부) — bit-packed (rec_idx, win_start)
-            # win_start < 2**32 (~497일 @ 100Hz) 가정. rec_idx는 high 32 bits.
-            crop_rng = random.Random(rec_idx * 2**32 + int(win_start))
+            # epoch을 섞어 augmentation diversity 유지 — train loop의
+            # dataset.set_epoch(epoch) 호출로 갱신.
+            # bit-packed: rec_idx는 high 32 bits, win_start는 low 32 bits.
+            # epoch은 별도 prime으로 XOR (collision 회피).
+            base_seed = rec_idx * 2**32 + int(win_start)
+            epoch_salt = self._current_epoch() * 0x9E3779B97F4A7C15  # golden ratio prime
+            crop_rng = random.Random((base_seed ^ epoch_salt) & ((1 << 63) - 1))
             lo, hi = self.crop_ratio_range
             ratio = crop_rng.uniform(lo, hi)
             crop_len = max(1, int(len(values) * ratio))
