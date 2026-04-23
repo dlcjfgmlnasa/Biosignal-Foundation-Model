@@ -480,8 +480,17 @@ def train_one_epoch(
     scaler: torch.amp.GradScaler | None = None,
 ) -> dict[str, float]:
     """1에폭 학습을 수행하고 평균 loss를 반환한다."""
-    # 데이터셋에 epoch 전파 — 같은 (rec, win) 샘플도 epoch마다 다른 random crop을
-    # 받음. mp.Value 기반이라 fork된 worker도 즉시 보임 (persistent_workers와 호환).
+    # γ>0인데 collate_mode="ci"면 같은 row 내 cross-modal pair가 구조적으로
+    # 존재하지 않아 cross-modal loss가 silent 0이 됨. 명시적으로 차단.
+    if config.gamma > 0 and config.collate_mode == "ci":
+        raise ValueError(
+            "config.gamma > 0 requires collate_mode='any_variate' "
+            "(CI 모드는 row당 1 variate라 cross-modal pair 없음 → loss=0). "
+            f"received: gamma={config.gamma}, collate_mode={config.collate_mode}"
+        )
+
+    # 데이터셋에 epoch 전파 — 같은 (rec, win) 샘플도 epoch마다 다른 random crop을 받음.
+    # mp.Value 기반이라 fork된 worker도 즉시 보임 (persistent_workers와 호환).
     if hasattr(dataloader.dataset, "set_epoch"):
         dataloader.dataset.set_epoch(epoch)
 
@@ -599,7 +608,17 @@ def train_one_epoch(
                     f"contrastive={losses['contrastive_loss'].item():.4f})"
                 )
             nan_count += 1
-            if nan_count >= max_nan_batches:
+            # 글로벌 동기화: 어떤 rank든 임계치 도달하면 모든 rank가 같이 break.
+            # rank별 local nan_count 비교만 하면 일부 rank만 epoch 탈출 → 나머지
+            # rank의 backward/all_reduce가 짝 없는 collective로 데드락.
+            should_break = nan_count >= max_nan_batches
+            if dist.is_available() and dist.is_initialized():
+                flag = torch.tensor(
+                    1 if should_break else 0, device=device, dtype=torch.int
+                )
+                dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+                should_break = bool(flag.item())
+            if should_break:
                 if is_main_process():
                     print(
                         f"  [{phase_name}] ERROR: {nan_count} consecutive NaN/Inf batches. "
@@ -713,19 +732,36 @@ def train_one_epoch(
 
     denom = max(n_batches, 1)
     contrastive_denom = epoch_contrastive_anchors.clamp(min=1.0)
+    agg_masked = (epoch_masked / denom).item()
+    agg_next = (epoch_next / denom).item()
+    agg_cross = (epoch_cross / denom).item()
+    agg_contrastive = (epoch_contrastive_weighted / contrastive_denom).item()
+    agg_spec = (epoch_spec / denom).item()
+    agg_aux = (epoch_aux / denom).item()
+    # total을 aggregated 컴포넌트로부터 재계산 — per-batch total은 contrastive를
+    # batch-local mean으로 합산하지만 epoch contrastive는 anchor-weighted mean
+    # 이라 두 값이 일치 안 함. 컴포넌트 합으로 재계산하여 보고 일관성 확보.
+    agg_total = (
+        config.alpha * agg_masked
+        + config.beta * agg_next
+        + config.gamma * agg_cross
+        + config.delta * agg_contrastive
+        + config.aux_loss_weight * agg_aux
+    )
     return {
-        "total": (epoch_total / denom).item(),
-        "masked_loss": (epoch_masked / denom).item(),
-        "masked_spec": (epoch_spec / denom).item(),
-        "next_loss": (epoch_next / denom).item(),
-        "cross_modal_loss": (epoch_cross / denom).item(),
+        "total": agg_total,
+        "masked_loss": agg_masked,
+        "masked_spec": agg_spec,
+        "next_loss": agg_next,
+        "cross_modal_loss": agg_cross,
         # Weighted per-anchor mean (zero-anchor batches excluded)
-        "contrastive_loss": (
-            epoch_contrastive_weighted / contrastive_denom
-        ).item(),
+        "contrastive_loss": agg_contrastive,
         "contrastive_n_anchors": epoch_contrastive_anchors.item(),
-        "aux_loss": (epoch_aux / denom).item(),
+        "aux_loss": agg_aux,
     }
+
+
+_VAL_DETERMINISTIC_SEED = 0xCAFEBABE  # validation에서 mask/dropout 결정성 확보용
 
 
 @torch.no_grad()
@@ -740,12 +776,36 @@ def validate(
 ) -> dict[str, float]:
     """Validation 루프. train_one_epoch()과 동일한 loss 계산, backward 없이.
 
+    Val 결정성:
+      * dataset.set_epoch(0) — random crop 고정 (epoch 간 동일 sample 동일 crop)
+      * torch.manual_seed(고정값) — model 내부 mask/dropout 결정성 확보
+    이후 RNG state는 복원하여 train 측 stochasticity에 영향 없음.
+
     DDP 환경에서는 unwrapped 모델로 forward하여 rank별 배치 수
     불일치로 인한 데드락을 방지한다.
     """
+    if config.gamma > 0 and config.collate_mode == "ci":
+        raise ValueError(
+            "config.gamma > 0 requires collate_mode='any_variate' "
+            f"(got: gamma={config.gamma}, collate_mode={config.collate_mode})"
+        )
+
+    # Val crop 고정 — epoch=0으로 set하여 매 epoch 같은 crop 사용
+    if hasattr(dataloader.dataset, "set_epoch"):
+        dataloader.dataset.set_epoch(0)
+
     model.eval()
     # DDP wrapper를 벗겨서 forward — validation에서는 gradient sync 불필요
     raw_model = model.module if isinstance(model, DDP) else model
+
+    # RNG state 백업 + val seed 고정 (model 내부 create_patch_mask 결정성)
+    cpu_rng_state = torch.get_rng_state()
+    cuda_rng_state = (
+        torch.cuda.get_rng_state() if torch.cuda.is_available() else None
+    )
+    torch.manual_seed(_VAL_DETERMINISTIC_SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(_VAL_DETERMINISTIC_SEED)
 
     epoch_total = 0.0
     epoch_masked = 0.0
@@ -848,18 +908,39 @@ def validate(
         if val_limit > 0 and n_batches >= val_limit:
             break
 
+    # RNG state 복원 — train 측 stochasticity에 val 시드 누출 방지
+    torch.set_rng_state(cpu_rng_state)
+    if cuda_rng_state is not None:
+        torch.cuda.set_rng_state(cuda_rng_state)
+
     model.train()
     denom = max(n_batches, 1)
     contrastive_denom = max(epoch_contrastive_anchors, 1.0)
+    agg_masked = epoch_masked / denom
+    agg_next = epoch_next / denom
+    agg_cross = epoch_cross / denom
+    agg_contrastive = epoch_contrastive_weighted / contrastive_denom
+    agg_spec = epoch_spec / denom
+    agg_aux = epoch_aux / denom
+    # total을 aggregated 컴포넌트로부터 재계산 — per-batch total은 contrastive를
+    # batch-local mean으로 합산하지만 epoch contrastive는 anchor-weighted mean이라
+    # 두 값이 일치 안 함. 컴포넌트 합으로 재계산하여 보고 일관성 확보.
+    agg_total = (
+        config.alpha * agg_masked
+        + config.beta * agg_next
+        + config.gamma * agg_cross
+        + config.delta * agg_contrastive
+        + config.aux_loss_weight * agg_aux
+    )
     return {
-        "total": epoch_total / denom,
-        "masked_loss": epoch_masked / denom,
-        "masked_spec": epoch_spec / denom,
-        "next_loss": epoch_next / denom,
-        "cross_modal_loss": epoch_cross / denom,
-        "contrastive_loss": epoch_contrastive_weighted / contrastive_denom,
+        "total": agg_total,
+        "masked_loss": agg_masked,
+        "masked_spec": agg_spec,
+        "next_loss": agg_next,
+        "cross_modal_loss": agg_cross,
+        "contrastive_loss": agg_contrastive,
         "contrastive_n_anchors": epoch_contrastive_anchors,
-        "aux_loss": epoch_aux / denom,
+        "aux_loss": agg_aux,
     }
 
 
