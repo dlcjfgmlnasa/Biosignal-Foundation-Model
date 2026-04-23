@@ -106,17 +106,16 @@ def _select_diverse_grid(
 ) -> dict[int, list[RowCandidate]]:
     """신호 타입별 여러 샘플을 선택한다.
 
-    매우 짧은 candidate (예: n_valid=1)는 mask 시 모든 patch가 가려져
-    실제 신호가 거의 안 보이고, 모델의 random 예측이 panel을 차지해
-    "다른 신호"처럼 오인됨. min_n_valid로 필터링.
+    너무 짧은 segment (n_valid < min_n_valid)는 제외. mask 시 모든 patch가
+    가려져 raw 신호가 안 보이고, 모델 예측만 panel 차지해 다른 신호처럼
+    오인되는 것 방지.
 
     Parameters
     ----------
     samples_per_type:
         signal type별 표시할 panel 수.
     min_n_valid:
-        candidate 최소 patch 수. 이보다 짧은 segment는 시각화에서 제외.
-        기본 5 = 10초 (patch_size=200, 100Hz 기준).
+        candidate 최소 patch 수. 기본 5 = 10초 (patch_size=200, 100Hz).
 
     Returns
     -------
@@ -124,7 +123,6 @@ def _select_diverse_grid(
     """
     by_type: dict[int, list[RowCandidate]] = {}
     for c in candidates:
-        # 너무 짧은 segment 필터링
         if c.n_valid < min_n_valid:
             continue
         by_type.setdefault(c.signal_type, []).append(c)
@@ -279,14 +277,9 @@ def _plot_figure_grid(
             if col == 0:
                 ax.set_ylabel(cand.signal_name, fontsize=10)
 
-            # 디버그 라벨 — 실제로 어느 batch row / sample / variate에서 왔는지
-            # 명시. 같은 row(=signal_type) 안 패널이 다른 신호처럼 보이면 여기서
-            # bi/sid가 다른지 확인 → 데이터 매핑 추적 가능.
             ax.set_title(
-                f"{cand.signal_name} | bi={cand.batch_idx} sid={cand.sample_id} "
-                f"vid={cand.variate_id} | {n_pred}/{n_show} patches | "
-                f"{duration_shown:.0f}s",
-                fontsize=7,
+                f"{n_pred}/{n_show} patches | {duration_shown:.0f}s",
+                fontsize=8,
                 loc="right",
             )
             ax.tick_params(labelsize=7)

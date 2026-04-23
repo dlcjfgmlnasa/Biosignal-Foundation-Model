@@ -641,14 +641,12 @@ def main():
             and (epoch % viz_every == 0 or epoch == config.n_epochs - 1)
         ):
             viz_model = raw_model
-            # 시각화는 작은 mask_ratio로 (학습용 높은 값은 raw signal 가시성 저하)
-            viz_mask_ratio = min(0.15, config.mask_ratio)
             fig_path = save_reconstruction_figure(
                 viz_model,
                 viz_batches,
                 epoch=epoch,
                 output_dir=viz_recon_dir,
-                mask_ratio=viz_mask_ratio,
+                mask_ratio=config.mask_ratio,
                 device=device,
                 block_mask=config.block_mask,
                 block_size_min=config.block_size_min,
@@ -670,7 +668,7 @@ def main():
                 viz_batches,
                 epoch=epoch,
                 output_dir=viz_cross_dir,
-                mask_ratio=viz_mask_ratio,
+                mask_ratio=config.mask_ratio,
                 device=device,
                 block_mask=config.block_mask,
                 block_size_min=config.block_size_min,

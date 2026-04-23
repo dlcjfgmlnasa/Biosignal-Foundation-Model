@@ -448,16 +448,14 @@ def main():
     viz_batches: list | None = None
     viz_dir = None
     if rank0 and viz_every > 0 and val_dataloader is not None:
-        # viz_batches는 학습 내내 메모리에 상주 → 너무 많으면 OOM.
-        # batch당 ~30MB (batch_size=128 × max_length=64000 × 4B), 20 batches =
-        # ~600MB 정도 안전한 한도. 모든 signal type 커버되면 조기 종료.
+        # 모든 signal type이 포함될 때까지 배치 수집 (최대 100 배치)
         viz_iter = iter(val_dataloader)
         viz_batches = []
         seen_types: set[int] = set()
         all_types = (
             set(config.signal_types) if hasattr(config, "signal_types") else set()
         )
-        max_viz_batches = min(20, len(val_dataloader))
+        max_viz_batches = min(100, len(val_dataloader))
         for _ in range(max_viz_batches):
             try:
                 b = next(viz_iter)
@@ -567,14 +565,12 @@ def main():
                 epoch % viz_every == 0 or epoch == config.n_epochs - 1
             ):
                 viz_model = model.module if use_ddp else model
-                # 시각화는 작은 mask_ratio로 (학습용 0.4는 panel의 40%+가 빨간색
-                # 이 되어 raw 신호 가시성 저하). 0.15면 raw + model pred 둘 다 잘 보임.
                 fig_path = save_reconstruction_figure(
                     viz_model,
                     viz_batches,
                     epoch=epoch,
                     output_dir=viz_recon_dir,
-                    mask_ratio=min(0.15, config.mask_ratio),
+                    mask_ratio=config.mask_ratio,
                     device=device,
                     block_mask=config.block_mask,
                     block_size_min=config.block_size_min,
