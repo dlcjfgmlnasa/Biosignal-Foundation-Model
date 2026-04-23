@@ -62,7 +62,7 @@ max_batches: 4000
 # ── Loss 가중치 (Phase 2: MPM + Next-Pred + Cross-Modal + Contrastive) ──
 alpha: 0.7                     # masked reconstruction (Phase 1 대비 낮춤)
 beta: 0.3                      # next-patch prediction (Phase 1 대비 낮춤)
-gamma: 0.5                     # cross-modal prediction (Phase 2 활성)
+gamma: 0.15                    # cross-modal (criterion fix 후 β와 분리; 이전 β*γ=0.15 dynamics 유지)
 delta: 0.5                     # cross-modal contrastive (InfoNCE)
 peak_alpha: 1.0                # Peak-Weighted MSE
 lambda_spec: 0.2               # Multi-Resolution STFT Loss

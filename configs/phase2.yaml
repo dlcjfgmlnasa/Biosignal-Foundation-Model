@@ -46,7 +46,7 @@ collate_mode: any_variate
 # ── Loss 가중치 (Phase 2: 전체 활성) ──
 alpha: 0.7          # masked reconstruction
 beta: 0.3           # next-patch prediction
-gamma: 1.0          # cross-modal
+gamma: 0.3          # cross-modal (criterion fix 후 β와 분리; 이전 β*γ=0.3 dynamics 유지)
 delta: 0.1          # contrastive
 contrastive_temperature: 0.07
 learnable_temperature: true
