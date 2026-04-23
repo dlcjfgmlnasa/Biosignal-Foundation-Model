@@ -68,17 +68,18 @@ class TransformerEncoderLayer(nn.Module):
         attn_mask: torch.Tensor | None = None,  # (*batch, time_len, time_len) bool
         var_id: torch.Tensor | None = None,  # (*batch, time_len) long
         time_id: torch.Tensor | None = None,  # (*batch, time_len) long
+        token_mask: torch.Tensor | None = None,  # (*batch, time_len) bool — True=유효
     ) -> torch.Tensor:  # (*batch, time_len, dim)
         if self.pre_norm:
             x = x + self._sa_block(
                 self.norm1(x), attn_mask, var_id=var_id, time_id=time_id
             )
-            x = x + self.ffn(self.norm2(x))
+            x = x + self.ffn(self.norm2(x), token_mask=token_mask)
         else:
             x = self.norm1(
                 x + self._sa_block(x, attn_mask, var_id=var_id, time_id=time_id)
             )
-            x = self.norm2(x + self.ffn(x))
+            x = self.norm2(x + self.ffn(x, token_mask=token_mask))
 
         return x
 
@@ -257,7 +258,10 @@ class TransformerEncoder(nn.Module):
         attn_mask: torch.Tensor | None = None,  # (*batch, time_len, time_len) bool
         var_id: torch.Tensor | None = None,  # (*batch, time_len) long
         time_id: torch.Tensor | None = None,  # (*batch, time_len) long
+        token_mask: torch.Tensor | None = None,  # (*batch, time_len) bool — True=유효
     ) -> torch.Tensor:  # (*batch, time_len, dim)
         for layer in self.layers:
-            x = layer(x, attn_mask, var_id=var_id, time_id=time_id)
+            x = layer(
+                x, attn_mask, var_id=var_id, time_id=time_id, token_mask=token_mask
+            )
         return self.norm(x)

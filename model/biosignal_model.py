@@ -442,7 +442,11 @@ class BiosignalFoundationModel(nn.Module):
             "pred_mask": pred_mask,
         }
 
-        encoder_kwargs = dict(var_id=p_vid, time_id=time_id)  # RoPE는 상대적 time_id
+        # MoE 라우팅에서 padded 토큰 제외용 — (B, N) bool
+        token_valid = (p_vid > 0)
+        encoder_kwargs = dict(
+            var_id=p_vid, time_id=time_id, token_mask=token_valid
+        )  # RoPE는 상대적 time_id; token_mask는 MoE aux_loss 산정용
         use_causal = task in ("next_pred", "both")
 
         # causal mask (next_pred, both에서 공유)

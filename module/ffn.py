@@ -61,7 +61,9 @@ class FeedForward(nn.Module):
     def forward(
         self,
         x: torch.Tensor,  # (..., in_dim)
+        token_mask: torch.Tensor | None = None,  # noqa: ARG002 — MoE 인터페이스 호환
     ) -> torch.Tensor:  # (..., out_dim)
+        # token_mask는 MoE FFN과의 인터페이스 통일용; 일반 FFN은 무시.
         x = self._in_proj(x)
         return self.dropout2(self.fc2(self.dropout1(x)))
 
@@ -189,8 +191,18 @@ class MoEFeedForward(nn.Module):
     def forward(
         self,
         x: torch.Tensor,  # (..., in_dim)
+        token_mask: torch.Tensor | None = None,  # (..., ) bool — True=유효, False=padded
     ) -> torch.Tensor:  # (..., dim)
         x_squashed = x.view(-1, x.shape[-1])  # (T, in_dim)
+
+        # 유효 토큰 마스크: 패딩 토큰은 라우팅에서 제외해야 load balance가 왜곡되지
+        # 않음. 마스크 미제공 시 모든 토큰 유효로 가정 (하위 호환).
+        if token_mask is not None:
+            valid_flat = token_mask.reshape(-1).bool()  # (T,)
+        else:
+            valid_flat = torch.ones(
+                x_squashed.shape[0], dtype=torch.bool, device=x.device
+            )
 
         # ── Gate: linear → softmax → topk ──
         gate_logits = self.gate(x_squashed)  # (T, num_experts)
@@ -206,16 +218,21 @@ class MoEFeedForward(nn.Module):
         weights = F.softmax(weights, dim=1, dtype=torch.float).type_as(x)  # (T, K)
 
         # ── Load balancing auxiliary loss (Switch Transformer) ──
-        # f_i: 각 expert에 할당된 토큰 비율
-        num_tokens = x_squashed.shape[0]
-        one_hot = F.one_hot(
-            selected_experts.reshape(-1),
-            self.num_experts,
-        ).float()  # (T*K, E)
-        tokens_per_expert = one_hot.sum(dim=0)  # (E,)
-        f = tokens_per_expert / (num_tokens * self.num_experts_per_token)  # (E,)
-        # P_i: 각 expert의 평균 gate 확률
-        probs = gate_probs.mean(dim=0)  # (E,)
+        # f_i / probs는 유효 토큰만으로 계산해야 padded 토큰이 expert 부하를 왜곡
+        # 시키지 않음.
+        valid_count = int(valid_flat.sum().item())
+        if valid_count > 0:
+            valid_one_hot = F.one_hot(
+                selected_experts[valid_flat].reshape(-1),
+                self.num_experts,
+            ).float()  # (V*K, E)
+            tokens_per_expert = valid_one_hot.sum(dim=0)  # (E,)
+            f = tokens_per_expert / (valid_count * self.num_experts_per_token)  # (E,)
+            probs = gate_probs[valid_flat].mean(dim=0)  # (E,)
+        else:
+            f = gate_logits.new_zeros(self.num_experts)
+            probs = gate_logits.new_zeros(self.num_experts)
+            tokens_per_expert = f
 
         if self.training:
             self.aux_loss = self.num_experts * (f * probs).sum()
