@@ -524,13 +524,28 @@ def main():
     viz_np_dir = None
     viz_cross_dir = None
     if viz_every > 0 and val_dataloader is not None and rank0:
+        # cold val shard 로드 진행률 표시
         viz_iter = iter(val_dataloader)
         viz_batches = []
-        for _ in range(min(10, len(val_dataloader))):
+        max_viz = min(10, len(val_dataloader))
+        try:
+            from tqdm import tqdm
+            pbar = tqdm(
+                total=max_viz,
+                desc="viz_batches prep (cold val shard load)",
+                unit="batch",
+            )
+        except ImportError:
+            pbar = None
+        for _ in range(max_viz):
             try:
                 viz_batches.append(next(viz_iter))
+                if pbar is not None:
+                    pbar.update(1)
             except StopIteration:
                 break
+        if pbar is not None:
+            pbar.close()
         del viz_iter
         viz_dir = output_dir / "figures"
         viz_recon_dir = viz_dir / "recon"

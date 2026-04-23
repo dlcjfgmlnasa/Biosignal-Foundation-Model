@@ -450,6 +450,7 @@ def main():
     viz_dir = None
     if rank0 and viz_every > 0 and val_dataloader is not None:
         # 모든 signal type이 포함될 때까지 배치 수집 (최대 100 배치)
+        # cold val shard 로드라 1-3분 걸릴 수 있음 → tqdm으로 진행률 표시
         viz_iter = iter(val_dataloader)
         viz_batches = []
         seen_types: set[int] = set()
@@ -457,16 +458,32 @@ def main():
             set(config.signal_types) if hasattr(config, "signal_types") else set()
         )
         max_viz_batches = min(100, len(val_dataloader))
+        try:
+            from tqdm import tqdm
+            pbar = tqdm(
+                total=max_viz_batches,
+                desc="viz_batches prep (cold val shard load)",
+                unit="batch",
+            )
+        except ImportError:
+            pbar = None
         for _ in range(max_viz_batches):
             try:
                 b = next(viz_iter)
                 viz_batches.append(b)
                 for j in range(len(b.signal_types)):
                     seen_types.add(int(b.signal_types[j]))
+                if pbar is not None:
+                    pbar.update(1)
+                    pbar.set_postfix(
+                        types_seen=f"{len(seen_types)}/{len(all_types) if all_types else '?'}",
+                    )
                 if all_types and seen_types >= all_types:
                     break
             except StopIteration:
                 break
+        if pbar is not None:
+            pbar.close()
         del viz_iter
         viz_dir = output_dir / "figures"
         viz_recon_dir = viz_dir / "recon"
