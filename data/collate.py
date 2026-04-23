@@ -346,12 +346,16 @@ class PackCollate:
                     all_spatial_ids.extend(unit.variate_spatial_ids)
                     all_start_samples.extend(unit.variate_start_samples)
                 else:
-                    # 잘린 unit: 포함된 variate만 수집
+                    # 잘린 unit: 포함된 variate만 수집.
+                    # span (start, end)는 unit-relative 좌표 (0-based).
+                    # 절단 컷오프는 unit-relative로 actual_seg_len.
+                    # included = min(end, actual_seg_len) - start  (unit-relative).
+                    # NOTE: row_offset을 더하지 않고 unit-relative로 비교해야
+                    # row_offset > 0인 unit이 잘릴 때 included가 잘못 계산되지 않음.
                     for var_id, (_ch_idx, start, end) in enumerate(unit.channel_spans):
-                        var_start = max(0, row_offset + start)
-                        var_end = min(actual_seg_len, row_offset + end)
-                        if var_end > var_start:
-                            included = var_end - var_start
+                        seg_end_in_unit = min(end, actual_seg_len)
+                        if seg_end_in_unit > start:
+                            included = seg_end_in_unit - start
                             all_lengths.append(
                                 min(included, unit.variate_lengths[var_id])
                             )
