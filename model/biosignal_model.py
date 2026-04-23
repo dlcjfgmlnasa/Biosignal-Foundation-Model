@@ -357,21 +357,23 @@ class BiosignalFoundationModel(nn.Module):
                 abs_time_id = abs_time // self.patch_size  # (B, N)
                 abs_time_id[~patch_mask] = 0
 
-        # 4. Projection (linear 또는 CNN stem)
-        embedded = self.patch_embed.project(patches, patch_signal_types)
-        # embedded: (B, N, d_model)
+        # 4. Projection (linear 또는 CNN stem) — patch content 표현만 생성
+        patch_embed = self.patch_embed.project(patches, patch_signal_types)
+        # patch_embed: (B, N, d_model)
 
         # 패딩 마스크 (p_vid==0은 패딩 토큰)
         valid_token = (p_vid > 0).unsqueeze(-1)  # (B, N, 1)
 
-        # 5. Spatial Positional Encoding (Dual Embedding)
+        # 5-6. Conditioning Embedding 계산 (signal_type + spatial_id + loc + scale)
+        # mask_token이 patch content를 덮어써도 conditioning은 살아남도록 별도 계산.
+        # 이후 mask 적용 후 합산하여 마스킹된 위치도 자기 신호 종류/레벨 정보를 유지.
+        cond = torch.zeros_like(patch_embed)
         if self.use_spatial_embed and patch_signal_types is not None:
             sig_emb = self.signal_type_embed(patch_signal_types)  # (B, N, d_model)
             spa_emb = self.spatial_id_embed(patch_spatial_ids)  # (B, N, d_model)
-            embedded = embedded + (sig_emb + spa_emb) * valid_token
+            cond = cond + sig_emb + spa_emb
 
-        # 6. Loc/Scale Dual Injection — 절대 레벨 정보 보존
-        n = embedded.shape[1]
+        n = patch_embed.shape[1]
         stride = self.patch_embed.stride
         patch_starts = torch.arange(n, device=device) * stride  # (N,)
         patch_starts = patch_starts.clamp(max=loc.shape[1] - 1)
@@ -379,9 +381,9 @@ class BiosignalFoundationModel(nn.Module):
         patch_scale = scale[:, patch_starts, :]  # (B, N, 1)
         loc_emb = self.loc_proj(patch_loc)  # (B, N, d_model)
         scale_emb = self.scale_proj(patch_scale)  # (B, N, d_model)
-        embedded = embedded + (loc_emb + scale_emb) * valid_token
+        cond = (cond + loc_emb + scale_emb) * valid_token
 
-        # 7. [MASK] Token — 마스킹된 패치의 content를 learnable token으로 교체
+        # 7. Pred Mask 생성 (random/block/variate-level)
         pred_mask: torch.Tensor | None = None
         if mask_ratio > 0 and task in ("masked", "both"):
             pred_mask = create_patch_mask(
@@ -404,6 +406,7 @@ class BiosignalFoundationModel(nn.Module):
         # 8.5. Complete Variate Dropout: attention에서 variate를 물리적으로 제거
         # → 학습 시 "해당 variate 없이 cross-pred" 시나리오를 경험
         # → zero-shot cross-modal generation의 train-inference gap 해소
+        drop_mask: torch.Tensor | None = None
         if variate_drop_prob > 0 and self.training and task in ("masked", "both"):
             drop_mask = self._sample_variate_drop(
                 p_sid, p_vid, patch_mask, variate_drop_prob
@@ -412,12 +415,19 @@ class BiosignalFoundationModel(nn.Module):
                 keep = ~drop_mask  # (B, N)
                 # attention에서 제거: dropped 토큰은 attend 못하고, attend 받지도 못함
                 base_attn_mask = base_attn_mask & keep.unsqueeze(-1) & keep.unsqueeze(-2)
-                # content를 mask_token으로 교체
-                drop_expanded = drop_mask.unsqueeze(-1)  # (B, N, 1)
-                mask_token_expanded = self.mask_token.expand_as(embedded)
-                embedded = torch.where(drop_expanded, mask_token_expanded, embedded)
 
-        # 9. Task에 따른 Masking 스위치 + Transformer Encoder
+        # 9. Encoder 입력 빌드 헬퍼
+        # patch content를 mask_token으로 교체(content_mask 위치) → conditioning 합산.
+        # 이렇게 해야 마스킹/드롭된 위치도 signal_type·spatial·loc·scale 정보가 유지됨.
+        def _make_input(content_mask: torch.Tensor | None) -> torch.Tensor:
+            if content_mask is None:
+                x = patch_embed
+            else:
+                mt = self.mask_token.expand_as(patch_embed)
+                x = torch.where(content_mask.unsqueeze(-1), mt, patch_embed)
+            return x + cond
+
+        # 10. Task에 따른 Encoder 호출
         result: dict[str, torch.Tensor] = {
             "patches": patches,
             "patch_signal_types": patch_signal_types,
@@ -440,39 +450,35 @@ class BiosignalFoundationModel(nn.Module):
             causal_tri = torch.tril(torch.ones(n, n, dtype=torch.bool, device=device))
             causal_mask = base_attn_mask & causal_tri.unsqueeze(0)  # (B, N, N)
 
+        # bidirectional 입력: pred_mask | drop_mask 위치를 mask_token으로 교체
+        bi_content_mask = drop_mask
+        if pred_mask is not None:
+            bi_content_mask = (
+                pred_mask if bi_content_mask is None else (pred_mask | bi_content_mask)
+            )
+
         if task == "both":
-            # bidirectional: [MASK] 토큰 적용 → 마스킹된 패치 정보 차단
-            embedded_bi = embedded.clone()
-            if pred_mask is not None:
-                mask_expanded = pred_mask.unsqueeze(-1)  # (B, N, 1)
-                mask_token_expanded = self.mask_token.expand_as(embedded_bi)
-                embedded_bi = torch.where(
-                    mask_expanded, mask_token_expanded, embedded_bi
-                )
             result["encoded"] = self.encoder(
-                embedded_bi,
+                _make_input(bi_content_mask),
                 attn_mask=base_attn_mask,
                 **encoder_kwargs,
             )
-            # causal: [MASK] 불필요 — causal attention이 미래 정보 차단
+            # causal: drop_mask만 적용 (causal attention이 미래 정보 차단하므로
+            # pred_mask는 불필요).
             result["encoded_causal"] = self.encoder(
-                embedded.clone(),
+                _make_input(drop_mask),
                 attn_mask=causal_mask,
                 **encoder_kwargs,
             )
         elif task == "next_pred":
             result["encoded"] = self.encoder(
-                embedded,
+                _make_input(drop_mask),
                 attn_mask=causal_mask,
                 **encoder_kwargs,
             )
         else:  # "masked"
-            if pred_mask is not None:
-                mask_expanded = pred_mask.unsqueeze(-1)
-                mask_token_expanded = self.mask_token.expand_as(embedded)
-                embedded = torch.where(mask_expanded, mask_token_expanded, embedded)
             result["encoded"] = self.encoder(
-                embedded,
+                _make_input(bi_content_mask),
                 attn_mask=base_attn_mask,
                 **encoder_kwargs,
             )
