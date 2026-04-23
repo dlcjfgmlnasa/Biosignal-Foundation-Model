@@ -826,6 +826,26 @@ def validate(
     use_amp = config.use_amp and device.type == "cuda"
     amp_dtype = torch.float16 if device.type == "cuda" else torch.bfloat16
 
+    # validation 진행률 표시 (rank 0만, cold val shard 로드라 분 단위 걸림)
+    val_limit = (
+        config.val_max_batches if config.val_max_batches > 0 else config.max_batches
+    )
+    pbar = None
+    if is_main_process():
+        try:
+            from tqdm import tqdm
+            total_batches = (
+                min(val_limit, len(dataloader)) if val_limit > 0 else len(dataloader)
+            )
+            pbar = tqdm(
+                total=total_batches,
+                desc=f"  [{phase_name}] val",
+                unit="batch",
+                leave=False,
+            )
+        except ImportError:
+            pass
+
     for batch in dataloader:
         batch.values = batch.values.to(device)
         batch.sample_id = batch.sample_id.to(device)
@@ -906,11 +926,17 @@ def validate(
         epoch_aux += aux_loss
         n_batches += 1
 
-        val_limit = (
-            config.val_max_batches if config.val_max_batches > 0 else config.max_batches
-        )
+        if pbar is not None:
+            pbar.update(1)
+            pbar.set_postfix(
+                masked=f"{epoch_masked / n_batches:.3f}",
+            )
+
         if val_limit > 0 and n_batches >= val_limit:
             break
+
+    if pbar is not None:
+        pbar.close()
 
     # RNG state 복원 — train 측 stochasticity에 val 시드 누출 방지
     torch.set_rng_state(cpu_rng_state)
