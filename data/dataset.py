@@ -243,8 +243,16 @@ class BiosignalDataset(Dataset[BiosignalSample]):
             and self.crop_ratio_range is not None
             and len(values) > 0
         ):
+            # 결정적 seed: 같은 (recording, window)의 모든 채널이 동일한 crop을
+            # 받도록 한다. any_variate 모드에서 sibling 채널마다 독립 crop이면
+            # 같은 recording에서 온 variate들이 시간적으로 어긋나 cross-modal
+            # pair가 실제로는 다른 시간 구간을 비교하게 되는 버그 방지.
+            # (rec_idx, win_start)는 같은 recording-window의 모든 채널이 공유.
+            # int seed (Python 3.11+ tuple seed 거부) — bit-packed (rec_idx, win_start)
+            # win_start < 2**32 (~497일 @ 100Hz) 가정. rec_idx는 high 32 bits.
+            crop_rng = random.Random(rec_idx * 2**32 + int(win_start))
             lo, hi = self.crop_ratio_range
-            ratio = random.uniform(lo, hi)
+            ratio = crop_rng.uniform(lo, hi)
             crop_len = max(1, int(len(values) * ratio))
             if hasattr(self, "_patch_size") and self._patch_size is not None:
                 # 최소 crop 길이: min_patches × patch_size
@@ -257,7 +265,7 @@ class BiosignalDataset(Dataset[BiosignalSample]):
                     (crop_len // self._patch_size) * self._patch_size,
                 )
             if crop_len < len(values):
-                start = random.randint(0, len(values) - crop_len)
+                start = crop_rng.randint(0, len(values) - crop_len)
                 values = values[start : start + crop_len]
                 win_start = win_start + start
 
