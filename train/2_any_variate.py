@@ -294,40 +294,86 @@ def main():
         print(f"Loading Phase 1 checkpoint: {ckpt_path}")
 
     # Model + checkpoint load
-    # Phase 1 checkpoint의 config를 우선 사용하여 아키텍처 불일치 방지
+    # Phase 1 checkpoint의 config 기반으로 아키텍처를 결정하되, 각 필드를
+    # 카테고리별로 명시적으로 처리한다. silent override(yaml 무시) 방지.
     ckpt_state = torch.load(ckpt_path, map_location=device, weights_only=False)
     if "config" in ckpt_state:
         ckpt_model_config = ModelConfig.from_dict(ckpt_state["config"])
+        user_model_config = config.model_config
 
-        # contrastive_proj_dim: 덮어쓰기 안전 (Phase 1: 0 → Phase 2: 128, 새 모듈 random init)
-        ckpt_model_config.contrastive_proj_dim = (
-            config.model_config.contrastive_proj_dim
+        # weight shape에 영향을 주는 필드 — ckpt 값이 우선. yaml과 다르면 경고만.
+        # 변경 시 weight 로딩 실패하거나(대부분 필드) 학습된 표현의 의미가
+        # 어긋나므로(stride: 토큰 시간 정렬 변경) ckpt 값을 강제 사용.
+        # 또한 구버전 ckpt에 없는 필드는 ModelConfig.from_dict에서 기본값으로
+        # 채워지므로(예: 신규 추가된 next_head_d_inner=None), yaml에 명시된
+        # 값과 다르면 yaml 값이 무시된다는 경고가 표시됨 — 의도된 동작.
+        SHAPE_LOCKED_FIELDS = {
+            "d_model", "num_layers", "patch_size", "stride",
+            "num_heads", "num_groups",
+            "use_glu", "use_moe", "num_experts",
+            "use_rope", "use_var_attn_bias", "use_spatial_embed",
+            "num_signal_types", "num_spatial_ids", "next_head_d_inner",
+        }
+        # 런타임 또는 안전한 재초기화 가능 필드 — yaml 값이 우선.
+        # (next_block_size, contrastive_proj_dim은 head shape에 영향 있지만
+        #  새 head를 random init으로 만들 수 있어 user override 허용.)
+        USER_OVERRIDABLE_FIELDS = {
+            "dropout_p", "num_experts_per_token",
+            "next_block_size", "contrastive_proj_dim",
+        }
+
+        from dataclasses import fields as dc_fields
+        all_field_names = {f.name for f in dc_fields(ModelConfig)}
+        # 카테고리 누락 검출 — ModelConfig 확장 시 분류 강제
+        unclassified = (
+            all_field_names - SHAPE_LOCKED_FIELDS - USER_OVERRIDABLE_FIELDS
         )
-
-        # next_block_size: K가 다르면 BlockNextHead.heads shape mismatch 발생 →
-        # strict=False로 로드 시 일부 heads만 로드되고 나머지는 random init (silent).
-        # 안전을 위해 값이 다르면 경고, 같으면 no-op(ckpt 값 유지).
-        if (
-            ckpt_model_config.next_block_size
-            != config.model_config.next_block_size
-        ):
-            if rank0:
-                print(
-                    f"  ⚠️  next_block_size override: ckpt="
-                    f"{ckpt_model_config.next_block_size} → "
-                    f"config={config.model_config.next_block_size} "
-                    "(일부 BlockNextHead.heads가 재초기화됩니다)"
-                )
-            ckpt_model_config.next_block_size = (
-                config.model_config.next_block_size
+        if unclassified and rank0:
+            print(
+                f"  ⚠️  ModelConfig에 새 필드 추가됨, 분류 필요: {unclassified} "
+                f"(현재 ckpt 값 사용)"
             )
+
+        # 1. SHAPE_LOCKED: ckpt 값 강제 사용, yaml과 다르면 경고
+        shape_mismatches = []
+        for fname in SHAPE_LOCKED_FIELDS:
+            ckpt_val = getattr(ckpt_model_config, fname)
+            user_val = getattr(user_model_config, fname)
+            if user_val != ckpt_val:
+                shape_mismatches.append((fname, user_val, ckpt_val))
+        if shape_mismatches and rank0:
+            print(
+                "  ⚠️  YAML의 다음 필드가 Phase 1 ckpt와 다름 — ckpt 값 사용 "
+                "(YAML 값 무시):"
+            )
+            for fname, user_val, ckpt_val in shape_mismatches:
+                print(f"      {fname}: yaml={user_val} → ckpt={ckpt_val}")
+
+        # 2. USER_OVERRIDABLE: yaml 값 적용, 다르면 알림
+        for fname in USER_OVERRIDABLE_FIELDS:
+            user_val = getattr(user_model_config, fname)
+            ckpt_val = getattr(ckpt_model_config, fname)
+            if user_val != ckpt_val and rank0:
+                # next_block_size / contrastive_proj_dim은 새 head 재초기화 안내
+                if fname in ("next_block_size", "contrastive_proj_dim"):
+                    print(
+                        f"  ⚠️  {fname} override: ckpt={ckpt_val} → "
+                        f"yaml={user_val} (해당 head 일부가 random 재초기화됩니다)"
+                    )
+                else:
+                    print(
+                        f"  ℹ️  {fname}: ckpt={ckpt_val} → yaml={user_val} 적용"
+                    )
+            setattr(ckpt_model_config, fname, user_val)
 
         config.model_config = ckpt_model_config
         if rank0:
             print(
-                f"  Model config loaded from checkpoint (patch_size="
-                f"{ckpt_model_config.patch_size}, "
-                f"next_block_size K={ckpt_model_config.next_block_size})"
+                f"  Model config: patch_size={ckpt_model_config.patch_size}, "
+                f"d_model={ckpt_model_config.d_model}, "
+                f"num_layers={ckpt_model_config.num_layers}, "
+                f"next_block_size K={ckpt_model_config.next_block_size}, "
+                f"contrastive_proj_dim={ckpt_model_config.contrastive_proj_dim}"
             )
 
     model = BiosignalFoundationModel.from_config(config.model_config)
