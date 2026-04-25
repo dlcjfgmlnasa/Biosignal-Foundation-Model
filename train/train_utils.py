@@ -601,49 +601,25 @@ def train_one_epoch(
 
             loss = losses["total"] + config.aux_loss_weight * aux_loss
 
-        # NaN/Inf 감지 — DDP에서는 forward 후 반드시 backward 필요
+        # NaN/Inf loss 경고 (선택적). 분기는 하지 않음 — rank마다 loss 유한성이
+        # 다르면 collective 호출 패턴이 어긋나 NCCL 데드락. 무조건 backward 수행
+        # 하여 DDP allreduce 시퀀스를 모든 rank에서 동일하게 유지하고, NaN 처리는
+        # grad_norm 단계(DDP-sync된 후의 값이라 모든 rank가 같은 값 관찰)에서
+        # 일괄적으로 한다.
         if not torch.isfinite(loss):
-            if is_main_process():
-                print(
-                    f"  [{phase_name}] WARNING: NaN/Inf loss detected at batch {n_batches + 1}, "
-                    f"skipping batch (masked={losses['masked_loss'].item():.4f}, "
-                    f"next={losses['next_loss'].item():.4f}, "
-                    f"cross={losses['cross_modal_loss'].item():.4f}, "
-                    f"contrastive={losses['contrastive_loss'].item():.4f})"
-                )
-            nan_count += 1
-            # 글로벌 동기화: 어떤 rank든 임계치 도달하면 모든 rank가 같이 break.
-            # rank별 local nan_count 비교만 하면 일부 rank만 epoch 탈출 → 나머지
-            # rank의 backward/all_reduce가 짝 없는 collective로 데드락.
-            should_break = nan_count >= max_nan_batches
-            if dist.is_available() and dist.is_initialized():
-                flag = torch.tensor(
-                    1 if should_break else 0, device=device, dtype=torch.int
-                )
-                dist.all_reduce(flag, op=dist.ReduceOp.MAX)
-                should_break = bool(flag.item())
-            if should_break:
-                if is_main_process():
-                    print(
-                        f"  [{phase_name}] ERROR: {nan_count} consecutive NaN/Inf batches. "
-                        f"Stopping epoch early."
-                    )
-                break
-            # DDP: forward 했으면 backward도 해야 all-reduce deadlock 방지
-            # zero loss로 backward하여 gradient sync 수행
-            zero_loss = loss.new_tensor(0.0, requires_grad=True)
-            if scaler is not None:
-                scaler.scale(zero_loss).backward()
-                scaler.update()
-            else:
-                zero_loss.backward()
-            # Criterion grad sync도 normal path와 동일 횟수 호출 — 데드락 방지
-            _sync_criterion_grads()
-            optimizer.zero_grad(set_to_none=True)
-            n_batches += 1
-            continue
+            # rank-local 경고. is_main_process() 게이트하면 silent rank divergence
+            # 디버깅 불가 — 모든 rank에서 출력.
+            rank_str = f"rank{dist.get_rank()}" if (
+                dist.is_available() and dist.is_initialized()
+            ) else "rank?"
+            print(
+                f"  [{phase_name}][{rank_str}] WARNING: NaN/Inf loss at batch "
+                f"{n_batches + 1} (masked={losses['masked_loss'].item():.4f}, "
+                f"next={losses['next_loss'].item():.4f}, "
+                f"cross={losses['cross_modal_loss'].item():.4f}, "
+                f"contrastive={losses['contrastive_loss'].item():.4f})"
+            )
 
-        nan_count = 0  # 정상 batch면 카운터 리셋
         optimizer.zero_grad(set_to_none=True)
 
         if scaler is not None:
@@ -656,7 +632,8 @@ def train_one_epoch(
         # _sync_criterion_grads docstring 참조.
         _sync_criterion_grads()
 
-        # Gradient NaN/Inf 감지 — model + criterion 모두 클리핑
+        # Gradient NaN/Inf 감지 — model + criterion 모두 클리핑.
+        # grad_norm은 DDP allreduce 후 값이라 모든 rank에서 동일 → 분기 안전.
         grad_norm = nn.utils.clip_grad_norm_(
             list(raw_model.parameters()) + list(criterion.parameters()),
             max_norm=config.gradient_clip,
@@ -667,11 +644,23 @@ def train_one_epoch(
                     f"  [{phase_name}] WARNING: NaN/Inf gradient at batch {n_batches + 1}, "
                     f"skipping update."
                 )
+            nan_count += 1
+            # max_nan_batches 도달 시 모든 rank가 같은 값(grad_norm 동기화)을
+            # 보므로 break 결정도 자동으로 동기화됨. 추가 collective 불필요.
+            if nan_count >= max_nan_batches:
+                if is_main_process():
+                    print(
+                        f"  [{phase_name}] ERROR: {nan_count} consecutive NaN/Inf batches. "
+                        f"Stopping epoch early."
+                    )
+                break
             optimizer.zero_grad(set_to_none=True)
             n_batches += 1
             if scaler is not None:
                 scaler.update()
             continue
+
+        nan_count = 0  # 정상 batch면 카운터 리셋
 
         if scaler is not None:
             scaler.step(optimizer)

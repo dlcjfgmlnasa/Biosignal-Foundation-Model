@@ -736,6 +736,11 @@ def main():
                     output_dir=output_dir,
                 )
 
+        # rank0가 viz/checkpoint 저장하는 동안 다른 rank가 다음 epoch 진입 →
+        # 첫 backward all_reduce에서 NCCL timeout. barrier로 동기화.
+        if use_ddp:
+            dist.barrier()
+
         # Early Stopping
         if early_stopper is not None and val_losses is not None:
             if early_stopper.step(val_losses["total"]):
