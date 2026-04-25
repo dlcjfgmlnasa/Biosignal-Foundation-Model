@@ -519,6 +519,7 @@ def train_one_epoch(
     enable_next = config.beta > 0
     use_amp = scaler is not None
     amp_dtype = torch.float16 if device.type == "cuda" else torch.bfloat16
+    use_dist = dist.is_available() and dist.is_initialized()
 
     def _sync_criterion_grads() -> None:
         """Criterion 파라미터(예: log_temperature) gradient를 rank 간 동기화.
@@ -527,7 +528,7 @@ def train_one_epoch(
         rank마다 collective 호출 패턴이 달라질 수 있으므로 zero-init으로
         대칭성 보장. NaN-skip 경로에서도 동일하게 호출해야 데드락 방지.
         """
-        if not (dist.is_available() and dist.is_initialized()):
+        if not use_dist:
             return
         for p in criterion.parameters():
             if not p.requires_grad:
@@ -536,7 +537,28 @@ def train_one_epoch(
                 p.grad = torch.zeros_like(p)
             dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
 
-    for batch in dataloader:
+    # RecordingLocalitySampler가 recording 단위로 rank에 분배 + PackCollate
+    # dynamic bin-packing → rank별 batch 수 불일치 가능. 한 rank가 먼저 epoch
+    # 종료하면 다른 rank의 다음 backward all_reduce가 timeout. 매 iteration마다
+    # "모든 rank가 batch를 가지고 있는가?" sync하여 가장 적은 rank에 맞춰 종료.
+    data_iter = iter(dataloader)
+    while True:
+        try:
+            batch = next(data_iter)
+        except StopIteration:
+            batch = None
+
+        if use_dist:
+            flag = torch.tensor(
+                [1 if batch is not None else 0], device=device, dtype=torch.long
+            )
+            dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+            if flag.item() == 0:
+                break
+        elif batch is None:
+            break
+
+        assert batch is not None  # sync 후 모든 rank가 batch 보유 보장
         # GPU로 이동
         batch.values = batch.values.to(device)
         batch.sample_id = batch.sample_id.to(device)
