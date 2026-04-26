@@ -984,7 +984,29 @@ def main() -> None:
 
     raw_dir = Path(args.raw)
     # 재귀 검색: 중첩 디렉토리 구조 지원 (K-MIMIC-MORTAL 등)
-    vital_files = sorted(raw_dir.glob("**/*.vital"))
+    # 대규모 raw_dir에서는 glob 자체가 수십 초~분 단위로 걸리므로 tqdm으로 진행 표시
+    try:
+        from tqdm import tqdm as _tqdm_scan
+        _scan_have_tqdm = True
+    except ImportError:
+        _scan_have_tqdm = False
+
+    import os
+
+    vital_files: list[Path] = []
+    scan_iter = os.walk(raw_dir)
+    if _scan_have_tqdm:
+        scan_iter = _tqdm_scan(
+            scan_iter, desc=f"Scanning {raw_dir}", unit="dir"
+        )
+    for dirpath, _dirnames, filenames in scan_iter:
+        for fn in filenames:
+            if fn.endswith(".vital"):
+                vital_files.append(Path(dirpath) / fn)
+        if _scan_have_tqdm:
+            scan_iter.set_postfix(found=len(vital_files))
+    vital_files.sort()
+
     if not vital_files:
         print(f"ERROR: {raw_dir} 하위에 .vital 파일이 없습니다.", file=sys.stderr)
         sys.exit(1)
