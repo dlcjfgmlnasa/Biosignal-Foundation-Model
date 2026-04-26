@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from pathlib import Path
 
@@ -55,13 +56,37 @@ def main() -> None:
                     manifest_paths.append(mf)
         print(f"Using {source}: {len(manifest_paths)} subject manifests")
 
-    # ── 우선순위 2: glob */manifest.json ──
+    # ── 우선순위 2: scandir */manifest.json (progress 표시) ──
     if not manifest_paths:
-        source = "glob */manifest.json"
+        source = "scandir */manifest.json"
         print(f"Falling back to {source}...")
         t0 = time.time()
-        manifest_paths = sorted(data_dir.glob("*/manifest.json"))
-        print(f"Found {len(manifest_paths)} subject manifests in {time.time() - t0:.1f}s")
+
+        try:
+            from tqdm import tqdm
+            scan_pbar = tqdm(desc="Scanning subject dirs", unit="dir")
+        except ImportError:
+            scan_pbar = None
+
+        with os.scandir(data_dir) as it:
+            for entry in it:
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+                mf = Path(entry.path) / "manifest.json"
+                if mf.exists():
+                    manifest_paths.append(mf)
+                if scan_pbar is not None:
+                    scan_pbar.update(1)
+                    scan_pbar.set_postfix_str(f"found {len(manifest_paths)}")
+
+        if scan_pbar is not None:
+            scan_pbar.close()
+
+        manifest_paths.sort()
+        print(
+            f"Found {len(manifest_paths)} subject manifests in "
+            f"{time.time() - t0:.1f}s"
+        )
 
     if not manifest_paths:
         print(f"ERROR: no manifests found in {data_dir}")
