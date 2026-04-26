@@ -1,0 +1,107 @@
+# Phase 2: Any-Variate Cross-Modal Training — VitalDB only with shard backend
+# ──────────────────────────────────────────────────────────────
+# Server: Biosignal-FM2 — 2xL40S 48GB, 32vCPU, 192GB RAM
+# Dataset: VitalDB ~5,111 subjects (Phase 1과 동일, shard backend)
+#
+# Phase 1 → Phase 2 전환:
+#   * collate_mode: ci → any_variate (train.2_any_variate가 자동 강제)
+#   * Loss: MPM/Next-pred 비중 ↓, Cross-modal/Contrastive 활성
+#   * Variate-level masking 활성 → cross-modal 학습 강제
+#   * lr: Phase 1(8e-4) 대비 낮춤, 끝값(8e-5)보다는 높여 새 head warm-up
+#   * contrastive_proj_dim=128 → Phase 1에 없던 head random init
+#
+# Usage (2-GPU DDP):
+#   torchrun --nproc_per_node=2 -m train.2_any_variate \
+#       --config configs/phase2_vital.yaml \
+#       --resume outputs/phase1/vital_d256_L12_10min_p200_shard/checkpoints/<best>.pt
+
+# ── 모델 ──
+# ⚠️ SHAPE_LOCKED 필드(d_model, num_layers, patch_size, num_heads, num_groups,
+#   use_glu/moe/rope, use_var_attn_bias, use_spatial_embed, num_signal_types/
+#   spatial_ids, next_head_d_inner)는 Phase 1 ckpt 값으로 강제됨. yaml은 참고용.
+# USER_OVERRIDABLE: dropout_p, next_block_size, contrastive_proj_dim
+#   → contrastive_proj_dim은 Phase 1엔 0이었으므로 head random init.
+model_config:
+  d_model: 256                   # ckpt 강제 (참고용)
+  num_layers: 12
+  patch_size: 200
+  stride: null
+  num_heads: 8
+  num_groups: null
+  num_signal_types: 8
+  num_spatial_ids: 13
+  use_glu: true
+  use_moe: false
+  use_rope: true
+  use_var_attn_bias: true
+  use_spatial_embed: true
+  dropout_p: 0.1
+
+  # ── Task heads ──
+  next_block_size: 4             # Phase 1과 동일
+  contrastive_proj_dim: 128      # Phase 2 활성 — Phase 1 ckpt에 없으므로 random init
+
+# ── 데이터 (Phase 1과 동일 source) ──
+data_dir:
+  - /home/coder/workspace/updown/bio_fm/data/train/vitaldb/
+signal_types: [0, 1, 2, 3, 4, 5, 6]  # ECG, ABP, PPG, CVP, CO2, AWP, PAP
+max_subjects: null
+window_seconds: 600.0            # 10분 윈도우
+max_length: 96000                # any_variate multi-channel packing 고려해 Phase 1(64000) 대비 1.5x
+cache_size: 16
+crop_ratio_min: 0.01
+crop_ratio_max: 1.0
+min_patches: 5                   # 임상 10s floor
+
+# ── Shard backend (Phase 1과 동일) ──
+# ⚠️ shard_cache_size는 PER WORKER 값. 총 RAM ≈
+#     num_workers × shard_cache_size × shard_size_GB × num_ranks
+#     = 2 × 4 × 1GB × 2 = 16GB (192GB의 8%, 안전)
+shard_index_path: /home/coder/workspace/updown/bio_fm/data/train/vitaldb/vitaldb_wbs/shard_index.json
+shard_cache_size: 4
+
+# ── 학습 (Phase 1 끝값에서 fine-tune) ──
+batch_size: 64                   # any_variate multi-variate packing → Phase 1(128)의 절반
+lr: 2.0e-4                       # Phase 1(8e-4) 대비 낮춤, 끝값(8e-5)보다는 높여 cross/contrastive head warm-up
+n_epochs: 50
+warmup_epochs: 3                 # 짧은 warmup (이미 학습된 backbone)
+min_lr_ratio: 0.05               # 최종 LR = 1e-5
+mask_ratio: 0.3                  # Phase 1과 동일
+gradient_clip: 1.0
+seed: 42
+collate_mode: any_variate        # 코드에서 자동 강제 (참고용)
+max_batches: 10000               # Phase 1과 동일 (epoch당 batch 수)
+
+# ── Loss 가중치 (Phase 2: MPM + Next + Cross-modal + Contrastive) ──
+alpha: 0.7                       # masked reconstruction (Phase 1: 1.0 → ↓)
+beta: 0.3                        # next-pred (Phase 1: 0.8 → ↓)
+gamma: 0.15                      # cross-modal — criterion fix 후 β와 독립
+delta: 0.5                       # cross-modal contrastive (InfoNCE)
+lambda_spec: 0.2                 # Multi-Resolution STFT Loss (Phase 1과 동일)
+peak_alpha: 0.5                  # Peak-Weighted MSE — Phase 1과 동일
+aux_loss_weight: 0.01
+contrastive_temperature: 0.07
+learnable_temperature: true
+
+# ── Masking (Block MPM + Variate-level) ──
+variate_mask_prob: 0.3           # 30% 확률로 한 variate 전체 마스킹 → cross-modal 학습 강제
+variate_drop_prob: 0.1           # 10% 확률로 variate를 attention에서 완전 제거 (zero-shot virtual sensing)
+block_mask: true
+block_size_min: 3                # Phase 1과 동일 — 호흡 1 cycle (6s) 보장
+block_size_max: 5                # Phase 1과 동일 — 최대 10s
+
+# ── Mixed Precision ──
+use_amp: true                    # L40S BF16/FP16 tensor cores
+
+# ── Validation & Early Stopping ──
+val_ratio: 0.0005                # subject 단위 5% validation
+val_max_batches: 20
+patience: 15
+
+# ── 시스템 ──
+device: auto
+num_workers: 2                   # Phase 1과 동일 (OOM 회피)
+output_dir: outputs/phase2
+checkpoint_every: 5
+viz_every: 1
+exp_name: vital_d256_L12_10min_p200_shard_av

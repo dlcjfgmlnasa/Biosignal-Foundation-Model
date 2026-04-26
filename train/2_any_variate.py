@@ -524,24 +524,39 @@ def main():
     viz_np_dir = None
     viz_cross_dir = None
     if viz_every > 0 and val_dataloader is not None and rank0:
-        # cold val shard 로드 진행률 표시
+        # 모든 signal type이 viz batches에 포함될 때까지 수집 (최대 100 batch).
+        # any_variate cross-modal 시각화는 같은 (session, time_slot)에서 다른
+        # variate가 한 PackUnit에 묶여야 pair로 추출 가능 → 충분한 batch 필요.
+        # cold val shard 로드라 1-3분 걸릴 수 있음 → tqdm 진행률 표시.
         viz_iter = iter(val_dataloader)
         viz_batches = []
-        max_viz = min(10, len(val_dataloader))
+        seen_types: set[int] = set()
+        all_types = (
+            set(config.signal_types) if hasattr(config, "signal_types") else set()
+        )
+        max_viz_batches = min(100, len(val_dataloader))
         try:
             from tqdm import tqdm
             pbar = tqdm(
-                total=max_viz,
+                total=max_viz_batches,
                 desc="viz_batches prep (cold val shard load)",
                 unit="batch",
             )
         except ImportError:
             pbar = None
-        for _ in range(max_viz):
+        for _ in range(max_viz_batches):
             try:
-                viz_batches.append(next(viz_iter))
+                b = next(viz_iter)
+                viz_batches.append(b)
+                for j in range(len(b.signal_types)):
+                    seen_types.add(int(b.signal_types[j]))
                 if pbar is not None:
                     pbar.update(1)
+                    pbar.set_postfix(
+                        types_seen=f"{len(seen_types)}/{len(all_types) if all_types else '?'}",
+                    )
+                if all_types and seen_types >= all_types:
+                    break
             except StopIteration:
                 break
         if pbar is not None:
