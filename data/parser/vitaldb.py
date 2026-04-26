@@ -1095,6 +1095,12 @@ def main() -> None:
                 existing_train.add(subject_id)
             counts["train"] += 1
 
+    try:
+        from tqdm import tqdm
+        _have_tqdm = True
+    except ImportError:
+        _have_tqdm = False
+
     if args.workers > 1:
         from multiprocessing import Pool
 
@@ -1113,13 +1119,30 @@ def main() -> None:
             tasks.append((vf_path, target_dir))
 
         with Pool(processes=args.workers) as pool:
-            for i, result in enumerate(pool.imap(_worker_split, tasks)):
+            iterator = pool.imap(_worker_split, tasks)
+            if _have_tqdm:
+                iterator = tqdm(
+                    iterator, total=len(tasks),
+                    desc="Parsing .vital", unit="file",
+                )
+            for i, result in enumerate(iterator):
                 _handle_result(result, i)
+                if _have_tqdm:
+                    iterator.set_postfix(
+                        train=counts["train"], test=counts["test"]
+                    )
     else:
-        for i, vf_path in enumerate(vital_files):
+        single_iter = enumerate(vital_files)
+        if _have_tqdm:
+            single_iter = tqdm(
+                list(enumerate(vital_files)),
+                desc="Parsing .vital", unit="file",
+            )
+        for i, vf_path in single_iter:
             target_dir = test_out_dir if i in test_indices else out_dir
             split_tag = "[TEST]" if i in test_indices else "[TRAIN]"
-            print(f"{split_tag} [{vf_path.name}]")
+            if not _have_tqdm:
+                print(f"{split_tag} [{vf_path.name}]")
             result = _process_one_worker(
                 vf_path,
                 out_dir=target_dir,
@@ -1131,9 +1154,14 @@ def main() -> None:
                 continue
             subject_id, session_id, recordings = result
             if not recordings:
-                print("    [SKIP] 유효 레코딩 없음")
+                if not _have_tqdm:
+                    print("    [SKIP] 유효 레코딩 없음")
                 continue
             _handle_result(result, i)
+            if _have_tqdm:
+                single_iter.set_postfix(
+                    train=counts["train"], test=counts["test"]
+                )
 
     # ── 통합 manifest 생성 (manifest_full.jsonl) ──
     if not args.skip_manifest_full:
