@@ -98,6 +98,37 @@ def _group_into_shards(
     return shards
 
 
+def _load_existing_index(out_dir: Path) -> dict | None:
+    """기존 shard_index.json이 있으면 로드. 없으면 None."""
+    index_path = out_dir / "shard_index.json"
+    if not index_path.exists():
+        return None
+    with open(index_path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _extract_done_subjects(index: dict) -> set[str]:
+    """기존 index에서 이미 sharded된 subject_id 집합 추출.
+
+    각 shard meta에 'subjects' 필드가 있으면 사용. 없으면 shards 자체를
+    스캔(과거 인덱스 호환). 후자는 느리므로 가능하면 'subjects' 필드 사용 권장.
+    """
+    done: set[str] = set()
+    missing_subjects_field = False
+    for sm in index.get("shards", []):
+        if "subjects" in sm:
+            done.update(sm["subjects"])
+        else:
+            missing_subjects_field = True
+    if missing_subjects_field:
+        print(
+            "  WARN: 기존 shard_index.json에 'subjects' 필드 없음. "
+            "incremental 동작 불완전 — 전체 재빌드 권장.",
+            flush=True,
+        )
+    return done
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="Build .pt shards from per-recording files")
     p.add_argument(
@@ -124,6 +155,12 @@ def main() -> None:
         help="병렬 torch.load worker 수 (기본 8). 0=직렬. "
              "디스크 IO bound면 4-16이 sweet spot, CPU 코어 수보다 더 안 빠름.",
     )
+    p.add_argument(
+        "--incremental",
+        action="store_true",
+        help="기존 shard_index.json이 있으면 done subjects는 skip하고 "
+             "신규 entry만 새 shard로 추가 (기존 shard 무수정).",
+    )
     args = p.parse_args()
 
     manifest_path = Path(args.manifest)
@@ -138,8 +175,37 @@ def main() -> None:
     total_bytes = sum(_estimate_size_bytes(r) for r in entries)
     print(f"  Total estimated size: {total_bytes / 1024**3:.2f} GB")
 
+    # ── Incremental: 기존 index 있으면 done subjects 제외 ──
+    existing_index: dict | None = None
+    shard_id_offset = 0
+    rec_idx_offset = 0
+    if args.incremental:
+        existing_index = _load_existing_index(out_dir)
+        if existing_index is None:
+            print("  --incremental 지정됐으나 기존 shard_index.json 없음 → 전체 빌드 진행")
+        else:
+            done_subjects = _extract_done_subjects(existing_index)
+            shard_id_offset = existing_index.get("n_shards", 0)
+            rec_idx_offset = existing_index.get("n_recordings", 0)
+            n_before = len(entries)
+            entries = [e for e in entries if e["subject_id"] not in done_subjects]
+            n_skipped = n_before - len(entries)
+            print(
+                f"  Incremental: {len(done_subjects)} subjects already sharded, "
+                f"skipped {n_skipped} entries. Remaining: {len(entries)}",
+                flush=True,
+            )
+            print(
+                f"  New shards will start at id={shard_id_offset}, "
+                f"rec_idx={rec_idx_offset}",
+                flush=True,
+            )
+            if not entries:
+                print("  Nothing new to shard. Exiting.")
+                return
+
     shards = _group_into_shards(entries, target_bytes)
-    print(f"  Will produce {len(shards)} shards "
+    print(f"  Will produce {len(shards)} new shards "
           f"(target {args.target_shard_mb} MB each)")
 
     if args.dry_run:
@@ -163,7 +229,7 @@ def main() -> None:
 
     rec_to_shard: dict[str, int] = {}
     shard_meta: list[dict] = []
-    rec_global_idx = 0
+    rec_global_idx = rec_idx_offset
     t_start = time.time()
 
     shard_pbar = (
@@ -183,6 +249,7 @@ def main() -> None:
 
     def _build_one_shard(shard_id: int, shard: list[dict]) -> None:
         nonlocal rec_global_idx
+        local_idx = shard_id - shard_id_offset  # 진행률/ETA용 0-based 로컬 인덱스
         shard_dict: dict[str, dict] = {}
         paths = [rec["abs_path"] for rec in shard]
 
@@ -195,7 +262,7 @@ def main() -> None:
             tensor_iter = tqdm(
                 tensor_iter,
                 total=len(shard),
-                desc=f"  shard {shard_id+1}/{len(shards)} read",
+                desc=f"  shard {local_idx+1}/{len(shards)} read",
                 unit="rec",
                 leave=False,
                 position=1,
@@ -226,10 +293,11 @@ def main() -> None:
             "shard_id": shard_id,
             "n_recordings": len(shard),
             "size_mb": round(actual_size_mb, 2),
+            "subjects": sorted({r["subject_id"] for r in shard}),
         })
         elapsed = time.time() - t_start
-        avg_per_shard = elapsed / (shard_id + 1)
-        eta_seconds = avg_per_shard * (len(shards) - shard_id - 1)
+        avg_per_shard = elapsed / (local_idx + 1)
+        eta_seconds = avg_per_shard * (len(shards) - local_idx - 1)
         if _have_tqdm:
             shard_pbar.set_postfix_str(
                 f"{actual_size_mb:.0f}MB | avg {avg_per_shard:.0f}s/shard | "
@@ -238,36 +306,57 @@ def main() -> None:
             shard_pbar.update(1)
         else:
             print(
-                f"  shard {shard_id+1}/{len(shards)}: "
+                f"  shard {local_idx+1}/{len(shards)} (id={shard_id}): "
                 f"{len(shard)} recordings, {actual_size_mb:.1f} MB "
                 f"[elapsed {elapsed:.1f}s, ETA {eta_seconds/60:.1f}min]",
                 flush=True,
             )
 
     try:
-        for shard_id, shard in enumerate(shards):
-            _build_one_shard(shard_id, shard)
+        for local_idx, shard in enumerate(shards):
+            _build_one_shard(local_idx + shard_id_offset, shard)
     finally:
         if pool is not None:
             pool.shutdown(wait=True)
         if shard_pbar is not None:
             shard_pbar.close()
 
-    # 인덱스 저장
-    index = {
-        "n_shards": len(shards),
-        "n_recordings": rec_global_idx,
-        "target_shard_mb": args.target_shard_mb,
-        "source_manifest": str(manifest_path),
-        "rec_to_shard": rec_to_shard,
-        "shards": shard_meta,
-        "build_seconds": round(time.time() - t_start, 2),
-    }
+    # 인덱스 저장 — incremental이면 기존과 머지
+    if existing_index is not None:
+        merged_rec_to_shard = dict(existing_index.get("rec_to_shard", {}))
+        merged_rec_to_shard.update(rec_to_shard)
+        merged_shards = list(existing_index.get("shards", [])) + shard_meta
+        index = {
+            "n_shards": len(merged_shards),
+            "n_recordings": rec_global_idx,
+            "target_shard_mb": args.target_shard_mb,
+            "source_manifest": str(manifest_path),
+            "rec_to_shard": merged_rec_to_shard,
+            "shards": merged_shards,
+            "build_seconds": round(time.time() - t_start, 2),
+            "incremental_runs": existing_index.get("incremental_runs", 0) + 1,
+        }
+    else:
+        index = {
+            "n_shards": len(shards),
+            "n_recordings": rec_global_idx,
+            "target_shard_mb": args.target_shard_mb,
+            "source_manifest": str(manifest_path),
+            "rec_to_shard": rec_to_shard,
+            "shards": shard_meta,
+            "build_seconds": round(time.time() - t_start, 2),
+        }
     index_path = out_dir / "shard_index.json"
     with open(index_path, "w", encoding="utf-8") as f:
         json.dump(index, f, indent=2)
 
-    print(f"\nDone. Wrote {len(shards)} shards + {index_path}")
+    if existing_index is not None:
+        print(
+            f"\nDone. Wrote {len(shards)} new shards "
+            f"(total now {index['n_shards']}) + {index_path}"
+        )
+    else:
+        print(f"\nDone. Wrote {len(shards)} shards + {index_path}")
     print(f"Total time: {index['build_seconds']:.1f}s")
 
 

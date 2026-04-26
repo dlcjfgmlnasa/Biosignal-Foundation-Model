@@ -34,9 +34,18 @@ def main() -> None:
     data_dir = Path(args.data_dir)
     out_path = Path(args.out) if args.out else data_dir / "manifest_full.jsonl"
 
+    print(f"data_dir = {data_dir}", flush=True)
+    print(f"out_path = {out_path}", flush=True)
+
     if not data_dir.exists():
         print(f"ERROR: {data_dir} not found")
         return
+
+    try:
+        from tqdm import tqdm
+        _have_tqdm = True
+    except ImportError:
+        _have_tqdm = False
 
     # ── 우선순위 1: manifest.jsonl ──
     index_file = data_dir / "manifest.jsonl"
@@ -45,16 +54,26 @@ def main() -> None:
 
     if index_file.exists():
         source = "manifest.jsonl"
+        print(f"Reading index: {index_file}", flush=True)
+        t0 = time.time()
         with open(index_file, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                meta = json.loads(line)
-                mf = data_dir / meta["manifest"]
-                if mf.exists():
-                    manifest_paths.append(mf)
-        print(f"Using {source}: {len(manifest_paths)} subject manifests")
+            lines = [ln.strip() for ln in f if ln.strip()]
+        print(f"  {len(lines)} entries; verifying paths exist...", flush=True)
+
+        line_iter = (
+            tqdm(lines, desc="Checking manifests", unit="entry")
+            if _have_tqdm else lines
+        )
+        for line in line_iter:
+            meta = json.loads(line)
+            mf = data_dir / meta["manifest"]
+            if mf.exists():
+                manifest_paths.append(mf)
+        print(
+            f"Using {source}: {len(manifest_paths)} subject manifests "
+            f"(in {time.time() - t0:.1f}s)",
+            flush=True,
+        )
 
     # ── 우선순위 2: scandir */manifest.json (progress 표시) ──
     if not manifest_paths:
