@@ -74,7 +74,7 @@ def load_preop_and_opend(
       ※ aneend도 가능하나 공식 xgb_aki 예제는 opend 사용 → 일관성 위해 opend 채택.
     """
     out: dict[int, tuple[float, float]] = {}
-    with open(clinical_csv, encoding="utf-8") as f:
+    with open(clinical_csv, encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         for col in ("caseid", "preop_cr", "opend"):
             if col not in reader.fieldnames:
@@ -116,7 +116,7 @@ def load_postop_peak_cr(
     by_case: dict[int, list[tuple[float, float]]] = defaultdict(list)
     max_postop_sec = max_postop_days * 86400.0
 
-    with open(lab_csv, encoding="utf-8") as f:
+    with open(lab_csv, encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         for col in ("caseid", "dt", "name", "result"):
             if col not in reader.fieldnames:
