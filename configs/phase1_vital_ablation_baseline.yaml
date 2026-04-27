@@ -1,0 +1,83 @@
+# AdaLN ablation — Baseline (use_adaln=False)
+# Pair: configs/phase1_vital_ablation_adaln.yaml
+# Shortened version of phase1_vital.yaml for fast A/B test.
+#
+# Usage (2-GPU DDP):
+#   torchrun --nproc_per_node=2 -m train.1_channel_independency \
+#       --config configs/phase1_vital_ablation_baseline.yaml
+
+model_config:
+  d_model: 256
+  num_layers: 12
+  patch_size: 200
+  stride: null
+  num_heads: 8
+  num_groups: null
+  num_signal_types: 8
+  num_spatial_ids: 13
+  use_glu: true
+  use_moe: false
+  use_rope: true
+  use_var_attn_bias: true
+  use_spatial_embed: true
+  dropout_p: 0.1
+  next_block_size: 4
+  contrastive_proj_dim: 0
+
+  # ── ABLATION KNOB ──
+  use_adaln: false
+  d_cond: 0
+
+data_dir:
+  - /home/coder/workspace/updown/bio_fm/data/train/vitaldb/
+signal_types: [0, 1, 2, 3, 4, 5, 6]
+max_subjects: null
+window_seconds: 600.0
+max_length: 64000
+cache_size: 16
+crop_ratio_min: 0.01
+crop_ratio_max: 1.0
+min_patches: 5
+
+shard_index_path: /home/coder/workspace/updown/bio_fm/data/train/vitaldb/vitaldb_wbs/shard_index.json
+shard_cache_size: 1
+
+# ── 학습 (단축: 80→6 epochs, 10000→2000 batches/epoch) ──
+batch_size: 128
+lr: 8.0e-4
+n_epochs: 6                    # 빠른 A/B용 (full 80 → 6)
+warmup_epochs: 1               # 10% 유지
+min_lr_ratio: 0.1
+mask_ratio: 0.4
+gradient_clip: 1.0
+seed: 42
+collate_mode: ci
+max_batches: 2000              # 1 epoch당 2000 batch (= 256K samples)
+
+alpha: 1.0
+beta: 0.8
+gamma: 0.0
+delta: 0.0
+lambda_spec: 0.2
+peak_alpha: 1.0
+aux_loss_weight: 0.01
+contrastive_temperature: 0.07
+learnable_temperature: true
+
+variate_mask_prob: 0.0
+block_mask: true
+block_size_min: 3
+block_size_max: 8
+
+use_amp: true
+
+val_ratio: 0.05
+val_max_batches: 100           # 500 → 100 (단축)
+patience: 15
+
+device: auto
+num_workers: 2
+output_dir: outputs/ablation_adaln/baseline
+checkpoint_every: 5
+viz_every: 1
+exp_name: ablation_baseline
