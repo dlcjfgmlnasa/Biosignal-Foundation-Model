@@ -139,11 +139,16 @@ class BiosignalFoundationModel(nn.Module):
         next_block_size: int = 4,
         next_head_d_inner: int | None = None,
         contrastive_proj_dim: int = 0,
+        use_adaln: bool = False,
+        d_cond: int = 0,
     ) -> None:
         super().__init__()
         self.d_model = d_model
         self.patch_size = patch_size
         self.num_signal_types = num_signal_types
+        self.use_adaln = use_adaln
+        # d_cond: AdaLN modulation 입력 차원. 0이면 d_model 사용.
+        self.d_cond = d_cond if d_cond > 0 else d_model
 
         # 1. Scaler (point-level)
         self.scaler = scaler or PackedStdScaler()
@@ -181,6 +186,8 @@ class BiosignalFoundationModel(nn.Module):
             var_attn_bias_layer=var_attn_bias_layer,
             time_qk_proj_layer=time_qk_proj_layer,
             dropout_p=dropout_p,
+            use_adaln=use_adaln,
+            d_cond=self.d_cond if use_adaln else 0,
         )
 
         # 4. Spatial Positional Encoding (Dual Embedding)
@@ -190,8 +197,21 @@ class BiosignalFoundationModel(nn.Module):
             self.spatial_id_embed = nn.Embedding(num_spatial_ids, d_model)
 
         # 5. Loc/Scale Injection (환자별 절대 레벨 정보 보존)
-        self.loc_proj = nn.Linear(1, d_model)
-        self.scale_proj = nn.Linear(1, d_model)
+        # use_adaln=True일 때는 additive embedding 대신 cond_proj가 AdaLN modulation에 사용됨.
+        if use_adaln:
+            # (loc, scale) 2D scalar → d_cond conditioning vector
+            # MLP(2 → d_cond → d_cond) — non-linearity로 expressiveness 확보
+            self.cond_proj = nn.Sequential(
+                nn.Linear(2, self.d_cond),
+                nn.SiLU(),
+                nn.Linear(self.d_cond, self.d_cond),
+            )
+            self.loc_proj = None
+            self.scale_proj = None
+        else:
+            self.cond_proj = None
+            self.loc_proj = nn.Linear(1, d_model)
+            self.scale_proj = nn.Linear(1, d_model)
 
         # 6. Reconstruction Head (자기 variate 복원)
         self.head = nn.Linear(d_model, patch_size)
@@ -379,9 +399,19 @@ class BiosignalFoundationModel(nn.Module):
         patch_starts = patch_starts.clamp(max=loc.shape[1] - 1)
         patch_loc = loc[:, patch_starts, :]  # (B, N, 1)
         patch_scale = scale[:, patch_starts, :]  # (B, N, 1)
-        loc_emb = self.loc_proj(patch_loc)  # (B, N, d_model)
-        scale_emb = self.scale_proj(patch_scale)  # (B, N, d_model)
-        cond = (cond + loc_emb + scale_emb) * valid_token
+
+        # AdaLN 모드: loc/scale을 cond_proj로 → encoder 모든 layer에 modulation 입력
+        # additive 모드: loc/scale을 token에 더해주는 기존 방식
+        ada_cond: torch.Tensor | None = None
+        if self.use_adaln:
+            loc_scale = torch.cat([patch_loc, patch_scale], dim=-1)  # (B, N, 2)
+            ada_cond = self.cond_proj(loc_scale)  # (B, N, d_cond)
+            ada_cond = ada_cond * valid_token  # 패딩 위치는 0으로
+            cond = cond * valid_token  # signal_type + spatial_id만 token에 더해짐
+        else:
+            loc_emb = self.loc_proj(patch_loc)  # (B, N, d_model)
+            scale_emb = self.scale_proj(patch_scale)  # (B, N, d_model)
+            cond = (cond + loc_emb + scale_emb) * valid_token
 
         # 7. Pred Mask 생성 (random/block/variate-level)
         pred_mask: torch.Tensor | None = None
@@ -445,8 +475,8 @@ class BiosignalFoundationModel(nn.Module):
         # MoE 라우팅에서 padded 토큰 제외용 — (B, N) bool
         token_valid = (p_vid > 0)
         encoder_kwargs = dict(
-            var_id=p_vid, time_id=time_id, token_mask=token_valid
-        )  # RoPE는 상대적 time_id; token_mask는 MoE aux_loss 산정용
+            var_id=p_vid, time_id=time_id, token_mask=token_valid, cond=ada_cond,
+        )  # RoPE는 상대적 time_id; token_mask는 MoE aux_loss 산정용; cond는 AdaLN용 (None이면 무시)
         use_causal = task in ("next_pred", "both")
 
         # causal mask (next_pred, both에서 공유)

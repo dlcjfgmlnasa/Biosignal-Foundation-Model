@@ -17,7 +17,7 @@ from torch import nn
 
 from .attention import GroupedQueryAttention
 from .ffn import FeedForward, GatedLinearUnitFeedForward, MoEFeedForward
-from .norm import RMSNorm
+from .norm import AdaRMSNorm, RMSNorm
 from .position import AttentionBias, QueryKeyProjection
 
 
@@ -62,6 +62,13 @@ class TransformerEncoderLayer(nn.Module):
         self.norm2 = norm2 or nn.Identity()
         self.dropout = nn.Dropout(post_attn_dropout_p)
 
+    def _norm(self, n: nn.Module, x: torch.Tensor, cond: torch.Tensor | None) -> torch.Tensor:
+        """AdaRMSNorm일 때만 cond를 전달, 그 외엔 plain norm."""
+        if isinstance(n, AdaRMSNorm):
+            assert cond is not None, "AdaRMSNorm requires cond"
+            return n(x, cond)
+        return n(x)
+
     def forward(
         self,
         x: torch.Tensor,  # (*batch, time_len, dim)
@@ -69,17 +76,20 @@ class TransformerEncoderLayer(nn.Module):
         var_id: torch.Tensor | None = None,  # (*batch, time_len) long
         time_id: torch.Tensor | None = None,  # (*batch, time_len) long
         token_mask: torch.Tensor | None = None,  # (*batch, time_len) bool — True=유효
+        cond: torch.Tensor | None = None,  # (*batch, time_len, d_cond) — AdaLN conditioning
     ) -> torch.Tensor:  # (*batch, time_len, dim)
         if self.pre_norm:
             x = x + self._sa_block(
-                self.norm1(x), attn_mask, var_id=var_id, time_id=time_id
+                self._norm(self.norm1, x, cond), attn_mask, var_id=var_id, time_id=time_id
             )
-            x = x + self.ffn(self.norm2(x), token_mask=token_mask)
+            x = x + self.ffn(self._norm(self.norm2, x, cond), token_mask=token_mask)
         else:
-            x = self.norm1(
-                x + self._sa_block(x, attn_mask, var_id=var_id, time_id=time_id)
+            x = self._norm(
+                self.norm1,
+                x + self._sa_block(x, attn_mask, var_id=var_id, time_id=time_id),
+                cond,
             )
-            x = self.norm2(x + self.ffn(x, token_mask=token_mask))
+            x = self._norm(self.norm2, x + self.ffn(x, token_mask=token_mask), cond)
 
         return x
 
@@ -164,9 +174,12 @@ class TransformerEncoder(nn.Module):
         d_ff: int | None = None,
         num_experts: int = 8,
         num_experts_per_token: int = 2,
+        use_adaln: bool = False,
+        d_cond: int = 0,
     ):
         super().__init__()
         self.use_moe = use_moe
+        self.use_adaln = use_adaln
         num_heads = num_heads or d_model // 64
         num_groups = num_groups or num_heads  # 기본 MHA
 
@@ -219,7 +232,14 @@ class TransformerEncoder(nn.Module):
                 bias=False,
                 ffn_dropout_p=dropout_p,
             )
-        get_encoder_layer_norm = partial(norm_layer, d_model)
+        if use_adaln:
+            assert d_cond > 0, "use_adaln requires d_cond > 0"
+            get_encoder_layer_norm = partial(AdaRMSNorm, d_model, d_cond=d_cond)
+            # 최종 norm도 AdaLN 적용 — encoder 출력이 cond에 의존하도록
+            final_norm = AdaRMSNorm(d_model, d_cond=d_cond)
+        else:
+            get_encoder_layer_norm = partial(norm_layer, d_model)
+            final_norm = norm_layer(d_model)
 
         self.layers = nn.ModuleList(
             [
@@ -234,7 +254,7 @@ class TransformerEncoder(nn.Module):
                 for _ in range(num_layers)
             ]
         )
-        self.norm = norm_layer(d_model)
+        self.norm = final_norm
 
     @staticmethod
     def get_layer(
@@ -259,9 +279,14 @@ class TransformerEncoder(nn.Module):
         var_id: torch.Tensor | None = None,  # (*batch, time_len) long
         time_id: torch.Tensor | None = None,  # (*batch, time_len) long
         token_mask: torch.Tensor | None = None,  # (*batch, time_len) bool — True=유효
+        cond: torch.Tensor | None = None,  # (*batch, time_len, d_cond) — AdaLN
     ) -> torch.Tensor:  # (*batch, time_len, dim)
         for layer in self.layers:
             x = layer(
-                x, attn_mask, var_id=var_id, time_id=time_id, token_mask=token_mask
+                x, attn_mask, var_id=var_id, time_id=time_id,
+                token_mask=token_mask, cond=cond,
             )
+        if isinstance(self.norm, AdaRMSNorm):
+            assert cond is not None
+            return self.norm(x, cond)
         return self.norm(x)
