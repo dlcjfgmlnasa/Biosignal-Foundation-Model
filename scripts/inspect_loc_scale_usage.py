@@ -55,6 +55,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--task", type=str, default="masked",
                    choices=["masked", "both"],
                    help="forward task. 'masked'는 alpha만 측정, 'both'는 alpha+beta")
+    p.add_argument("--batch-size", type=int, default=None,
+                   help="override config.batch_size (큰 값일수록 shuffle ablation 의미 ↑)")
+    p.add_argument("--mask-ratio", type=float, default=None,
+                   help="override config.mask_ratio")
     return p.parse_args()
 
 
@@ -126,10 +130,11 @@ def build_loaders(
         shard_index_path=config.shard_index_path,
         shard_cache_size=config.shard_cache_size,
     )
+    bs = args.batch_size if args.batch_size is not None else config.batch_size
     val_loader = create_dataloader(
         val_dataset,
         max_length=config.max_length,
-        batch_size=config.batch_size,
+        batch_size=bs,
         shuffle=False,
         num_workers=0,  # inspection만이라 단순화
         pin_memory=False,
@@ -326,6 +331,11 @@ def main() -> None:
     # Config + ckpt
     config = TrainConfig.from_yaml(args.config)
     print(f"Config loaded: {args.config}")
+    if args.mask_ratio is not None:
+        config.mask_ratio = args.mask_ratio
+        print(f"  override mask_ratio={config.mask_ratio}")
+    if args.batch_size is not None:
+        print(f"  override batch_size={args.batch_size}")
 
     ckpt_state = torch.load(args.ckpt, map_location=device, weights_only=False)
     config.model_config = reconcile_model_config(ckpt_state, config.model_config)
@@ -414,7 +424,7 @@ def main() -> None:
 
     # 출력
     print()
-    print(f"  {'case':18s} | {'total':>10s} | {'masked':>10s} | {'next':>10s} | {'cross':>10s} | {'Δ total %':>10s}")
+    print(f"  {'case':18s} | {'total':>10s} | {'masked':>10s} | {'next':>10s} | {'cross':>10s} | {'delta %':>10s}")
     print(f"  {'-' * 18} | {'-' * 10} | {'-' * 10} | {'-' * 10} | {'-' * 10} | {'-' * 10}")
     base_total = baseline.get("total", baseline.get("masked_loss", 0.0))
     for label, r in rows:
@@ -425,7 +435,7 @@ def main() -> None:
         nxt = r.get("next_loss", 0.0)
         crs = r.get("cross_modal_loss", 0.0)
         delta = ((tot - base_total) / base_total * 100.0) if base_total > 0 else 0.0
-        delta_str = "  ──    " if label == "baseline" else f"{delta:+8.2f}"
+        delta_str = "    --    " if label == "baseline" else f"{delta:+8.2f}"
         print(f"  {label:18s} | {tot:10.4f} | {msk:10.4f} | {nxt:10.4f} | {crs:10.4f} | {delta_str}")
 
     # 의사결정
@@ -439,14 +449,14 @@ def main() -> None:
     if base_total > 0 and zero_both_total is not None:
         delta_zb = (zero_both_total - base_total) / base_total * 100.0
         if delta_zb < 5.0:
-            verdict = "<5% : 모델이 loc/scale embedding을 거의 무시 → (c) AdaLN 도입 권장"
+            verdict = "<5% : model mostly ignores loc/scale embedding -> recommend AdaLN"
         elif delta_zb < 20.0:
-            verdict = "5–20% : 부분 사용 → 진행 가능, paper에 ablation 표 기재"
+            verdict = "5-20% : partial use -> OK to proceed, log ablation table in paper"
         else:
-            verdict = ">20% : 잘 사용 중 → 현재 설계 유지"
-        print(f"  zero(loc+scale) Δ total = {delta_zb:+.2f}%  →  {verdict}")
+            verdict = ">20% : well used -> current design OK"
+        print(f"  zero(loc+scale) delta_total = {delta_zb:+.2f}%  ->  {verdict}")
     else:
-        print("  (could not compute verdict — missing total loss)")
+        print("  (could not compute verdict - missing total loss)")
 
 
 if __name__ == "__main__":
