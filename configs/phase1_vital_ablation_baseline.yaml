@@ -42,11 +42,11 @@ min_patches: 5
 shard_index_path: /home/coder/workspace/updown/bio_fm/data/train/vitaldb/vitaldb_wbs/shard_index.json
 shard_cache_size: 1
 
-# ── 학습 (단축: 80→6 epochs, 10000→2000 batches/epoch) ──
+# ── 학습 (단축: 80→30 epochs, 10000→2000 batches/epoch) ──
 batch_size: 128
 lr: 8.0e-4
-n_epochs: 6                    # 빠른 A/B용 (full 80 → 6)
-warmup_epochs: 1               # 10% 유지
+n_epochs: 30                   # A/B용 (full 80 → 30)
+warmup_epochs: 3               # 10% 유지
 min_lr_ratio: 0.1
 mask_ratio: 0.4
 gradient_clip: 1.0

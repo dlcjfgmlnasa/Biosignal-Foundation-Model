@@ -49,8 +49,8 @@ shard_cache_size: 1
 
 batch_size: 128
 lr: 8.0e-4
-n_epochs: 6
-warmup_epochs: 1
+n_epochs: 30
+warmup_epochs: 3
 min_lr_ratio: 0.1
 mask_ratio: 0.4
 gradient_clip: 1.0
