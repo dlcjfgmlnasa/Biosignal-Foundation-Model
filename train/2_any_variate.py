@@ -279,7 +279,7 @@ def main():
         print(f"Device: {device}" + (f" (DDP: {world_size} GPUs)" if use_ddp else ""))
         print(f"{'=' * 60}")
 
-    # ── Phase 1 Checkpoint ──
+    # ── Checkpoint (Phase 1 transition or Phase 2 resume) ──
     ckpt_path = args.resume
     if ckpt_path is None:
         found = find_phase1_checkpoint()
@@ -291,13 +291,19 @@ def main():
                 cleanup_ddp()
             return
         ckpt_path = str(found)
-    if rank0:
-        print(f"Loading Phase 1 checkpoint: {ckpt_path}")
 
     # Model + checkpoint load
     # Phase 1 checkpoint의 config 기반으로 아키텍처를 결정하되, 각 필드를
     # 카테고리별로 명시적으로 처리한다. silent override(yaml 무시) 방지.
     ckpt_state = torch.load(ckpt_path, map_location=device, weights_only=False)
+    # phase 메타데이터로 두 모드 자동 감지:
+    #  - phase2_av* : 같은 phase 이어 학습 → optimizer/epoch/best_loss 복원
+    #  - 그 외(phase1_ci, 누락) : Phase 1 → 2 transition → weight만, optimizer fresh
+    ckpt_phase = str(ckpt_state.get("phase", ""))
+    is_resume_phase2 = ckpt_phase.startswith("phase2_av")
+    mode_label = "Resume Phase 2" if is_resume_phase2 else "Transition from Phase 1"
+    if rank0:
+        print(f"Loading checkpoint ({mode_label}): {ckpt_path}")
     if "config" in ckpt_state:
         ckpt_model_config = ModelConfig.from_dict(ckpt_state["config"])
         user_model_config = config.model_config
@@ -378,13 +384,18 @@ def main():
             )
 
     model = BiosignalFoundationModel.from_config(config.model_config)
-    state = load_checkpoint(ckpt_path, model, device=device)
+    # Transition 모드는 여기서 weight만 로드. Resume 모드는 optimizer 생성 후
+    # 아래에서 한 번에 weight + optimizer state를 복원하므로 여기선 skip.
+    if not is_resume_phase2:
+        state = load_checkpoint(ckpt_path, model, device=device)
+    else:
+        state = ckpt_state  # 메타데이터만 사용
     model.to(device)
 
-    phase1_epoch = state.get("epoch", "?")
-    phase1_loss = state.get("loss", "?")
+    ckpt_epoch = state.get("epoch", "?")
+    ckpt_loss = state.get("loss", "?")
     if rank0:
-        print(f"  Phase 1 epoch: {phase1_epoch}, loss: {phase1_loss}")
+        print(f"  Checkpoint epoch: {ckpt_epoch}, loss: {ckpt_loss}")
         total_params = sum(p.numel() for p in model.parameters())
         print(f"Model params: {total_params:,}")
 
@@ -393,9 +404,10 @@ def main():
             output_dir,
             phase_name="Phase2_AV",
             extra_info={
-                "phase1_ckpt": ckpt_path,
-                "phase1_epoch": str(phase1_epoch),
-                "phase1_loss": str(phase1_loss),
+                "resume_ckpt": ckpt_path,
+                "resume_mode": mode_label,
+                "ckpt_epoch": str(ckpt_epoch),
+                "ckpt_loss": str(ckpt_loss),
                 "next_block_size": str(config.model_config.next_block_size),
             },
         )
@@ -515,6 +527,36 @@ def main():
     if rank0 and scaler is not None:
         print("AMP enabled (GradScaler)")
 
+    # ── Resume state restore (Phase 2 ckpt만 해당) ──
+    # save_training_checkpoint은 scheduler/scaler state는 저장하지 않으므로,
+    # Phase 1과 동일하게 scheduler.step()을 start_epoch까지 다시 돌려 LR을 맞춘다.
+    start_epoch = 0
+    resumed_best_loss: float | None = None
+    if is_resume_phase2:
+        resume_state = load_checkpoint(
+            ckpt_path, raw_model, optimizer=optimizer, device=device
+        )
+        start_epoch = int(resume_state.get("epoch", 0)) + 1
+        loss_val = resume_state.get("loss", float("inf"))
+        try:
+            resumed_best_loss = float(loss_val)
+        except (TypeError, ValueError):
+            resumed_best_loss = None
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            for _ in range(start_epoch):
+                scheduler.step()
+        if rank0:
+            best_str = (
+                f"{resumed_best_loss:.6f}" if resumed_best_loss is not None else "?"
+            )
+            print(
+                f"Resumed: continuing from epoch {start_epoch}, "
+                f"best_loss={best_str}, "
+                f"LR={optimizer.param_groups[0]['lr']:.6e}"
+            )
+
     # ── Visualization cache ──
     viz_every = getattr(args, "viz_every", 5)
     if hasattr(config, "viz_every") and config.viz_every is not None:
@@ -586,14 +628,22 @@ def main():
         dist.barrier()
 
     # ── Training loop ──
-    best_loss = float("inf")
+    best_loss = (
+        resumed_best_loss if resumed_best_loss is not None else float("inf")
+    )
     early_stopper = (
         EarlyStopping(patience=config.patience) if config.patience > 0 else None
     )
     csv_logger = CSVLogger(output_dir / "training_log.csv") if rank0 else None
 
     if rank0:
-        print(f"\nStarting training: {config.n_epochs} epochs")
+        if start_epoch > 0:
+            print(
+                f"\nStarting training: epoch {start_epoch} → {config.n_epochs - 1} "
+                f"({config.n_epochs - start_epoch} epochs to go)"
+            )
+        else:
+            print(f"\nStarting training: {config.n_epochs} epochs")
         print(
             f"  alpha={config.alpha}, beta={config.beta}, gamma={config.gamma}, delta={config.delta}"
         )
@@ -610,7 +660,7 @@ def main():
             print(f"  val_ratio={config.val_ratio}, patience={config.patience}")
         print(f"{'=' * 60}")
 
-    for epoch in range(config.n_epochs):
+    for epoch in range(start_epoch, config.n_epochs):
         # DDP: sampler epoch sync
         if sampler is not None:
             sampler.set_epoch(epoch)
