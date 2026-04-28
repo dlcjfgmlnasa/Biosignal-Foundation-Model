@@ -9,7 +9,7 @@ Transformer Aggregator로 환자 수준 표현을 생성하여 cardiac_arrest �
     → [CLS] + h_1..h_K → Transformer Aggregator → CLS → Probe → cardiac_arrest 예측
 
 사용법:
-    python -m downstream.outcome.cardiac_arrest.run \
+    python -m downstream.acute_event.cardiac_arrest.run \
         --checkpoint best.pt \
         --data-path datasets/processed/cardiac_arrest/cardiac_arrest_w600s.pt \
         --mode linear_probe --epochs 30

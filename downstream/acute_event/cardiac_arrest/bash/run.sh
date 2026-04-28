@@ -2,7 +2,7 @@
 # cardiac arrest prediction — 실험 스크립트
 #
 # 사용법:
-#   bash downstream/outcome/cardiac_arrest/bash/run.sh
+#   bash downstream/acute_event/cardiac_arrest/bash/run.sh
 
 set -e
 
@@ -24,7 +24,7 @@ EXP_DIR="${OUT_DIR}/linear_probe"
 mkdir -p "$EXP_DIR"
 
 echo -e "\n[1/2] Linear Probe"
-python -m downstream.outcome.cardiac_arrest.run \
+python -m downstream.acute_event.cardiac_arrest.run \
     --checkpoint "$CHECKPOINT" \
     --data-path "$DATA_PATH" \
     --mode linear_probe \
@@ -38,7 +38,7 @@ EXP_DIR="${OUT_DIR}/lora"
 mkdir -p "$EXP_DIR"
 
 echo -e "\n[2/2] LoRA Fine-tuning"
-python -m downstream.outcome.cardiac_arrest.run \
+python -m downstream.acute_event.cardiac_arrest.run \
     --checkpoint "$CHECKPOINT" \
     --data-path "$DATA_PATH" \
     --mode lora \

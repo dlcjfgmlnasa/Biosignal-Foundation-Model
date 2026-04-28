@@ -1,20 +1,24 @@
 # -*- coding:utf-8 -*-
-"""cardiac arrest prediction — 데이터 준비.
+"""cardiac arrest prediction — 데이터 준비 (Acute Event Approach 1).
 
 MIMIC-III Waveform + cardiac_arrest cohort CSV →
-Cardiac Arrest 예측용 환자 단위 train/test .pt 파일 생성.
+Cardiac Arrest 조기 경보 예측용 환자 단위 train/test .pt 파일 생성.
 
-라벨: cardiac_arrest (0=non-cardiac_arrest, 1=cardiac_arrest)
+Framework: Acute Event Detection (Approach 1, Future Prediction)
+  - Hypotension(1.1.1) / ICH(1.1.3) 와 동일한 sliding window framework
+  - 600s(10min) input window, 30s stride
+  - download_waveforms.py가 risk-set matched anchor를 제공한 후 호출
 
-Mortality task와 동일한 구조이되, 라벨이 cardiac_arrest3이다.
+라벨: cardiac_arrest (0=non-arrest, 1=arrest)
+
 교차 일반화 스토리: 한국 데이터(VitalDB) pretrain → 미국 데이터(MIMIC-III) 평가.
 
 사용법:
-    python -m downstream.outcome.cardiac_arrest.prepare_data \
-        --cohort-csv downstream/outcome/cardiac_arrest/bquxjob_cardiac_arrest_TODO.csv \
+    python -m downstream.acute_event.cardiac_arrest.prepare_data \
+        --cohort-csv downstream/acute_event/cardiac_arrest/bquxjob_cardiac_arrest_TODO.csv \
         --waveform-dir datasets/raw/mimic3-waveform-cardiac-arrest \
         --out-dir datasets/processed/cardiac_arrest \
-        --window-sec 600 --stride-sec 300
+        --window-sec 600 --stride-sec 30
 """
 
 from __future__ import annotations
@@ -147,7 +151,7 @@ def prepare_dataset(
     waveform_dir: str,
     out_dir: str,
     window_sec: float = 600.0,
-    stride_sec: float = 300.0,
+    stride_sec: float = 30.0,  # 30s sliding (Acute Event 표준 — hypotension/ICH와 일관)
     train_ratio: float = 0.7,
     max_patients: int | None = None,
 ) -> None:
@@ -302,8 +306,11 @@ def main() -> None:
     parser.add_argument("--cohort-csv", type=str, required=True)
     parser.add_argument("--waveform-dir", type=str, required=True)
     parser.add_argument("--out-dir", type=str, default="datasets/processed/cardiac_arrest")
-    parser.add_argument("--window-sec", type=float, default=600.0)
-    parser.add_argument("--stride-sec", type=float, default=300.0)
+    parser.add_argument("--window-sec", type=float, default=600.0,
+                        help="입력 윈도우 길이(초). 기본 600s (10분).")
+    parser.add_argument("--stride-sec", type=float, default=30.0,
+                        help="sliding window stride(초). 기본 30s "
+                             "(Acute Event 표준 — Hypotension/ICH와 일관).")
     parser.add_argument("--train-ratio", type=float, default=0.7)
     parser.add_argument("--max-patients", type=int, default=None)
     args = parser.parse_args()

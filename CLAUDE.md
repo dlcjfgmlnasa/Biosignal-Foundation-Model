@@ -84,15 +84,15 @@ main.py     # Entry point / training orchestration
 
 사전학습된 encoder는 아래 9개 downstream task에 transfer된다 (카테고리 명칭은 영문 유지).
 
-### 1. Acute Event Detection (분류 head — binary 또는 multi-class)
+### 1. Acute Event Detection (분류 head — binary 또는 multi-class, 5-30 min horizon)
 - Intraoperative Hypotension Prediction
 - Arrhythmia Classification
 - Intracranial Hypertension
+- Cardiac Arrest Prediction (5/15/30 min horizon, risk-set matched negatives)
 
-### 2. Outcome Prediction (분류 head — 시점 예측)
+### 2. Outcome Prediction (분류 head — 시점 예측, 시간 단위 horizon)
 - Sepsis Prediction
 - Mortality Prediction
-- Cardiac Arrest Prediction
 - Postoperative Acute Kidney Injury Prediction
 
 ### 3. Physiological Generation (생성 head — patch decoder)

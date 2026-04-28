@@ -6,17 +6,17 @@ download_waveforms.py의 레코드 선택 로직(onset ± pre/post hours)과
 목록만 파일로 떨어뜨린다.
 
 사용법:
-    python -m downstream.outcome.cardiac_arrest.build_records_to_download \
-        --cohort-csv downstream/outcome/cardiac_arrest/bquxjob_cardiac_arrest_TODO.csv \
-        --records-file downstream/outcome/cardiac_arrest/RECORDS-waveforms \
-        --out-file downstream/outcome/cardiac_arrest/RECORDS-to-download
+    python -m downstream.acute_event.cardiac_arrest.build_records_to_download \
+        --cohort-csv downstream/acute_event/cardiac_arrest/bquxjob_cardiac_arrest_TODO.csv \
+        --records-file downstream/acute_event/cardiac_arrest/RECORDS-waveforms \
+        --out-file downstream/acute_event/cardiac_arrest/RECORDS-to-download
 """
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
 
-from downstream.outcome.cardiac_arrest.download_waveforms import (
+from downstream.acute_event.cardiac_arrest.download_waveforms import (
     load_cohort,
     load_waveform_index,
     select_records_for_patient,
@@ -31,7 +31,7 @@ def main() -> None:
     parser.add_argument("--records-file", type=str, required=True)
     parser.add_argument(
         "--out-file", type=str,
-        default="downstream/outcome/cardiac_arrest/RECORDS-to-download",
+        default="downstream/acute_event/cardiac_arrest/RECORDS-to-download",
     )
     parser.add_argument("--pre-hours", type=float, default=24.0)
     parser.add_argument("--post-hours", type=float, default=6.0)

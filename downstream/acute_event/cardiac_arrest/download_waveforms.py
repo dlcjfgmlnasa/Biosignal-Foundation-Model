@@ -1,40 +1,51 @@
 # -*- coding:utf-8 -*-
-"""MIMIC-III Waveform 선택적 다운로드 — Cardiac Arrest onset 주변만.
+"""MIMIC-III Waveform 선택적 다운로드 — Cardiac Arrest (Acute Event 방식).
 
-cardiac_arrest_cohort CSV + RECORDS-waveforms → prediction horizon union window 다운로드.
+cardiac_arrest_cohort CSV + RECORDS-waveforms → 예측 시점 기준 윈도우 다운로드.
 
-각 환자에 대해:
+Framework: **Acute Event Detection (Approach 1, Future Prediction)**
+  - 5/15/30분 horizon으로 곧 일어날 cardiac arrest를 조기 경보
+  - Hypotension(1.1.1) / ICH(1.1.3)와 동일한 framework
+
+각 환자의 다운로드 윈도우:
   - Cardiac Arrest+: horizons의 union window — [onset - pre - max(h), onset - min(h) + post]
+    여기서 onset = first arrest documented time (chartevents asystole/VF/VT 우선,
+    부재 시 procedureevents CPR 시작).
     → 한 번 다운로드로 여러 horizon downstream 평가 가능 (multi-horizon reporting).
-  - Cardiac Arrest-: ICU intime 기준 [intime, intime + pre + post] 구간.
+  - Cardiac Arrest- (risk-set matching): positive의 (t_arrest - icu_intime) Δt 분포에서
+    무작위 Δt 샘플링하여 anchor = icu_intime + Δt 설정. icu_los가 Δt + max(h) + pre를
+    수용하는 negative만 채택. 결과적으로 positive와 동일 시간 컨텍스트(ICU 입실 후 동일
+    시간)에서 윈도우를 추출하여 shortcut learning ("입실 직후 stable vs. 후기 deterio-
+    rating") 방지.
 
 Cohort 로드:
   - Subject-level dedup (multi-stay → 1명)
   - Seeded shuffle (top-N slice bias 제거)
 
-Paper 1 Outcome Prediction 통일 horizon: **T-4/6/12/24h**
-  (Sepsis/Cardiac Arrest/Mortality 동일; Yun 2022 + Nemati 2018 + Futoma 2017 계보 모두 커버)
+기본 horizons (Acute Event scale): **5 / 15 / 30 분** (= 0.0833 / 0.25 / 0.5 hours)
+  (Pioneer/JAHA 2024, Tonekaboni/Lancet Digit Health 2020, Kwon/JAHA 2018 계보)
+  --pre-hours 0.1667 (= 10분 input window) 권장
 
 사용법:
-    # Multi-horizon (4h, 6h, 12h, 24h — paper 1 표준)
-    python -m downstream.outcome.cardiac_arrest.download_waveforms \\
-        --cohort-csv downstream/outcome/cardiac_arrest/bquxjob_cardiac_arrest_TODO.csv \\
-        --records-file downstream/outcome/cardiac_arrest/RECORDS-waveforms \\
+    # 기본 (5/15/30 min horizon, 10분 input window)
+    python -m downstream.acute_event.cardiac_arrest.download_waveforms \\
+        --cohort-csv downstream/acute_event/cardiac_arrest/bquxjob_cardiac_arrest_TODO.csv \\
+        --records-file downstream/acute_event/cardiac_arrest/RECORDS-waveforms \\
         --out-dir datasets/raw/mimic3-waveform-cardiac-arrest \\
         --max-arrest-pos 500 --max-arrest-neg 2500 \\
-        --horizons 4 6 12 24 --seed 42
+        --horizons 0.0833 0.25 0.5 --pre-hours 0.1667 --seed 42
 
-    # 단일 horizon fallback (e.g., T-12h만)
-    python -m downstream.outcome.cardiac_arrest.download_waveforms \\
-        --cohort-csv downstream/outcome/cardiac_arrest/bquxjob_cardiac_arrest_TODO.csv \\
-        --records-file downstream/outcome/cardiac_arrest/RECORDS-waveforms \\
+    # 단일 horizon fallback (e.g., 15분만)
+    python -m downstream.acute_event.cardiac_arrest.download_waveforms \\
+        --cohort-csv downstream/acute_event/cardiac_arrest/bquxjob_cardiac_arrest_TODO.csv \\
+        --records-file downstream/acute_event/cardiac_arrest/RECORDS-waveforms \\
         --out-dir datasets/raw/mimic3-waveform-cardiac-arrest \\
-        --prediction-horizon-h 12 --seed 42
+        --prediction-horizon-h 0.25 --pre-hours 0.1667 --seed 42
 
 Cohort 크기 권고:
     - arrest+ (positive): ~500-1500 (MIMIC-III waveform 교집합 기준, rare event)
-    - arrest- (negative): ~2500 (natural prevalence ~1:5) 또는 balanced 500:500
-    - Yun 2022 MIMIC-IV와 유사 scale
+    - arrest- (negative): ~2500 (natural prevalence ~1:5) — risk-set matching 후 일부 손실 가능
+    - Tonekaboni 2020 / Kwon 2018 MIMIC-III와 유사 scale
 """
 
 from __future__ import annotations
@@ -178,10 +189,103 @@ def parse_datetime_str(s: str) -> datetime | None:
     return None
 
 
+def assign_negative_anchors(
+    arrest_pos: list[dict],
+    arrest_neg: list[dict],
+    pre_hours: float,
+    post_hours: float,
+    horizons: list[float],
+    seed: int = 42,
+) -> list[dict]:
+    """Risk-set matching으로 negative 환자에게 anchor_time을 할당한다.
+
+    Approach 1 (Future Prediction)에서 positive와 negative의 시간 컨텍스트를 맞추기
+    위한 처리. 단순히 icu_intime을 anchor로 쓰면 positive(arrest 직전, ICU 후기)와
+    negative(ICU 입실 직후)가 ICU 체류 시점이 달라 모델이 "체류 시점"을 shortcut
+    feature로 학습할 수 있다.
+
+    Algorithm:
+      1. positive별 Δt_p = (first_arrest_time - icu_intime) 계산.
+      2. negative별 icu_los = (icu_outtime - icu_intime) 계산.
+      3. negative마다 {Δt_p : Δt_p + post_hours ≤ icu_los AND
+                       Δt_p ≥ pre_hours + max(horizons)} 후보군에서 무작위 1개 샘플링.
+         (= "이 환자가 동일 Δt 시점에 ICU에 있었고, 윈도우가 stay 안에 들어가는 경우")
+      4. 후보군이 비어있는 negative는 매칭 실패 → 제외.
+      5. anchor_time = icu_intime + Δt 를 patient dict에 기록.
+
+    Returns
+    -------
+    Risk-set matching에 성공한 negative 환자 리스트 (실패한 환자는 제외됨).
+    각 dict에 새 키 "anchor_time" (ISO datetime 문자열) 추가.
+    """
+    rng = random.Random(seed)
+    max_h = max(horizons) if horizons else 0.0
+    min_window_required = pre_hours + max_h  # Δt가 최소 이만큼은 되어야 윈도우가 stay 안에 들어감
+
+    # 1) positive의 Δt 분포 계산
+    delta_t_pool: list[float] = []
+    for p in arrest_pos:
+        intime = parse_datetime_str(p["icu_intime"])
+        arrest_t = parse_datetime_str(p["first_arrest_time"])
+        if intime is None or arrest_t is None:
+            continue
+        dt_h = (arrest_t - intime).total_seconds() / 3600.0
+        if dt_h < min_window_required:
+            continue  # 윈도우가 stay 시작 전으로 빠지면 사용 불가
+        delta_t_pool.append(dt_h)
+
+    if not delta_t_pool:
+        print(
+            "  WARN: positive Δt pool empty — risk-set matching unavailable. "
+            "Falling back to icu_intime anchor for all negatives.",
+            file=sys.stderr,
+        )
+        for n in arrest_neg:
+            n["anchor_time"] = n["icu_intime"]
+        return arrest_neg
+
+    print(f"  Positive Δt pool: n={len(delta_t_pool)}, "
+          f"min={min(delta_t_pool):.2f}h, max={max(delta_t_pool):.2f}h, "
+          f"median={sorted(delta_t_pool)[len(delta_t_pool)//2]:.2f}h")
+
+    # 2) negative마다 risk-set 매칭
+    matched: list[dict] = []
+    n_skip_no_los = 0
+    n_skip_no_match = 0
+
+    for n in arrest_neg:
+        intime = parse_datetime_str(n["icu_intime"])
+        outtime = parse_datetime_str(n["icu_outtime"])
+        if intime is None or outtime is None:
+            n_skip_no_los += 1
+            continue
+        icu_los_h = (outtime - intime).total_seconds() / 3600.0
+
+        # 후보: pre_window가 stay 안에 들어가고, post가 outtime을 넘지 않음
+        candidates = [
+            dt for dt in delta_t_pool
+            if dt >= min_window_required and dt + post_hours <= icu_los_h
+        ]
+        if not candidates:
+            n_skip_no_match += 1
+            continue
+
+        chosen_dt = rng.choice(candidates)
+        anchor = intime + timedelta(hours=chosen_dt)
+        n["anchor_time"] = anchor.strftime("%Y-%m-%d %H:%M:%S")
+        n["matched_delta_t_h"] = chosen_dt
+        matched.append(n)
+
+    print(f"  Risk-set matching: kept {len(matched)}/{len(arrest_neg)} negatives "
+          f"(skip: invalid_stay={n_skip_no_los}, no_match={n_skip_no_match})")
+
+    return matched
+
+
 def select_records_for_patient(
     patient: dict,
     wf_records: list[tuple[str, datetime]],
-    pre_hours: float = 24.0,
+    pre_hours: float = 0.1667,  # 10 min default (acute event scale)
     post_hours: float = 0.0,
     horizons: list[float] | None = None,
 ) -> list[str]:
@@ -194,27 +298,29 @@ def select_records_for_patient(
       → 한 번 다운로드로 여러 horizon downstream 평가 가능.
       → horizons=[0]이면 legacy 동작 ([onset - pre, onset + post]).
 
-    Cardiac Arrest- window (horizon 무관):
-      [icu_intime, icu_intime + pre_hours + post_hours]
+    Cardiac Arrest- window (risk-set matched):
+      assign_negative_anchors()로 미리 부여된 anchor_time을 positive와 동일 구조로 사용:
+          [anchor - pre_hours - max(h), anchor - min(h) + post_hours]
+      anchor_time 키가 없으면 icu_intime fallback (legacy).
     """
     if horizons is None or len(horizons) == 0:
         horizons = [0.0]
 
     if patient["cardiac_arrest"] == 1:
         center = parse_datetime_str(patient["first_arrest_time"])
-        if center is None:
-            return []
-        max_h = max(horizons)
-        min_h = min(horizons)
-        window_start = center - timedelta(hours=pre_hours + max_h)
-        window_end = center - timedelta(hours=min_h) + timedelta(hours=post_hours)
     else:
-        center = parse_datetime_str(patient["icu_intime"])
-        if center is None:
-            return []
-        duration = pre_hours + post_hours
-        window_start = center
-        window_end = center + timedelta(hours=duration)
+        # Risk-set matched anchor (assign_negative_anchors가 부여) 또는 fallback
+        center = parse_datetime_str(
+            patient.get("anchor_time") or patient["icu_intime"]
+        )
+
+    if center is None:
+        return []
+
+    max_h = max(horizons)
+    min_h = min(horizons)
+    window_start = center - timedelta(hours=pre_hours + max_h)
+    window_end = center - timedelta(hours=min_h) + timedelta(hours=post_hours)
 
     selected = []
     for rec_path, rec_dt in wf_records:
@@ -284,8 +390,9 @@ def main() -> None:
         help="최대 arrest- 환자 수 (None=전부)",
     )
     parser.add_argument(
-        "--pre-hours", type=float, default=24.0,
-        help="윈도우 duration 전반부 (arrest+: anchor 전, arrest-: intime 후)",
+        "--pre-hours", type=float, default=0.1667,  # 10 min
+        help="입력 윈도우 길이(시간). 기본 0.1667h = 10분 (Acute Event scale). "
+             "Outcome-style이면 24.0 등 사용 가능.",
     )
     parser.add_argument(
         "--post-hours", type=float, default=0.0,
@@ -294,13 +401,16 @@ def main() -> None:
     parser.add_argument(
         "--prediction-horizon-h", type=float, default=0.0,
         help="단일 prediction horizon(시간). --horizons가 지정되면 무시됨. "
-             "> 0이면 onset-horizon 이전 신호만 사용 (label leakage 완화).",
+             "> 0이면 onset-horizon 이전 신호만 사용 (label leakage 완화). "
+             "예: 0.0833 (=5분), 0.25 (=15분), 0.5 (=30분).",
     )
     parser.add_argument(
-        "--horizons", type=float, nargs="+", default=None,
+        "--horizons", type=float, nargs="+",
+        default=[0.0833, 0.25, 0.5],  # 5/15/30 min (Acute Event default)
         help="여러 prediction horizon (시간) 다중 채택. 지정 시 모든 horizon을 "
              "커버하는 union window 한 번에 다운로드 → prepare_data.py에서 "
-             "horizon별로 cut 가능. 예: --horizons 4 6 12",
+             "horizon별로 cut 가능. 기본 [0.0833, 0.25, 0.5] = 5/15/30 min "
+             "(Acute Event framework).",
     )
     parser.add_argument(
         "--seed", type=int, default=42,
@@ -340,6 +450,17 @@ def main() -> None:
         arrest_pos = arrest_pos[: args.max_arrest_pos]
     if args.max_arrest_neg is not None:
         arrest_neg = arrest_neg[: args.max_arrest_neg]
+
+    # 3.5 Risk-set matching — negative에 anchor_time 부여 (Acute Event Approach 1)
+    print(f"\nRisk-set matching negatives (pre={args.pre_hours}h, "
+          f"max_horizon={max(horizons)}h)...")
+    arrest_neg = assign_negative_anchors(
+        arrest_pos, arrest_neg,
+        pre_hours=args.pre_hours,
+        post_hours=args.post_hours,
+        horizons=horizons,
+        seed=args.seed,
+    )
 
     all_patients = arrest_pos + arrest_neg
     print(f"\nTarget: {len(arrest_pos)} arrest+ + {len(arrest_neg)} arrest- "
@@ -427,6 +548,8 @@ def main() -> None:
     manifest_path = out_dir / "download_manifest.json"
     with open(manifest_path, "w") as f:
         json.dump({
+            "framework": "Acute Event Detection (Approach 1, Future Prediction)",
+            "negative_strategy": "risk-set matching (time-from-admission)",
             "n_patients": len(manifest),
             "n_arrest_pos": sum(1 for m in manifest if m["cardiac_arrest"] == 1),
             "n_arrest_neg": sum(1 for m in manifest if m["cardiac_arrest"] == 0),
