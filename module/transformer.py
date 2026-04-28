@@ -174,12 +174,10 @@ class TransformerEncoder(nn.Module):
         d_ff: int | None = None,
         num_experts: int = 8,
         num_experts_per_token: int = 2,
-        use_adaln: bool = False,
-        d_cond: int = 0,
+        d_cond: int = 16,
     ):
         super().__init__()
         self.use_moe = use_moe
-        self.use_adaln = use_adaln
         num_heads = num_heads or d_model // 64
         num_groups = num_groups or num_heads  # 기본 MHA
 
@@ -232,14 +230,10 @@ class TransformerEncoder(nn.Module):
                 bias=False,
                 ffn_dropout_p=dropout_p,
             )
-        if use_adaln:
-            assert d_cond > 0, "use_adaln requires d_cond > 0"
-            get_encoder_layer_norm = partial(AdaRMSNorm, d_model, d_cond=d_cond)
-            # 최종 norm도 AdaLN 적용 — encoder 출력이 cond에 의존하도록
-            final_norm = AdaRMSNorm(d_model, d_cond=d_cond)
-        else:
-            get_encoder_layer_norm = partial(norm_layer, d_model)
-            final_norm = norm_layer(d_model)
+        assert d_cond > 0, "AdaRMSNorm requires d_cond > 0"
+        get_encoder_layer_norm = partial(AdaRMSNorm, d_model, d_cond=d_cond)
+        # 최종 norm도 AdaRMSNorm 적용 — encoder 출력이 cond에 의존하도록
+        final_norm = AdaRMSNorm(d_model, d_cond=d_cond)
 
         self.layers = nn.ModuleList(
             [

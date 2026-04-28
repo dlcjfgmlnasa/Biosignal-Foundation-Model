@@ -38,9 +38,9 @@ main.py     # Entry point / training orchestration
 
 ### Implemented Components
 
-**`module/norm.py` — `RMSNorm`**: Root Mean Square Layer Normalization as a `torch.nn.Module`. Supports optional learnable weight (`gamma`), configurable `normalized_shape`, and numerical stability via `eps`.
+**`module/norm.py`**: `RMSNorm` (Root Mean Square Layer Normalization) + `AdaRMSNorm` (RMSNorm + AdaLN-style affine modulation conditioned on `cond` vector, zero-init for safe pretrain swap-in). Encoder의 모든 layer norm은 AdaRMSNorm을 사용한다.
 
-**`module/transformer.py`**: TransformerEncoder / TransformerEncoderLayer with GQA, GLU FFN, MoE, RoPE support.
+**`module/transformer.py`**: TransformerEncoder / TransformerEncoderLayer with GQA, GLU FFN, MoE, RoPE, AdaRMSNorm modulation 지원. 모든 layer가 `cond` 벡터를 받아 per-channel scale·shift gating 적용.
 
 **`module/attention.py`**: GroupedQueryAttention, MultiHeadAttention, MultiQueryAttention.
 
@@ -56,7 +56,7 @@ main.py     # Entry point / training orchestration
 
 **`module/patch.py`**: PatchEmbedding (고정/overlapping 패치 토큰화), MultiResolutionPatchEmbedding (MOIRAI 스타일 다중 해상도).
 
-**`model/biosignal_model.py`**: BiosignalFoundationModel — Scaler → PatchEmbedding → SpatialEmbedding → TransformerEncoder → Head 파이프라인. signal_type + spatial_id 이중 임베딩(Dual Additive Embedding) 지원. `task="masked"` (양방향 attention → reconstruction head + cross_head) / `task="next_pred"` (causal attention → next-patch head) 단일 encoder 기반 멀티태스크. forward 출력에 `time_id`, `cross_pred` 포함.
+**`model/biosignal_model.py`**: BiosignalFoundationModel — Scaler → PatchEmbedding → SpatialEmbedding → TransformerEncoder(AdaRMSNorm) → Head 파이프라인. signal_type + spatial_id 이중 임베딩(Dual Additive Embedding) 지원. (loc, scale)은 `cond_proj`(MLP 2→d_cond→d_cond)를 거쳐 모든 layer의 AdaRMSNorm modulation으로 주입됨 (per-patch loc/scale conditioning). `task="masked"` (양방향 attention → reconstruction head + cross_head) / `task="next_pred"` (causal attention → next-patch head) 단일 encoder 기반 멀티태스크. forward 출력에 `time_id`, `cross_pred` 포함. `d_cond` (default=16)는 hyperparameter로 조정 가능.
 
 **`loss/masked_mse_loss.py`**: MaskedPatchLoss (마스킹된 패치 MSE) + create_patch_mask (랜덤/variate-level 마스킹). Phase 2에서 variate_mask_prob로 전체 variate 마스킹 지원.
 
@@ -79,3 +79,26 @@ main.py     # Entry point / training orchestration
 - 텐서 타입은 `torch.Tensor`로 선언하고, 차원은 인라인 주석으로 명시: `x: torch.Tensor,  # (batch, seq_len, dim)`
 - Follow the `RMSNorm` pattern: `nn.Module` subclass with explicit `__init__` typed params and a typed `forward()`.
 - No tests or linting config yet — when adding, prefer `pytest` and `ruff`.
+
+## Downstream Tasks
+
+사전학습된 encoder는 아래 9개 downstream task에 transfer된다 (카테고리 명칭은 영문 유지).
+
+### 1. Acute Event Detection (분류 head — binary 또는 multi-class)
+- Intraoperative Hypotension Prediction
+- Arrhythmia Classification
+- Intracranial Hypertension
+
+### 2. Outcome Prediction (분류 head — 시점 예측)
+- Sepsis Prediction
+- Mortality Prediction
+- Cardiac Arrest Prediction
+- Postoperative Acute Kidney Injury Prediction
+
+### 3. Physiological Generation (생성 head — patch decoder)
+- Cross-Modal Reconstruction
+- Waveform Forecasting
+
+**Head 전략**:
+- 카테고리 1·2: 사전학습 encoder 위에 task-specific classification head 부착 (`extract_features()` 활용).
+- 카테고리 3: 사전학습 reconstruction(`cross_head`) / next-pred(`next_head`) head를 재사용하거나 fine-tune.
