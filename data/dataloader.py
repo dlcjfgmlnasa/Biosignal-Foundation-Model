@@ -5,6 +5,7 @@ from torch.utils.data import DataLoader, Sampler
 
 from data.collate import PackCollate
 from data.dataset import BiosignalDataset
+from data.length_aware_batch_sampler import LengthAwareBatchSampler
 from data.sampler import GroupedBatchSampler
 
 
@@ -23,6 +24,8 @@ def create_dataloader(
     stride: int | None = None,
     sampler: Sampler | None = None,
     min_patches: int = 5,
+    use_length_aware_batching: bool = False,
+    length_overpack: int = 8,
 ) -> DataLoader:
     """PackCollate가 적용된 DataLoader를 생성한다."""
     # slot_size: cross-modal 그루핑 단위 (같은 슬롯 = 같은 sample_id)
@@ -67,6 +70,29 @@ def create_dataloader(
         )
     else:
         # CI 모드: 개별 샘플 랜덤 샘플링 (DDP 시 sampler 사용)
+        # Length-aware batching: PackCollate FFD packing 의 memory variance 완화
+        if use_length_aware_batching:
+            if sampler is None:
+                raise ValueError(
+                    "use_length_aware_batching=True requires `sampler` "
+                    "(e.g. RecordingLocalitySampler). Pass sampler= explicitly."
+                )
+            batch_sampler = LengthAwareBatchSampler(
+                base_sampler=sampler,
+                dataset=dataset,
+                batch_size=batch_size,
+                overpack=length_overpack,
+                drop_last=drop_last,
+            )
+            return DataLoader(
+                dataset,
+                batch_sampler=batch_sampler,
+                num_workers=num_workers,
+                collate_fn=collate_fn,
+                pin_memory=pin_memory,
+                persistent_workers=(persistent_workers and num_workers > 0),
+                prefetch_factor=(prefetch_factor if num_workers > 0 else None),
+            )
         return DataLoader(
             dataset,
             batch_size=batch_size,

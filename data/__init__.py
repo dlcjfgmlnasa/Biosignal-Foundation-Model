@@ -4,6 +4,7 @@ from __future__ import annotations
 from data.collate import PackCollate, PackedBatch
 from data.dataloader import create_dataloader
 from data.dataset import BiosignalDataset, BiosignalSample, RecordingManifest
+from data.length_aware_batch_sampler import LengthAwareBatchSampler
 from data.sampler import GroupedBatchSampler, RecordingLocalitySampler
 from data.spatial_map import (
     SPATIAL_MAP,
@@ -19,6 +20,7 @@ __all__ = [
     "PackCollate",
     "PackedBatch",
     "GroupedBatchSampler",
+    "LengthAwareBatchSampler",
     "RecordingLocalitySampler",
     "create_dataloader",
     "SPATIAL_MAP",

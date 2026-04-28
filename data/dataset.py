@@ -380,6 +380,21 @@ class BiosignalDataset(Dataset[BiosignalSample]):
     def __len__(self) -> int:
         return self._rec_offsets[-1]
 
+    def length_at(self, idx: int) -> int:
+        """Flat 인덱스 → 예상 윈도우 길이 (디스크 read 없이).
+
+        Length-aware batch sampler 가 packing memory 균등화를 위해 사용.
+        ``crop_ratio_range`` 활성 시 실제 길이는 이 값 × crop_ratio 가 되지만
+        bucket 결정엔 base length 만으로 충분 (같은 base 가 같은 분포로 cropping).
+        ``window_seconds=None`` (가변) 인 경우 0 (= 모두 한 bucket) 으로 fallback.
+        """
+        rec_idx = (
+            bisect.bisect_right(self._rec_offsets, idx, hi=len(self._rec_offsets) - 1)
+            - 1
+        )
+        wl = self._window_lengths_per_rec[rec_idx]
+        return int(wl) if wl is not None else 0
+
     def set_epoch(self, epoch: int) -> None:
         """Random crop seed에 epoch을 섞어 epoch마다 다른 crop이 나오게 한다.
 

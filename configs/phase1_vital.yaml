@@ -104,3 +104,11 @@ output_dir: outputs/phase1
 checkpoint_every: 5
 viz_every: 1
 exp_name: vital_d256_L12_10min_p200_shard
+
+# ── Length-aware batching (opt-in) ──
+# Sanity test 결과: 우리 case (윈도우 길이 60000 ≈ max_length 64000) 에선
+# 대부분 unit 이 bin 하나를 단독 점유 → length 분포 영향 없이 max bins ≈ batch_size.
+# OOM 의 worst case 를 줄이지 못하므로 기본 비활성. 다른 데이터셋 / max_length 이
+# unit 길이보다 훨씬 클 때 (NLP sentence packing 등) 의미가 있다.
+use_length_aware_batching: false
+length_overpack: 8

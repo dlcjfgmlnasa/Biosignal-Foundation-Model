@@ -343,6 +343,8 @@ def main():
         prefetch_factor=8,
         persistent_workers=True,
         sampler=sampler,
+        use_length_aware_batching=config.use_length_aware_batching,
+        length_overpack=config.length_overpack,
     )
     if rank0:
         print(f"Train batches per epoch: {len(dataloader)}")
@@ -377,6 +379,8 @@ def main():
             prefetch_factor=8,
             persistent_workers=True,
             sampler=val_sampler,
+            use_length_aware_batching=config.use_length_aware_batching,
+            length_overpack=config.length_overpack,
         )
         if rank0:
             print(

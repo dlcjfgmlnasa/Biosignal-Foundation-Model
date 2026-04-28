@@ -92,6 +92,11 @@ class TrainConfig:
     output_dir: str = "outputs"
     checkpoint_every: int = 10  # 에폭 간격 체크포인트 저장
 
+    # Length-aware batching (FFD packing memory variance 완화 → OOM 방지)
+    # ci collate_mode 에서만 작동 (any_variate 는 GroupedBatchSampler 사용).
+    use_length_aware_batching: bool = False
+    length_overpack: int = 8  # buffer = batch_size × overpack (4~16 권장)
+
     # Validation & Early Stopping
     val_ratio: float = 0.2  # subject 단위 validation 비율
     patience: int = 10  # early stopping patience (0=비활성)
