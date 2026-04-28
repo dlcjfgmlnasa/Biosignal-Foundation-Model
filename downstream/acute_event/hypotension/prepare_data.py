@@ -13,12 +13,12 @@ Input 소스: 선택된 signal type의 현재 윈도우
     # 단일 조합
     python -m downstream.acute_event.hypotension.prepare_data \
         --data-dir vitaldb_pt_test --input-signals abp \
-        --window-secs 30 --horizon-mins 5
+        --window-secs 60 --horizon-mins 5
 
     # Sweep: window × horizon 전체 조합 생성
     python -m downstream.acute_event.hypotension.prepare_data \
         --data-dir vitaldb_pt_test --input-signals abp \
-        --window-secs 30 60 300 600 --horizon-mins 5 10 15
+        --window-secs 60 180 300 600 --horizon-mins 5 10 15
 """
 
 from __future__ import annotations
