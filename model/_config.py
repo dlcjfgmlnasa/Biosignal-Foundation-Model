@@ -77,9 +77,9 @@ class ModelConfig:
     # Contrastive
     contrastive_proj_dim: int = 0  # 0=비활성, >0=projection head 출력 차원
 
-    # AdaLN conditioning (loc/scale을 multiplicative gate로 강제 사용)
-    use_adaln: bool = False  # True면 additive loc/scale embedding 대신 AdaRMSNorm 사용
-    d_cond: int = 0  # AdaLN cond vector 차원. 0이면 d_model 사용
+    # AdaLN conditioning (loc/scale을 multiplicative gate로 모든 layer에 주입)
+    # AdaRMSNorm은 항상 활성화 — additive embedding은 ablation에서 열등 확인됨.
+    d_cond: int = 16  # AdaLN cond vector 차원 (ablation에서 16 채택, override 가능)
 
     def to_dict(self) -> dict:
         """Checkpoint 저장용 직렬화."""
