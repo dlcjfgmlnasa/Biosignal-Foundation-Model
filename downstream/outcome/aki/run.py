@@ -24,7 +24,9 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -32,6 +34,7 @@ import torch
 from torch import nn
 
 from downstream.metrics import (
+    bootstrap_ci,
     compute_auprc,
     compute_auroc,
     compute_f1,
@@ -58,6 +61,7 @@ def train_model(
     aggregator: TransformerAggregator,
     probe: LinearProbe,
     train_patients: list[dict],
+    val_patients: list[dict],
     label_mode: str,
     epochs: int,
     lr: float,
@@ -67,7 +71,13 @@ def train_model(
     batch_size: int = 8,
     use_lora: bool = False,
     gradient_clip: float = 1.0,
-) -> list[float]:
+) -> tuple[list[float], list[float], dict, int]:
+    """학습 + 매 epoch val에서 best AUROC ckpt 추적.
+
+    Returns
+    -------
+    train_losses, val_aurocs, best_state, best_epoch
+    """
     aggregator = aggregator.to(device)
     probe = probe.to(device)
     aggregator.train()
@@ -100,8 +110,17 @@ def train_model(
               f"(counts={class_counts.tolist()})")
 
     losses: list[float] = []
+    val_aurocs: list[float] = []
+    best_val_auroc = -float("inf")
+    best_state: dict = {}
+    best_epoch = 0
 
     for epoch in range(epochs):
+        aggregator.train()
+        probe.train()
+        if use_lora:
+            model.model.train()
+
         rng = np.random.default_rng(epoch)
         order = rng.permutation(len(train_patients))
 
@@ -142,10 +161,50 @@ def train_model(
 
         avg = epoch_loss / max(n_batches, 1)
         losses.append(avg)
-        if (epoch + 1) % 5 == 0 or epoch == 0:
-            print(f"  Epoch {epoch + 1}/{epochs}  loss={avg:.4f}")
 
-    return losses
+        # ── val 평가 + best-ckpt 추적 ──
+        val_metrics = evaluate_model(
+            model, aggregator, probe, val_patients, label_mode,
+            device=device, patch_size=patch_size, max_windows=max_windows,
+        )
+        val_metrics.pop("y_true", None)
+        val_metrics.pop("y_score", None)
+        val_auroc = (
+            val_metrics.get("auroc")
+            if label_mode == "binary"
+            else val_metrics.get("macro_auroc")
+        )
+        val_auroc = float(val_auroc) if val_auroc is not None else float("nan")
+        val_aurocs.append(val_auroc)
+
+        if not np.isnan(val_auroc) and val_auroc > best_val_auroc:
+            best_val_auroc = val_auroc
+            best_epoch = epoch + 1
+            best_state = {
+                "aggregator": copy.deepcopy(aggregator.state_dict()),
+                "probe": copy.deepcopy(probe.state_dict()),
+            }
+            if use_lora and hasattr(model, "model"):
+                best_state["lora"] = copy.deepcopy(model.model.state_dict())
+
+        print(
+            f"  Epoch {epoch + 1}/{epochs}  loss={avg:.4f}  "
+            f"val_auroc={val_auroc:.4f}  (best={best_val_auroc:.4f}@ep{best_epoch})"
+        )
+
+    if not best_state:
+        warnings.warn(
+            "No best state captured (val AUROC always NaN). Using last-epoch weights."
+        )
+        best_state = {
+            "aggregator": copy.deepcopy(aggregator.state_dict()),
+            "probe": copy.deepcopy(probe.state_dict()),
+        }
+        if use_lora and hasattr(model, "model"):
+            best_state["lora"] = copy.deepcopy(model.model.state_dict())
+        best_epoch = epochs
+
+    return losses, val_aurocs, best_state, best_epoch
 
 
 # ── 평가 ─────────────────────────────────────────────────────
@@ -271,7 +330,10 @@ def _compute_metrics_stage(y_true: np.ndarray, y_score: np.ndarray) -> dict:
 # ── 데이터 로딩 ──────────────────────────────────────────────
 
 
-def _load_data(data_path: str) -> tuple[list[dict], list[dict], dict]:
+def _load_data(
+    data_path: str, val_split_seed: int = 42
+) -> tuple[list[dict], list[dict], list[dict], dict]:
+    """Train/val/test 3-way 로드. legacy 2-way 산출물은 train에서 dynamic split."""
     print(f"\nLoading data: {data_path}")
     data = torch.load(data_path, weights_only=False)
     meta = data.get("metadata", {})
@@ -280,7 +342,26 @@ def _load_data(data_path: str) -> tuple[list[dict], list[dict], dict]:
     print(f"  Signals:     {meta.get('input_signals', '?')}")
     print(f"  Window:      {meta.get('window_sec', '?')}s")
     print(f"  Postop win:  {meta.get('max_postop_days', '?')} days")
-    return data["train"], data["test"], meta
+
+    train_p = data["train"]
+    test_p = data["test"]
+    val_p = data.get("val")
+
+    if val_p is None:
+        warnings.warn(
+            "data['val'] missing — falling back to dynamic 20% split of train. "
+            "Re-run prepare_data.py to get a stable patient-level val split."
+        )
+        rng = np.random.default_rng(val_split_seed)
+        idx = np.arange(len(train_p))
+        rng.shuffle(idx)
+        n_val = max(1, len(train_p) // 5)
+        val_idx = set(idx[:n_val].tolist())
+        val_p = [p for i, p in enumerate(train_p) if i in val_idx]
+        train_p = [p for i, p in enumerate(train_p) if i not in val_idx]
+        print(f"  (fallback) Val split: {len(val_p)} patients from train")
+
+    return train_p, val_p, test_p, meta
 
 
 # ── CLI ──────────────────────────────────────────────────────
@@ -316,6 +397,18 @@ def main() -> None:
     parser.add_argument("--agg-heads", type=int, default=4)
     parser.add_argument("--out-dir", type=str, default=".")
     parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument(
+        "--val-split-seed",
+        type=int,
+        default=42,
+        help="Seed for fallback dynamic val split when data['val'] is missing.",
+    )
+    parser.add_argument(
+        "--bootstrap-iters",
+        type=int,
+        default=1000,
+        help="Bootstrap iterations for 95% CI on test metrics.",
+    )
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -335,25 +428,33 @@ def main() -> None:
     if use_lora:
         model.inject_lora(rank=args.lora_rank, alpha=args.lora_alpha)
 
-    # ── 데이터 로드 ──
-    train_patients, test_patients, meta = _load_data(args.data_path)
+    # ── 데이터 로드 (train/val/test 3-way) ──
+    train_patients, val_patients, test_patients, meta = _load_data(
+        args.data_path, val_split_seed=args.val_split_seed
+    )
     label_mode = meta.get("label_mode", "binary")
     if label_mode not in {"binary", "stage"}:
         raise ValueError(f"Unknown label_mode in data: {label_mode}")
 
     if label_mode == "binary":
         n_pos_tr = sum(1 for p in train_patients if p["label"] == 1)
+        n_pos_va = sum(1 for p in val_patients if p["label"] == 1)
         n_pos_te = sum(1 for p in test_patients if p["label"] == 1)
         print(f"  Train: {len(train_patients)} patients (AKI={n_pos_tr})")
+        print(f"  Val:   {len(val_patients)} patients (AKI={n_pos_va})")
         print(f"  Test:  {len(test_patients)} patients (AKI={n_pos_te})")
     else:
         tr_counts = np.bincount(
             [p["label"] for p in train_patients], minlength=4
         ).tolist()
+        va_counts = np.bincount(
+            [p["label"] for p in val_patients], minlength=4
+        ).tolist()
         te_counts = np.bincount(
             [p["label"] for p in test_patients], minlength=4
         ).tolist()
         print(f"  Train stages: {tr_counts}")
+        print(f"  Val stages:   {va_counts}")
         print(f"  Test stages:  {te_counts}")
     avg_win = float(np.mean([p["n_windows"] for p in train_patients]))
     print(f"  Avg windows/patient (train): {avg_win:.1f}")
@@ -378,17 +479,23 @@ def main() -> None:
         n_lora = sum(p.numel() for p in model.lora_parameters())
         print(f"  LoRA: {n_lora:,} params (rank={args.lora_rank})")
 
-    # ── 학습 ──
+    # ── 학습 (val에서 best AUROC ckpt 추적) ──
     print(f"\nTraining ({args.mode}, label_mode={label_mode})...")
-    train_losses = train_model(
-        model, aggregator, probe, train_patients, label_mode,
+    train_losses, val_aurocs, best_state, best_epoch = train_model(
+        model, aggregator, probe, train_patients, val_patients, label_mode,
         epochs=args.epochs, lr=args.lr, device=device,
         patch_size=patch_size, max_windows=args.max_windows,
         batch_size=args.batch_size, use_lora=use_lora,
     )
 
-    # ── 평가 ──
-    print("\nEvaluating...")
+    # ── Best ckpt 복원 후 test 평가 ──
+    print(f"\nRestoring best checkpoint (epoch {best_epoch})...")
+    aggregator.load_state_dict(best_state["aggregator"])
+    probe.load_state_dict(best_state["probe"])
+    if use_lora and "lora" in best_state:
+        model.model.load_state_dict(best_state["lora"])
+
+    print("Evaluating on test set with best-val ckpt...")
     metrics = evaluate_model(
         model, aggregator, probe, test_patients, label_mode,
         device=device, patch_size=patch_size, max_windows=args.max_windows,
@@ -397,13 +504,49 @@ def main() -> None:
     y_true = metrics.pop("y_true")
     y_score = metrics.pop("y_score")
 
+    # ── Bootstrap CI on test metrics ──
+    print(f"Computing {args.bootstrap_iters}-iter bootstrap 95% CI...")
+    ci: dict[str, tuple[float, float]] = {}
+    if label_mode == "binary":
+        score_1d = y_score[:, 0]
+        ci["auroc"] = bootstrap_ci(
+            compute_auroc, y_true, score_1d, n_iter=args.bootstrap_iters
+        )
+        ci["auprc"] = bootstrap_ci(
+            compute_auprc, y_true, score_1d, n_iter=args.bootstrap_iters
+        )
+        thr = float(metrics["optimal_threshold"])
+        y_pred = (score_1d >= thr).astype(int)
+        ci["f1_macro"] = bootstrap_ci(
+            lambda yt, yp: compute_f1(yt, yp, average="macro"),
+            y_true, y_pred, n_iter=args.bootstrap_iters,
+        )
+    else:
+        # stage: macro AUROC + binary AUROC (stage>=1)
+        y_true_bin = (y_true >= 1).astype(int)
+        y_score_bin = 1.0 - y_score[:, 0]
+        ci["binary_auroc"] = bootstrap_ci(
+            compute_auroc, y_true_bin, y_score_bin, n_iter=args.bootstrap_iters
+        )
+        y_pred = y_score.argmax(axis=1)
+        ci["f1_macro"] = bootstrap_ci(
+            lambda yt, yp: compute_f1(yt, yp, average="macro"),
+            y_true, y_pred, n_iter=args.bootstrap_iters,
+        )
+
     print(f"\n{'=' * 60}")
     print(f"  Postop AKI ({label_mode}) — {args.mode}")
+    print(f"  Best epoch:  {best_epoch}/{args.epochs}")
+    val_auroc_best = max(val_aurocs) if val_aurocs else float("nan")
+    print(f"  Val AUROC:   {val_auroc_best:.4f}")
     print(f"{'=' * 60}")
     if label_mode == "binary":
-        print(f"  AUROC:       {metrics['auroc']:.4f}")
-        print(f"  AUPRC:       {metrics['auprc']:.4f}")
-        print(f"  F1 (macro):  {metrics['f1_macro']:.4f}")
+        a_lo, a_hi = ci["auroc"]
+        p_lo, p_hi = ci["auprc"]
+        f_lo, f_hi = ci["f1_macro"]
+        print(f"  AUROC:       {metrics['auroc']:.4f} [{a_lo:.4f}, {a_hi:.4f}]")
+        print(f"  AUPRC:       {metrics['auprc']:.4f} [{p_lo:.4f}, {p_hi:.4f}]")
+        print(f"  F1 (macro):  {metrics['f1_macro']:.4f} [{f_lo:.4f}, {f_hi:.4f}]")
         print(f"  Sensitivity: {metrics['sensitivity']:.4f}")
         print(f"  Specificity: {metrics['specificity']:.4f}")
         print(f"  Prevalence:  {metrics['prevalence']:.3f} "
@@ -415,12 +558,15 @@ def main() -> None:
         )
         print(f"\nROC curve: {roc_path}")
     else:
+        b_lo, b_hi = ci["binary_auroc"]
+        f_lo, f_hi = ci["f1_macro"]
         print(f"  Macro AUROC:    {metrics['macro_auroc']:.4f}")
         print(f"  Per-class AUROC: "
               f"{[f'{a:.3f}' for a in metrics['per_class_auroc']]}")
         print(f"  Accuracy:       {metrics['accuracy']:.4f}")
-        print(f"  F1 (macro):     {metrics['f1_macro']:.4f}")
-        print(f"  Binary AUROC:   {metrics['binary_auroc']:.4f}  (stage≥1)")
+        print(f"  F1 (macro):     {metrics['f1_macro']:.4f} [{f_lo:.4f}, {f_hi:.4f}]")
+        print(f"  Binary AUROC:   {metrics['binary_auroc']:.4f} "
+              f"[{b_lo:.4f}, {b_hi:.4f}]  (stage≥1)")
         print(f"  Class counts:   {metrics['class_counts']}")
         # 이항 환원 ROC (stage>=1 vs no AKI)
         y_true_bin = (y_true >= 1).astype(int)
@@ -436,6 +582,10 @@ def main() -> None:
     results = {
         **metrics,
         "train_losses": train_losses,
+        "val_aurocs": val_aurocs,
+        "val_auroc_best": val_auroc_best,
+        "best_epoch": best_epoch,
+        **{f"{k}_ci": list(v) for k, v in ci.items()},
         "config": {
             "task": "postop_aki_prediction",
             "label_mode": label_mode,
@@ -447,6 +597,7 @@ def main() -> None:
             "data_path": args.data_path,
             "epochs": args.epochs,
             "lr": args.lr,
+            "bootstrap_iters": args.bootstrap_iters,
         },
     }
     results_path = out_dir / f"aki_results_{args.mode}_{label_mode}.json"

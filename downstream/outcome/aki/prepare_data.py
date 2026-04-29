@@ -325,7 +325,8 @@ def prepare_aki_dataset(
     input_signals: list[str],
     window_sec: float = 600.0,
     stride_sec: float = 300.0,
-    train_ratio: float = 0.7,
+    train_ratio: float = 0.6,
+    val_ratio: float = 0.2,
     label_mode: str = "binary",
     max_postop_days: float = 7.0,
     max_subjects: int | None = None,
@@ -440,16 +441,31 @@ def prepare_aki_dataset(
         f"avg/patient: {total_windows / len(patient_data):.1f}"
     )
 
-    # ── 4. Patient-level train/test split + 저장 ──
-    print(f"\n[4/4] Patient-level split (train_ratio={train_ratio}) and save...")
+    # ── 4. Patient-level train/val/test 3-way split + 저장 ──
+    test_ratio = 1.0 - train_ratio - val_ratio
+    if test_ratio <= 0.0:
+        raise ValueError(
+            f"train_ratio + val_ratio must be < 1, got {train_ratio} + {val_ratio}"
+        )
+    print(
+        f"\n[4/4] Patient-level split "
+        f"(train={train_ratio}, val={val_ratio}, test={test_ratio:.2f}) and save..."
+    )
     rng = np.random.default_rng(42)
     sids = [p["subject_id"] for p in patient_data]
     rng.shuffle(sids)
-    n_train = max(1, int(len(sids) * train_ratio))
+    n_total = len(sids)
+    n_train = max(1, int(n_total * train_ratio))
+    n_val = max(1, int(n_total * val_ratio))
+    if n_train + n_val >= n_total:
+        n_val = max(1, n_total - n_train - 1)
     train_sids = set(sids[:n_train])
+    val_sids = set(sids[n_train : n_train + n_val])
+    test_sids = set(sids[n_train + n_val :])
 
     train_p = [p for p in patient_data if p["subject_id"] in train_sids]
-    test_p = [p for p in patient_data if p["subject_id"] not in train_sids]
+    val_p = [p for p in patient_data if p["subject_id"] in val_sids]
+    test_p = [p for p in patient_data if p["subject_id"] in test_sids]
 
     def _pack(plist: list[dict]) -> list[dict]:
         packed = []
@@ -472,6 +488,7 @@ def prepare_aki_dataset(
 
     save_dict = {
         "train": _pack(train_p),
+        "val": _pack(val_p),
         "test": _pack(test_p),
         "metadata": {
             "task": "postop_aki_prediction",
@@ -488,12 +505,15 @@ def prepare_aki_dataset(
             "sampling_rate": TARGET_SR,
             "max_postop_days": max_postop_days,
             "train_ratio": train_ratio,
+            "val_ratio": val_ratio,
             "n_train_patients": len(train_p),
+            "n_val_patients": len(val_p),
             "n_test_patients": len(test_p),
         },
     }
     if label_mode == "binary":
         save_dict["metadata"]["n_pos_train"] = sum(1 for p in train_p if p["label"] == 1)
+        save_dict["metadata"]["n_pos_val"] = sum(1 for p in val_p if p["label"] == 1)
         save_dict["metadata"]["n_pos_test"] = sum(1 for p in test_p if p["label"] == 1)
 
     sig_str = "_".join(sorted(input_signals))
@@ -503,10 +523,12 @@ def prepare_aki_dataset(
     print(f"\n{'=' * 60}")
     print(f"  Saved: {out_file}")
     print(f"  Train: {len(train_p)} patients")
+    print(f"  Val:   {len(val_p)} patients")
     print(f"  Test:  {len(test_p)} patients")
     if label_mode == "binary":
         print(
             f"  Class balance — train: AKI={save_dict['metadata']['n_pos_train']}, "
+            f"val: AKI={save_dict['metadata']['n_pos_val']}, "
             f"test: AKI={save_dict['metadata']['n_pos_test']}"
         )
     print(f"{'=' * 60}")
@@ -532,7 +554,18 @@ def main() -> None:
     )
     parser.add_argument("--window-sec", type=float, default=600.0)
     parser.add_argument("--stride-sec", type=float, default=300.0)
-    parser.add_argument("--train-ratio", type=float, default=0.7)
+    parser.add_argument(
+        "--train-ratio",
+        type=float,
+        default=0.6,
+        help="Train split ratio (patient-level). Default 0.6.",
+    )
+    parser.add_argument(
+        "--val-ratio",
+        type=float,
+        default=0.2,
+        help="Val split ratio (patient-level). Test = 1 - train - val. Default 0.2.",
+    )
     parser.add_argument(
         "--label-mode", choices=["binary", "stage"], default="binary",
         help="binary=AKI vs no, stage=KDIGO 0/1/2/3",
@@ -556,6 +589,7 @@ def main() -> None:
         window_sec=args.window_sec,
         stride_sec=args.stride_sec,
         train_ratio=args.train_ratio,
+        val_ratio=args.val_ratio,
         label_mode=args.label_mode,
         max_postop_days=args.max_postop_days,
         max_subjects=args.max_subjects,
