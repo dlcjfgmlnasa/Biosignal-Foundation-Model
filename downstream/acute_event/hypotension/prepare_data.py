@@ -259,13 +259,19 @@ def extract_forecast_samples(
             future_abp = abp[future_start:future_end]
 
             # 미래 구간의 MAP (10초 윈도우별 평균)
+            # MAP <30 또는 >200 mmHg 윈도우는 artifact로 제외 (docs/downstream_tasks.md:260)
             future_maps: list[float] = []
             for j in range(0, len(future_abp) - map_win + 1, map_win):
                 w = future_abp[j : j + map_win]
-                if not np.isnan(w).any():
-                    future_maps.append(float(np.mean(w)))
+                if np.isnan(w).any():
+                    continue
+                m = float(np.mean(w))
+                if m < 30.0 or m > 200.0:
+                    continue
+                future_maps.append(m)
 
-            if not future_maps:
+            # artifact 제거 후 최소 min_consecutive의 절반은 남아야 신뢰 가능
+            if len(future_maps) < max(1, min_consecutive // 2):
                 continue
 
             # ≥1분 지속 MAP<65 여부 확인
@@ -301,13 +307,14 @@ def extract_forecast_samples(
 
 def save_dataset(
     train_samples: list[ForecastSample],
+    val_samples: list[ForecastSample],
     test_samples: list[ForecastSample],
     input_signals: list[str],
     horizon_sec: float,
     window_sec: float,
     out_dir: str,
 ) -> Path:
-    """ForecastSample 리스트를 .pt로 저장한다."""
+    """ForecastSample 리스트를 .pt로 저장한다 (train/val/test 3-way)."""
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
@@ -317,6 +324,7 @@ def save_dataset(
                 "signals": {},
                 "labels": torch.tensor([]),
                 "label_values": torch.tensor([]),
+                "case_ids": [],
             }
 
         # 각 signal type별 텐서 생성
@@ -343,6 +351,7 @@ def save_dataset(
 
     save_dict = {
         "train": _to_tensors(train_samples),
+        "val": _to_tensors(val_samples),
         "test": _to_tensors(test_samples),
         "metadata": {
             "task": "hypotension_forecast",
@@ -354,6 +363,7 @@ def save_dataset(
             "map_threshold": 65.0,
             "sustained_sec": 60.0,
             "n_train": len(train_samples),
+            "n_val": len(val_samples),
             "n_test": len(test_samples),
         },
     }
@@ -405,15 +415,17 @@ def prepare_hypotension_sweep(
     window_secs: list[float],
     horizon_mins: list[float],
     stride_sec: float = 30.0,
-    train_ratio: float = 0.7,
+    train_ratio: float = 0.6,
+    val_ratio: float = 0.2,
     max_subjects: int | None = None,
     out_dir: str = "outputs/downstream/hypotension",
     required_signals: list[str] | None = None,
 ) -> list[Path]:
     """(window, horizon) 조합을 sweep하여 데이터셋을 생성한다.
 
-    데이터 로딩과 train/test 분할은 한번만 수행하고,
+    데이터 로딩과 train/val/test 분할은 한번만 수행하고,
     윈도우 추출 + 라벨링만 조합별로 반복한다.
+    test_ratio = 1 - train_ratio - val_ratio.
     """
     # ── 1. 데이터 로딩 (1회) ──
     # 가장 긴 window + horizon 기준으로 min_duration 설정
@@ -442,18 +454,34 @@ def prepare_hypotension_sweep(
         print("ERROR: No valid cases loaded.", file=sys.stderr)
         sys.exit(1)
 
-    # ── 2. Train/Test 분할 (1회) ──
-    print(f"\n[2/3] Splitting by patient (ratio={train_ratio})...")
+    # ── 2. Train/Val/Test 3-way patient-level 분할 (1회) ──
+    test_ratio = 1.0 - train_ratio - val_ratio
+    if test_ratio <= 0.0:
+        raise ValueError(
+            f"train_ratio + val_ratio must be < 1, got {train_ratio} + {val_ratio}"
+        )
+    print(
+        f"\n[2/3] Splitting by patient "
+        f"(train={train_ratio}, val={val_ratio}, test={test_ratio:.2f})..."
+    )
     rng = np.random.default_rng(42)
     patient_ids = list({c["patient_id"] for c in cases})
     rng.shuffle(patient_ids)
-    n_train_patients = max(1, int(len(patient_ids) * train_ratio))
-    train_patients = set(patient_ids[:n_train_patients])
+    n_total = len(patient_ids)
+    n_train = max(1, int(n_total * train_ratio))
+    n_val = max(1, int(n_total * val_ratio))
+    if n_train + n_val >= n_total:
+        n_val = max(1, n_total - n_train - 1)
+    train_patients = set(patient_ids[:n_train])
+    val_patients = set(patient_ids[n_train : n_train + n_val])
+    test_patients = set(patient_ids[n_train + n_val :])
 
     train_cases = [c for c in cases if c["patient_id"] in train_patients]
-    test_cases = [c for c in cases if c["patient_id"] not in train_patients]
+    val_cases = [c for c in cases if c["patient_id"] in val_patients]
+    test_cases = [c for c in cases if c["patient_id"] in test_patients]
     print(f"  Train: {len(train_cases)} cases ({len(train_patients)} patients)")
-    print(f"  Test:  {len(test_cases)} cases ({len(patient_ids) - n_train_patients} patients)")
+    print(f"  Val:   {len(val_cases)} cases ({len(val_patients)} patients)")
+    print(f"  Test:  {len(test_cases)} cases ({len(test_patients)} patients)")
 
     # ── 3. 조합별 윈도우 추출 + 저장 ──
     combos = [(w, h) for w in window_secs for h in horizon_mins]
@@ -467,19 +495,23 @@ def prepare_hypotension_sweep(
         train_samples = extract_forecast_samples(
             train_cases, input_signals, window_sec, stride_sec, horizon_sec,
         )
+        val_samples = extract_forecast_samples(
+            val_cases, input_signals, window_sec, stride_sec, horizon_sec,
+        )
         test_samples = extract_forecast_samples(
             test_cases, input_signals, window_sec, stride_sec, horizon_sec,
         )
 
         print_stats("    Train", train_samples)
+        print_stats("    Val", val_samples)
         print_stats("    Test", test_samples)
 
-        if not train_samples and not test_samples:
+        if not train_samples and not val_samples and not test_samples:
             print("    SKIP: No samples extracted.")
             continue
 
         save_path = save_dataset(
-            train_samples, test_samples, input_signals,
+            train_samples, val_samples, test_samples, input_signals,
             horizon_sec, window_sec, out_dir,
         )
         saved_paths.append(save_path)
@@ -534,7 +566,16 @@ def main() -> None:
         help="Sliding window stride in seconds",
     )
     parser.add_argument(
-        "--train-ratio", type=float, default=0.7, help="Train/test split ratio"
+        "--train-ratio",
+        type=float,
+        default=0.6,
+        help="Train split ratio (patient-level). Default 0.6.",
+    )
+    parser.add_argument(
+        "--val-ratio",
+        type=float,
+        default=0.2,
+        help="Val split ratio (patient-level). Test = 1 - train - val. Default 0.2.",
     )
     parser.add_argument(
         "--out-dir",
@@ -559,6 +600,7 @@ def main() -> None:
         horizon_mins=args.horizon_mins,
         stride_sec=args.stride_sec,
         train_ratio=args.train_ratio,
+        val_ratio=args.val_ratio,
         max_subjects=args.max_subjects,
         out_dir=args.out_dir,
         required_signals=args.required_signals,

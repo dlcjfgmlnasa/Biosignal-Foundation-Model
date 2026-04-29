@@ -52,8 +52,11 @@ def _multi_window_to_samples(
     """MultiSignalWindow → 신호별 BiosignalSample 리스트."""
     samples = []
     for ch, (sig_type, signal) in enumerate(mw.signals.items()):
+        # sig_type 은 문자열 ("ecg"/"abp"/"ppg"/...). SIGNAL_TYPES 로 int 인덱스 변환 후
+        # spatial_id 도 같은 int 인덱스를 사용해야 한다 (Patch C: 이전에 string 으로
+        # get_global_spatial_id 호출 → SIGNAL_TYPES 에 없는 키 → fallback 0 위험).
         stype_int = SIGNAL_TYPES.get(sig_type, 1)
-        spatial_id = get_global_spatial_id(sig_type, 0)
+        spatial_id = get_global_spatial_id(stype_int, 0)
         samples.append(
             BiosignalSample(
                 values=torch.from_numpy(signal).float(),

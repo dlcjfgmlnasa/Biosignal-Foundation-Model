@@ -293,3 +293,67 @@ def compute_sensitivity_specificity(
         "sensitivity": float(sensitivity),
         "specificity": float(specificity),
     }
+
+
+# ── Bootstrap Confidence Interval ─────────────────────────────
+
+
+def bootstrap_ci(
+    metric_fn,
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    n_iter: int = 1000,
+    alpha: float = 0.05,
+    seed: int = 42,
+) -> tuple[float, float]:
+    """Percentile bootstrap confidence interval for a binary classification metric.
+
+    With-replacement resamples ``y_true``/``y_pred`` ``n_iter`` 회 반복하고,
+    매 iteration마다 ``metric_fn(y_true_b, y_pred_b)`` 를 계산한 뒤
+    ``(alpha/2, 1-alpha/2)`` percentile 을 (lower, upper) 로 반환한다.
+
+    Parameters
+    ----------
+    metric_fn:
+        Callable taking ``(y_true, y_pred)`` 형태로 호출되어 scalar metric 값을
+        반환해야 한다. ``y_pred`` 는 score(threshold-free metrics: AUROC/AUPRC) 거나
+        binarized prediction(F1) 모두 사용 가능 — caller가 일관성 유지해야 함.
+    y_true, y_pred:
+        길이가 같은 1-D numpy array.
+    n_iter:
+        bootstrap iteration 수 (default=1000, paper spec과 일치).
+    alpha:
+        significance level (default=0.05 → 95% CI).
+    seed:
+        RNG seed (재현 가능성 확보).
+
+    Returns
+    -------
+    (lower, upper) : tuple of float
+        percentile-based confidence interval.
+    """
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    n = len(y_true)
+    if n == 0:
+        return 0.0, 0.0
+
+    rng = np.random.default_rng(seed)
+    values: list[float] = []
+    for _ in range(n_iter):
+        idx = rng.integers(0, n, size=n)
+        yt_b = y_true[idx]
+        yp_b = y_pred[idx]
+        try:
+            v = float(metric_fn(yt_b, yp_b))
+        except Exception:
+            # 일부 resample 에서 single-class → 0.0 처리 (AUROC 와 같은 동작)
+            v = 0.0
+        if not np.isfinite(v):
+            v = 0.0
+        values.append(v)
+
+    arr = np.asarray(values, dtype=np.float64)
+    lower = float(np.percentile(arr, 100.0 * (alpha / 2.0)))
+    upper = float(np.percentile(arr, 100.0 * (1.0 - alpha / 2.0)))
+    return lower, upper

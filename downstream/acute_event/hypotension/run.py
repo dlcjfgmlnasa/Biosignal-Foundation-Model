@@ -20,8 +20,10 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import sys
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -35,8 +37,10 @@ from data.spatial_map import get_global_spatial_id
 from data.parser.vitaldb import SIGNAL_TYPES
 
 from downstream.metrics import (
-    compute_auroc,
+    bootstrap_ci,
     compute_auprc,
+    compute_auroc,
+    compute_f1,
     compute_sensitivity_specificity,
 )
 from downstream.viz import plot_roc_curve
@@ -66,8 +70,10 @@ def _multi_window_to_samples(mw: MultiSignalWindow, idx: int) -> list[BiosignalS
     """MultiSignalWindow → 신호별 BiosignalSample 리스트."""
     samples = []
     for ch, (sig_type, signal) in enumerate(mw.signals.items()):
+        # sig_type 은 문자열. SIGNAL_TYPES 로 int 인덱스 변환 후
+        # get_global_spatial_id 도 int 인덱스로 호출해야 한다 (Patch C).
         stype_int = SIGNAL_TYPES.get(sig_type, 1)
-        spatial_id = get_global_spatial_id(sig_type, 0)
+        spatial_id = get_global_spatial_id(stype_int, 0)
         samples.append(
             BiosignalSample(
                 values=torch.from_numpy(signal).float(),
@@ -284,10 +290,14 @@ def _compute_metrics(y_true: np.ndarray, y_score: np.ndarray) -> dict:
 
     y_pred_opt = (y_score >= best_thresh).astype(int)
     ss_opt = compute_sensitivity_specificity(y_true, y_pred_opt)
+    # Patch B: F1 at best-Youden threshold (binary, 'macro' avg for parity with
+    # other downstream tasks like sepsis/aki/cardiac_arrest).
+    f1 = compute_f1(y_true, y_pred_opt, average="macro")
 
     return {
         "auroc": auroc,
         "auprc": auprc,
+        "f1": float(f1),
         "optimal_threshold": float(best_thresh),
         "sensitivity": ss_opt["sensitivity"],
         "specificity": ss_opt["specificity"],
@@ -302,8 +312,20 @@ def _compute_metrics(y_true: np.ndarray, y_score: np.ndarray) -> dict:
 # ── 데이터 로딩 ──────────────────────────────────────────────
 
 
-def _load_data(args) -> tuple[list[MultiSignalWindow], list[MultiSignalWindow]]:
-    """args에서 train/test MultiSignalWindow 리스트를 반환한다."""
+def _load_data(
+    args,
+) -> tuple[
+    list[MultiSignalWindow],
+    list[MultiSignalWindow],
+    list[MultiSignalWindow],
+]:
+    """args에서 train/val/test MultiSignalWindow 리스트를 반환한다.
+
+    prepare_data.py 가 ``data["val"]`` 을 포함해 저장하면 그대로 사용한다.
+    구(legacy) 산출물에 ``"val"`` 키가 없으면 backward-compat 으로 train 의
+    20%(patient/case 단위 X — sample 단위)를 dynamic split 하고 ``warnings.warn``
+    으로 알린다.
+    """
     if args.data_path and Path(args.data_path).exists():
         print(f"\nLoading prepared data: {args.data_path}")
         data = torch.load(args.data_path, weights_only=False)
@@ -317,6 +339,7 @@ def _load_data(args) -> tuple[list[MultiSignalWindow], list[MultiSignalWindow]]:
 
         train_data = data["train"]
         test_data = data["test"]
+        val_data = data.get("val")  # Patch A: prepare_data 가 추가하는 새 키
 
         input_keys = list(train_data["signals"].keys())
         if not input_keys:
@@ -346,7 +369,34 @@ def _load_data(args) -> tuple[list[MultiSignalWindow], list[MultiSignalWindow]]:
                 )
             return windows
 
-        return _pt_to_windows(train_data), _pt_to_windows(test_data)
+        train_windows = _pt_to_windows(train_data)
+        test_windows = _pt_to_windows(test_data)
+
+        if val_data is not None:
+            val_windows = _pt_to_windows(val_data)
+            print(f"  val split (from prepare_data): {len(val_windows)} samples")
+        else:
+            # Backward-compat: legacy 산출물 — train 에서 20% 동적 split.
+            warnings.warn(
+                "data['val'] not found; falling back to a 20% dynamic split of "
+                "train. Re-run prepare_data.py to get a deterministic val split.",
+                stacklevel=2,
+            )
+            rng = np.random.default_rng(args.val_split_seed)
+            n_train = len(train_windows)
+            idx = np.arange(n_train)
+            rng.shuffle(idx)
+            n_val = max(1, int(n_train * 0.2))
+            val_idx = set(idx[:n_val].tolist())
+            new_train = [w for i, w in enumerate(train_windows) if i not in val_idx]
+            val_windows = [w for i, w in enumerate(train_windows) if i in val_idx]
+            train_windows = new_train
+            print(
+                f"  val split (dynamic, seed={args.val_split_seed}): "
+                f"{len(val_windows)} samples"
+            )
+
+        return train_windows, val_windows, test_windows
 
     elif args.data_dir and Path(args.data_dir).is_dir():
         from downstream.acute_event.hypotension.prepare_data import (
@@ -370,15 +420,28 @@ def _load_data(args) -> tuple[list[MultiSignalWindow], list[MultiSignalWindow]]:
         patient_ids = list({c["patient_id"] for c in cases})
         rng.shuffle(patient_ids)
         n_train_p = max(1, int(len(patient_ids) * args.train_ratio))
+        # Patch A: train/val/test 3-way patient-level split.
+        # 남은(test+val) 환자를 절반씩 val/test 로 분할 — val 0 명 방지.
+        remaining = patient_ids[n_train_p:]
+        n_val_p = max(1, len(remaining) // 2) if len(remaining) >= 2 else 0
         train_pats = set(patient_ids[:n_train_p])
+        val_pats = set(remaining[:n_val_p])
+        test_pats = set(remaining[n_val_p:])
 
         train_cases = [c for c in cases if c["patient_id"] in train_pats]
-        test_cases = [c for c in cases if c["patient_id"] not in train_pats]
-        print(f"Split: {len(train_cases)} train, {len(test_cases)} test cases")
+        val_cases = [c for c in cases if c["patient_id"] in val_pats]
+        test_cases = [c for c in cases if c["patient_id"] in test_pats]
+        print(
+            f"Split: {len(train_cases)} train, {len(val_cases)} val, "
+            f"{len(test_cases)} test cases"
+        )
 
         train_samples = extract_forecast_samples(
             train_cases, input_sigs, args.window_sec, args.stride_sec, horizon_sec,
         )
+        val_samples = extract_forecast_samples(
+            val_cases, input_sigs, args.window_sec, args.stride_sec, horizon_sec,
+        ) if val_cases else []
         test_samples = extract_forecast_samples(
             test_cases, input_sigs, args.window_sec, args.stride_sec, horizon_sec,
         )
@@ -396,7 +459,27 @@ def _load_data(args) -> tuple[list[MultiSignalWindow], list[MultiSignalWindow]]:
                 )
             return windows
 
-        return _forecast_to_windows(train_samples), _forecast_to_windows(test_samples)
+        train_windows = _forecast_to_windows(train_samples)
+        val_windows = _forecast_to_windows(val_samples)
+        test_windows = _forecast_to_windows(test_samples)
+
+        # data_dir 경로에서도 val 이 비면 train 에서 20% 동적 split (backward-compat).
+        if not val_windows:
+            warnings.warn(
+                "No val cases produced from --data-dir split; falling back to a "
+                "20% dynamic split of train.",
+                stacklevel=2,
+            )
+            rng2 = np.random.default_rng(args.val_split_seed)
+            idx = np.arange(len(train_windows))
+            rng2.shuffle(idx)
+            n_val = max(1, int(len(train_windows) * 0.2))
+            val_idx = set(idx[:n_val].tolist())
+            new_train = [w for i, w in enumerate(train_windows) if i not in val_idx]
+            val_windows = [w for i, w in enumerate(train_windows) if i in val_idx]
+            train_windows = new_train
+
+        return train_windows, val_windows, test_windows
 
     else:
         print("ERROR: --data-path or --data-dir required.", file=sys.stderr)
@@ -436,6 +519,18 @@ def main() -> None:
         choices=["abp", "ecg", "ppg"],
         help="Input signal types (label always from ABP)",
     )
+    parser.add_argument(
+        "--val-split-seed",
+        type=int,
+        default=42,
+        help="Seed for backward-compat dynamic val split when data['val'] is missing.",
+    )
+    parser.add_argument(
+        "--bootstrap-iters",
+        type=int,
+        default=1000,
+        help="Bootstrap iterations for 95%% CI on test metrics (Patch D).",
+    )
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -466,22 +561,29 @@ def main() -> None:
     sig_str = " + ".join(s.upper() for s in args.input_signals)
     print(f"Mode: {args.mode} | Input: {sig_str} | Window: {args.window_sec}s")
 
-    # ── 데이터 로드 ──
-    train_labeled, test_labeled = _load_data(args)
+    # ── 데이터 로드 (Patch A: train/val/test 3-way) ──
+    train_labeled, val_labeled, test_labeled = _load_data(args)
 
-    n_pos_train = sum(1 for lw in train_labeled if lw.label == 1)
-    n_pos_test = sum(1 for lw in test_labeled if lw.label == 1)
-    print(
-        f"  Train: {len(train_labeled)} samples "
-        f"({n_pos_train} hypo, {n_pos_train / max(len(train_labeled), 1) * 100:.1f}%)"
-    )
-    print(
-        f"  Test:  {len(test_labeled)} samples "
-        f"({n_pos_test} hypo, {n_pos_test / max(len(test_labeled), 1) * 100:.1f}%)"
-    )
+    def _pos_stats(name: str, ws: list[MultiSignalWindow]) -> None:
+        n_pos = sum(1 for lw in ws if lw.label == 1)
+        print(
+            f"  {name}: {len(ws)} samples "
+            f"({n_pos} hypo, {n_pos / max(len(ws), 1) * 100:.1f}%)"
+        )
+
+    _pos_stats("Train", train_labeled)
+    _pos_stats("Val  ", val_labeled)
+    _pos_stats("Test ", test_labeled)
 
     if not train_labeled or not test_labeled:
         print("Insufficient data.", file=sys.stderr)
+        sys.exit(1)
+    if not val_labeled:
+        print(
+            "ERROR: val split is empty even after fallback — cannot do best-ckpt "
+            "selection.",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     first_sig = next(iter(train_labeled[0].signals.values()))
@@ -489,45 +591,157 @@ def main() -> None:
     train_batches = _make_batches(
         train_labeled, args.batch_size, args.patch_size, max_length
     )
+    val_batches = _make_batches(
+        val_labeled, args.batch_size, args.patch_size, max_length
+    )
     test_batches = _make_batches(
         test_labeled, args.batch_size, args.patch_size, max_length
     )
 
-    # ── 학습 ──
+    # ── 학습 + Best-ckpt selection on val (Patch A) ──
     probe = LinearProbe(d_model, n_classes=1)
 
-    if args.mode == "linear_probe":
-        print(f"\nTraining LinearProbe (frozen encoder, d_model={d_model})...")
-        train_losses = train_linear_probe(
-            model, probe, train_batches, args.epochs, args.lr, device
-        )
-        print("\nEvaluating...")
-        metrics = evaluate_linear_probe(model, probe, test_batches, device)
-
-    elif args.mode == "lora":
+    is_lora = args.mode == "lora"
+    if is_lora:
         n_lora = sum(p.numel() for p in model.lora_parameters())
         n_probe = sum(p.numel() for p in probe.parameters())
-        print(f"\nTraining LoRA + Probe (rank={args.lora_rank}, "
-              f"LoRA={n_lora:,} + Probe={n_probe:,} params)...")
-        train_losses = train_lora(
-            model, probe, train_batches, args.epochs, args.lr, device
+        print(
+            f"\nTraining LoRA + Probe (rank={args.lora_rank}, "
+            f"LoRA={n_lora:,} + Probe={n_probe:,} params)..."
         )
-        print("\nEvaluating...")
-        metrics = evaluate_lora(model, probe, test_batches, device)
+        evaluate_fn = evaluate_lora
+        probe = probe.to(device)
+        probe.train()
+        model.model.train()
+        lora_params = model.lora_parameters()
+        optimizer = torch.optim.AdamW(
+            [
+                {"params": lora_params, "lr": args.lr},
+                {"params": probe.parameters(), "lr": args.lr},
+            ],
+            weight_decay=0.01,
+        )
+    else:
+        print(f"\nTraining LinearProbe (frozen encoder, d_model={d_model})...")
+        evaluate_fn = evaluate_linear_probe
+        probe = probe.to(device)
+        probe.train()
+        optimizer = torch.optim.Adam(probe.parameters(), lr=args.lr)
+
+    criterion = nn.BCEWithLogitsLoss()
+    train_losses: list[float] = []
+    val_aurocs: list[float] = []
+    best_val_auroc = -1.0
+    best_epoch = -1
+    best_probe_state: dict | None = None
+    best_model_state: dict | None = None  # LoRA mode 에서만 저장
+
+    for epoch in range(args.epochs):
+        # ── train one epoch ──
+        probe.train()
+        if is_lora:
+            model.model.train()
+        epoch_loss, n_steps = 0.0, 0
+
+        for batch, labels in train_batches:
+            if is_lora:
+                batch = model.batch_to_device(batch)
+                out = model.model(batch, task="masked")
+                features = _mean_pool(out["encoded"], out["patch_mask"])
+            else:
+                with torch.no_grad():
+                    features = model.extract_features(batch, pool="mean").to(device)
+
+            logits = probe(features)
+            loss = criterion(logits, labels.to(device).unsqueeze(-1))
+            optimizer.zero_grad()
+            loss.backward()
+            if is_lora:
+                nn.utils.clip_grad_norm_(
+                    lora_params + list(probe.parameters()), 1.0
+                )
+            optimizer.step()
+            epoch_loss += loss.item()
+            n_steps += 1
+
+        avg_loss = epoch_loss / max(n_steps, 1)
+        train_losses.append(avg_loss)
+
+        # ── val evaluation ──
+        val_metrics = evaluate_fn(model, probe, val_batches, device)
+        val_auroc = float(val_metrics["auroc"])
+        val_aurocs.append(val_auroc)
+
+        if val_auroc > best_val_auroc:
+            best_val_auroc = val_auroc
+            best_epoch = epoch
+            # deepcopy to detach from current parameters (probe is small — cheap).
+            best_probe_state = copy.deepcopy(probe.state_dict())
+            if is_lora:
+                # LoRA params live inside model.model — copy entire encoder state.
+                best_model_state = copy.deepcopy(model.model.state_dict())
+
+        if (epoch + 1) % 5 == 0 or epoch == 0 or epoch == args.epochs - 1:
+            print(
+                f"  Epoch {epoch + 1}/{args.epochs}  loss={avg_loss:.4f}  "
+                f"val_auroc={val_auroc:.4f}  "
+                f"(best={best_val_auroc:.4f}@ep{best_epoch + 1})"
+            )
+
+    # ── Restore best ckpt and run test ONCE (Patch A) ──
+    if best_probe_state is None:
+        print("WARNING: no best ckpt captured; using last epoch.", file=sys.stderr)
+    else:
+        probe.load_state_dict(best_probe_state)
+        if is_lora and best_model_state is not None:
+            model.model.load_state_dict(best_model_state)
+
+    print("\nEvaluating on test set with best-val ckpt...")
+    metrics = evaluate_fn(model, probe, test_batches, device)
 
     # ── 결과 출력 ──
     y_true = metrics.pop("y_true")
     y_score = metrics.pop("y_score")
 
+    # Patch D: bootstrap 95% CI on test AUROC/AUPRC/F1 (1000 iter).
+    thr = metrics["optimal_threshold"]
+    y_pred_opt = (y_score >= thr).astype(int)
+
+    auroc_ci = bootstrap_ci(
+        compute_auroc, y_true, y_score, n_iter=args.bootstrap_iters,
+    )
+    auprc_ci = bootstrap_ci(
+        compute_auprc, y_true, y_score, n_iter=args.bootstrap_iters,
+    )
+    # F1 은 binarized prediction 기반 — best-Youden threshold 고정 사용.
+    f1_ci = bootstrap_ci(
+        lambda yt, yp: compute_f1(yt, yp, average="macro"),
+        y_true,
+        y_pred_opt,
+        n_iter=args.bootstrap_iters,
+    )
+
     print(f"\n{'=' * 50}")
-    print(f"  Mode:        {args.mode}")
-    print(f"  AUROC:       {metrics['auroc']:.4f}")
-    print(f"  AUPRC:       {metrics['auprc']:.4f}")
-    print(f"  Threshold:   {metrics['optimal_threshold']:.3f}")
-    print(f"  Sensitivity: {metrics['sensitivity']:.4f}")
-    print(f"  Specificity: {metrics['specificity']:.4f}")
+    print(f"  Mode:         {args.mode}")
+    print(f"  Best epoch:   {best_epoch + 1}/{args.epochs}")
+    print(f"  Val AUROC:    {best_val_auroc:.4f}")
     print(
-        f"  Prevalence:  {metrics['prevalence']:.3f} "
+        f"  AUROC:        {metrics['auroc']:.4f} "
+        f"[{auroc_ci[0]:.4f}, {auroc_ci[1]:.4f}]"
+    )
+    print(
+        f"  AUPRC:        {metrics['auprc']:.4f} "
+        f"[{auprc_ci[0]:.4f}, {auprc_ci[1]:.4f}]"
+    )
+    print(
+        f"  F1:           {metrics['f1']:.4f} "
+        f"[{f1_ci[0]:.4f}, {f1_ci[1]:.4f}]"
+    )
+    print(f"  Threshold:    {metrics['optimal_threshold']:.3f}")
+    print(f"  Sensitivity:  {metrics['sensitivity']:.4f}")
+    print(f"  Specificity:  {metrics['specificity']:.4f}")
+    print(
+        f"  Prevalence:   {metrics['prevalence']:.3f} "
         f"({metrics['n_positive']}/{metrics['n_total']})"
     )
     print(f"{'=' * 50}")
@@ -541,7 +755,13 @@ def main() -> None:
 
     results = {
         **metrics,
+        "val_auroc_best": float(best_val_auroc),
+        "best_epoch": int(best_epoch),
+        "auroc_ci": [float(auroc_ci[0]), float(auroc_ci[1])],
+        "auprc_ci": [float(auprc_ci[0]), float(auprc_ci[1])],
+        "f1_ci": [float(f1_ci[0]), float(f1_ci[1])],
         "train_losses": train_losses,
+        "val_aurocs": val_aurocs,
         "config": {
             "mode": args.mode,
             "input_signals": args.input_signals,
@@ -553,6 +773,8 @@ def main() -> None:
             "epochs": args.epochs,
             "lr": args.lr,
             "train_ratio": args.train_ratio,
+            "bootstrap_iters": args.bootstrap_iters,
+            "val_split_seed": args.val_split_seed,
         },
     }
     results_path = out_dir / f"task1_results_{args.mode}.json"
