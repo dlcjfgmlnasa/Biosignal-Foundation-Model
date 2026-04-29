@@ -8,11 +8,12 @@
 
 set -e
 
-DATA_DIR=/home/coder/workspace/updown/bio_fm/data/test/vitaldb
-OUT_DIR=/home/coder/workspace/updown/bio_fm/data/downstream/hypotension
-WINDOWS="60 180 300 600"
-HORIZONS="5 10 15"
-REQUIRED="ecg ppg abp"
+# env override 가능: DATA_DIR=... OUT_DIR=... bash prepare_data.sh
+DATA_DIR="${DATA_DIR:-/home/coder/workspace/updown/parser/vitaldb}"
+OUT_DIR="${OUT_DIR:-/home/coder/workspace/updown/bio_fm/data/downstream/hypotension}"
+WINDOWS="${WINDOWS:-60 180 300 600}"
+HORIZONS="${HORIZONS:-5 10 15}"
+REQUIRED="${REQUIRED:-ecg ppg abp}"
 
 echo "============================================================"
 echo "  Hypotension Prediction — Paired Comparison Data Preparation"
