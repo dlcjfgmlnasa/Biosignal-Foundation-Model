@@ -291,25 +291,74 @@ def load_aligned_signals_for_subject(
     return segments
 
 
+def _max_consecutive_nan(arr: np.ndarray) -> int:
+    """배열에서 연속 NaN의 최장 길이 (samples)."""
+    is_nan = np.isnan(arr)
+    if not is_nan.any():
+        return 0
+    # 연속 구간 길이 계산
+    diff = np.diff(np.concatenate([[0], is_nan.astype(int), [0]]))
+    starts = np.where(diff == 1)[0]
+    ends = np.where(diff == -1)[0]
+    return int((ends - starts).max()) if len(starts) else 0
+
+
+def _linear_interpolate_nan(arr: np.ndarray) -> np.ndarray:
+    """짧은 NaN 구간을 선형 보간 (양 끝 NaN은 forward/back fill)."""
+    out = arr.astype(np.float32, copy=True)
+    is_nan = np.isnan(out)
+    if not is_nan.any():
+        return out
+    idx = np.arange(len(out))
+    valid = ~is_nan
+    if valid.sum() == 0:
+        return out  # 전부 NaN — interpolation 불가
+    out[is_nan] = np.interp(idx[is_nan], idx[valid], out[valid])
+    return out
+
+
 def extract_windows(
     signals: dict[str, np.ndarray],
     window_sec: float,
     stride_sec: float,
     sr: float = TARGET_SR,
-) -> list[dict[str, np.ndarray]]:
-    """다채널 신호에서 sliding window 추출. NaN 포함 윈도우는 제외."""
+    nan_ratio_threshold: float = 0.05,
+    gap_max_sec: float = 1.0,
+) -> list[tuple[float, dict[str, np.ndarray]]]:
+    """다채널 sliding window 추출. NaN 정책: 짧은 dropout 보간, 긴 dropout 차단.
+
+    Returns
+    -------
+    list of (start_sec, {sig_type: (win_samples,)}). start_sec은 segment 내 절대시간 (초).
+    """
     win_samples = int(window_sec * sr)
     stride_samples = int(stride_sec * sr)
+    gap_max_samples = int(gap_max_sec * sr)
     min_len = min(len(v) for v in signals.values())
     if min_len < win_samples:
         return []
 
-    out: list[dict[str, np.ndarray]] = []
+    out: list[tuple[float, dict[str, np.ndarray]]] = []
     start = 0
     while start + win_samples <= min_len:
         win = {k: v[start: start + win_samples] for k, v in signals.items()}
-        if not any(np.isnan(arr).any() for arr in win.values()):
-            out.append(win)
+
+        # 1) 채널별 NaN ratio threshold 검사
+        nan_ratios = [float(np.isnan(arr).mean()) for arr in win.values()]
+        if max(nan_ratios) > nan_ratio_threshold:
+            start += stride_samples
+            continue
+
+        # 2) 채널별 단일 연속 NaN gap 길이 검사 (sensor blip만 허용)
+        max_gaps = [_max_consecutive_nan(arr) for arr in win.values()]
+        if max(max_gaps) > gap_max_samples:
+            start += stride_samples
+            continue
+
+        # 3) 통과한 윈도우 → NaN 선형 보간
+        win = {k: _linear_interpolate_nan(v) for k, v in win.items()}
+
+        out.append((start / sr, win))
         start += stride_samples
     return out
 
@@ -331,6 +380,7 @@ def prepare_aki_dataset(
     max_postop_days: float = 7.0,
     max_subjects: int | None = None,
     required_signals: list[str] | None = None,
+    min_windows_per_patient: int = 3,
 ) -> None:
     """AKI prediction 데이터셋을 패치(환자) 단위로 빌드."""
     if label_mode not in {"binary", "stage"}:
@@ -400,26 +450,39 @@ def prepare_aki_dataset(
         print(f"  Limited to {len(matched_dirs)} ({n_aki} AKI + {n_non} non-AKI)")
 
     # ── 3. 각 subject별로 윈도우 추출 ──
-    # required_set 기준으로 cohort + NaN-free window 결정 → paired comparison 일관성
+    # required_set 기준으로 cohort + NaN policy → paired comparison 일관성
+    # NaN 정책: ratio ≤ 5%, max gap ≤ 1s, 통과 시 선형 보간
     print(f"\n[3/4] Extracting windows from {len(matched_dirs)} subjects...")
+    print(
+        f"  NaN policy: ratio<=5% AND max_gap<=1s, "
+        f"passing windows linearly interpolated"
+    )
     patient_data: list[dict] = []
 
     for i, subj_dir in enumerate(matched_dirs):
         label = labels[subj_dir.name]
         segments = load_aligned_signals_for_subject(subj_dir, required_set)
 
-        windows: list[dict[str, np.ndarray]] = []
+        # 각 segment 내에서 sliding window 추출. seg_offset_sec로 segment간 시간 분리.
+        windowed: list[tuple[float, dict[str, np.ndarray]]] = []
+        seg_offset_sec = 0.0
         for seg in segments:
-            windows.extend(extract_windows(seg, window_sec, stride_sec))
+            seg_len_sec = (
+                min(len(v) for v in seg.values()) / TARGET_SR if seg else 0.0
+            )
+            for rel_sec, win in extract_windows(seg, window_sec, stride_sec):
+                windowed.append((seg_offset_sec + rel_sec, win))
+            # segment끼리 인접 윈도우로 보이지 않도록 offset 누적 + window_sec margin
+            seg_offset_sec += seg_len_sec + window_sec
 
-        if not windows:
+        if len(windowed) < min_windows_per_patient:
             continue
 
         # 출력은 input_signals만 — required ⊃ input일 수 있음
         if input_set != required_set:
-            windows = [
-                {st: w[st] for st in w.keys() if st in input_set}
-                for w in windows
+            windowed = [
+                (t, {st: w[st] for st in w.keys() if st in input_set})
+                for t, w in windowed
             ]
 
         target = label.aki_stage if label_mode == "stage" else label.aki_binary
@@ -429,13 +492,14 @@ def prepare_aki_dataset(
             "label": target,
             "preop_cr": label.preop_cr,
             "peak_postop_cr": label.peak_postop_cr,
-            "windows": windows,
+            "start_secs": [t for t, _ in windowed],
+            "windows": [w for _, w in windowed],
         })
 
         if (i + 1) % 50 == 0 or i == 0:
             print(
                 f"  [{i + 1}/{len(matched_dirs)}] {subj_dir.name}: "
-                f"label={target}, n_windows={len(windows)}"
+                f"label={target}, n_windows={len(windowed)}"
             )
 
     if not patient_data:
@@ -492,6 +556,7 @@ def prepare_aki_dataset(
                 st: torch.stack([torch.from_numpy(w[st]).float() for w in p["windows"]])
                 for st in sig_types
             }
+            start_secs = torch.tensor(p["start_secs"], dtype=torch.float32)
             packed.append({
                 "subject_id": p["subject_id"],
                 "case_id": p["case_id"],
@@ -500,6 +565,7 @@ def prepare_aki_dataset(
                 "peak_postop_cr": p["peak_postop_cr"],
                 "n_windows": len(p["windows"]),
                 "signals": sig_tensors,  # {sig_type: (K, win_samples)}
+                "start_secs": start_secs,  # (K,) seconds
             })
         return packed
 
@@ -600,6 +666,12 @@ def main() -> None:
     )
     parser.add_argument("--max-subjects", type=int, default=None)
     parser.add_argument(
+        "--min-windows-per-patient",
+        type=int,
+        default=3,
+        help="환자당 최소 윈도우 수. 미만 환자는 cohort에서 제외.",
+    )
+    parser.add_argument(
         "--out-dir", default="datasets/processed/aki",
     )
     args = parser.parse_args()
@@ -618,6 +690,7 @@ def main() -> None:
         max_postop_days=args.max_postop_days,
         max_subjects=args.max_subjects,
         required_signals=args.required_signals,
+        min_windows_per_patient=args.min_windows_per_patient,
     )
 
 

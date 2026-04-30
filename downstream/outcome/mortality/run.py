@@ -107,7 +107,7 @@ def train_model(
                 batch_labels.append(p["mortality"])
 
             # 2. 패딩 + Aggregator
-            padded, mask, labels = collate_patients(
+            padded, mask, labels, _ = collate_patients(
                 patient_reprs, batch_labels, device
             )
             patient_repr = aggregator(padded, mask)  # (B, d_model)

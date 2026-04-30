@@ -96,7 +96,7 @@ def train_model(
                 patient_reprs.append(reprs)
                 batch_labels.append(p["label"])
 
-            padded, mask, labels = collate_patients(
+            padded, mask, labels, _ = collate_patients(
                 patient_reprs, batch_labels, device
             )
             patient_repr = aggregator(padded, mask)

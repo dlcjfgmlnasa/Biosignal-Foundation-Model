@@ -37,10 +37,40 @@ SIGNAL_TYPE_INT: dict[str, int] = {
 }
 
 
+def _time_sinusoidal_embedding(
+    time_secs: torch.Tensor,  # (B, K)
+    d_model: int,
+    base: float = 10000.0,
+) -> torch.Tensor:  # (B, K, d_model)
+    """Continuous-time positional embedding (Vaswani-style on real time).
+
+    time_secs: 각 윈도우의 시작 시각 (초). 동일 환자 내에서 상대시간이면 충분.
+    """
+    half = d_model // 2
+    inv_freq = 1.0 / (
+        base ** (torch.arange(0, half, dtype=time_secs.dtype, device=time_secs.device) / half)
+    )  # (half,)
+    angles = time_secs.unsqueeze(-1) * inv_freq  # (B, K, half)
+    emb = torch.cat([angles.sin(), angles.cos()], dim=-1)  # (B, K, 2*half)
+    if emb.shape[-1] < d_model:
+        # d_model이 홀수일 경우 0으로 pad
+        pad = torch.zeros(
+            *emb.shape[:-1], d_model - emb.shape[-1],
+            dtype=emb.dtype, device=emb.device,
+        )
+        emb = torch.cat([emb, pad], dim=-1)
+    return emb
+
+
 class TransformerAggregator(nn.Module):
     """시간 순서를 반영하는 Transformer 기반 환자 표현 생성기.
 
     [CLS] 토큰 + K개 윈도우 representation → self-attention → CLS output.
+
+    Positional embedding 모드 (`pos_mode`):
+      - "time": time_secs 기반 sinusoidal (continuous, 갭 인지)
+      - "index": K개 학습 가능한 임베딩 (legacy, backward compat)
+      - "auto" (default): forward에서 time_secs가 주어지면 time, 아니면 index
     """
 
     def __init__(
@@ -50,13 +80,18 @@ class TransformerAggregator(nn.Module):
         n_layers: int = 2,
         dropout: float = 0.1,
         max_windows: int = 128,
+        pos_mode: str = "auto",
     ) -> None:
         super().__init__()
         self.d_model = d_model
+        self.pos_mode = pos_mode
         self.cls_token = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+        # Index-based pos_embed은 fallback용 항상 보유 (CLS 포함 max_windows+1)
         self.pos_embed = nn.Parameter(
             torch.randn(1, max_windows + 1, d_model) * 0.02
-        )  # +1 for CLS
+        )
+        # CLS 전용 학습 임베딩 (time mode에서 CLS 위치 표시)
+        self.cls_pos_embed = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
 
         layer = nn.TransformerEncoderLayer(
             d_model=d_model,
@@ -71,6 +106,7 @@ class TransformerAggregator(nn.Module):
         self,
         chunk_reprs: torch.Tensor,  # (B, K, d_model)
         mask: torch.Tensor | None = None,  # (B, K) bool, True=valid
+        time_secs: torch.Tensor | None = None,  # (B, K) float, 윈도우 시작 시각(초)
     ) -> torch.Tensor:  # (B, d_model)
         b, k, _ = chunk_reprs.shape
 
@@ -78,8 +114,19 @@ class TransformerAggregator(nn.Module):
         cls = self.cls_token.expand(b, -1, -1)  # (B, 1, D)
         x = torch.cat([cls, chunk_reprs], dim=1)  # (B, K+1, D)
 
-        # Positional embedding
-        x = x + self.pos_embed[:, : k + 1, :]
+        # Positional embedding 선택
+        use_time = (
+            self.pos_mode == "time"
+            or (self.pos_mode == "auto" and time_secs is not None)
+        )
+        if use_time:
+            assert time_secs is not None, "time_secs required for pos_mode='time'"
+            time_pe = _time_sinusoidal_embedding(time_secs, self.d_model)  # (B, K, D)
+            cls_pe = self.cls_pos_embed.expand(b, -1, -1)  # (B, 1, D)
+            pe = torch.cat([cls_pe, time_pe], dim=1)  # (B, K+1, D)
+            x = x + pe
+        else:
+            x = x + self.pos_embed[:, : k + 1, :]
 
         # Attention mask: CLS는 항상 valid
         if mask is not None:
@@ -137,7 +184,8 @@ def encode_patient_windows(
     max_windows: int,
     use_lora: bool = False,
     session_prefix: str = "patient",
-) -> torch.Tensor:
+    return_time_secs: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
     """한 환자의 K개 윈도우를 인코딩하여 (K, d_model) 반환.
 
     Parameters
@@ -145,7 +193,8 @@ def encode_patient_windows(
     model:
         DownstreamModelWrapper — extract_features 또는 batch_to_device + model
     patient:
-        {"signals": {sig_type: (K, win_samples)}, "n_windows": K, ...}
+        {"signals": {sig_type: (K, win_samples)}, "n_windows": K,
+         "start_secs": (K,) optional time meta, ...}
     patch_size:
         Encoder의 patch_size (보통 100 또는 200)
     max_windows:
@@ -154,6 +203,9 @@ def encode_patient_windows(
         True이면 gradient 활성 경로 (LoRA fine-tune 시). False이면 no_grad.
     session_prefix:
         BiosignalSample.session_id prefix (task별 구분용; 기본 "patient")
+    return_time_secs:
+        True이면 (chunk_reprs, time_secs) 튜플 반환. patient에 start_secs 없으면
+        time_secs는 None.
     """
     sig_types = list(patient["signals"].keys())
     k = patient["n_windows"]
@@ -189,19 +241,37 @@ def encode_patient_windows(
 
             chunk_reprs.append(feat)  # (1, d_model)
 
-    return torch.cat(chunk_reprs, dim=0)  # (K', d_model)
+    out_reprs = torch.cat(chunk_reprs, dim=0)  # (K', d_model)
+    if not return_time_secs:
+        return out_reprs
+
+    start_secs_full = patient.get("start_secs")
+    if start_secs_full is None:
+        return out_reprs, None
+    if isinstance(start_secs_full, torch.Tensor):
+        start_secs_full = start_secs_full.float()
+    else:
+        start_secs_full = torch.as_tensor(start_secs_full, dtype=torch.float32)
+    sub = start_secs_full[indices]  # (K',)
+    return out_reprs, sub
 
 
 def collate_patients(
     patient_reprs: list[torch.Tensor],  # [(K_i, d_model), ...]
     labels: list[int],
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    time_secs: list[torch.Tensor | None] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """가변 K를 패딩하여 배치를 만든다.
+
+    Parameters
+    ----------
+    time_secs : list of (K_i,) tensor or None per patient. None이면 시간 정보 미제공.
 
     Returns
     -------
-    (padded_reprs (B, K_max, d), mask (B, K_max), labels (B,))
+    (padded_reprs (B, K_max, d), mask (B, K_max), labels (B,),
+     time_secs (B, K_max) or None)
     """
     k_max = max(r.shape[0] for r in patient_reprs)
     d_model = patient_reprs[0].shape[1]
@@ -216,4 +286,14 @@ def collate_patients(
         mask[i, :k_i] = True
 
     labels_t = torch.tensor(labels, dtype=torch.float32, device=device)
-    return padded, mask, labels_t
+
+    times_t: torch.Tensor | None = None
+    if time_secs is not None and any(t is not None for t in time_secs):
+        times_t = torch.zeros(b, k_max, dtype=torch.float32, device=device)
+        for i, t in enumerate(time_secs):
+            if t is None:
+                continue
+            k_i = t.shape[0]
+            times_t[i, :k_i] = t.to(device)
+
+    return padded, mask, labels_t, times_t

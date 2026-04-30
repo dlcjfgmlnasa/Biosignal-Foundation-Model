@@ -130,20 +130,23 @@ def train_model(
             batch_indices = order[batch_start: batch_start + batch_size]
 
             patient_reprs = []
+            patient_times: list[torch.Tensor | None] = []
             batch_labels = []
             for idx in batch_indices:
                 p = train_patients[idx]
-                reprs = encode_patient_windows(
+                reprs, times = encode_patient_windows(
                     model, p, patch_size, max_windows,
                     use_lora=use_lora, session_prefix="aki",
+                    return_time_secs=True,
                 )
                 patient_reprs.append(reprs)
+                patient_times.append(times)
                 batch_labels.append(p["label"])
 
-            padded, mask, labels = collate_patients(
-                patient_reprs, batch_labels, device
+            padded, mask, labels, time_secs = collate_patients(
+                patient_reprs, batch_labels, device, time_secs=patient_times
             )
-            patient_repr = aggregator(padded, mask)  # (B, d_model)
+            patient_repr = aggregator(padded, mask, time_secs=time_secs)  # (B, d_model)
 
             logits = probe(patient_repr)
             if label_mode == "binary":
@@ -230,11 +233,14 @@ def evaluate_model(
     all_scores: list[np.ndarray] = []  # binary: scalar, stage: (4,) softmax
 
     for p in test_patients:
-        reprs = encode_patient_windows(model, p, patch_size, max_windows)
+        reprs, times = encode_patient_windows(
+            model, p, patch_size, max_windows, return_time_secs=True,
+        )
         padded = reprs.unsqueeze(0).to(device)  # (1, K, d_model)
         mask = torch.ones(1, reprs.shape[0], dtype=torch.bool, device=device)
+        time_secs = times.unsqueeze(0).to(device) if times is not None else None
 
-        patient_repr = aggregator(padded, mask)
+        patient_repr = aggregator(padded, mask, time_secs=time_secs)
         logit = probe(patient_repr)
 
         if label_mode == "binary":
