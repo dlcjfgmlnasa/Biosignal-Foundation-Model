@@ -215,6 +215,20 @@ TRACK_MAP: dict[str, tuple[str, int]] = {
     "SNUADCM/CVP": ("cvp", 0),  # Central venous pressure
     "SNUADCM/PAP": ("pap", 0),  # Pulmonary arterial pressure
     "SNUADCM/ICP": ("icp", 0),  # Intracranial pressure
+    # ── K-MIMIC-MORTAL (Philips Intellivue, ICU) ──
+    # 161K files (bucket 410+) 사용. 67K SNUADCM 외 나머지 모두 이쪽.
+    # ECG (0)
+    "Intellivue/ECG_II": ("ecg", 1),  # Lead II numeric (HR-derived)
+    "Intellivue/ECG_II_WAV": ("ecg", 1),  # Lead II waveform (선호)
+    "Intellivue/ECG_III": ("ecg", 0),  # Lead III
+    # ABP (1)
+    "Intellivue/ABP": ("abp", 1),  # Arterial line waveform
+    # PPG (2)
+    "Intellivue/PLETH": ("ppg", 1),  # SpO2 finger pleth waveform
+    # CO2 (4)
+    "Intellivue/CO2": ("co2", 0),  # Capnography waveform
+    # AWP (5)
+    "Intellivue/AWP_WAV": ("awp", 0),  # Airway pressure waveform
 }
 
 SIGNAL_TYPES: dict[str, int] = {
