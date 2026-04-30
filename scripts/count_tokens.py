@@ -39,6 +39,7 @@ SIGNAL_NAMES: dict[int, str] = {
     1: "ABP",
     2: "PPG",
     3: "CVP",
+    4: "CO2",
     5: "AWP",
     6: "PAP",
     7: "ICP",
