@@ -330,6 +330,7 @@ def prepare_aki_dataset(
     label_mode: str = "binary",
     max_postop_days: float = 7.0,
     max_subjects: int | None = None,
+    required_signals: list[str] | None = None,
 ) -> None:
     """AKI prediction 데이터셋을 패치(환자) 단위로 빌드."""
     if label_mode not in {"binary", "stage"}:
@@ -339,12 +340,21 @@ def prepare_aki_dataset(
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
+    # paired comparison: required_signals 기준으로 cohort + window 결정,
+    # 출력 .pt에는 input_signals만 저장. None이면 input_signals와 동일.
+    if required_signals is None:
+        required_set = set(input_signals)
+    else:
+        required_set = set(required_signals) | set(input_signals)
+    input_set = set(input_signals)
+
     print(f"\n{'=' * 60}")
     print(f"  Postoperative AKI Prediction — Data Preparation")
     print(f"  Data dir:    {data_dir}")
     print(f"  Clinical:    {clinical_csv}")
     print(f"  Lab:         {lab_csv}")
-    print(f"  Inputs:      {input_signals}")
+    print(f"  Inputs:      {sorted(input_set)}")
+    print(f"  Required:    {sorted(required_set)}")
     print(f"  Window:      {window_sec}s, Stride: {stride_sec}s")
     print(f"  Label mode:  {label_mode}")
     print(f"  Postop win:  {max_postop_days} days")
@@ -390,13 +400,13 @@ def prepare_aki_dataset(
         print(f"  Limited to {len(matched_dirs)} ({n_aki} AKI + {n_non} non-AKI)")
 
     # ── 3. 각 subject별로 윈도우 추출 ──
+    # required_set 기준으로 cohort + NaN-free window 결정 → paired comparison 일관성
     print(f"\n[3/4] Extracting windows from {len(matched_dirs)} subjects...")
-    required_signals = set(input_signals)
     patient_data: list[dict] = []
 
     for i, subj_dir in enumerate(matched_dirs):
         label = labels[subj_dir.name]
-        segments = load_aligned_signals_for_subject(subj_dir, required_signals)
+        segments = load_aligned_signals_for_subject(subj_dir, required_set)
 
         windows: list[dict[str, np.ndarray]] = []
         for seg in segments:
@@ -404,6 +414,13 @@ def prepare_aki_dataset(
 
         if not windows:
             continue
+
+        # 출력은 input_signals만 — required ⊃ input일 수 있음
+        if input_set != required_set:
+            windows = [
+                {st: w[st] for st in w.keys() if st in input_set}
+                for w in windows
+            ]
 
         target = label.aki_stage if label_mode == "stage" else label.aki_binary
         patient_data.append({
@@ -499,7 +516,8 @@ def prepare_aki_dataset(
                 "(≥1.5 = stage1, ≥2.0 = stage2, ≥3.0 or ≥4.0 mg/dL = stage3) "
                 "or absolute increase ≥0.3 mg/dL for stage 1."
             ),
-            "input_signals": sorted(input_signals),
+            "input_signals": sorted(input_set),
+            "required_signals": sorted(required_set),
             "window_sec": window_sec,
             "stride_sec": stride_sec,
             "sampling_rate": TARGET_SR,
@@ -552,6 +570,12 @@ def main() -> None:
         "--input-signals", nargs="+", default=DEFAULT_INPUT_SIGNALS,
         help="입력 신호 (K-MIMIC pretrain overlap: abp ecg ppg cvp)",
     )
+    parser.add_argument(
+        "--required-signals", nargs="+", default=None,
+        help="Paired comparison용 required cohort 신호. "
+        "지정 시 모든 sweep이 동일 환자/윈도우 풀 사용. "
+        "예: --required-signals abp ecg ppg",
+    )
     parser.add_argument("--window-sec", type=float, default=600.0)
     parser.add_argument("--stride-sec", type=float, default=300.0)
     parser.add_argument(
@@ -593,6 +617,7 @@ def main() -> None:
         label_mode=args.label_mode,
         max_postop_days=args.max_postop_days,
         max_subjects=args.max_subjects,
+        required_signals=args.required_signals,
     )
 
 
