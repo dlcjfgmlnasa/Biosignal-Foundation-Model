@@ -146,15 +146,21 @@ def _extract_records(subject_manifest: dict):
       (a) flat — {"session_id": ..., "recordings": [...]}, 또는 {"files": [...]}
       (b) K-MIMIC 중첩 — {"subject_id": ..., "sessions": [
               {"session_id": ..., "recordings": [...]}, ...]}
+
+    yield (n_channels, n_timesteps, signal_type, subject_key)
+      subject_key는 unique-subject 카운트용 — `subject_id` 우선,
+      없으면 session_id로 fallback. 같은 subject 의 여러 session 이 한 명으로 셈.
     """
-    # (b) K-MIMIC: sessions[] 중첩 구조
+    # (b) K-MIMIC: sessions[] 중첩 구조 — subject_id 로 통합 카운트
     sessions = subject_manifest.get("sessions")
     if isinstance(sessions, list) and sessions:
         subj_id = subject_manifest.get("subject_id", "")
         for sess in sessions:
             if not isinstance(sess, dict):
                 continue
-            sess_id = sess.get("session_id", subj_id)
+            sess_id = sess.get("session_id", "")
+            # subject_key: subject_id 우선 (unique patient 카운트). 없으면 session_id.
+            subject_key = subj_id if subj_id else sess_id
             for r in sess.get("recordings", []):
                 if not isinstance(r, dict):
                     continue
@@ -162,12 +168,14 @@ def _extract_records(subject_manifest: dict):
                     int(r.get("n_channels", 1)),
                     int(r.get("n_timesteps", r.get("length", 0))),
                     int(r.get("signal_type", 0)),
-                    r.get("session_id", sess_id),
+                    subject_key,
                 )
         return
 
     # (a) flat: recordings 또는 files 키
+    subj_id = subject_manifest.get("subject_id", "")
     session_id = subject_manifest.get("session_id", "")
+    subject_key = subj_id if subj_id else session_id
     recs = subject_manifest.get("recordings")
     if recs is None:
         recs = subject_manifest.get("files", [])
@@ -178,7 +186,7 @@ def _extract_records(subject_manifest: dict):
             int(r.get("n_channels", 1)),
             int(r.get("n_timesteps", r.get("length", 0))),
             int(r.get("signal_type", 0)),
-            r.get("session_id", session_id),
+            subject_key,
         )
 
 
