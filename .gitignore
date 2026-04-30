@@ -49,6 +49,10 @@ docs/
 # Claude Code
 .claude/
 .plans/
+
+# Obsidian vault (개인 노트, 추적 제외)
+obsidian/
+.obsidian/
 # BigQuery cohort exports (may contain PHI)
 bquxjob_*.csv
 
