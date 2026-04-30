@@ -128,6 +128,13 @@ def main() -> None:
              "manifest는 보존.",
     )
     p.add_argument(
+        "--from-list",
+        type=str,
+        default=None,
+        help="파일 경로 리스트(.txt) 사용 — os.walk 우회. "
+             "NAS scan silent-fail 회피용. find $RAW -name '*.vital' > list.txt 후 지정.",
+    )
+    p.add_argument(
         "--skip-parse",
         action="store_true",
         help="parse 단계 건너뛰기 (이미 processed-tmp에 manifest 있을 때)",
@@ -167,6 +174,8 @@ def main() -> None:
             parse_cmd += ["--max-files", str(args.max_files)]
         if args.subject_from_parent:
             parse_cmd += ["--subject-from-parent", str(args.subject_from_parent)]
+        if args.from_list:
+            parse_cmd += ["--from-list", str(args.from_list)]
 
         rc = run_step(parse_cmd, "parse")
         if rc != 0:

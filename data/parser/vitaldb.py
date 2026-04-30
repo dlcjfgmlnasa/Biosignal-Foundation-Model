@@ -926,6 +926,13 @@ def main() -> None:
         help="병렬 처리 worker 수 (기본 1=순차 처리)",
     )
     parser.add_argument(
+        "--from-list",
+        type=str,
+        default=None,
+        help="파일 경로 리스트(.txt) 사용. os.walk 우회 — NAS scan 지연/silent fail 회피. "
+        "한 줄에 하나씩 .vital 절대 경로. 지정 시 --raw 는 root prefix 검증용.",
+    )
+    parser.add_argument(
         "--test-ratio",
         type=float,
         default=0.0,
@@ -994,17 +1001,35 @@ def main() -> None:
     import os
 
     vital_files: list[Path] = []
-    scan_iter = os.walk(raw_dir)
-    if _scan_have_tqdm:
-        scan_iter = _tqdm_scan(
-            scan_iter, desc=f"Scanning {raw_dir}", unit="dir"
-        )
-    for dirpath, _dirnames, filenames in scan_iter:
-        for fn in filenames:
-            if fn.endswith(".vital"):
-                vital_files.append(Path(dirpath) / fn)
+
+    # --from-list: os.walk 우회 (NAS silent-fail 회피)
+    if args.from_list:
+        list_path = Path(args.from_list)
+        if not list_path.is_file():
+            print(f"ERROR: --from-list 파일이 없습니다: {list_path}", file=sys.stderr)
+            sys.exit(1)
+        with open(list_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or not line.endswith(".vital"):
+                    continue
+                p = Path(line)
+                if p.is_file():
+                    vital_files.append(p)
+        print(f".vital 파일 {len(vital_files)}개 (--from-list {list_path})")
+    else:
+        scan_iter = os.walk(raw_dir)
         if _scan_have_tqdm:
-            scan_iter.set_postfix(found=len(vital_files))
+            scan_iter = _tqdm_scan(
+                scan_iter, desc=f"Scanning {raw_dir}", unit="dir"
+            )
+        for dirpath, _dirnames, filenames in scan_iter:
+            for fn in filenames:
+                if fn.endswith(".vital"):
+                    vital_files.append(Path(dirpath) / fn)
+            if _scan_have_tqdm:
+                scan_iter.set_postfix(found=len(vital_files))
+
     vital_files.sort()
 
     if not vital_files:
