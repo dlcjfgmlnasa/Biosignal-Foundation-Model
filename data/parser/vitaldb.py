@@ -1004,19 +1004,33 @@ def main() -> None:
 
     # --from-list: os.walk 우회 (NAS silent-fail 회피)
     if args.from_list:
+        import re
+
         list_path = Path(args.from_list)
         if not list_path.is_file():
             print(f"ERROR: --from-list 파일이 없습니다: {list_path}", file=sys.stderr)
             sys.exit(1)
+        # 깨진 라인(병렬 find race condition으로 두 path가 한 줄에 합쳐진 경우) 까지
+        # robust 파싱: 라인 안에서 모든 .vital 종료 path 추출.
+        # NOTE: is_file() stat 호출은 NAS에서 path당 5-10ms × N = 매우 느림.
+        # find 로 이미 만든 list 라면 모든 path 가 존재 보장 → stat 생략.
+        seen: set[str] = set()
         with open(list_path, encoding="utf-8") as f:
             for line in f:
-                line = line.strip()
-                if not line or not line.endswith(".vital"):
+                line = line.rstrip("\n")
+                if not line:
                     continue
-                p = Path(line)
-                if p.is_file():
-                    vital_files.append(p)
-        print(f".vital 파일 {len(vital_files)}개 (--from-list {list_path})")
+                # 한 라인 안에 / 로 시작하고 .vital 로 끝나는 모든 절대 경로 매칭
+                for m in re.finditer(r"/[^/\s]+(?:/[^/\s]+)*\.vital", line):
+                    p_str = m.group(0)
+                    if p_str in seen:
+                        continue
+                    seen.add(p_str)
+                    vital_files.append(Path(p_str))
+        print(
+            f".vital 파일 {len(vital_files)}개 (--from-list {list_path}, "
+            f"unique={len(seen)}, stat-skip)"
+        )
     else:
         scan_iter = os.walk(raw_dir)
         if _scan_have_tqdm:
