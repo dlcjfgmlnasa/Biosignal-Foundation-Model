@@ -6,23 +6,35 @@ signal_type(대분류) + spatial_id(소분류) 이중 인코딩 체계.
 
 로컬 ID 0은 항상 Unknown(위치 정보 없음)이다.
 
-지원 신호 (8종):
-  ECG(0), ABP(1), PPG(2), CVP(3), CO2(4), AWP(5), PAP(6), ICP(7)
+지원 신호 (9종, 2026-05-01 갱신):
+  ECG(0), ABP(1), PPG(2), CVP(3), CO2(4), AWP(5), PAP(6), ICP(7), RESP(8)
 
 데이터 소스:
   VitalDB Open: SNUADC/ (OR, 500Hz) — ECG, ABP, PPG, CVP, CO2, AWP
-  K-MIMIC-MORTAL: SNUADCM/ (ICU, 500Hz) — ECG, ABP, PPG, CVP, PAP, ICP
+  K-MIMIC-MORTAL: SNUADCM/, Solar8000/, Intellivue/ (ICU/OR mixed, 500Hz)
 """
 
 from __future__ import annotations
 
 # signal_type → {로컬 이름: 로컬 ID}
 SPATIAL_MAP: dict[int, dict[str, int]] = {
-    # ECG (signal_type=0)
+    # ECG (signal_type=0) — 12-lead 표준 + Unknown
     0: {
         "Unknown": 0,
-        "Lead_II": 1,
-        "Lead_V5": 2,
+        # Limb leads
+        "Lead_I":   1,
+        "Lead_II":  2,
+        "Lead_III": 3,
+        "aVR":      4,
+        "aVL":      5,
+        "aVF":      6,
+        # Precordial leads (chest)
+        "V1": 7,
+        "V2": 8,
+        "V3": 9,
+        "V4": 10,
+        "V5": 11,
+        "V6": 12,
     },
     # ABP (signal_type=1)
     1: {
@@ -54,6 +66,14 @@ SPATIAL_MAP: dict[int, dict[str, int]] = {
     # ICP/Intracranial Pressure (signal_type=7)
     7: {
         "Unknown": 0,
+    },
+    # RESP/Respiration (signal_type=8) — 호흡 wave 통합
+    # Impedance: 가슴 임피던스 호흡 (ECG 전극 부수 측정)
+    # Flow: ventilator flow waveform (intubation 환자만)
+    8: {
+        "Unknown": 0,
+        "Impedance": 1,
+        "Flow": 2,
     },
 }
 
@@ -103,6 +123,7 @@ MECHANISM_GROUP: dict[int, int] = {
     5: 1,  # AWP → Respiratory
     6: 0,  # PAP → Cardiovascular
     7: 0,  # ICP → Cardiovascular
+    8: 1,  # RESP → Respiratory
 }
 
 MECHANISM_GROUP_NAMES: dict[int, str] = {
@@ -139,18 +160,28 @@ CROSS_PRED_ALLOWED_PAIRS: set[tuple[int, int]] = {
     (3, 6),  # CVP ↔ PAP — 우심 전후부하, 같은 pressure 도메인
     # Cerebral Perfusion (뇌관류)
     (1, 7),  # ABP ↔ ICP — CPP = MAP - ICP, 뇌자동조절
+    # Respiratory cycle (호흡 주기)
+    (4, 8),  # CO2 ↔ RESP — capnography ↔ impedance, 같은 호흡 cycle
+    (5, 8),  # AWP ↔ RESP — airway pressure ↔ impedance
+    (4, 5),  # CO2 ↔ AWP — 같은 호흡 cycle, ventilator 동기 (제한적)
 }
 
 
 # 채널명 → (signal_type, local_spatial_id) 역매핑
 CHANNEL_NAME_TO_SPATIAL: dict[str, tuple[int, int]] = {
-    # ECG (0)
-    "ECG Lead II": (0, 1),
-    "ECG II": (0, 1),
-    "II": (0, 1),
-    "ECG Lead V5": (0, 2),
-    "ECG V5": (0, 2),
-    "V5": (0, 2),
+    # ECG (0) — 12-lead
+    "ECG Lead I":   (0, 1), "ECG I":   (0, 1), "I":   (0, 1),
+    "ECG Lead II":  (0, 2), "ECG II":  (0, 2), "II":  (0, 2),
+    "ECG Lead III": (0, 3), "ECG III": (0, 3), "III": (0, 3),
+    "ECG aVR": (0, 4), "aVR": (0, 4),
+    "ECG aVL": (0, 5), "aVL": (0, 5),
+    "ECG aVF": (0, 6), "aVF": (0, 6),
+    "ECG V1": (0, 7),  "V1": (0, 7),
+    "ECG V2": (0, 8),  "V2": (0, 8),
+    "ECG V3": (0, 9),  "V3": (0, 9),
+    "ECG V4": (0, 10), "V4": (0, 10),
+    "ECG V5": (0, 11), "V5": (0, 11), "ECG Lead V5": (0, 11),
+    "ECG V6": (0, 12), "V6": (0, 12),
     # ABP (1)
     "ABP Radial": (1, 1),
     "ART": (1, 1),
@@ -170,4 +201,9 @@ CHANNEL_NAME_TO_SPATIAL: dict[str, tuple[int, int]] = {
     "PAP": (6, 0),
     # ICP (7)
     "ICP": (7, 0),
+    # RESP (8)
+    "RESP": (8, 1),
+    "Impedance": (8, 1),
+    "FLOW": (8, 2),
+    "FLOW_WAV": (8, 2),
 }

@@ -1,0 +1,105 @@
+# Phase 2: Any-Variate Cross-Modal Training — K-MIMIC only (K=2)
+# ──────────────────────────────────────────────────────────────
+# Server: 2×L40S 48GB, KHDP 분석환경
+# Dataset: K-MIMIC ICU ~3,500 subjects, ~1.94M recordings
+# Phase 1 K-MIMIC checkpoint 에서 resume → cross-modal 학습
+#
+# 핵심 차이 (vs phase2_base.yaml):
+#   * data_dir: K-MIMIC only (VitalDB 제외)
+#   * shard_index_path 추가 (1.94M recording → shard backend 필수)
+#   * next_block_size: 4 → 2 (8s → 4s 미래 예측)
+#   * resume: K-MIMIC Phase 1 best.pt
+#
+# Usage (2-GPU DDP):
+#   torchrun --nproc_per_node=2 -m train.2_any_variate \
+#       --config configs/phase2_kmimic.yaml
+#
+# Smoke test:
+#   python -m train.2_any_variate --config configs/phase2_kmimic.yaml --dry-run
+
+# ── Phase 1 K-MIMIC checkpoint ──
+resume: outputs/phase1_kmimic/kmimic_d256_L12_10min_p200_k2/checkpoints/best.pt
+
+# ── 모델 (Phase 1 과 동일 — checkpoint 에서 로드) ──
+model_config:
+  d_model: 256
+  num_layers: 12
+  patch_size: 200              # 100Hz × 2초 = 200 samples/patch
+  stride: null                 # non-overlapping (= patch_size)
+  num_heads: 8                 # head_dim = 256/8 = 32
+  num_groups: null             # MHA (= num_heads)
+  num_signal_types: 9        # ECG(0)~ICP(7), RESP(8) — 2026-05-01          # ECG(0)~ICP(7) — K-MIMIC ICP 포함
+  num_spatial_ids: 26        # ECG 12-lead + RESP          # TOTAL_SPATIAL_IDS
+  use_glu: true
+  use_moe: false
+  use_rope: true
+  use_var_attn_bias: true
+  use_spatial_embed: true
+  dropout_p: 0.1
+
+  # ── Task heads ──
+  next_block_size: 2           # Block Next Prediction K=2 — 4s 미래 예측 (Phase 1 과 동일)
+  contrastive_proj_dim: 128    # Contrastive projection head (Phase 2 활성)
+
+# ── 데이터 (K-MIMIC ICU 전용) ──
+data_dir:
+  - /home/coder/workspace/updown/bio_fm/data/train/k-mimic/
+signal_types: [0, 1, 2, 3, 4, 5, 6, 7]  # ECG, ABP, PPG, CVP, CO2, AWP, PAP, ICP
+max_subjects: null
+window_seconds: 600.0          # 10분 윈도우 — 다변량 세션
+max_length: 180000             # row 당 다수 unit packing 지원 (cross-session neg 풍부)
+cache_size: 16
+crop_ratio_min: 0.01           # Long recording(≥600s) 만 crop
+crop_ratio_max: 1.0
+min_patches: 5                 # 10s floor (cross-modal multi-tier truncate 기준)
+
+# ── Shard backend ──
+shard_index_path: /home/coder/workspace/updown/bio_fm/data/k-mimic_wbs/shard_index.json
+shard_cache_size: 1            # OOM 회피
+
+# ── 학습 ──
+batch_size: 64                 # any_variate multi-channel packing
+lr: 2.0e-4                     # Phase 1(8e-4) 대비 낮은 LR (fine-tuning)
+n_epochs: 50
+warmup_epochs: 3
+min_lr_ratio: 0.1              # 최종 LR = 2e-5
+mask_ratio: 0.4
+gradient_clip: 1.0
+seed: 42
+collate_mode: any_variate      # Phase 2 핵심: 다변량 collate
+max_batches: 4000
+
+# ── Loss 가중치 (Phase 2: MPM + Next-Pred + Cross-Modal + Contrastive) ──
+alpha: 0.7                     # masked reconstruction
+beta: 0.3                      # next-patch prediction
+gamma: 0.15                    # cross-modal
+delta: 0.5                     # cross-modal contrastive (InfoNCE)
+peak_alpha: 1.0                # Peak-Weighted MSE
+lambda_spec: 0.2               # Multi-Resolution STFT Loss
+spec_n_ffts: [32, 64, 128]
+aux_loss_weight: 0.01
+contrastive_temperature: 0.07
+learnable_temperature: true
+
+# ── Masking (Block MPM) ──
+variate_mask_prob: 0.3         # 30% 확률로 전체 variate 마스킹 (virtual sensing)
+variate_drop_prob: 0.1         # 10% 확률로 variate 를 attention 에서 완전 제거 (zero-shot용)
+block_mask: true
+block_size_min: 2
+block_size_max: 3
+
+# ── Mixed Precision ──
+use_amp: true
+
+# ── Validation & Early Stopping ──
+val_ratio: 0.05
+val_max_batches: 500
+patience: 15
+
+# ── 시스템 ──
+device: auto
+num_workers: 4                 # 보수적
+output_dir: outputs/phase2_kmimic
+checkpoint_every: 5
+viz_every: 1
+exp_name: kmimic_phase2_k2

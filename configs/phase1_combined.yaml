@@ -19,8 +19,8 @@ model_config:
   stride: null               # non-overlapping (= patch_size)
   num_heads: 8               # head_dim = 256/8 = 32
   num_groups: null            # MHA (= num_heads)
-  num_signal_types: 8         # ECG(0)~ICP(7) — K-MIMIC ICP 포함
-  num_spatial_ids: 13          # TOTAL_SPATIAL_IDS (spatial_map.py 기준)
+  num_signal_types: 9        # ECG(0)~ICP(7), RESP(8) — 2026-05-01         # ECG(0)~ICP(7) — K-MIMIC ICP 포함
+  num_spatial_ids: 26        # ECG 12-lead + RESP          # TOTAL_SPATIAL_IDS (spatial_map.py 기준)
   use_glu: true
   use_moe: false              # Phase 1 CI에서는 off
   use_rope: true

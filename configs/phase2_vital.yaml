@@ -28,8 +28,8 @@ model_config:
   stride: null
   num_heads: 8
   num_groups: null
-  num_signal_types: 8
-  num_spatial_ids: 13
+  num_signal_types: 9        # ECG(0)~ICP(7), RESP(8) — 2026-05-01
+  num_spatial_ids: 26        # ECG 12-lead + RESP
   use_glu: true
   use_moe: false
   use_rope: true

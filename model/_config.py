@@ -67,8 +67,8 @@ class ModelConfig:
     dropout_p: float = 0.0
 
     # Signal types
-    num_signal_types: int = 8  # ECG(0)~ICP(7)
-    num_spatial_ids: int = 13  # TOTAL_SPATIAL_IDS (spatial_map.py)
+    num_signal_types: int = 9  # ECG(0)~ICP(7), RESP(8) — 2026-05-01 RESP 추가
+    num_spatial_ids: int = 26  # TOTAL_SPATIAL_IDS (spatial_map.py): ECG 12-lead + RESP 추가
 
     # Task
     next_block_size: int = 4  # Block Next Prediction (K future patches per position)

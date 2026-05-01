@@ -172,6 +172,20 @@ SIGNAL_CONFIGS: dict[str, SignalConfig] = {
         spike_detection=True,
         spike_threshold_std=8.0,
     ),
+    # RESP: 호흡 wave (impedance + vent flow 통합).
+    # Impedance plethy. 는 unit-less arbitrary scale (보통 0~수천),
+    # Flow waveform 은 L/min (양/음 부호 가능).
+    # 두 wave 의 amplitude scale 차이가 커서 valid_range 매우 넓게 허용.
+    # 실제 학습 안정성은 PackedStdScaler 의 점-단위 z-score 정규화로 흡수.
+    "resp": SignalConfig(
+        valid_range=(-200.0, 5000.0),  # impedance unit + flow L/min 모두 포용
+        filter_type="lowpass",
+        filter_freq=(0.0, 5.0),  # 호흡 주기 0.1~0.5Hz, 5Hz 면 충분
+        max_high_freq_ratio=1.0,
+        max_flatline_ratio=0.5,
+        min_amplitude=1.0,
+        quality_window_s=15.0,  # 호흡 1 cycle 4-6s, 15s = 2-4 cycles
+    ),
 }
 
 
@@ -183,12 +197,12 @@ SIGNAL_CONFIGS: dict[str, SignalConfig] = {
 # 비공식: 일부 파일에 존재하는 대체 장비 트랙 (같은 신호, 다른 소스)
 TRACK_MAP: dict[str, tuple[str, int]] = {
     # ── VitalDB Open (SNUADC, OR) ──
-    # ECG (0) — 500Hz, mV
-    "SNUADC/ECG_II": ("ecg", 1),  # Lead II
-    "SNUADC/ECG_V5": ("ecg", 2),  # Lead V5
-    "SNUADC/ECG_I": ("ecg", 0),  # Lead I (비공식)
-    "SNUADC/ECG_III": ("ecg", 0),  # Lead III (비공식)
-    "Solar8000/ECG_II": ("ecg", 1),  # Lead II — Solar8000 대체
+    # ECG (0) — 500Hz, mV. spatial_id 는 spatial_map.py 의 ECG dict 참조 (12-lead).
+    "SNUADC/ECG_I":   ("ecg", 1),  # Lead I
+    "SNUADC/ECG_II":  ("ecg", 2),  # Lead II
+    "SNUADC/ECG_III": ("ecg", 3),  # Lead III
+    "SNUADC/ECG_V5":  ("ecg", 11),  # Lead V5
+    "Solar8000/ECG_II": ("ecg", 2),  # Lead II — Solar8000 대체
     # ABP (1) — 500Hz, mmHg
     "SNUADC/ART": ("abp", 1),  # Radial artery
     "SNUADC/FEM": ("abp", 2),  # Femoral artery
@@ -208,22 +222,25 @@ TRACK_MAP: dict[str, tuple[str, int]] = {
     # ICP (7) — 500Hz, mmHg
     "SNUADC/ICP": ("icp", 0),  # Intracranial pressure
     # ── K-MIMIC-MORTAL (SNUADCM, ICU) ──
-    "SNUADCM/ECG_II": ("ecg", 1),  # Lead II
-    "SNUADCM/ECG_V5": ("ecg", 2),  # Lead V5
+    "SNUADCM/ECG_I":   ("ecg", 1),  # Lead I
+    "SNUADCM/ECG_II":  ("ecg", 2),  # Lead II
+    "SNUADCM/ECG_III": ("ecg", 3),  # Lead III
+    "SNUADCM/ECG_V5":  ("ecg", 11),  # Lead V5
     "SNUADCM/ART": ("abp", 1),  # Radial artery
     "SNUADCM/PLETH": ("ppg", 1),  # Finger
     "SNUADCM/CVP": ("cvp", 0),  # Central venous pressure
     "SNUADCM/PAP": ("pap", 0),  # Pulmonary arterial pressure
     "SNUADCM/ICP": ("icp", 0),  # Intracranial pressure
+    "SNUADCM/RESP": ("resp", 1),  # Impedance plethy. (sample 발견 시)
     # ── K-MIMIC-MORTAL (Philips Intellivue, ICU) ──
-    # 161K files (bucket 410+) 사용. 67K SNUADCM 외 나머지 모두 이쪽.
-    # ECG (0)
-    "Intellivue/ECG_II": ("ecg", 1),  # Lead II
-    "Intellivue/ECG_II_WAV": ("ecg", 1),  # Lead II waveform (선호)
-    "Intellivue/ECG_III": ("ecg", 0),  # Lead III
-    "Intellivue/ECG_III_WAV": ("ecg", 0),  # Lead III waveform
-    "Intellivue/ECG_I": ("ecg", 0),  # Lead I (rare)
-    "Intellivue/ECG_I_WAV": ("ecg", 0),  # Lead I waveform (rare)
+    # 161K files (bucket 410+) 다수. 67K SNUADCM 외 대부분.
+    # ECG (0) — 12-lead spatial_id
+    "Intellivue/ECG_I":       ("ecg", 1),
+    "Intellivue/ECG_I_WAV":   ("ecg", 1),
+    "Intellivue/ECG_II":      ("ecg", 2),
+    "Intellivue/ECG_II_WAV":  ("ecg", 2),
+    "Intellivue/ECG_III":     ("ecg", 3),
+    "Intellivue/ECG_III_WAV": ("ecg", 3),
     # ABP (1)
     "Intellivue/ABP": ("abp", 1),  # Arterial line waveform
     "Intellivue/ART": ("abp", 1),  # Arterial waveform (alternative naming)
@@ -237,6 +254,10 @@ TRACK_MAP: dict[str, tuple[str, int]] = {
     "Intellivue/AWP_WAV": ("awp", 0),  # Airway pressure waveform
     # PAP (6)
     "Intellivue/PAP": ("pap", 0),  # PAP waveform
+    # RESP (8) — 호흡 wave 신규 추가 (2026-05-01)
+    "Intellivue/RESP": ("resp", 1),  # Impedance plethysmography (가슴 임피던스)
+    "Intellivue/FLOW_WAV": ("resp", 2),  # Vent flow waveform
+    "Solar8000/RESP": ("resp", 1),  # Solar8000 호흡 (있을 시)
 }
 
 SIGNAL_TYPES: dict[str, int] = {
@@ -248,6 +269,7 @@ SIGNAL_TYPES: dict[str, int] = {
     "awp": 5,
     "pap": 6,
     "icp": 7,
+    "resp": 8,
 }
 
 
