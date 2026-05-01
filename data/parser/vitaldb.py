@@ -241,6 +241,16 @@ TRACK_MAP: dict[str, tuple[str, int]] = {
     "Intellivue/ECG_II_WAV":  ("ecg", 2),
     "Intellivue/ECG_III":     ("ecg", 3),
     "Intellivue/ECG_III_WAV": ("ecg", 3),
+    "Intellivue/ECG_AVR_WAV": ("ecg", 4),  # aVR augmented limb
+    "Intellivue/ECG_AVL_WAV": ("ecg", 5),  # aVL augmented limb
+    "Intellivue/ECG_AVF_WAV": ("ecg", 6),  # aVF augmented limb
+    "Intellivue/ECG_V_WAV":   ("ecg", 11),  # V lead (가장 흔한 V5 로 가정)
+    "Intellivue/ECG_V1_WAV":  ("ecg", 7),
+    "Intellivue/ECG_V2_WAV":  ("ecg", 8),
+    "Intellivue/ECG_V3_WAV":  ("ecg", 9),
+    "Intellivue/ECG_V4_WAV":  ("ecg", 10),
+    "Intellivue/ECG_V5_WAV":  ("ecg", 11),
+    "Intellivue/ECG_V6_WAV":  ("ecg", 12),
     # ABP (1)
     "Intellivue/ABP": ("abp", 1),  # Arterial line waveform
     "Intellivue/ART": ("abp", 1),  # Arterial waveform (alternative naming)
@@ -250,6 +260,7 @@ TRACK_MAP: dict[str, tuple[str, int]] = {
     "Intellivue/CVP": ("cvp", 0),  # CVP waveform
     # CO2 (4)
     "Intellivue/CO2": ("co2", 0),  # Capnography waveform
+    "Intellivue/CO2_WAV": ("co2", 0),  # Capnography waveform (alt naming)
     # AWP (5)
     "Intellivue/AWP_WAV": ("awp", 0),  # Airway pressure waveform
     # PAP (6)
