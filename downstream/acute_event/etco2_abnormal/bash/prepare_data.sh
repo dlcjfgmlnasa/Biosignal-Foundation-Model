@@ -1,5 +1,6 @@
 #!/bin/bash
 # Intraoperative EtCO2 Abnormal — VitalDB primary 데이터 준비 sweep
+# Paper Table S7 (Task 5) 정렬: 4 combos × 4 windows × 3 horizons
 # Label: EtCO2 < 35 또는 > 45 mmHg sustained ≥ 1min
 # Input: CO2 wave (Primus) + ECG/ABP/PPG
 
@@ -34,9 +35,10 @@ run_combo() {
         --out-dir "$OUT_DIR"
 }
 
+# Paper Table S7: CO2 / PPG / CO2+PPG / CO2+PPG+ECG+ABP
 run_combo "1/4" "co2"
-run_combo "2/4" "ecg"
-run_combo "3/4" "ppg"
-run_combo "4/4" "co2 ecg ppg abp"
+run_combo "2/4" "ppg"
+run_combo "3/4" "co2 ppg"
+run_combo "4/4" "co2 ppg ecg abp"
 
 echo -e "\nDone! Saved to: $OUT_DIR"

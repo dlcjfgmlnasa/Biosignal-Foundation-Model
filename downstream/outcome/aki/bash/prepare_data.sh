@@ -1,5 +1,7 @@
 #!/bin/bash
 # Postoperative AKI Prediction — 4-combo sweep (paired comparison)
+# Paper Table S7 (Task 9) 정렬: ABP / ECG+PPG / ECG+ABP+PPG / ECG+ABP+PPG+CVP
+# Paper §Common preprocessing: window 600 s, stride 30 s
 # 모든 combo가 동일 환자 풀 (REQUIRED 보유 환자) 사용
 #
 # 사용법:
@@ -17,11 +19,17 @@ DATA_DIR="${DATA_DIR:-/home/coder/workspace/updown/parser/vitaldb}"
 CLINICAL_CSV="${CLINICAL_CSV:-/home/coder/workspace/datasets/vitaldb_open/1.0.0/clinical_data.csv}"
 LAB_CSV="${LAB_CSV:-/home/coder/workspace/datasets/vitaldb_open/1.0.0/lab_data.csv}"
 OUT_DIR="${OUT_DIR:-/home/coder/workspace/updown/bio_fm/data/downstream/aki}"
-WINDOW_SEC="${WINDOW_SEC:-60}"
+WINDOW_SEC="${WINDOW_SEC:-600}"
 STRIDE_SEC="${STRIDE_SEC:-30}"
 LABEL_MODE="${LABEL_MODE:-binary}"
 MAX_POSTOP_DAYS="${MAX_POSTOP_DAYS:-7}"
-REQUIRED="${REQUIRED:-abp ecg ppg}"
+# 4번째 combo 가 +CVP 이므로 paper 정렬을 위해 cvp 도 required 로 두면 cohort 가
+# 크게 줄어든다 (Postop_AKI 노트: CVP 보유율 낮음 + NaN-free 동시 600s 제약 시
+# 환자 98.9% 유실). 4 combos 의 paired comparison 만 유지하고 CVP 는 input 으로만
+# 사용하려면 REQUIRED 에서 cvp 를 제외하시고 (`abp ecg ppg`), 그러면 4번째 combo
+# 만 cvp 보유 환자에서 추가 추출됨 (paired 깨짐). 둘 다 가능 — 본 default 는
+# paper paired comparison 우선 (cvp 포함 동일 cohort).
+REQUIRED="${REQUIRED:-abp ecg ppg cvp}"
 
 echo "============================================================"
 echo "  Postop AKI — Paired Comparison Data Preparation"
@@ -53,17 +61,11 @@ run_combo() {
         --out-dir "$OUT_DIR"
 }
 
-# 1. ABP only (same patients as ABP+ECG+PPG)
+# Paper Table S7: ABP / ECG+PPG / ECG+ABP+PPG / ECG+ABP+PPG+CVP
 run_combo "1/4" "abp"
-
-# 2. ECG only (same patients)
-run_combo "2/4" "ecg"
-
-# 3. PPG only (same patients)
-run_combo "3/4" "ppg"
-
-# 4. ABP + ECG + PPG (same patients) — paper main result
-run_combo "4/4" "abp ecg ppg"
+run_combo "2/4" "ecg ppg"
+run_combo "3/4" "ecg abp ppg"
+run_combo "4/4" "ecg abp ppg cvp"
 
 echo -e "\n============================================================"
 echo "  Done! 4 datasets saved to: $OUT_DIR"
