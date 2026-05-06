@@ -31,12 +31,18 @@ run.py에서 오프라인으로 로드하여 평가에 사용.
 from __future__ import annotations
 
 import argparse
+import gc
 import sys
 import time
 from pathlib import Path
 
 import numpy as np
 import torch
+
+from downstream._save_utils import (
+    add_signal_dtype_arg,
+    stack_arrays_destructive,
+)
 
 
 TARGET_SR: float = 100.0
@@ -457,35 +463,42 @@ def save_dataset(
     window_sec: float,
     source: str,
     out_dir: str,
+    signal_dtype: torch.dtype = torch.float16,
 ) -> Path:
     """윈도우 리스트를 .pt로 저장한다."""
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
+    n_train = len(train_windows)
+    n_test = len(test_windows)
+
     def _to_tensors(windows: list[dict]) -> dict:
         if not windows:
             return {"signals": {}, "case_ids": []}
 
+        case_ids = [w["case_id"] for w in windows]
         sig_tensors = {}
         for st in signal_types:
-            arrs = [w["signals"][st] for w in windows]
-            sig_tensors[st] = torch.stack([torch.from_numpy(a).float() for a in arrs])
-            # (N, win_samples)
-
-        case_ids = [w["case_id"] for w in windows]
+            arrs = [w["signals"].pop(st) for w in windows]
+            sig_tensors[st] = stack_arrays_destructive(arrs, signal_dtype)
         return {"signals": sig_tensors, "case_ids": case_ids}
 
+    train_dict = _to_tensors(train_windows); train_windows.clear()
+    test_dict = _to_tensors(test_windows); test_windows.clear()
+    gc.collect()
+
     save_dict = {
-        "train": _to_tensors(train_windows),
-        "test": _to_tensors(test_windows),
+        "train": train_dict,
+        "test": test_dict,
         "metadata": {
             "task": "any_to_any_cross_modal",
             "source": source,
             "signal_types": signal_types,
             "window_sec": window_sec,
             "sampling_rate": TARGET_SR,
-            "n_train": len(train_windows),
-            "n_test": len(test_windows),
+            "n_train": n_train,
+            "n_test": n_test,
+            "signal_dtype": str(signal_dtype).replace("torch.", ""),
         },
     }
 
@@ -538,6 +551,7 @@ def prepare_any_to_any(
     out_dir: str = "outputs/downstream/any_to_any",
     manifest_path: str | None = None,
     data_dir: str | None = None,
+    signal_dtype: torch.dtype = torch.float16,
 ) -> Path:
     """Any-to-Any cross-modal 평가 데이터를 준비한다.
 
@@ -642,6 +656,7 @@ def prepare_any_to_any(
         window_sec,
         source,
         out_dir,
+        signal_dtype=signal_dtype,
     )
 
     print(f"\n{'=' * 60}")
@@ -702,6 +717,7 @@ def main() -> None:
     parser.add_argument(
         "--manifest", type=str, default=None, help="MIMIC-III manifest JSON path"
     )
+    dtype_map = add_signal_dtype_arg(parser)
     args = parser.parse_args()
 
     prepare_any_to_any(
@@ -714,6 +730,7 @@ def main() -> None:
         out_dir=args.out_dir,
         manifest_path=args.manifest,
         data_dir=args.data_dir,
+        signal_dtype=dtype_map(args.signal_dtype),
     )
 
 

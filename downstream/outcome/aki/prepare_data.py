@@ -41,6 +41,11 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from downstream._save_utils import (
+    add_signal_dtype_arg,
+    stack_window_dicts_destructive,
+)
+
 
 TARGET_SR: float = 100.0
 
@@ -381,6 +386,7 @@ def prepare_aki_dataset(
     max_subjects: int | None = None,
     required_signals: list[str] | None = None,
     min_windows_per_patient: int = 3,
+    signal_dtype: torch.dtype = torch.float16,
 ) -> None:
     """AKI prediction 데이터셋을 패치(환자) 단위로 빌드."""
     if label_mode not in {"binary", "stage"}:
@@ -551,11 +557,11 @@ def prepare_aki_dataset(
     def _pack(plist: list[dict]) -> list[dict]:
         packed = []
         for p in plist:
-            sig_types = sorted(p["windows"][0].keys())
-            sig_tensors = {
-                st: torch.stack([torch.from_numpy(w[st]).float() for w in p["windows"]])
-                for st in sig_types
-            }
+            n_w = len(p["windows"])
+            sig_tensors = stack_window_dicts_destructive(
+                p["windows"], signal_dtype
+            )
+            p["windows"] = []
             start_secs = torch.tensor(p["start_secs"], dtype=torch.float32)
             packed.append({
                 "subject_id": p["subject_id"],
@@ -563,11 +569,18 @@ def prepare_aki_dataset(
                 "label": p["label"],
                 "preop_cr": p["preop_cr"],
                 "peak_postop_cr": p["peak_postop_cr"],
-                "n_windows": len(p["windows"]),
+                "n_windows": n_w,
                 "signals": sig_tensors,  # {sig_type: (K, win_samples)}
                 "start_secs": start_secs,  # (K,) seconds
             })
         return packed
+
+    n_train_p = len(train_p)
+    n_val_p = len(val_p)
+    n_test_p = len(test_p)
+    n_pos_train = sum(1 for p in train_p if p["label"] == 1)
+    n_pos_val = sum(1 for p in val_p if p["label"] == 1)
+    n_pos_test = sum(1 for p in test_p if p["label"] == 1)
 
     save_dict = {
         "train": _pack(train_p),
@@ -590,15 +603,16 @@ def prepare_aki_dataset(
             "max_postop_days": max_postop_days,
             "train_ratio": train_ratio,
             "val_ratio": val_ratio,
-            "n_train_patients": len(train_p),
-            "n_val_patients": len(val_p),
-            "n_test_patients": len(test_p),
+            "n_train_patients": n_train_p,
+            "n_val_patients": n_val_p,
+            "n_test_patients": n_test_p,
+            "signal_dtype": str(signal_dtype).replace("torch.", ""),
         },
     }
     if label_mode == "binary":
-        save_dict["metadata"]["n_pos_train"] = sum(1 for p in train_p if p["label"] == 1)
-        save_dict["metadata"]["n_pos_val"] = sum(1 for p in val_p if p["label"] == 1)
-        save_dict["metadata"]["n_pos_test"] = sum(1 for p in test_p if p["label"] == 1)
+        save_dict["metadata"]["n_pos_train"] = n_pos_train
+        save_dict["metadata"]["n_pos_val"] = n_pos_val
+        save_dict["metadata"]["n_pos_test"] = n_pos_test
 
     sig_str = "_".join(sorted(input_signals))
     out_file = out_path / f"aki_{label_mode}_{sig_str}_w{int(window_sec)}s.pt"
@@ -674,6 +688,7 @@ def main() -> None:
     parser.add_argument(
         "--out-dir", default="datasets/processed/aki",
     )
+    dtype_map = add_signal_dtype_arg(parser)
     args = parser.parse_args()
 
     prepare_aki_dataset(
@@ -691,6 +706,7 @@ def main() -> None:
         max_subjects=args.max_subjects,
         required_signals=args.required_signals,
         min_windows_per_patient=args.min_windows_per_patient,
+        signal_dtype=dtype_map(args.signal_dtype),
     )
 
 

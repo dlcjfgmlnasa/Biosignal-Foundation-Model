@@ -19,6 +19,7 @@ Input 소스: ICP + 동시 기록된 ECG, ABP, PPG 등
 from __future__ import annotations
 
 import argparse
+import gc
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -129,8 +130,15 @@ def load_patient_signals(
     -------
     list of {"case_id": str, "patient_id": str, "signals": {type: ndarray}}
     """
-    all_hea = sorted(waveform_dir.rglob("*.hea"))
-    print(f"  Found {len(all_hea)} .hea files")
+    import re
+
+    # 마스터 헤더만 선별: 파일명이 p<6자리>-... 형태
+    # (segment: <num>_NNNN.hea, layout: <num>_layout.hea 는 제외)
+    master_re = re.compile(r"^p\d{6}-\d{4}-\d{2}-\d{2}-\d{2}-\d{2}$")
+    all_hea = sorted(
+        h for h in waveform_dir.rglob("*.hea") if master_re.match(h.stem)
+    )
+    print(f"  Found {len(all_hea)} master .hea files")
 
     cases: list[dict] = []
     n_no_icp = 0
@@ -139,12 +147,14 @@ def load_patient_signals(
         rec_name = hea_path.stem
         rec_dir = hea_path.parent
 
-        # subject_id 추출
+        # subject_id 추출: 디렉토리(p00/p000907) 우선, 없으면 파일명 prefix(p000907)에서
         patient_id = "unknown"
         for part in hea_path.parts:
             if part.startswith("p") and len(part) == 7 and part[1:].isdigit():
                 patient_id = part
                 break
+        if patient_id == "unknown":
+            patient_id = rec_name.split("-", 1)[0]  # p000907
 
         signals = parse_waveform_record(rec_dir, rec_name)
         if signals is None:
@@ -276,36 +286,67 @@ def save_dataset(
     horizon_sec: float,
     window_sec: float,
     out_dir: str,
+    signal_dtype: torch.dtype = torch.float16,
 ) -> Path:
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
-    def _to_tensors(samples: list[ICHSample]) -> dict:
-        if not samples:
-            return {"signals": {}, "labels": torch.tensor([]),
-                    "label_values": torch.tensor([])}
+    n_train_in = len(train_samples)
+    n_test_in = len(test_samples)
 
-        sig_tensors = {}
+    def _consume_to_tensors(samples: list[ICHSample]) -> dict:
+        # torch.stack 은 중간 list + contiguous 출력 두 벌을 잡아 600s
+        # window 에서 ~70 GB 피크가 발생한다. 출력 텐서를 미리 할당하고
+        # numpy 참조를 pop 하면서 채워 피크를 절반으로 낮춘다.
+        if not samples:
+            return {"signals": {}, "labels": torch.tensor([], dtype=torch.long),
+                    "label_values": torch.tensor([], dtype=torch.float32),
+                    "case_ids": [], "subject_ids": []}
+
+        labels = torch.tensor([s.label for s in samples], dtype=torch.long)
+        label_values = torch.tensor(
+            [s.label_value for s in samples], dtype=torch.float32
+        )
+        case_ids = [s.case_id for s in samples]
+        subject_ids = [s.patient_id for s in samples]
+
+        sig_tensors: dict[str, torch.Tensor] = {}
         for stype in input_signals:
-            arrs = [s.input_signals[stype] for s in samples if stype in s.input_signals]
-            if arrs:
-                sig_tensors[stype] = torch.stack(
-                    [torch.from_numpy(a).float() for a in arrs]
-                )
+            T = next(
+                (int(s.input_signals[stype].shape[0])
+                 for s in samples if stype in s.input_signals),
+                None,
+            )
+            if T is None:
+                continue
+            n = sum(1 for s in samples if stype in s.input_signals)
+            out = torch.empty((n, T), dtype=signal_dtype)
+            i = 0
+            for s in samples:
+                arr = s.input_signals.pop(stype, None)
+                if arr is None:
+                    continue
+                # in-place copy + cast; numpy ref 는 pop 으로 즉시 해제됨
+                out[i].copy_(torch.from_numpy(arr))
+                i += 1
+            sig_tensors[stype] = out
 
         return {
             "signals": sig_tensors,
-            "labels": torch.tensor([s.label for s in samples], dtype=torch.long),
-            "label_values": torch.tensor(
-                [s.label_value for s in samples], dtype=torch.float32
-            ),
-            "case_ids": [s.case_id for s in samples],
-            "subject_ids": [s.patient_id for s in samples],
+            "labels": labels,
+            "label_values": label_values,
+            "case_ids": case_ids,
+            "subject_ids": subject_ids,
         }
 
+    train_dict = _consume_to_tensors(train_samples)
+    train_samples.clear()
+    test_dict = _consume_to_tensors(test_samples)
+    test_samples.clear()
+
     save_dict = {
-        "train": _to_tensors(train_samples),
-        "test": _to_tensors(test_samples),
+        "train": train_dict,
+        "test": test_dict,
         "metadata": {
             "task": "intracranial_hypertension_detection",
             "source": "MIMIC-III Waveform",
@@ -315,8 +356,9 @@ def save_dataset(
             "sampling_rate": TARGET_SR,
             "icp_threshold": ICP_THRESHOLD,
             "sustained_sec": SUSTAINED_SEC,
-            "n_train": len(train_samples),
-            "n_test": len(test_samples),
+            "n_train": n_train_in,
+            "n_test": n_test_in,
+            "signal_dtype": str(signal_dtype).replace("torch.", ""),
         },
     }
 
@@ -366,6 +408,7 @@ def prepare_ich_sweep(
     train_ratio: float = 0.7,
     out_dir: str = "outputs/downstream/intracranial_hypertension",
     split_mode: str = "random",
+    signal_dtype: torch.dtype = torch.float16,
 ) -> list[Path]:
     """(window, horizon) 조합을 sweep하여 데이터셋을 생성한다.
 
@@ -437,8 +480,11 @@ def prepare_ich_sweep(
         save_path = save_dataset(
             train_samples, test_samples, input_signals,
             horizon_sec, window_sec, out_dir,
+            signal_dtype=signal_dtype,
         )
         saved_paths.append(save_path)
+        # 다음 (window, horizon) 조합 시작 전에 GC 강제 실행해 600s 텐서를 회수
+        gc.collect()
 
     print(f"\n{'=' * 60}")
     print(f"  Done! {len(saved_paths)}/{len(combos)} datasets saved to {out_dir}")
@@ -483,7 +529,15 @@ def main() -> None:
         "--out-dir", type=str,
         default="outputs/downstream/intracranial_hypertension",
     )
+    parser.add_argument(
+        "--signal-dtype", type=str, default="float16",
+        choices=["float16", "float32"],
+        help="Storage dtype for waveform tensors. fp16 halves disk/RAM peak; "
+             "run.py auto-casts back to fp32 at load time.",
+    )
     args = parser.parse_args()
+
+    dtype_map = {"float16": torch.float16, "float32": torch.float32}
 
     prepare_ich_sweep(
         waveform_dir=args.waveform_dir,
@@ -494,6 +548,7 @@ def main() -> None:
         train_ratio=args.train_ratio,
         out_dir=args.out_dir,
         split_mode=args.split_mode,
+        signal_dtype=dtype_map[args.signal_dtype],
     )
 
 

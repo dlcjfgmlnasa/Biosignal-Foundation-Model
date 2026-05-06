@@ -20,6 +20,7 @@ Input 소스: parsed .pt 디렉토리의 wave (ECG/ABP/PPG/CO2)
 from __future__ import annotations
 
 import argparse
+import gc
 import re
 import sys
 from dataclasses import dataclass
@@ -27,6 +28,8 @@ from pathlib import Path
 
 import numpy as np
 import torch
+
+from downstream._save_utils import add_signal_dtype_arg, consume_input_signals
 
 TARGET_SR: float = 100.0
 ETCO2_TRACKS = [
@@ -319,10 +322,15 @@ def save_dataset(
     horizon_sec: float,
     window_sec: float,
     out_dir: str,
+    signal_dtype: torch.dtype = torch.float16,
 ) -> Path:
     """train/val/test 3-way 저장 (hypotension/aki 와 동일 schema)."""
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
+
+    n_train = len(train_samples)
+    n_val = len(val_samples)
+    n_test = len(test_samples)
 
     def _to_tensors(samples: list[ForecastSample]) -> dict:
         if not samples:
@@ -333,19 +341,12 @@ def save_dataset(
                 "case_ids": [],
             }
 
-        sig_tensors = {}
-        for stype in input_signals:
-            arrs = [s.input_signals[stype] for s in samples if stype in s.input_signals]
-            if arrs:
-                sig_tensors[stype] = torch.stack(
-                    [torch.from_numpy(a).float() for a in arrs]
-                )
-
         labels = torch.tensor([s.label for s in samples], dtype=torch.long)
         label_values = torch.tensor(
             [s.label_value for s in samples], dtype=torch.float32
         )
         case_ids = [s.case_id for s in samples]
+        sig_tensors = consume_input_signals(samples, input_signals, signal_dtype)
 
         return {
             "signals": sig_tensors,
@@ -354,10 +355,15 @@ def save_dataset(
             "case_ids": case_ids,
         }
 
+    train_dict = _to_tensors(train_samples); train_samples.clear()
+    val_dict = _to_tensors(val_samples); val_samples.clear()
+    test_dict = _to_tensors(test_samples); test_samples.clear()
+    gc.collect()
+
     save_dict = {
-        "train": _to_tensors(train_samples),
-        "val": _to_tensors(val_samples),
-        "test": _to_tensors(test_samples),
+        "train": train_dict,
+        "val": val_dict,
+        "test": test_dict,
         "metadata": {
             "task": "etco2_abnormal_forecast",
             "source": "vitaldb_pt + raw_vital",
@@ -368,9 +374,10 @@ def save_dataset(
             "etco2_normal_low": ETCO2_NORMAL_LOW,
             "etco2_normal_high": ETCO2_NORMAL_HIGH,
             "sustained_sec": 60.0,
-            "n_train": len(train_samples),
-            "n_val": len(val_samples),
-            "n_test": len(test_samples),
+            "n_train": n_train,
+            "n_val": n_val,
+            "n_test": n_test,
+            "signal_dtype": str(signal_dtype).replace("torch.", ""),
         },
     }
 
@@ -417,6 +424,7 @@ def prepare_etco2_sweep(
     max_subjects: int | None = None,
     out_dir: str = "outputs/downstream/etco2_abnormal",
     required_signals: list[str] | None = None,
+    signal_dtype: torch.dtype = torch.float16,
 ) -> list[Path]:
     max_window = max(window_secs)
     max_horizon_sec = max(horizon_mins) * 60.0
@@ -517,8 +525,10 @@ def prepare_etco2_sweep(
         save_path = save_dataset(
             train_s, val_s, test_s, input_signals,
             horizon_sec, window_sec, out_dir,
+            signal_dtype=signal_dtype,
         )
         saved_paths.append(save_path)
+        gc.collect()
 
     print(f"\n{'=' * 60}")
     print(f"  Done! {len(saved_paths)}/{len(combos)} datasets saved to {out_dir}")
@@ -541,6 +551,7 @@ def main() -> None:
     parser.add_argument("--train-ratio", type=float, default=0.6)
     parser.add_argument("--val-ratio", type=float, default=0.2)
     parser.add_argument("--out-dir", default="outputs/downstream/etco2_abnormal")
+    dtype_map = add_signal_dtype_arg(parser)
     args = parser.parse_args()
 
     prepare_etco2_sweep(
@@ -555,6 +566,7 @@ def main() -> None:
         max_subjects=args.max_subjects,
         out_dir=args.out_dir,
         required_signals=args.required_signals,
+        signal_dtype=dtype_map(args.signal_dtype),
     )
 
 

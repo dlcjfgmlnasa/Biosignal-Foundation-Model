@@ -35,6 +35,10 @@ from data.parser.mimic3_waveform import (
     MIMIC3_NATIVE_SR,
     _apply_pipeline,
 )
+from downstream._save_utils import (
+    add_signal_dtype_arg,
+    stack_window_dicts_destructive,
+)
 
 
 TARGET_SR: float = 100.0
@@ -154,6 +158,7 @@ def prepare_dataset(
     stride_sec: float = 30.0,  # 30s sliding (Acute Event 표준 — hypotension/ICH와 일관)
     train_ratio: float = 0.7,
     max_patients: int | None = None,
+    signal_dtype: torch.dtype = torch.float16,
 ) -> None:
     """cardiac arrest prediction 데이터셋 준비 (환자 단위 그룹핑)."""
     wf_path = Path(waveform_dir)
@@ -249,19 +254,24 @@ def prepare_dataset(
     def _pack_patients(plist: list[dict]) -> list[dict]:
         packed = []
         for p in plist:
-            sig_types = sorted(p["windows"][0].keys())
-            windows_per_type = {}
-            for st in sig_types:
-                windows_per_type[st] = torch.stack([
-                    torch.from_numpy(w[st]).float() for w in p["windows"]
-                ])  # (K, win_samples)
+            n_w = len(p["windows"])
+            windows_per_type = stack_window_dicts_destructive(
+                p["windows"], signal_dtype
+            )
+            p["windows"] = []
             packed.append({
                 "subject_id": p["subject_id"],
                 "label": p["cardiac_arrest"],
-                "n_windows": len(p["windows"]),
+                "n_windows": n_w,
                 "signals": windows_per_type,
             })
         return packed
+
+    input_signals_meta = sorted(train_patients[0]["windows"][0].keys())
+    n_pos_train = sum(1 for p in train_patients if p["cardiac_arrest"] == 1)
+    n_pos_test = sum(1 for p in test_patients if p["cardiac_arrest"] == 1)
+    n_train_p = len(train_patients)
+    n_test_p = len(test_patients)
 
     data = {
         "train": _pack_patients(train_patients),
@@ -271,15 +281,16 @@ def prepare_dataset(
             "source": "MIMIC-III Waveform Matched",
             "label": "cardiac_arrest",
             "aggregation": "patient_level",
-            "input_signals": sorted(train_patients[0]["windows"][0].keys()),
+            "input_signals": input_signals_meta,
             "window_sec": window_sec,
             "stride_sec": stride_sec,
             "sampling_rate": TARGET_SR,
-            "n_train_patients": len(train_patients),
-            "n_test_patients": len(test_patients),
-            "n_pos_train": sum(1 for p in train_patients if p["cardiac_arrest"] == 1),
-            "n_pos_test": sum(1 for p in test_patients if p["cardiac_arrest"] == 1),
+            "n_train_patients": n_train_p,
+            "n_test_patients": n_test_p,
+            "n_pos_train": n_pos_train,
+            "n_pos_test": n_pos_test,
             "train_ratio": train_ratio,
+            "signal_dtype": str(signal_dtype).replace("torch.", ""),
         },
     }
 
@@ -313,6 +324,7 @@ def main() -> None:
                              "(Acute Event 표준 — Hypotension/ICH와 일관).")
     parser.add_argument("--train-ratio", type=float, default=0.7)
     parser.add_argument("--max-patients", type=int, default=None)
+    dtype_map = add_signal_dtype_arg(parser)
     args = parser.parse_args()
 
     prepare_dataset(
@@ -323,6 +335,7 @@ def main() -> None:
         stride_sec=args.stride_sec,
         train_ratio=args.train_ratio,
         max_patients=args.max_patients,
+        signal_dtype=dtype_map(args.signal_dtype),
     )
 
 

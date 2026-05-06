@@ -21,6 +21,7 @@ model.generate() (autoregressive) API를 평가한다.
 from __future__ import annotations
 
 import argparse
+import gc
 import sys
 import time
 from dataclasses import dataclass
@@ -28,6 +29,11 @@ from pathlib import Path
 
 import numpy as np
 import torch
+
+from downstream._save_utils import (
+    add_signal_dtype_arg,
+    stack_attr_destructive,
+)
 
 TARGET_SR: float = 100.0
 
@@ -193,28 +199,35 @@ def save_multi_input_dataset(
     target_sec: float,
     source: str,
     out_dir: str,
+    signal_dtype: torch.dtype = torch.float16,
 ) -> Path:
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
-    def _to_tensors(samples: list[MultiInputForecastSample]) -> dict:
+    n_train = len(train_samples)
+    n_test = len(test_samples)
+
+    def _to_tensors(samples) -> dict:
         if not samples:
             return {}
-        return {
-            # (N, n_context_signals, context_samples)
-            "context": torch.stack(
-                [torch.from_numpy(s.context).float() for s in samples]
-            ),
-            # (N, target_samples)
-            "target": torch.stack(
-                [torch.from_numpy(s.target).float() for s in samples]
-            ),
-            "case_ids": [s.case_id for s in samples],
-        }
+        case_ids = [s.case_id for s in samples]
+        # context 는 다차원 — stack_attr_destructive 가 1D 가정. context 는 따로 처리.
+        ctx = torch.empty(
+            (len(samples),) + samples[0].context.shape, dtype=signal_dtype
+        )
+        for i, s in enumerate(samples):
+            ctx[i].copy_(torch.from_numpy(s.context))
+            s.context = None
+        tgt = stack_attr_destructive(samples, "target", signal_dtype)
+        return {"context": ctx, "target": tgt, "case_ids": case_ids}
+
+    train_dict = _to_tensors(train_samples); train_samples.clear()
+    test_dict = _to_tensors(test_samples); test_samples.clear()
+    gc.collect()
 
     save_dict = {
-        "train": _to_tensors(train_samples),
-        "test": _to_tensors(test_samples),
+        "train": train_dict,
+        "test": test_dict,
         "metadata": {
             "task": "multi_input_forecasting",
             "source": source,
@@ -223,8 +236,9 @@ def save_multi_input_dataset(
             "context_sec": context_sec,
             "target_sec": target_sec,
             "sampling_rate": TARGET_SR,
-            "n_train": len(train_samples),
-            "n_test": len(test_samples),
+            "n_train": n_train,
+            "n_test": n_test,
+            "signal_dtype": str(signal_dtype).replace("torch.", ""),
         },
     }
 
@@ -290,22 +304,29 @@ def save_dataset(
     target_sec: float,
     source: str,
     out_dir: str,
+    signal_dtype: torch.dtype = torch.float16,
 ) -> Path:
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
-    def _to_tensors(samples: list[ForecastSample]) -> dict:
+    n_train = len(train_samples)
+    n_test = len(test_samples)
+
+    def _to_tensors(samples) -> dict:
         if not samples:
             return {}
-        return {
-            "context": torch.stack([torch.from_numpy(s.context).float() for s in samples]),
-            "target": torch.stack([torch.from_numpy(s.target).float() for s in samples]),
-            "case_ids": [s.case_id for s in samples],
-        }
+        case_ids = [s.case_id for s in samples]
+        ctx = stack_attr_destructive(samples, "context", signal_dtype)
+        tgt = stack_attr_destructive(samples, "target", signal_dtype)
+        return {"context": ctx, "target": tgt, "case_ids": case_ids}
+
+    train_dict = _to_tensors(train_samples); train_samples.clear()
+    test_dict = _to_tensors(test_samples); test_samples.clear()
+    gc.collect()
 
     save_dict = {
-        "train": _to_tensors(train_samples),
-        "test": _to_tensors(test_samples),
+        "train": train_dict,
+        "test": test_dict,
         "metadata": {
             "task": "vital_sign_forecasting",
             "source": source,
@@ -313,8 +334,9 @@ def save_dataset(
             "context_sec": context_sec,
             "target_sec": target_sec,
             "sampling_rate": TARGET_SR,
-            "n_train": len(train_samples),
-            "n_test": len(test_samples),
+            "n_train": n_train,
+            "n_test": n_test,
+            "signal_dtype": str(signal_dtype).replace("torch.", ""),
         },
     }
 
@@ -403,6 +425,7 @@ def prepare_forecasting(
     train_ratio: float = 0.7,
     out_dir: str = "outputs/downstream/forecasting",
     visualize: bool = False,
+    signal_dtype: torch.dtype = torch.float16,
 ) -> list[Path]:
     # "all"이면 모든 signal type에 대해 반복
     if signal_type == "all":
@@ -460,6 +483,7 @@ def prepare_forecasting(
         path = save_dataset(
             train_samples, test_samples,
             stype, context_sec, target_sec, source, out_dir,
+            signal_dtype=signal_dtype,
         )
         saved_paths.append(path)
 
@@ -487,6 +511,7 @@ def prepare_multi_input_forecasting(
     train_ratio: float = 0.7,
     out_dir: str = "outputs/downstream/forecasting",
     source: str = "mimic3",
+    signal_dtype: torch.dtype = torch.float16,
 ) -> Path | None:
     """ABP+ICP → ICP 같은 multi-input forecasting 데이터셋 구축."""
     print(f"\n{'='*60}")
@@ -528,6 +553,7 @@ def prepare_multi_input_forecasting(
         train_samples, test_samples,
         context_signals, target_signal,
         context_sec, target_sec, source, out_dir,
+        signal_dtype=signal_dtype,
     )
 
 
@@ -569,7 +595,9 @@ def main() -> None:
         default="datasets/raw/mimic3-waveform-ich",
         help="MIMIC-III waveform directory for multi-input (ICH download 결과)",
     )
+    dtype_map = add_signal_dtype_arg(parser)
     args = parser.parse_args()
+    sig_dtype = dtype_map(args.signal_dtype)
 
     if args.multi_input:
         if not args.context_channels or not args.target_channel:
@@ -586,6 +614,7 @@ def main() -> None:
             train_ratio=args.train_ratio,
             out_dir=args.out_dir,
             source=args.source,
+            signal_dtype=sig_dtype,
         )
     else:
         prepare_forecasting(
@@ -598,6 +627,7 @@ def main() -> None:
             train_ratio=args.train_ratio,
             out_dir=args.out_dir,
             visualize=args.visualize,
+            signal_dtype=sig_dtype,
         )
 
 
