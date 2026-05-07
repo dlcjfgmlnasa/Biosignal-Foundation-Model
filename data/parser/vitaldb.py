@@ -452,6 +452,49 @@ def _detect_electrocautery(
     return out, int(n_blanked)
 
 
+def _fill_short_nan_gaps(
+    data: np.ndarray,  # (T,) float
+    max_fill_samples: int,
+) -> np.ndarray:
+    """짧은 NaN gap (<=max_fill_samples) 을 양쪽 인접 valid 값의 평균으로 채움.
+
+    vitaldb library 가 K-MIMIC .vital 파일의 chunk 경계마다 1-2 sample NaN 을
+    채우는 artifact 제거용. 100ms 이내 (예: 500Hz 면 50 samples) 짜리 NaN gap
+    만 보간하고, 그보다 긴 진짜 disconnect 는 NaN 으로 유지.
+
+    Returns
+    -------
+    원본과 같은 길이의 ndarray (원본 비파괴 복사).
+    """
+    if max_fill_samples < 1:
+        return data
+    out = data.copy()
+    isnan = np.isnan(out)
+    if not isnan.any():
+        return out
+
+    # NaN run 의 (start, end) 페어 추출
+    diff = np.diff(isnan.astype(np.int8), prepend=0, append=0)
+    starts = np.where(diff == 1)[0]
+    ends = np.where(diff == -1)[0]
+
+    for s, e in zip(starts, ends):
+        gap_len = e - s
+        if gap_len > max_fill_samples:
+            continue
+        # 양쪽 인접 valid 값으로 forward-fill (왼쪽 우선, 없으면 오른쪽)
+        left = out[s - 1] if s > 0 else np.nan
+        right = out[e] if e < len(out) else np.nan
+        if not np.isnan(left) and not np.isnan(right):
+            out[s:e] = (left + right) / 2.0
+        elif not np.isnan(left):
+            out[s:e] = left
+        elif not np.isnan(right):
+            out[s:e] = right
+        # 양쪽 다 NaN 이면 그대로 둠 (실제 disconnect)
+    return out
+
+
 def _extract_nan_free_segments(
     data: np.ndarray,  # (T,) float
     min_samples: int,
@@ -679,6 +722,13 @@ def process_vital(
             continue
 
         data = data.flatten()
+
+        # ── Step 0: vitaldb chunk 경계 micro NaN 보간 ──
+        # vitaldb library 가 .vital 파일의 2-3s chunk 경계마다 1-2 sample NaN 을
+        # 채우는 artifact. 이를 인접 값으로 forward-fill 보간해서 artificial
+        # fragmentation 제거. 진짜 disconnect (>= 100ms) 는 NaN 그대로 둠.
+        max_fill_samples = max(1, int(0.1 * native_sr))  # 100ms
+        data = _fill_short_nan_gaps(data, max_fill_samples)
 
         # ── Step 1: Physiological range check ──
         if cfg.valid_range is not None:
