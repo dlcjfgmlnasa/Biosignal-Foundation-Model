@@ -94,6 +94,10 @@ def main() -> None:
     p.add_argument("--filter-substring", type=str, default="Intellivue",
                    help="이 substring 가진 path 만 샘플링 (default Intellivue)")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--mode", choices=["random", "sequential"], default="random",
+                   help="random: 무작위 샘플 (verbose). sequential: list 첫 N (parser 순서 모사)")
+    p.add_argument("--summary-only", action="store_true",
+                   help="파일별 상세 출력 끄고 파일당 OK/SKIP 한 줄만 + 마지막 통계")
     args = p.parse_args()
 
     rng = random.Random(args.seed)
@@ -110,24 +114,38 @@ def main() -> None:
         print("(no match — try --filter-substring '' to disable)")
         return
 
-    sampled = rng.sample(all_paths, k=min(args.n_samples, len(all_paths)))
+    if args.mode == "sequential":
+        sampled = all_paths[: args.n_samples]
+    else:
+        sampled = rng.sample(all_paths, k=min(args.n_samples, len(all_paths)))
+
+    n_ok = 0
+    n_skip = 0
+    n_load_err = 0
 
     for idx, vital_path in enumerate(sampled, 1):
-        print(f"\n{'='*80}")
-        print(f"[{idx}/{len(sampled)}] {vital_path}")
+        if not args.summary_only:
+            print(f"\n{'='*80}")
+            print(f"[{idx}/{len(sampled)}] {vital_path}")
         try:
             vf = vitaldb.VitalFile(vital_path)
         except Exception as e:
-            print(f"  LOAD ERROR: {e}")
+            print(f"[{idx}/{len(sampled)}] LOAD ERROR: {vital_path}: {e}")
+            n_load_err += 1
             continue
 
         try:
             track_names = vf.get_track_names()
         except Exception as e:
-            print(f"  TRACK LIST ERROR: {e}")
+            print(f"[{idx}/{len(sampled)}] TRACK LIST ERROR: {e}")
+            n_load_err += 1
             continue
-        print(f"  Tracks ({len(track_names)}): {track_names[:20]}"
-              + (" ..." if len(track_names) > 20 else ""))
+        if not args.summary_only:
+            print(f"  Tracks ({len(track_names)}): {track_names[:20]}"
+                  + (" ..." if len(track_names) > 20 else ""))
+
+        file_ok_tracks = 0
+        file_skip_tracks = 0
 
         for tn in track_names:
             mapping = TRACK_MAP.get(tn)
@@ -179,14 +197,38 @@ def main() -> None:
             final_segs = _extract_nan_free_segments(data, min_samples)
             n_final_seg = len(final_segs)
 
-            stage_str = " → ".join(f"{name}={v:.0f}s" for name, v in stages)
-            verdict = (
-                f"OK ({n_final_seg} seg)"
-                if n_final_seg > 0
-                else "SKIP (<60s 연속 없음)"
-            )
-            print(f"    {tn:30s} sr={native_sr:.0f} n={n_total:>8d} "
-                  f"longest_nanfree[{stage_str}] → {verdict}")
+            if n_final_seg > 0:
+                file_ok_tracks += 1
+            else:
+                file_skip_tracks += 1
+
+            if not args.summary_only:
+                stage_str = " → ".join(f"{name}={v:.0f}s" for name, v in stages)
+                verdict = (
+                    f"OK ({n_final_seg} seg)"
+                    if n_final_seg > 0
+                    else "SKIP (<60s 연속 없음)"
+                )
+                print(f"    {tn:30s} sr={native_sr:.0f} n={n_total:>8d} "
+                      f"longest_nanfree[{stage_str}] → {verdict}")
+
+        if file_ok_tracks > 0:
+            n_ok += 1
+            tag = "OK"
+        else:
+            n_skip += 1
+            tag = "SKIP"
+        if args.summary_only:
+            print(f"[{idx}/{len(sampled)}] {tag:4s} ok={file_ok_tracks:2d} "
+                  f"skip={file_skip_tracks:2d} {vital_path}")
+
+    # ── 마지막 요약 ──
+    n_processed = len(sampled) - n_load_err
+    print(f"\n{'='*80}")
+    print(f"Summary (mode={args.mode}, n={len(sampled)})")
+    print(f"  Load errors: {n_load_err}")
+    print(f"  File OK:     {n_ok} ({100*n_ok/max(1,n_processed):.1f}%)")
+    print(f"  File SKIP:   {n_skip} ({100*n_skip/max(1,n_processed):.1f}%)")
 
 
 if __name__ == "__main__":
