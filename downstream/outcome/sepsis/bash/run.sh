@@ -7,9 +7,10 @@
 set -e
 
 REPO_ROOT="${REPO_ROOT:-/home/coder/workspace/Biosignal-Foundation-Model}"
-CHECKPOINT="${CHECKPOINT:-${REPO_ROOT}/output/phase2/base/checkpoints/best.pt}"
-DATA_DIR="${DATA_DIR:-${REPO_ROOT}/data/downstream/sepsis}"
-OUT_DIR="${OUT_DIR:-${REPO_ROOT}/result/downstream/sepsis}"
+UPDOWN_ROOT="${UPDOWN_ROOT:-/home/coder/workspace/updown}"
+CHECKPOINT="${CHECKPOINT:-${UPDOWN_ROOT}/output/phase2/base/checkpoints/best.pt}"
+DATA_DIR="${DATA_DIR:-${UPDOWN_ROOT}/downstream/sepsis}"
+OUT_DIR="${OUT_DIR:-${UPDOWN_ROOT}/result/downstream/sepsis}"
 DEVICE=cuda
 
 DATA_PATH="${DATA_DIR}/sepsis_w600s.pt"

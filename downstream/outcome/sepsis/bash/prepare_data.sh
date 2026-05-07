@@ -11,9 +11,10 @@
 set -e
 
 REPO_ROOT="${REPO_ROOT:-/home/coder/workspace/Biosignal-Foundation-Model}"
+UPDOWN_ROOT="${UPDOWN_ROOT:-/home/coder/workspace/updown}"
 COHORT_CSV="${COHORT_CSV:-${REPO_ROOT}/downstream/outcome/sepsis/bquxjob_93e3c7c_19d8f609070.csv}"
-WAVEFORM_DIR="${WAVEFORM_DIR:-${REPO_ROOT}/data/raw/mimic3-waveform-sepsis}"
-OUT_DIR="${OUT_DIR:-${REPO_ROOT}/data/downstream/sepsis}"
+WAVEFORM_DIR="${WAVEFORM_DIR:-${UPDOWN_ROOT}/raw/mimic3-waveform-sepsis}"
+OUT_DIR="${OUT_DIR:-${UPDOWN_ROOT}/downstream/sepsis}"
 
 echo "============================================================"
 echo "  Sepsis Prediction — Data Preparation"

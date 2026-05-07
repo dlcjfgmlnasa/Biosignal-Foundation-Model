@@ -12,9 +12,10 @@
 set -e
 
 REPO_ROOT="${REPO_ROOT:-/home/coder/workspace/Biosignal-Foundation-Model}"
-CHECKPOINT="${CHECKPOINT:-${REPO_ROOT}/output/phase2/base/checkpoints/best.pt}"
-DATA_DIR="${DATA_DIR:-${REPO_ROOT}/data/downstream/intracranial_hypertension}"
-OUT_DIR="${OUT_DIR:-${REPO_ROOT}/result/downstream/intracranial_hypertension}"
+UPDOWN_ROOT="${UPDOWN_ROOT:-/home/coder/workspace/updown}"
+CHECKPOINT="${CHECKPOINT:-${UPDOWN_ROOT}/output/phase2/base/checkpoints/best.pt}"
+DATA_DIR="${DATA_DIR:-${UPDOWN_ROOT}/downstream/intracranial_hypertension}"
+OUT_DIR="${OUT_DIR:-${UPDOWN_ROOT}/result/downstream/intracranial_hypertension}"
 DEVICE=cuda
 
 WINDOW_SECS=(30 60 300 600)
