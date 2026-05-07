@@ -20,10 +20,11 @@ set -e
 
 REPO_ROOT="${REPO_ROOT:-/home/coder/workspace/Biosignal-Foundation-Model}"
 UPDOWN_ROOT="${UPDOWN_ROOT:-/home/coder/workspace/updown}"
+BIOFM_ROOT="${BIOFM_ROOT:-${UPDOWN_ROOT}/bio_fm}"
 RECORDS_FILE="${RECORDS_FILE:-${REPO_ROOT}/downstream/outcome/sepsis/RECORDS-waveforms}"
 ICP_RECORDS="${ICP_RECORDS:-downstream/acute_event/intracranial_hypertension/ICP-RECORDS}"
 WAVEFORM_DIR="${WAVEFORM_DIR:-${UPDOWN_ROOT}/raw/mimic3-waveform-ich}"
-OUT_DIR="${OUT_DIR:-${UPDOWN_ROOT}/downstream/intracranial_hypertension}"
+OUT_DIR="${OUT_DIR:-${BIOFM_ROOT}/data/downstream/intracranial_hypertension}"
 WINDOWS="${WINDOWS:-60 180 300 600}"
 HORIZONS="${HORIZONS:-10 15 30}"
 STRIDE="${STRIDE:-30}"
