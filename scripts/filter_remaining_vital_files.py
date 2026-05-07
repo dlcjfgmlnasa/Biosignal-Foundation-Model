@@ -63,13 +63,22 @@ def _process_one_manifest(manifest_path: Path) -> tuple[set[tuple[str, str]], st
     subj_dir = manifest_path.parent
     subject_id = data.get("subject_id") or subj_dir.name
 
+    # subj_dir 내 파일 set 을 1회 readdir 로 만들고 membership check
+    # (per-recording stat 호출이 NAS 에서 누적되어 느림)
+    try:
+        files_in_dir = {
+            e.name for e in os.scandir(subj_dir) if e.is_file(follow_symlinks=False)
+        }
+    except OSError:
+        return set(), "ok"
+
     out: set[tuple[str, str]] = set()
     for sess in data.get("sessions", []):
         session_id = sess.get("session_id")
         recs = sess.get("recordings", [])
         if not session_id or not recs:
             continue
-        if all((subj_dir / r["file"]).exists() for r in recs):
+        if all(r["file"] in files_in_dir for r in recs):
             out.add((subject_id, session_id))
     return out, "ok"
 
