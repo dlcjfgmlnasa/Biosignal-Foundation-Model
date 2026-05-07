@@ -128,6 +128,12 @@ def main() -> None:
              "60s+ NaN-free segment 만으로 통과 → yield 대폭 증가.",
     )
     p.add_argument(
+        "--lenient-quality",
+        action="store_true",
+        help="ICU 친화 loose threshold — 명백한 garbage (95%%+ flatline / 50%%+ saturation / "
+             "진폭 ~0) 만 거름. domain check 는 skip. strict 와 skip 의 중간.",
+    )
+    p.add_argument(
         "--cleanup-intermediate",
         action="store_true",
         help="shard 빌드 후 per-recording .pt 자동 삭제 (디스크 ~50%% 절약). "
@@ -184,6 +190,8 @@ def main() -> None:
             parse_cmd += ["--from-list", str(args.from_list)]
         if args.skip_quality_window:
             parse_cmd += ["--skip-quality-window"]
+        if args.lenient_quality:
+            parse_cmd += ["--lenient-quality"]
 
         rc = run_step(parse_cmd, "parse")
         if rc != 0:

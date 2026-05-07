@@ -587,6 +587,7 @@ def process_vital(
     signal_types: set[int] | None = None,
     subject_from_parent: int = 0,
     skip_quality_window: bool = False,
+    lenient_quality: bool = False,
 ) -> tuple[str, str, list[dict]]:
     """단일 .vital 파일을 처리하여 zarr 파일들을 저장한다.
 
@@ -764,6 +765,28 @@ def process_vital(
                     window_results.append((win_idx, win))
                     continue
 
+                if lenient_quality:
+                    # ICU 친화 loose threshold — 명백한 garbage 만 거름.
+                    # - 거의 완전한 flatline (95%+)
+                    # - 거의 완전한 saturation (50%+ clip)
+                    # - 진폭 0 에 가까운 신호
+                    # domain check (HR/regularity) 는 부정맥 환자 보호 위해 skip.
+                    qscore = segment_quality_score(
+                        win,
+                        max_flatline_ratio=0.95,
+                        max_clip_ratio=0.5,
+                        max_high_freq_ratio=10.0,  # effectively bypass
+                        min_amplitude=cfg.min_amplitude * 0.2 if cfg.min_amplitude > 0 else 0.0,
+                        max_amplitude=0.0,  # bypass
+                        min_high_freq_ratio=0.0,  # bypass
+                    )
+                    if not qscore["pass"]:
+                        n_fail_basic += 1
+                        window_results.append((win_idx, None))
+                        continue
+                    window_results.append((win_idx, win))
+                    continue
+
                 # 기본 품질 검사
                 qscore = segment_quality_score(
                     win,
@@ -882,6 +905,7 @@ def _process_one_worker(
     signal_types: set[int] | None,
     subject_from_parent: int = 0,
     skip_quality_window: bool = False,
+    lenient_quality: bool = False,
 ) -> tuple[str, str, list[dict]] | None:
     """단일 vital 파일 처리 (multiprocessing worker 호환)."""
     try:
@@ -892,6 +916,7 @@ def _process_one_worker(
             signal_types=signal_types,
             subject_from_parent=subject_from_parent,
             skip_quality_window=skip_quality_window,
+            lenient_quality=lenient_quality,
         )
     except Exception as exc:
         print(f"    [{vf_path.name}] [ERROR] {exc}", file=sys.stderr)
@@ -903,6 +928,7 @@ _mp_min_dur: float = 60.0
 _mp_sig_filter: set[int] | None = None
 _mp_subj_depth: int = 0
 _mp_skip_quality: bool = False
+_mp_lenient_quality: bool = False
 
 
 def _worker_split(task_tuple: tuple) -> tuple | None:
@@ -915,6 +941,7 @@ def _worker_split(task_tuple: tuple) -> tuple | None:
         signal_types=_mp_sig_filter,
         subject_from_parent=_mp_subj_depth,
         skip_quality_window=_mp_skip_quality,
+        lenient_quality=_mp_lenient_quality,
     )
 
 
@@ -972,6 +999,13 @@ def main() -> None:
         action="store_true",
         help="윈도우 단위 quality check (basic/domain) 를 건너뜀. ICU 등 noisy 데이터에서 "
              "60s+ NaN-free segment 만으로 통과시킴 (학습 시 PackedStdScaler + masking 으로 흡수).",
+    )
+    parser.add_argument(
+        "--lenient-quality",
+        action="store_true",
+        help="ICU 친화 loose threshold — 명백한 garbage (95%%+ flatline / 50%%+ saturation / "
+             "진폭 ~0) 만 거름. domain check (HR/regularity) 는 부정맥 환자 보호 위해 skip. "
+             "--skip-quality-window 와 함께 쓰면 --skip 이 우선.",
     )
     parser.add_argument(
         "--discover",
@@ -1240,11 +1274,12 @@ def main() -> None:
         print(f"병렬 처리: {args.workers} workers\n")
 
         # 모듈 레벨 변수 설정 (worker가 참조)
-        global _mp_min_dur, _mp_sig_filter, _mp_subj_depth, _mp_skip_quality
+        global _mp_min_dur, _mp_sig_filter, _mp_subj_depth, _mp_skip_quality, _mp_lenient_quality
         _mp_min_dur = min_dur
         _mp_sig_filter = sig_filter
         _mp_subj_depth = args.subject_from_parent
         _mp_skip_quality = args.skip_quality_window
+        _mp_lenient_quality = args.lenient_quality
 
         # 파일별로 출력 디렉토리 결정하여 worker에 전달
         tasks = []
@@ -1284,6 +1319,7 @@ def main() -> None:
                 signal_types=sig_filter,
                 subject_from_parent=args.subject_from_parent,
                 skip_quality_window=args.skip_quality_window,
+                lenient_quality=args.lenient_quality,
             )
             if result is None:
                 continue
