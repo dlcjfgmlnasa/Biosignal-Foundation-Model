@@ -523,7 +523,8 @@ def _apply_pipeline(
     if not segments:
         return None
 
-    segment = max(segments, key=len)
+    # _extract_nan_free_segments → list[(start_idx, ndarray)]; ndarray 길이로 최대 선택
+    _, segment = max(segments, key=lambda sa: len(sa[1]))
 
     # Step 4: Median → Filter
     if cfg.median_kernel > 0:
