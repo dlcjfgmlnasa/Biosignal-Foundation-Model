@@ -27,6 +27,16 @@ except ImportError:
     print("ERROR: vitaldb 패키지 필요")
     raise SystemExit(1)
 
+from data.parser.vitaldb import (
+    SIGNAL_CONFIGS,
+    TRACK_MAP,
+    _apply_range_check,
+    _detect_electrocautery,
+    _detect_motion_artifact,
+    _detect_step_change,
+    _extract_nan_free_segments,
+)
+
 # data/parser/vitaldb.py 의 valid_range 와 동기화 (참고용)
 VALID_RANGE = {
     "ECG": (-5.0, 5.0),
@@ -120,34 +130,63 @@ def main() -> None:
               + (" ..." if len(track_names) > 20 else ""))
 
         for tn in track_names:
-            label = short_track_label(tn)
-            if not label:
+            mapping = TRACK_MAP.get(tn)
+            if mapping is None:
+                continue  # numeric/unmapped track 은 파서가 무시
+            stype_key, _ = mapping
+            cfg = SIGNAL_CONFIGS.get(stype_key)
+            if cfg is None:
                 continue
+
             try:
-                samples = vf.to_numpy([tn], 1.0 / 500.0).flatten()
+                trk = vf.find_track(tn)
+                native_sr = trk.srate if trk is not None and trk.srate > 0 else 500.0
+                samples = vf.to_numpy(tn, interval=1.0 / native_sr)
             except Exception as e:
                 print(f"    {tn}: to_numpy ERROR: {e}")
                 continue
-
-            if samples.size == 0:
+            if samples is None or samples.size == 0:
                 print(f"    {tn}: EMPTY")
                 continue
+            samples = samples.flatten()
 
-            s = stats(samples)
-            run = longest_nanfree_run(samples)
-            run_sec = run / 500.0  # assume 500Hz
-            vr = VALID_RANGE.get(label, (None, None))
+            n_total = samples.size
+            run_raw = longest_nanfree_run(samples) / native_sr
 
-            if "values_finite" in s:
-                print(f"    {tn:30s} n={s['n']:>8d} 100% NaN")
-                continue
+            # 파서와 동일 pipeline 단계별 적용
+            data = samples.copy()
+            stages: list[tuple[str, float]] = [("raw", run_raw)]
 
-            print(f"    {tn:30s} n={s['n']:>8d} "
-                  f"NaN={s['nan_pct']:5.1f}% "
-                  f"range=[{s['min']:8.2f}, {s['p1']:7.2f}, {s['p50']:7.2f}, "
-                  f"{s['p99']:7.2f}, {s['max']:8.2f}] "
-                  f"valid={vr} "
-                  f"longest_nanfree={run_sec:.1f}s")
+            if cfg.valid_range is not None:
+                data, _ = _apply_range_check(data, cfg.valid_range)
+                stages.append(("range", longest_nanfree_run(data) / native_sr))
+
+            if cfg.spike_detection:
+                data, _ = _detect_electrocautery(
+                    data, native_sr, threshold_std=cfg.spike_threshold_std
+                )
+                stages.append(("spike", longest_nanfree_run(data) / native_sr))
+
+            if stype_key in ("abp", "ppg"):
+                data, _ = _detect_step_change(data, native_sr)
+                stages.append(("step", longest_nanfree_run(data) / native_sr))
+
+            if stype_key == "ppg":
+                data, _ = _detect_motion_artifact(data, native_sr)
+                stages.append(("motion", longest_nanfree_run(data) / native_sr))
+
+            min_samples = int(60.0 * native_sr)
+            final_segs = _extract_nan_free_segments(data, min_samples)
+            n_final_seg = len(final_segs)
+
+            stage_str = " → ".join(f"{name}={v:.0f}s" for name, v in stages)
+            verdict = (
+                f"OK ({n_final_seg} seg)"
+                if n_final_seg > 0
+                else "SKIP (<60s 연속 없음)"
+            )
+            print(f"    {tn:30s} sr={native_sr:.0f} n={n_total:>8d} "
+                  f"longest_nanfree[{stage_str}] → {verdict}")
 
 
 if __name__ == "__main__":
