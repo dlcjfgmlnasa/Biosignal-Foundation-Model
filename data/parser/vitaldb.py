@@ -547,12 +547,21 @@ def _save_subject_manifest(
     try:
         if _has_flock:
             fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX)
+        manifest: dict | None = None
         if manifest_path.exists():
-            with open(manifest_path, encoding="utf-8") as f:
-                manifest = json.load(f)
+            try:
+                with open(manifest_path, encoding="utf-8") as f:
+                    manifest = json.load(f)
+            except (json.JSONDecodeError, OSError) as exc:
+                print(
+                    f"    [WARN] {manifest_path} 손상 — 새로 작성 ({exc})",
+                    file=sys.stderr,
+                )
+                manifest = None
+        if manifest is not None:
             # 같은 session_id가 있으면 recordings 병합, 없으면 세션 추가
             existing_session = None
-            for s in manifest["sessions"]:
+            for s in manifest.get("sessions", []):
                 if s["session_id"] == session_id:
                     existing_session = s
                     break
@@ -562,7 +571,7 @@ def _save_subject_manifest(
                     if rec["file"] not in existing_files:
                         existing_session["recordings"].append(rec)
             else:
-                manifest["sessions"].append(
+                manifest.setdefault("sessions", []).append(
                     {"session_id": session_id, "recordings": recordings}
                 )
         else:
