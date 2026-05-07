@@ -72,8 +72,10 @@ def _process_one_manifest(manifest_path: Path) -> tuple[set[tuple[str, str]], bo
 
 
 def collect_completed(processed: Path, workers: int) -> set[tuple[str, str]]:
-    print(f"  Globbing manifest.json under {processed} ...")
-    manifest_paths = list(processed.rglob("manifest.json"))
+    # manifest.json 은 항상 subject_dir/manifest.json (depth 1) 에 위치하므로
+    # rglob 대신 glob("*/manifest.json") 로 트리 walk 비용 회피.
+    print(f"  Globbing manifest.json under {processed}/* ...")
+    manifest_paths = list(processed.glob("*/manifest.json"))
     print(f"  manifest.json found: {len(manifest_paths)}")
 
     completed: set[tuple[str, str]] = set()
