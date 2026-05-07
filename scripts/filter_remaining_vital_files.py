@@ -63,12 +63,11 @@ def _process_one_manifest(manifest_path: Path) -> tuple[set[tuple[str, str]], st
     subj_dir = manifest_path.parent
     subject_id = data.get("subject_id") or subj_dir.name
 
-    # subj_dir 내 파일 set 을 1회 readdir 로 만들고 membership check
-    # (per-recording stat 호출이 NAS 에서 누적되어 느림)
+    # subj_dir 내 파일 이름 set 을 listdir 1회로 수집 (stat 호출 없음).
+    # os.scandir + is_file() 은 NAS 에서 d_type=DT_UNKNOWN 인 경우 stat 으로
+    # 폴백되어 entry 마다 stat 비용이 누적됨. listdir 은 readdir 한 번으로 끝남.
     try:
-        files_in_dir = {
-            e.name for e in os.scandir(subj_dir) if e.is_file(follow_symlinks=False)
-        }
+        files_in_dir = set(os.listdir(subj_dir))
     except OSError:
         return set(), "ok"
 
