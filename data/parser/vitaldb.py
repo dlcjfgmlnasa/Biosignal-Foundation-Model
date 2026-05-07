@@ -775,17 +775,17 @@ def process_vital(
                     continue
 
                 if lenient_quality:
-                    # ICU 친화 loose threshold — 명백한 garbage 만 거름.
-                    # - 거의 완전한 flatline (95%+)
-                    # - 거의 완전한 saturation (50%+ clip)
-                    # - 진폭 0 에 가까운 신호
+                    # ICU 친화 ultra-loose threshold — 완전 garbage 만 거름.
+                    # - 거의 완전한 flatline (99%+)
+                    # - 거의 완전한 saturation (80%+ clip)
+                    # - amplitude / high_freq check 는 모두 bypass
                     # domain check (HR/regularity) 는 부정맥 환자 보호 위해 skip.
                     qscore = segment_quality_score(
                         win,
-                        max_flatline_ratio=0.95,
-                        max_clip_ratio=0.5,
-                        max_high_freq_ratio=10.0,  # effectively bypass
-                        min_amplitude=cfg.min_amplitude * 0.2 if cfg.min_amplitude > 0 else 0.0,
+                        max_flatline_ratio=0.99,
+                        max_clip_ratio=0.8,
+                        max_high_freq_ratio=100.0,  # effectively bypass
+                        min_amplitude=0.0,  # bypass
                         max_amplitude=0.0,  # bypass
                         min_high_freq_ratio=0.0,  # bypass
                     )
