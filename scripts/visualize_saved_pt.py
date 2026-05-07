@@ -23,9 +23,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import random
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import matplotlib
@@ -33,30 +35,29 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from tqdm import tqdm
 
 
 # .pt 파일명 패턴: <session_id>_<stype>_<spatial_id>_seg<i>_<j>.pt
 PT_RE = re.compile(r"^(.+)_(ecg|abp|ppg|cvp|co2|awp|pap|icp|resp)_(\d+)_seg(\d+)_(\d+)\.pt$")
 
 
-def collect_recent_pts(
-    processed: Path, since_ts: float, signal_types: list[str]
-) -> dict[str, list[Path]]:
-    """processed/<subject>/<file>.pt 중 mtime >= since_ts 만 signal_type 별로 모음."""
-    by_type: dict[str, list[Path]] = {st: [] for st in signal_types}
-
-    for subj_dir in processed.iterdir():
-        if not subj_dir.is_dir():
-            continue
-        try:
-            for entry in subj_dir.iterdir():
-                if not entry.is_file() or entry.suffix != ".pt":
+def _scan_subject_dir(
+    subj_dir: Path, since_ts: float, sig_set: set[str]
+) -> list[tuple[str, Path]]:
+    """단일 subject_dir 내에서 mtime >= since_ts + signal_type 매칭 .pt 만."""
+    results: list[tuple[str, Path]] = []
+    try:
+        with os.scandir(subj_dir) as it:
+            for entry in it:
+                name = entry.name
+                if not name.endswith(".pt"):
                     continue
-                m = PT_RE.match(entry.name)
+                m = PT_RE.match(name)
                 if not m:
                     continue
                 stype = m.group(2)
-                if stype not in by_type:
+                if stype not in sig_set:
                     continue
                 try:
                     mtime = entry.stat().st_mtime
@@ -64,9 +65,57 @@ def collect_recent_pts(
                     continue
                 if mtime < since_ts:
                     continue
-                by_type[stype].append(entry)
-        except OSError:
-            continue
+                results.append((stype, Path(entry.path)))
+    except OSError:
+        pass
+    return results
+
+
+def collect_recent_pts(
+    processed: Path,
+    since_ts: float,
+    signal_types: list[str],
+    workers: int = 32,
+) -> dict[str, list[Path]]:
+    """processed/<subject>/<file>.pt 중 mtime >= since_ts 만 signal_type 별로 모음.
+
+    1단계: subject dir 의 mtime 으로 1차 필터 (NAS readdir 1회).
+    2단계: 1차 통과한 subject dir 에 대해서만 ThreadPool 로 .pt 스캔.
+    """
+    sig_set = set(signal_types)
+
+    # 1차 필터: subject dir mtime
+    print(f"  Scanning subject dirs in {processed}/ ...")
+    candidate_dirs: list[Path] = []
+    n_total = 0
+    with os.scandir(processed) as it:
+        for entry in tqdm(it, desc="Filter subject dirs", unit="dir"):
+            n_total += 1
+            try:
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+                stat = entry.stat()
+                if stat.st_mtime < since_ts:
+                    continue
+            except OSError:
+                continue
+            candidate_dirs.append(Path(entry.path))
+    print(f"  total subject dirs: {n_total}, candidates (recently touched): {len(candidate_dirs)}")
+
+    by_type: dict[str, list[Path]] = {st: [] for st in signal_types}
+    if not candidate_dirs:
+        return by_type
+
+    # 2차 필터: .pt mtime + signal_type
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for entries in tqdm(
+            ex.map(lambda d: _scan_subject_dir(d, since_ts, sig_set), candidate_dirs),
+            total=len(candidate_dirs),
+            desc="Scanning .pt files",
+            unit="dir",
+        ):
+            for stype, p in entries:
+                by_type[stype].append(p)
 
     return by_type
 
@@ -112,6 +161,8 @@ def main() -> None:
                    choices=["ecg", "abp", "ppg", "cvp", "co2", "awp", "pap", "icp", "resp"])
     p.add_argument("--out-dir", type=Path, default=Path("/tmp/saved_pt_check"))
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--workers", type=int, default=32,
+                   help="NAS scan thread 수")
     args = p.parse_args()
 
     if args.since_minutes is None and args.since_timestamp is None:
@@ -124,7 +175,9 @@ def main() -> None:
     print(f"Scanning {args.processed} for .pt with mtime >= "
           f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(since_ts))}")
 
-    by_type = collect_recent_pts(args.processed, since_ts, args.signal_types)
+    by_type = collect_recent_pts(
+        args.processed, since_ts, args.signal_types, workers=args.workers,
+    )
     for st in args.signal_types:
         print(f"  {st}: {len(by_type[st])} new .pt files")
 
