@@ -11,9 +11,10 @@
 
 set -e
 
+REPO_ROOT="${REPO_ROOT:-/home/coder/workspace/Biosignal-Foundation-Model}"
 DATA_DIR="${DATA_DIR:-/home/coder/workspace/updown/parser/vitaldb}"
 RAW_DIR="${RAW_DIR:-/home/coder/workspace/datasets/vitaldb_open/1.0.0}"
-OUT_DIR="${OUT_DIR:-/home/coder/workspace/updown/bio_fm/data/downstream/hypoxemia}"
+OUT_DIR="${OUT_DIR:-${REPO_ROOT}/data/downstream/hypoxemia}"
 WINDOWS="${WINDOWS:-60 180 300 600}"
 HORIZONS="${HORIZONS:-5 10 15}"
 # Paper full 6-modal combo 가능하려면 ecg ppg abp co2 awp resp 모두 보유 환자만 사용
