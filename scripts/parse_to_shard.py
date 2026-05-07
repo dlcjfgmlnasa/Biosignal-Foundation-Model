@@ -122,6 +122,12 @@ def main() -> None:
         help="K-MIMIC 같은 4단계 구조면 2 사용 (bucket/subject/stay/file)",
     )
     p.add_argument(
+        "--skip-quality-window",
+        action="store_true",
+        help="윈도우 단위 quality check 건너뜀 (ICU noisy 데이터용). "
+             "60s+ NaN-free segment 만으로 통과 → yield 대폭 증가.",
+    )
+    p.add_argument(
         "--cleanup-intermediate",
         action="store_true",
         help="shard 빌드 후 per-recording .pt 자동 삭제 (디스크 ~50%% 절약). "
@@ -176,6 +182,8 @@ def main() -> None:
             parse_cmd += ["--subject-from-parent", str(args.subject_from_parent)]
         if args.from_list:
             parse_cmd += ["--from-list", str(args.from_list)]
+        if args.skip_quality_window:
+            parse_cmd += ["--skip-quality-window"]
 
         rc = run_step(parse_cmd, "parse")
         if rc != 0:

@@ -586,6 +586,7 @@ def process_vital(
     min_duration_s: float = 60.0,
     signal_types: set[int] | None = None,
     subject_from_parent: int = 0,
+    skip_quality_window: bool = False,
 ) -> tuple[str, str, list[dict]]:
     """단일 .vital 파일을 처리하여 zarr 파일들을 저장한다.
 
@@ -757,6 +758,12 @@ def process_vital(
                 win = segment[win_start : win_start + win_samples]
                 n_windows += 1
 
+                if skip_quality_window:
+                    # ICU 데이터 quality threshold 가 너무 strict — 60s+ NaN-free 만으로
+                    # 통과시키고 학습 시 PackedStdScaler 정규화 + masking 으로 흡수.
+                    window_results.append((win_idx, win))
+                    continue
+
                 # 기본 품질 검사
                 qscore = segment_quality_score(
                     win,
@@ -874,6 +881,7 @@ def _process_one_worker(
     min_duration_s: float,
     signal_types: set[int] | None,
     subject_from_parent: int = 0,
+    skip_quality_window: bool = False,
 ) -> tuple[str, str, list[dict]] | None:
     """단일 vital 파일 처리 (multiprocessing worker 호환)."""
     try:
@@ -883,6 +891,7 @@ def _process_one_worker(
             min_duration_s=min_duration_s,
             signal_types=signal_types,
             subject_from_parent=subject_from_parent,
+            skip_quality_window=skip_quality_window,
         )
     except Exception as exc:
         print(f"    [{vf_path.name}] [ERROR] {exc}", file=sys.stderr)
@@ -893,6 +902,7 @@ def _process_one_worker(
 _mp_min_dur: float = 60.0
 _mp_sig_filter: set[int] | None = None
 _mp_subj_depth: int = 0
+_mp_skip_quality: bool = False
 
 
 def _worker_split(task_tuple: tuple) -> tuple | None:
@@ -904,6 +914,7 @@ def _worker_split(task_tuple: tuple) -> tuple | None:
         min_duration_s=_mp_min_dur,
         signal_types=_mp_sig_filter,
         subject_from_parent=_mp_subj_depth,
+        skip_quality_window=_mp_skip_quality,
     )
 
 
@@ -955,6 +966,12 @@ def main() -> None:
         type=float,
         default=60.0,
         help="최소 유효 신호 길이 (초, 기본 60)",
+    )
+    parser.add_argument(
+        "--skip-quality-window",
+        action="store_true",
+        help="윈도우 단위 quality check (basic/domain) 를 건너뜀. ICU 등 noisy 데이터에서 "
+             "60s+ NaN-free segment 만으로 통과시킴 (학습 시 PackedStdScaler + masking 으로 흡수).",
     )
     parser.add_argument(
         "--discover",
@@ -1223,10 +1240,11 @@ def main() -> None:
         print(f"병렬 처리: {args.workers} workers\n")
 
         # 모듈 레벨 변수 설정 (worker가 참조)
-        global _mp_min_dur, _mp_sig_filter, _mp_subj_depth
+        global _mp_min_dur, _mp_sig_filter, _mp_subj_depth, _mp_skip_quality
         _mp_min_dur = min_dur
         _mp_sig_filter = sig_filter
         _mp_subj_depth = args.subject_from_parent
+        _mp_skip_quality = args.skip_quality_window
 
         # 파일별로 출력 디렉토리 결정하여 worker에 전달
         tasks = []
@@ -1265,6 +1283,7 @@ def main() -> None:
                 min_duration_s=min_dur,
                 signal_types=sig_filter,
                 subject_from_parent=args.subject_from_parent,
+                skip_quality_window=args.skip_quality_window,
             )
             if result is None:
                 continue
