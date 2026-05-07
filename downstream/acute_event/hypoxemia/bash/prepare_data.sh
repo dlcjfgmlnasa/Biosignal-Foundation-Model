@@ -1,6 +1,6 @@
 #!/bin/bash
 # Intraoperative Hypoxemia Prediction — VitalDB primary 데이터 준비 sweep
-# Paper Table S7 (Task 6) 정렬: 6 signal combos × 4 windows × 3 horizons
+# Paper Table S7 (Task 6) + 단독 호흡 baseline = 9 signal combos × 4 windows × 3 horizons
 # Label: SpO2 < 90% sustained ≥ 1min (raw .vital → PLETH_SPO2 1Hz trend)
 #
 # 사용법:
@@ -44,13 +44,16 @@ run_combo() {
         --out-dir "$OUT_DIR"
 }
 
-# Paper Table S7: 6 combos
-run_combo "1/6" "ppg"
-run_combo "2/6" "ecg"
-run_combo "3/6" "ppg ecg"
-run_combo "4/6" "ppg abp"
-run_combo "5/6" "ppg ecg abp"
-run_combo "6/6" "ppg ecg abp co2 awp resp"  # full 6-modal cardiorespiratory
+# Paper Table S7 (6) + 단독 호흡 baseline (3) = 9 combos
+run_combo "1/9" "ppg"
+run_combo "2/9" "ecg"
+run_combo "3/9" "ppg ecg"
+run_combo "4/9" "ppg abp"
+run_combo "5/9" "ppg ecg abp"
+run_combo "6/9" "ppg ecg abp co2 awp resp"  # full 6-modal cardiorespiratory
+run_combo "7/9" "co2"
+run_combo "8/9" "awp"
+run_combo "9/9" "resp"
 
 echo -e "\n============================================================"
 echo "  Done! Saved to: $OUT_DIR"
