@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -44,18 +45,20 @@ def derive_session_id(vital_path: Path, subject_from_parent: int) -> tuple[str, 
     return subject_id, session_id
 
 
-def _process_one_manifest(manifest_path: Path) -> tuple[set[tuple[str, str]], bool]:
+def _process_one_manifest(manifest_path: Path) -> tuple[set[tuple[str, str]], str]:
     """하나의 manifest.json 을 읽어 완료된 (subject, session) set 반환.
 
     Returns
     -------
-    (completed_set, corrupt_flag)
+    (completed_set, status) where status in {"ok", "missing", "corrupt"}.
     """
     try:
         with open(manifest_path, encoding="utf-8") as f:
             data = json.load(f)
+    except FileNotFoundError:
+        return set(), "missing"
     except (json.JSONDecodeError, OSError):
-        return set(), True
+        return set(), "corrupt"
 
     subj_dir = manifest_path.parent
     subject_id = data.get("subject_id") or subj_dir.name
@@ -68,18 +71,35 @@ def _process_one_manifest(manifest_path: Path) -> tuple[set[tuple[str, str]], bo
             continue
         if all((subj_dir / r["file"]).exists() for r in recs):
             out.add((subject_id, session_id))
-    return out, False
+    return out, "ok"
+
+
+def _scan_subject_dirs(processed: Path) -> list[Path]:
+    """processed/ 1 단계 하위 subject 디렉토리에서 manifest.json 후보 경로 수집.
+
+    `m_path.exists()` 검증은 안 하고 후보를 모은 뒤, 후속 read 단계에서
+    FileNotFoundError 로 자연 처리한다 (NAS stat 호출 절약).
+    """
+    candidates: list[Path] = []
+    with os.scandir(processed) as it:
+        for entry in tqdm(it, desc="Scanning subject dirs", unit="dir"):
+            try:
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+            except OSError:
+                continue
+            candidates.append(Path(entry.path) / "manifest.json")
+    return candidates
 
 
 def collect_completed(processed: Path, workers: int) -> set[tuple[str, str]]:
-    # manifest.json 은 항상 subject_dir/manifest.json (depth 1) 에 위치하므로
-    # rglob 대신 glob("*/manifest.json") 로 트리 walk 비용 회피.
-    print(f"  Globbing manifest.json under {processed}/* ...")
-    manifest_paths = list(processed.glob("*/manifest.json"))
-    print(f"  manifest.json found: {len(manifest_paths)}")
+    print(f"  Scanning subject dirs in {processed}/ ...")
+    manifest_paths = _scan_subject_dirs(processed)
+    print(f"  subject dirs found: {len(manifest_paths)}")
 
     completed: set[tuple[str, str]] = set()
     n_corrupt = 0
+    n_missing = 0
     if not manifest_paths:
         return completed
 
@@ -91,14 +111,17 @@ def collect_completed(processed: Path, workers: int) -> set[tuple[str, str]]:
             desc="Reading manifests",
             unit="file",
         ):
-            sess_set, corrupt = fut.result()
-            if corrupt:
+            sess_set, status = fut.result()
+            if status == "corrupt":
                 n_corrupt += 1
+            elif status == "missing":
+                n_missing += 1
             else:
                 completed.update(sess_set)
 
-    print(f"  corrupt manifests:   {n_corrupt}")
-    print(f"  completed sessions:  {len(completed)}")
+    print(f"  manifest.json missing: {n_missing} (subject dir 만 있고 manifest 없음)")
+    print(f"  corrupt manifests:     {n_corrupt}")
+    print(f"  completed sessions:    {len(completed)}")
     return completed
 
 
