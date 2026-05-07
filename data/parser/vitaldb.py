@@ -252,8 +252,10 @@ TRACK_MAP: dict[str, tuple[str, int]] = {
     "Intellivue/ECG_V5_WAV":  ("ecg", 11),
     "Intellivue/ECG_V6_WAV":  ("ecg", 12),
     # ABP (1)
-    "Intellivue/ABP": ("abp", 1),  # Arterial line waveform
-    "Intellivue/ART": ("abp", 1),  # Arterial waveform (alternative naming)
+    "Intellivue/ABP": ("abp", 1),  # Arterial line waveform (mmHg, primary)
+    # NOTE: "Intellivue/ART" 는 raw ADC 또는 다른 스케일이라 99% out of valid_range.
+    # 같은 파일에 ABP 가 함께 있을 때만 의미 있고 ART 단독은 단위 변환 없이 unusable.
+    # → TRACK_MAP 에서 제거. 필요 시 unit conversion 추가 후 복구.
     # PPG (2)
     "Intellivue/PLETH": ("ppg", 1),  # SpO2 finger pleth waveform
     # CVP (3)
@@ -264,7 +266,8 @@ TRACK_MAP: dict[str, tuple[str, int]] = {
     # AWP (5)
     "Intellivue/AWP_WAV": ("awp", 0),  # Airway pressure waveform
     # PAP (6)
-    "Intellivue/PAP": ("pap", 0),  # PAP waveform
+    # "Intellivue/PAP": ("pap", 0),  # raw ADC 단위 미스매치 (99% out of range)
+                                     # → 제거. PAP 는 SNUADC/SNUADCM 만 사용
     # RESP (8) — 호흡 wave 신규 추가 (2026-05-01)
     "Intellivue/RESP": ("resp", 1),  # Impedance plethysmography (가슴 임피던스)
     "Intellivue/FLOW_WAV": ("resp", 2),  # Vent flow waveform
