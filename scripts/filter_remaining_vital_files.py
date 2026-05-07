@@ -10,13 +10,17 @@
         --processed /home/coder/workspace/updown/bio_fm/data/train/k_mimic_full \
         --in-list /home/coder/workspace/updown/kmimic_vital_all.txt \
         --out-list /home/coder/workspace/updown/kmimic_vital_remaining.txt \
-        --subject-from-parent 2
+        --subject-from-parent 2 \
+        --workers 32
 """
 from __future__ import annotations
 
 import argparse
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+
+from tqdm import tqdm
 
 
 def derive_session_id(vital_path: Path, subject_from_parent: int) -> tuple[str, str]:
@@ -40,30 +44,58 @@ def derive_session_id(vital_path: Path, subject_from_parent: int) -> tuple[str, 
     return subject_id, session_id
 
 
-def collect_completed(processed: Path) -> set[tuple[str, str]]:
-    completed: set[tuple[str, str]] = set()
-    n_manifest = 0
-    n_corrupt = 0
-    for manifest_path in processed.rglob("manifest.json"):
-        n_manifest += 1
-        try:
-            with open(manifest_path, encoding="utf-8") as f:
-                data = json.load(f)
-        except (json.JSONDecodeError, OSError):
-            n_corrupt += 1
+def _process_one_manifest(manifest_path: Path) -> tuple[set[tuple[str, str]], bool]:
+    """하나의 manifest.json 을 읽어 완료된 (subject, session) set 반환.
+
+    Returns
+    -------
+    (completed_set, corrupt_flag)
+    """
+    try:
+        with open(manifest_path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return set(), True
+
+    subj_dir = manifest_path.parent
+    subject_id = data.get("subject_id") or subj_dir.name
+
+    out: set[tuple[str, str]] = set()
+    for sess in data.get("sessions", []):
+        session_id = sess.get("session_id")
+        recs = sess.get("recordings", [])
+        if not session_id or not recs:
             continue
+        if all((subj_dir / r["file"]).exists() for r in recs):
+            out.add((subject_id, session_id))
+    return out, False
 
-        subj_dir = manifest_path.parent
-        subject_id = data.get("subject_id") or subj_dir.name
 
-        for sess in data.get("sessions", []):
-            session_id = sess.get("session_id")
-            recs = sess.get("recordings", [])
-            if not session_id or not recs:
-                continue
-            if all((subj_dir / r["file"]).exists() for r in recs):
-                completed.add((subject_id, session_id))
-    print(f"  manifest.json found: {n_manifest} (corrupt: {n_corrupt})")
+def collect_completed(processed: Path, workers: int) -> set[tuple[str, str]]:
+    print(f"  Globbing manifest.json under {processed} ...")
+    manifest_paths = list(processed.rglob("manifest.json"))
+    print(f"  manifest.json found: {len(manifest_paths)}")
+
+    completed: set[tuple[str, str]] = set()
+    n_corrupt = 0
+    if not manifest_paths:
+        return completed
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = [ex.submit(_process_one_manifest, p) for p in manifest_paths]
+        for fut in tqdm(
+            as_completed(futures),
+            total=len(futures),
+            desc="Reading manifests",
+            unit="file",
+        ):
+            sess_set, corrupt = fut.result()
+            if corrupt:
+                n_corrupt += 1
+            else:
+                completed.update(sess_set)
+
+    print(f"  corrupt manifests:   {n_corrupt}")
     print(f"  completed sessions:  {len(completed)}")
     return completed
 
@@ -77,10 +109,18 @@ def main() -> None:
     p.add_argument("--out-list", type=Path, required=True,
                    help="remaining list 출력 경로")
     p.add_argument("--subject-from-parent", type=int, default=2)
+    p.add_argument("--workers", type=int, default=32,
+                   help="manifest 읽기 thread 수 (NAS I/O bound 라 thread 32+ 권장)")
     args = p.parse_args()
 
     print(f"Scanning completed sessions in {args.processed} ...")
-    completed = collect_completed(args.processed)
+    completed = collect_completed(args.processed, workers=args.workers)
+
+    # in-list 라인 수 미리 카운트 (tqdm total 용)
+    print(f"Counting lines in {args.in_list} ...")
+    with open(args.in_list, encoding="utf-8") as f:
+        total_lines = sum(1 for _ in f)
+    print(f"  {total_lines} lines")
 
     print(f"Filtering {args.in_list} ...")
     n_total = 0
@@ -88,7 +128,7 @@ def main() -> None:
     n_unparseable = 0
     with open(args.in_list, encoding="utf-8") as fin, \
             open(args.out_list, "w", encoding="utf-8") as fout:
-        for line in fin:
+        for line in tqdm(fin, total=total_lines, desc="Filtering", unit="path"):
             path = line.strip()
             if not path:
                 continue
@@ -105,7 +145,7 @@ def main() -> None:
             fout.write(path + "\n")
             n_remaining += 1
 
-    print(f"Total:       {n_total}")
+    print(f"\nTotal:       {n_total}")
     print(f"Remaining:   {n_remaining}")
     print(f"Skipped:     {n_total - n_remaining}")
     print(f"Unparseable: {n_unparseable}")
