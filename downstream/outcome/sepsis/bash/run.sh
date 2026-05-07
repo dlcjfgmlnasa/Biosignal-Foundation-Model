@@ -6,9 +6,10 @@
 
 set -e
 
-CHECKPOINT=/home/coder/workspace/updown/bio_fm/output/phase2/base/checkpoints/best.pt
-DATA_DIR=/home/coder/workspace/updown/bio_fm/data/downstream/sepsis
-OUT_DIR=/home/coder/workspace/updown/bio_fm/result/downstream/sepsis
+REPO_ROOT="${REPO_ROOT:-/home/coder/workspace/Biosignal-Foundation-Model}"
+CHECKPOINT="${CHECKPOINT:-${REPO_ROOT}/output/phase2/base/checkpoints/best.pt}"
+DATA_DIR="${DATA_DIR:-${REPO_ROOT}/data/downstream/sepsis}"
+OUT_DIR="${OUT_DIR:-${REPO_ROOT}/result/downstream/sepsis}"
 DEVICE=cuda
 
 DATA_PATH="${DATA_DIR}/sepsis_w600s.pt"

@@ -11,9 +11,10 @@
 
 set -e
 
-CHECKPOINT=/home/coder/workspace/updown/bio_fm/output/phase2/base/checkpoints/best.pt
-DATA_DIR=/home/coder/workspace/updown/bio_fm/data/downstream/intracranial_hypertension
-OUT_DIR=/home/coder/workspace/updown/bio_fm/result/downstream/intracranial_hypertension
+REPO_ROOT="${REPO_ROOT:-/home/coder/workspace/Biosignal-Foundation-Model}"
+CHECKPOINT="${CHECKPOINT:-${REPO_ROOT}/output/phase2/base/checkpoints/best.pt}"
+DATA_DIR="${DATA_DIR:-${REPO_ROOT}/data/downstream/intracranial_hypertension}"
+OUT_DIR="${OUT_DIR:-${REPO_ROOT}/result/downstream/intracranial_hypertension}"
 DEVICE=cuda
 
 WINDOW_SECS=(30 60 300 600)
