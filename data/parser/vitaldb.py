@@ -459,6 +459,10 @@ def _fill_short_nan_gaps(
     채우는 artifact 제거용. 100ms 이내 (예: 500Hz 면 50 samples) 짜리 NaN gap
     만 보간하고, 그보다 긴 진짜 disconnect 는 NaN 으로 유지.
 
+    구현: NaN run 탐지 + fill value 계산 모두 numpy 벡터로 수행. 1-sample gap
+    (vitaldb chunk artifact 의 dominant case) 은 fancy indexing 으로 fully
+    vectorized 쓰기. multi-sample gap 만 fallback loop.
+
     Returns
     -------
     원본과 같은 길이의 ndarray (원본 비파괴 복사).
@@ -475,20 +479,45 @@ def _fill_short_nan_gaps(
     starts = np.where(diff == 1)[0]
     ends = np.where(diff == -1)[0]
 
-    for s, e in zip(starts, ends):
-        gap_len = e - s
-        if gap_len > max_fill_samples:
-            continue
-        # 양쪽 인접 valid 값으로 forward-fill (왼쪽 우선, 없으면 오른쪽)
-        left = out[s - 1] if s > 0 else np.nan
-        right = out[e] if e < len(out) else np.nan
-        if not np.isnan(left) and not np.isnan(right):
-            out[s:e] = (left + right) / 2.0
-        elif not np.isnan(left):
-            out[s:e] = left
-        elif not np.isnan(right):
-            out[s:e] = right
-        # 양쪽 다 NaN 이면 그대로 둠 (실제 disconnect)
+    # short gap 만 필터
+    gap_lens = ends - starts
+    short = gap_lens <= max_fill_samples
+    if not short.any():
+        return out
+    starts = starts[short]
+    ends = ends[short]
+
+    n = len(out)
+    # 양쪽 인접 값 벡터화 추출 (boundary 는 NaN 처리)
+    left_idx = np.maximum(starts - 1, 0)
+    right_idx = np.minimum(ends, n - 1)
+    left_vals = np.where(starts > 0, out[left_idx], np.nan)
+    right_vals = np.where(ends < n, out[right_idx], np.nan)
+    left_ok = ~np.isnan(left_vals)
+    right_ok = ~np.isnan(right_vals)
+
+    # Fill 값 결정: 양쪽 valid → 평균, 한쪽만 valid → 그 값, 둘 다 NaN → NaN
+    fill = np.where(
+        left_ok & right_ok,
+        (left_vals + right_vals) * 0.5,
+        np.where(left_ok, left_vals, np.where(right_ok, right_vals, np.nan)),
+    )
+    valid = ~np.isnan(fill)
+    if not valid.any():
+        return out
+
+    # 1-sample gap (dominant) → fancy indexing 으로 한 번에 쓰기
+    single = (ends - starts) == 1
+    single_valid = single & valid
+    if single_valid.any():
+        out[starts[single_valid]] = fill[single_valid]
+
+    # multi-sample gap → fallback loop (드물게 발생)
+    multi_valid = (~single) & valid
+    if multi_valid.any():
+        for s, e, v in zip(starts[multi_valid], ends[multi_valid], fill[multi_valid]):
+            out[s:e] = v
+
     return out
 
 
