@@ -587,6 +587,8 @@ def main() -> None:
 
     results = {
         **metrics,
+        "y_true": y_true.tolist(),
+        "y_score": y_score.tolist(),
         "train_losses": train_losses,
         "val_aurocs": val_aurocs,
         "val_auroc_best": val_auroc_best,

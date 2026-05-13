@@ -36,15 +36,15 @@ TARGET_SR: float = 100.0
 ICP_THRESHOLD: float = 20.0  # mmHg
 SUSTAINED_SEC: float = 60.0  # 1분 이상 지속
 
-# MIMIC-III 채널명 → signal_type 매핑 (pretrained 채널만)
+# MIMIC-III 채널명 → signal_type 매핑 (Task #3 ICH: ABP, ECG, PPG, CO2 + ICP for label)
+# ICP는 라벨 산출 전용 (input 신호로는 사용하지 않음, --input-signals 로 별도 제어)
 MIMIC_SIGNAL_MAP: dict[str, str] = {
     "II": "ecg",
     "V": "ecg",
     "ABP": "abp",
     "ART": "abp",
     "PLETH": "ppg",
-    "CVP": "cvp",
-    "PAP": "pap",
+    "CO2": "co2",
     "ICP": "icp",
 }
 
@@ -506,8 +506,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--input-signals", nargs="+",
-        default=["icp", "abp", "ecg", "ppg"],
-        choices=["icp", "ecg", "abp", "ppg", "cvp", "pap"],
+        default=["abp", "ecg", "ppg", "co2"],
+        choices=["icp", "ecg", "abp", "ppg", "co2"],
         help="Input signal types (label always from ICP). "
              "Default: ICP + ABP + ECG + PPG (4ch).",
     )

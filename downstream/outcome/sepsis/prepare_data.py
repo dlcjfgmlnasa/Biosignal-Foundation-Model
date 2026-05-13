@@ -39,16 +39,15 @@ from downstream._save_utils import (
 
 TARGET_SR: float = 100.0
 
-# WFDB sig_name → signal_type 매핑 (pretrained 채널만)
+# WFDB sig_name → signal_type 매핑 (Task #7 Sepsis: ABP, ECG, PPG, RESP)
+# RESP — qSOFA 의 RR component (Singer et al. JAMA 2016)
 MIMIC_SIGNAL_MAP: dict[str, str] = {
     "II": "ecg",
     "V": "ecg",
     "ABP": "abp",
     "ART": "abp",
     "PLETH": "ppg",
-    "CVP": "cvp",
-    "PAP": "pap",
-    "ICP": "icp",
+    "RESP": "resp",
 }
 
 

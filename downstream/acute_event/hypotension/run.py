@@ -755,6 +755,8 @@ def main() -> None:
 
     results = {
         **metrics,
+        "y_true": y_true.tolist(),
+        "y_score": y_score.tolist(),
         "val_auroc_best": float(best_val_auroc),
         "best_epoch": int(best_epoch),
         "auroc_ci": [float(auroc_ci[0]), float(auroc_ci[1])],

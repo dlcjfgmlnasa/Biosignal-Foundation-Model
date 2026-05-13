@@ -68,6 +68,15 @@ PAP_CHANNEL_NAMES = {"PAP"}
 # ICP 채널명 후보
 ICP_CHANNEL_NAMES = {"ICP"}
 
+# CO2/Capnography 채널명 후보 (MIMIC-III 일반: "CO2")
+CO2_CHANNEL_NAMES = {"CO2"}
+
+# AWP/Airway Pressure 채널명 후보 (MIMIC-III: "AWP" 혹은 "PAP_AWP")
+AWP_CHANNEL_NAMES = {"AWP", "PAP_AWP"}
+
+# RESP/Respiration 채널명 후보 (impedance plethysmography)
+RESP_CHANNEL_NAMES = {"RESP"}
+
 
 # ── 데이터 구조 ──────────────────────────────────────────────────
 
@@ -325,6 +334,15 @@ def load_and_preprocess_record(
         channel_map["ecg"] = info.ecg_channel
     if "ppg" in signal_types and info.ppg_channel:
         channel_map["ppg"] = info.ppg_channel
+    # Extended modality (Task #4/7/8/10/11): WFDB header 에서 직접 채널명 확인 후 매핑.
+    # scan_abp_records 가 채널 캐싱을 안 하므로 이 경로는 단일 채널 확장에는 약하지만,
+    # load_patient_signals (ICH prepare_data) 가 multi-channel 추출을 담당함.
+    if "co2" in signal_types:
+        channel_map["co2"] = "CO2"
+    if "awp" in signal_types:
+        channel_map["awp"] = "AWP"
+    if "resp" in signal_types:
+        channel_map["resp"] = "RESP"
 
     if "abp" not in channel_map:
         return None  # ABP 필수

@@ -26,6 +26,8 @@ import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+from tqdm import tqdm
+
 
 PHYSIONET_BASE = "https://physionet.org/files/mimic3wdb-matched/1.0"
 
@@ -191,9 +193,9 @@ def _download_one_record(
 
     db_subdir = f"mimic3wdb-matched/{parts[0]}/{parts[1]}"
     rec_name = parts[-1]
-    patient_dir = out_path / parts[0] / parts[1]
 
-    if (patient_dir / f"{rec_name}.hea").exists():
+    # wfdb.dl_database(records=[...])는 flat layout으로 파일을 떨어뜨린다.
+    if (out_path / f"{rec_name}.hea").exists():
         return record_path, "skipped", ""
 
     try:
@@ -231,45 +233,50 @@ def download_icp_records(
     out_path.mkdir(parents=True, exist_ok=True)
 
     total = len(records)
-    print(
-        f"Downloading {total} ICP records to {out_dir} "
-        f"with {workers} workers..."
-    )
+    mode = "sequential" if workers <= 1 else f"{workers} workers"
+    print(f"Downloading {total} ICP records to {out_dir} ({mode})...")
 
     downloaded = 0
     failed = 0
     skipped = 0
-    n_done = 0
 
-    executor = ThreadPoolExecutor(max_workers=workers)
+    pbar = tqdm(total=total, desc="ICH download", unit="rec", dynamic_ncols=True)
+
+    def _handle_result(record_path: str, status: str, msg: str) -> None:
+        nonlocal downloaded, skipped, failed
+        if status == "downloaded":
+            downloaded += 1
+        elif status == "skipped":
+            skipped += 1
+        else:
+            failed += 1
+            tqdm.write(f"  FAIL {record_path}: {msg}")
+        pbar.set_postfix(dl=downloaded, skip=skipped, fail=failed)
+        pbar.update(1)
+
     try:
-        futures = {
-            executor.submit(_download_one_record, rec, out_path): rec
-            for rec in records
-        }
-
-        for fut in as_completed(futures):
-            record_path, status, msg = fut.result()
-            if status == "downloaded":
-                downloaded += 1
-            elif status == "skipped":
-                skipped += 1
-            else:
-                failed += 1
-                print(f"  FAIL {record_path}: {msg}")
-
-            n_done += 1
-            if n_done % 10 == 0 or n_done == 1:
-                print(
-                    f"  [{n_done}/{total}] downloaded={downloaded}, "
-                    f"skipped={skipped}, failed={failed}"
-                )
+        if workers <= 1:
+            for rec in records:
+                record_path, status, msg = _download_one_record(rec, out_path)
+                _handle_result(record_path, status, msg)
+        else:
+            executor = ThreadPoolExecutor(max_workers=workers)
+            try:
+                futures = {
+                    executor.submit(_download_one_record, rec, out_path): rec
+                    for rec in records
+                }
+                for fut in as_completed(futures):
+                    record_path, status, msg = fut.result()
+                    _handle_result(record_path, status, msg)
+            finally:
+                executor.shutdown(wait=True)
     except KeyboardInterrupt:
-        print("\nInterrupted — shutting down workers...", file=sys.stderr)
-        executor.shutdown(wait=False, cancel_futures=True)
+        pbar.close()
+        print("\nInterrupted.", file=sys.stderr)
         raise
     finally:
-        executor.shutdown(wait=True)
+        pbar.close()
 
     print(f"\n{'=' * 60}")
     print(f"  Download Complete")
@@ -312,8 +319,8 @@ def main() -> None:
     )
     dl_parser.add_argument("--max-records", type=int, default=None)
     dl_parser.add_argument(
-        "--workers", type=int, default=8,
-        help="병렬 다운로드 worker 수 (기본 8). bandwidth 한계로 16 이상은 비추천.",
+        "--workers", type=int, default=1,
+        help="병렬 다운로드 worker 수 (기본 1=순차). 16 이상은 비추천.",
     )
 
     args = parser.parse_args()

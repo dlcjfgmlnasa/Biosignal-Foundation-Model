@@ -329,7 +329,10 @@ def main() -> None:
     print(f"\nROC curve: {roc_path}")
 
     results = {
-        **metrics, "train_losses": train_losses,
+        **metrics,
+        "y_true": y_true.tolist(),
+        "y_score": y_score.tolist(),
+        "train_losses": train_losses,
         "config": {
             "task": "icu_vent_need_prediction",
             "mode": args.mode,

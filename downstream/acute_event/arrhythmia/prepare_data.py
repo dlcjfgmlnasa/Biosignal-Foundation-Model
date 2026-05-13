@@ -11,7 +11,8 @@
     3: SBRAD (Sinus Bradycardia)
     4: AFLT  (Atrial Flutter)
 
-입력 신호: PPG(PLETH) + ECG(II) + ABP — MIMIC-III-Ext-PPG native 125Hz → 100Hz 리샘플.
+입력 신호: PPG(PLETH) + ECG(II) — MIMIC-III-Ext-PPG native 125Hz → 100Hz 리샘플.
+(Task #2 Arrhythmia: ECG = gold standard, PPG 보조. ABP 제거로 cohort↑)
 
 분할 (strat_fold 0-9):
     fold 0-5 → train (60%)
@@ -57,15 +58,13 @@ CLASS_NAMES = ["SR", "AF", "STACH", "SBRAD", "AFLT"]
 N_CLASSES = len(CLASS_NAMES)
 
 # SIGNAL_TYPE 정수 매핑 (foundation model과 정합)
-SIGNAL_TYPE_MAP: dict[int, str] = {0: "ecg", 1: "abp", 2: "ppg"}
+SIGNAL_TYPE_MAP: dict[int, str] = {0: "ecg", 2: "ppg"}
 
-# wfdb 채널명 → 내부 signal type
+# wfdb 채널명 → 내부 signal type (Task #2: ECG + PPG 만)
 CHANNEL_TO_STYPE: dict[str, str] = {
     "PLETH": "ppg",
     "II": "ecg",
     "II+": "ecg",
-    "ABP": "abp",
-    "ART": "abp",
 }
 
 
@@ -386,9 +385,9 @@ def main() -> None:
     parser.add_argument("--out-dir", type=str,
                         default="outputs/downstream/arrhythmia")
     parser.add_argument("--input-signals", nargs="+",
-                        default=["ecg", "abp", "ppg"],
-                        choices=["ecg", "abp", "ppg"],
-                        help="사용할 신호 타입")
+                        default=["ecg", "ppg"],
+                        choices=["ecg", "ppg"],
+                        help="사용할 신호 타입 (Task #2: ECG, PPG)")
     parser.add_argument("--max-segments-per-class", type=int, default=None,
                         help="class당 segment 상한 (balance 강화)")
     args = parser.parse_args()

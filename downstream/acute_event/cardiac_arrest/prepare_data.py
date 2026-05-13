@@ -43,16 +43,15 @@ from downstream._save_utils import (
 
 TARGET_SR: float = 100.0
 
-# WFDB sig_name → signal_type 매핑 (pretrained 채널만)
+# WFDB sig_name → signal_type 매핑 (Task #4 Cardiac Arrest: ABP, ECG, PPG, RESP)
+# RESP — MEWS/NEWS2 의 RR component, pre-arrest apnea sign (Churpek 2014)
 MIMIC_SIGNAL_MAP: dict[str, str] = {
     "II": "ecg",
     "V": "ecg",
     "ABP": "abp",
     "ART": "abp",
     "PLETH": "ppg",
-    "CVP": "cvp",
-    "PAP": "pap",
-    "ICP": "icp",
+    "RESP": "resp",
 }
 
 

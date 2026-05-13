@@ -438,6 +438,7 @@ def main() -> None:
             "n_sepsis_neg": sum(1 for m in manifest if m["sepsis3"] == 0),
             "total_records": total_records,
             "downloaded": downloaded,
+            "skipped_records": skipped_records,
             "failed": failed,
             "skipped_no_records": skipped,
             "pre_hours": args.pre_hours,
@@ -450,7 +451,8 @@ def main() -> None:
     print(f"\n{'=' * 60}")
     print(f"  Download Complete")
     print(f"  Patients: {len(manifest)} ({sum(1 for m in manifest if m['sepsis3']==1)} sepsis+)")
-    print(f"  Records: {downloaded} downloaded, {failed} failed, {skipped} skipped")
+    print(f"  Records: {downloaded} downloaded, {skipped_records} skipped, "
+          f"{failed} failed ({skipped} patients had no records in window)")
     print(f"  Manifest: {manifest_path}")
     print(f"{'=' * 60}")
 

@@ -279,7 +279,12 @@ def main() -> None:
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--model-version", type=str, default="v1")
     parser.add_argument("--data-path", type=str, default=None)
-    parser.add_argument("--signal-type", type=str, default="ecg")
+    parser.add_argument(
+        "--signal-type", type=str, default="ecg",
+        choices=["ecg", "abp", "ppg", "co2", "resp", "awp", "cvp", "icp", "pap"],
+        help="Task #13 Forecasting target signal. Main paper: ecg/abp/ppg/co2. "
+             "Appendix: resp/awp/cvp/icp/pap (rare/specialized cohorts).",
+    )
     parser.add_argument("--dummy", action="store_true")
     parser.add_argument("--out-dir", type=str, default="outputs/downstream/forecasting")
     parser.add_argument(

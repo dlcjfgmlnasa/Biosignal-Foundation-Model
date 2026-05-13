@@ -37,7 +37,12 @@ from downstream._save_utils import (
 
 TARGET_SR: float = 100.0
 
-ALL_SIGNAL_TYPES = ["ecg", "abp", "ppg", "co2", "awp", "cvp"]
+# Task #13 Waveform Forecasting: All 9 modality.
+# Main paper: ECG, ABP, PPG, CO2 (universal coverage).
+# Appendix: RESP, AWP, CVP, ICP, PAP (rare/specialized cohorts).
+MAIN_SIGNAL_TYPES = ["ecg", "abp", "ppg", "co2"]
+APPENDIX_SIGNAL_TYPES = ["resp", "awp", "cvp", "icp", "pap"]
+ALL_SIGNAL_TYPES = MAIN_SIGNAL_TYPES + APPENDIX_SIGNAL_TYPES
 
 
 # ---- 데이터 구조 ----
@@ -77,7 +82,14 @@ def _load_mimic3_signal(
     )
 
     if signal_type not in ("abp", "ecg", "ppg"):
-        print(f"  WARNING: MIMIC-III only supports abp/ecg/ppg, got {signal_type}")
+        # Task #13 main 4 (incl. co2) 및 appendix 5: 단일 채널 single-input 은
+        # 현재 scan_abp_records (ABP-필수) 경로만 지원. CO2/RESP/AWP/CVP/ICP/PAP 는
+        # --multi-input 모드 + ICH waveform_dir 경유 추출 필요.
+        print(
+            f"  WARNING: single-input MIMIC-III loader supports abp/ecg/ppg only "
+            f"(got {signal_type}). For Task #13 appendix modalities, use --multi-input "
+            f"with --waveform-dir pointing at the ICH-style multi-channel extraction."
+        )
         return []
 
     records = scan_abp_records(max_records=n_cases * 5, verbose=False)

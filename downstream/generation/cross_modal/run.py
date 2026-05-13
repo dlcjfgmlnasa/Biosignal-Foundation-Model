@@ -49,7 +49,7 @@ from torch import nn
 from data.collate import PackCollate, PackedBatch
 from data.dataset import BiosignalSample
 
-# signal_type_key -> signal_type_id
+# signal_type_key -> signal_type_id (data/spatial_map.py 와 정합)
 SIGNAL_TYPE_IDS: dict[str, int] = {
     "ecg": 0,
     "abp": 1,
@@ -59,6 +59,7 @@ SIGNAL_TYPE_IDS: dict[str, int] = {
     "awp": 5,
     "pap": 6,
     "icp": 7,
+    "resp": 8,
 }
 
 # Mechanism groups for analysis
@@ -69,6 +70,7 @@ MECHANISM_GROUPS: dict[str, str] = {
     "cvp": "cardiovascular",
     "co2": "respiratory",
     "awp": "respiratory",
+    "resp": "respiratory",
     "pap": "cardiovascular",
     "icp": "neurological",
 }
@@ -118,19 +120,28 @@ def parse_scenario(scenario_str: str) -> Scenario:
 
 
 def get_default_scenarios() -> list[Scenario]:
-    """Default evaluation scenarios spanning various complexities."""
+    """Task #12 Cross-Modal Reconstruction default scenarios.
+
+    Paper-confirmed pair definition (docs/paper_task_modality.md):
+      - ECG → ABP (baseline cardiac cycle)
+      - ECG → PPG (cardiac → peripheral)
+      - ABP → PPG (arterial pulse wave)
+      - CO2 → RESP (respiratory coupling)
+      - ABP → ICP (virtual ICP probe — non-invasive ICP estimation)
+      - ABP → PAP (virtual Swan-Ganz — non-invasive PA pressure)
+      - CVP → PAP (right heart hemodynamics)
+    """
     scenarios = [
-        # 1-to-1: Cardiovascular intra-group
+        # Cardiovascular intra-group baselines
         Scenario("ECG->ABP", ["ecg"], "abp", "intra", 1),
-        Scenario("ABP->ECG", ["abp"], "ecg", "intra", 1),
-        Scenario("PPG->ABP", ["ppg"], "abp", "intra", 1),
-        # 2-to-1: Cardiovascular intra-group
-        Scenario("ECG+PPG->ABP", ["ecg", "ppg"], "abp", "intra", 2),
-        Scenario("ECG+ABP->PPG", ["ecg", "abp"], "ppg", "intra", 2),
-        # 3-to-1: Rich input
-        Scenario("ECG+PPG+CVP->ABP", ["ecg", "ppg", "cvp"], "abp", "intra", 3),
-        # Inter-group (baseline - expect low performance)
-        Scenario("ECG->CO2", ["ecg"], "co2", "inter", 1),
+        Scenario("ECG->PPG", ["ecg"], "ppg", "intra", 1),
+        Scenario("ABP->PPG", ["abp"], "ppg", "intra", 1),
+        # Respiratory coupling
+        Scenario("CO2->RESP", ["co2"], "resp", "intra", 1),
+        # Rare-modality virtual probes (primary novelty)
+        Scenario("ABP->ICP", ["abp"], "icp", "inter", 1),
+        Scenario("ABP->PAP", ["abp"], "pap", "intra", 1),
+        Scenario("CVP->PAP", ["cvp"], "pap", "intra", 1),
     ]
     return scenarios
 

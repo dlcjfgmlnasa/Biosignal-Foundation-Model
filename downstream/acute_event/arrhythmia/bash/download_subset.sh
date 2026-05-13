@@ -51,11 +51,16 @@ echo "Downloading $N patient folders to $OUT_DIR with $PARALLEL workers..."
 download_one() {
   local folder="$1"
   local out="$2"
-  # 이미 .dat 파일 많은 환자는 전체 skip (HEAD 체크 비용 회피)
-  local existing=$(find "$out/$folder" -name "*.dat" 2>/dev/null | wc -l)
-  if [[ "$existing" -gt 0 ]]; then
-    echo "  SKIP $folder ($existing .dat files already present)"
-    return 0
+  # RECORDS의 레코드 수와 실제 .dat 수가 일치할 때만 전체 skip.
+  # 일치하지 않으면 wget -c가 부족한 파일만 추가 다운로드한다.
+  local records_file="$out/$folder/RECORDS"
+  if [[ -f "$records_file" ]]; then
+    local expected=$(grep -cve '^\s*$' "$records_file" 2>/dev/null || echo 0)
+    local existing=$(find "$out/$folder" -name "*.dat" 2>/dev/null | wc -l)
+    if [[ "$expected" -gt 0 && "$existing" -eq "$expected" ]]; then
+      echo "  SKIP $folder ($existing/$expected .dat files complete)"
+      return 0
+    fi
   fi
   # 환경변수 PHYSIONET_USER / PHYSIONET_PASS 있으면 사용, 없으면 .netrc 폴백
   local auth_args=()

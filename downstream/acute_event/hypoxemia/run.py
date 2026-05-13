@@ -515,9 +515,9 @@ def main() -> None:
     parser.add_argument(
         "--input-signals",
         nargs="+",
-        default=["abp"],
-        choices=["abp", "ecg", "ppg"],
-        help="Input signal types (label always from ABP)",
+        default=["ppg", "ecg", "abp", "co2"],
+        choices=["abp", "ecg", "ppg", "co2"],
+        help="Input signal types (Task #6: PPG, ECG, ABP, CO2; label from SpO2 numerics)",
     )
     parser.add_argument(
         "--val-split-seed",
@@ -755,6 +755,8 @@ def main() -> None:
 
     results = {
         **metrics,
+        "y_true": y_true.tolist(),
+        "y_score": y_score.tolist(),
         "val_auroc_best": float(best_val_auroc),
         "best_epoch": int(best_epoch),
         "auroc_ci": [float(auroc_ci[0]), float(auroc_ci[1])],

@@ -293,7 +293,10 @@ def main() -> None:
                    title=f"Sepsis — {args.mode} ROC")
 
     results = {
-        **metrics, "train_losses": train_losses,
+        **metrics,
+        "y_true": y_true.tolist(),
+        "y_score": y_score.tolist(),
+        "train_losses": train_losses,
         "config": {
             "task": "sepsis_prediction", "mode": args.mode,
             "aggregation": "transformer",

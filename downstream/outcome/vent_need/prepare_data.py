@@ -41,9 +41,9 @@ from downstream._save_utils import (
 TARGET_SR: float = 100.0
 
 # WFDB sig_name → 우리 signal_type 매핑
-# Pretrained model에서 학습한 채널만 사용:
-#   ECG: II, V5 (VitalDB SNUADC/ECG_II, ECG_V5)
-#   ABP, PPG, CVP, PAP, ICP: 각 1채널
+# Task #11 Mech Vent Need: ABP, ECG, PPG, RESP (4 modality).
+# AWP/CO2 명시적 제외 — insertion 전 환자엔 ventilator/capnography 가 없음
+# (data leakage 가 아니라 임상적 불가능성).
 MIMIC_SIGNAL_MAP: dict[str, str] = {
     # ECG — pretrained lead만
     "II": "ecg",
@@ -53,12 +53,8 @@ MIMIC_SIGNAL_MAP: dict[str, str] = {
     "ART": "abp",
     # PPG
     "PLETH": "ppg",
-    # CVP
-    "CVP": "cvp",
-    # PAP
-    "PAP": "pap",
-    # ICP
-    "ICP": "icp",
+    # RESP / Respiration (impedance, non-invasive)
+    "RESP": "resp",
 }
 
 

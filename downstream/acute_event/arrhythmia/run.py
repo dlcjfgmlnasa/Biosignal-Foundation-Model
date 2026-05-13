@@ -319,6 +319,8 @@ def _compute_multiclass_metrics(
         "class_distribution": {
             CLASS_NAMES[i]: int((y_true == i).sum()) for i in range(N_CLASSES)
         },
+        "y_true": y_true,
+        "y_probs": y_probs,
     }
 
 
@@ -492,6 +494,8 @@ def main() -> None:
         "per_class_stats": metrics["per_class_stats"],
         "confusion_matrix": metrics["confusion_matrix"],
         "class_distribution": metrics["class_distribution"],
+        "y_true": metrics["y_true"].tolist(),
+        "y_probs": metrics["y_probs"].tolist(),
         "train_losses": train_losses,
         "config": {
             "mode": args.mode,

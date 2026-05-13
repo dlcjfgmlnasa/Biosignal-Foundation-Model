@@ -686,9 +686,10 @@ def main() -> None:
     parser.add_argument(
         "--signal-types",
         nargs="+",
-        default=["ecg", "abp", "ppg", "cvp"],
-        choices=["ecg", "abp", "ppg", "cvp", "co2", "awp", "pap", "icp"],
-        help="Signal types to extract",
+        default=["ecg", "abp", "ppg", "cvp", "co2", "resp", "icp", "pap"],
+        choices=["ecg", "abp", "ppg", "cvp", "co2", "awp", "resp", "pap", "icp"],
+        help="Signal types to extract (Task #12 default: 8 modality — "
+             "ECG, ABP, PPG, CVP, CO2, RESP, ICP, PAP)",
     )
     parser.add_argument(
         "--n-cases", type=int, default=10, help="Number of cases to load"
