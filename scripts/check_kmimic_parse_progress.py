@@ -39,6 +39,15 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+try:
+    from tqdm import tqdm
+    _HAS_TQDM = True
+except ImportError:
+    _HAS_TQDM = False
+
+    def tqdm(it, **_kwargs):  # type: ignore[no-redef]
+        return it
+
 
 # ── Vital 파일 목록 로더 ──────────────────────────────────────
 
@@ -59,12 +68,24 @@ def _extract_bucket(path_str: str) -> str:
     return "unknown"
 
 
+def _count_lines(path: Path) -> int:
+    """파일 라인 수 (progress bar total 용)."""
+    n = 0
+    with open(path, "rb") as f:
+        for _ in f:
+            n += 1
+    return n
+
+
 def load_vital_list(list_path: Path) -> tuple[int, dict[str, int]]:
     """vital list 파일 → (total_count, bucket_count_dict)."""
     bucket_total: dict[str, int] = defaultdict(int)
     n = 0
+    total_lines = _count_lines(list_path)
     with open(list_path, encoding="utf-8") as f:
-        for line in f:
+        for line in tqdm(
+            f, total=total_lines, desc="vital list", unit="line", mininterval=0.5,
+        ):
             line = line.strip()
             if not line:
                 continue
@@ -77,7 +98,9 @@ def scan_vital_root(root: Path) -> tuple[int, dict[str, int]]:
     """raw .vital 디렉토리 walk → (total_count, bucket_count_dict)."""
     bucket_total: dict[str, int] = defaultdict(int)
     n = 0
-    for vp in root.rglob("*.vital"):
+    for vp in tqdm(
+        root.rglob("*.vital"), desc="rglob *.vital", unit="file", mininterval=0.5,
+    ):
         n += 1
         bucket_total[_extract_bucket(str(vp))] += 1
     return n, dict(bucket_total)
@@ -86,16 +109,13 @@ def scan_vital_root(root: Path) -> tuple[int, dict[str, int]]:
 # ── 처리된 subject manifest 로더 ────────────────────────────────
 
 
-def iter_processed_manifests(processed_dir: Path, limit: int | None = None):
-    """processed_dir 의 subject manifest 를 yield."""
-    # manifest.jsonl 인덱스 우선 (있으면)
+def _enumerate_manifest_paths(processed_dir: Path) -> list[Path]:
+    """스캔 대상 manifest 경로 목록 (tqdm total 용)."""
     idx = processed_dir / "manifest.jsonl"
-    cnt = 0
     if idx.exists():
+        paths: list[Path] = []
         with open(idx, encoding="utf-8") as f:
             for line in f:
-                if limit is not None and cnt >= limit:
-                    return
                 line = line.strip()
                 if not line:
                     continue
@@ -104,24 +124,25 @@ def iter_processed_manifests(processed_dir: Path, limit: int | None = None):
                 except json.JSONDecodeError:
                     continue
                 mf_path = processed_dir / meta["manifest"]
-                if not mf_path.exists():
-                    continue
-                try:
-                    with open(mf_path, encoding="utf-8") as mf:
-                        yield json.load(mf), mf_path
-                        cnt += 1
-                except (OSError, json.JSONDecodeError):
-                    continue
-    else:
-        for mf_path in sorted(processed_dir.glob("**/manifest.json")):
-            if limit is not None and cnt >= limit:
-                return
-            try:
-                with open(mf_path, encoding="utf-8") as mf:
-                    yield json.load(mf), mf_path
-                    cnt += 1
-            except (OSError, json.JSONDecodeError):
-                continue
+                if mf_path.exists():
+                    paths.append(mf_path)
+        return paths
+    return sorted(processed_dir.glob("**/manifest.json"))
+
+
+def iter_processed_manifests(processed_dir: Path, limit: int | None = None):
+    """processed_dir 의 subject manifest 를 yield (tqdm 진척표시 포함)."""
+    paths = _enumerate_manifest_paths(processed_dir)
+    if limit is not None:
+        paths = paths[:limit]
+    for mf_path in tqdm(
+        paths, desc="manifests", unit="file", mininterval=0.5,
+    ):
+        try:
+            with open(mf_path, encoding="utf-8") as mf:
+                yield json.load(mf), mf_path
+        except (OSError, json.JSONDecodeError):
+            continue
 
 
 def aggregate_processed(

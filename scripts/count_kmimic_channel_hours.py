@@ -37,6 +37,15 @@ from pathlib import Path
 
 from data.spatial_map import SPATIAL_MAP
 
+try:
+    from tqdm import tqdm
+    _HAS_TQDM = True
+except ImportError:
+    _HAS_TQDM = False
+
+    def tqdm(it, **_kwargs):  # type: ignore[no-redef]
+        return it
+
 
 SIGNAL_NAMES: dict[int, str] = {
     0: "ECG",
@@ -74,9 +83,10 @@ def _iter_manifest_full_jsonl(path: Path):
                 continue
 
 
-def _iter_per_subject_manifests(data_dir: Path):
+def _enumerate_manifest_paths(data_dir: Path) -> list[Path]:
     idx = data_dir / "manifest.jsonl"
     if idx.exists():
+        paths: list[Path] = []
         with open(idx, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
@@ -87,20 +97,24 @@ def _iter_per_subject_manifests(data_dir: Path):
                 except json.JSONDecodeError:
                     continue
                 mf_path = data_dir / meta["manifest"]
-                if not mf_path.exists():
-                    continue
-                try:
-                    with open(mf_path, encoding="utf-8") as mf:
-                        yield json.load(mf)
-                except (OSError, json.JSONDecodeError):
-                    continue
-    else:
-        for mf_path in sorted(data_dir.glob("**/manifest.json")):
-            try:
-                with open(mf_path, encoding="utf-8") as mf:
-                    yield json.load(mf)
-            except (OSError, json.JSONDecodeError):
-                continue
+                if mf_path.exists():
+                    paths.append(mf_path)
+        return paths
+    return sorted(data_dir.glob("**/manifest.json"))
+
+
+def _iter_per_subject_manifests(data_dir: Path, limit: int | None = None):
+    paths = _enumerate_manifest_paths(data_dir)
+    if limit is not None:
+        paths = paths[:limit]
+    for mf_path in tqdm(
+        paths, desc="manifests", unit="file", mininterval=0.5,
+    ):
+        try:
+            with open(mf_path, encoding="utf-8") as mf:
+                yield json.load(mf)
+        except (OSError, json.JSONDecodeError):
+            continue
 
 
 def _iter_records(subject_manifest: dict):
@@ -173,7 +187,7 @@ def scan(
         it = _iter_manifest_full_jsonl(full)
     else:
         src = "per-subject manifest"
-        it = _iter_per_subject_manifests(data_dir)
+        it = _iter_per_subject_manifests(data_dir, limit=max_subjects)
 
     print(f"  Scanning {data_dir}  ({src})", file=sys.stderr)
 
