@@ -214,7 +214,11 @@ def _load_one_subject(
                     break
                 if arr.dim() > 1:
                     arr = arr.squeeze(0)
-                arr_np = arr.numpy()
+                # OOM 회피: parser 가 float32 로 저장한 신호를 즉시 float16 로 캐스팅.
+                # 6000+ case 전체를 memory 적재 → float32 (4B) → float16 (2B) → 50%
+                # 절감. NaN 보존 (np.nan.astype(float16)=nan), 정확도 영향 0 (저장
+                # dtype 정책과 일관 — _save_utils 정책).
+                arr_np = arr.numpy().astype(np.float16, copy=False)
                 rel_start = i_start - seg.start_sample
                 rel_end = i_end - seg.start_sample
                 rel_end = min(rel_end, len(arr_np))
