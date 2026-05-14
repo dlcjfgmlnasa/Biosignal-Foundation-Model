@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
 import re
 import sys
@@ -44,6 +45,11 @@ import torch
 from tqdm import tqdm
 
 TARGET_SR: float = 100.0  # parsed .pt 는 100Hz 통일 (CLAUDE.md 참조)
+
+SIGNAL_TYPE_STR: dict[int, str] = {
+    0: "ecg", 1: "abp", 2: "ppg", 3: "cvp",
+    4: "co2", 5: "awp", 6: "pap", 7: "icp", 8: "resp",
+}
 
 # ── Task 사양 ─────────────────────────────────────────────────────
 #  required_signals: [(signal_type_str, allowed_spatial_ids_or_None), ...]
@@ -133,6 +139,196 @@ def estimate_n_samples(file_size: int, overhead: int, dtype_bytes: int) -> int:
 
 
 # ── 신호 가용성 + segment 집계 ──────────────────────────────────
+
+# ── Manifest 기반 scan (시간선 intersection 용) ──────────────────
+
+
+def _scan_one_subject_manifest(
+    subj_dir: Path,
+) -> tuple[str, dict[str, dict[str, list[dict]]], int]:
+    """한 subject 의 manifest.json 로딩.
+
+    Returns
+    -------
+    (subject_id, sessions_dict, n_records)
+    sessions_dict = {
+        session_id: {
+            signal_type_str: [
+                {"start_sample": int, "n_timesteps": int, "spatial_id": int}, ...
+            ],
+            ...
+        },
+        ...
+    }
+    """
+    sid = subj_dir.name
+    sessions: dict[str, dict[str, list[dict]]] = {}
+    mp = subj_dir / "manifest.json"
+    n_rec = 0
+    if not mp.is_file():
+        return sid, sessions, 0
+    try:
+        with open(mp, encoding="utf-8") as f:
+            m = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return sid, sessions, 0
+
+    for sess in m.get("sessions", []):
+        sess_id = sess.get("session_id", "")
+        sig_dict: dict[str, list[dict]] = defaultdict(list)
+        for rec in sess.get("recordings", []):
+            st_int = rec.get("signal_type")
+            ss = rec.get("start_sample")
+            nt = rec.get("n_timesteps")
+            sp_ids = rec.get("spatial_ids", [])
+            if st_int is None or ss is None or nt is None:
+                continue
+            st_str = SIGNAL_TYPE_STR.get(st_int)
+            if st_str is None:
+                continue
+            sp_id = sp_ids[0] if sp_ids else 0
+            sig_dict[st_str].append({
+                "start_sample": int(ss),
+                "n_timesteps": int(nt),
+                "spatial_id": int(sp_id),
+            })
+            n_rec += 1
+        # 각 signal_type 별 start_sample 정렬
+        for st_str in sig_dict:
+            sig_dict[st_str].sort(key=lambda r: r["start_sample"])
+        sessions[sess_id] = dict(sig_dict)
+    return sid, sessions, n_rec
+
+
+def scan_subjects_manifest(
+    root: Path,
+    max_subjects: int | None = None,
+    workers: int = 16,
+) -> tuple[dict, int]:
+    """전체 subject manifest 병렬 로딩.
+
+    Returns
+    -------
+    subjects : {subject_id: {session_id: {signal_type_str: [records]}}}
+    n_records : 총 record 수
+    """
+    print(f"  Listing {root} ...", flush=True)
+    subject_dirs: list[Path] = []
+    list_pbar = tqdm(os.scandir(root), desc="  Listing entries", unit="entry",
+                     dynamic_ncols=True)
+    for entry in list_pbar:
+        if entry.is_dir():
+            subject_dirs.append(Path(entry.path))
+        list_pbar.set_postfix(dirs=len(subject_dirs), refresh=False)
+    list_pbar.close()
+    subject_dirs.sort()
+    print(f"  → {len(subject_dirs)} subject directory(ies)", flush=True)
+    if max_subjects is not None:
+        subject_dirs = subject_dirs[:max_subjects]
+
+    subjects: dict[str, dict] = {}
+    n_records_total = 0
+
+    print(f"  Loading manifests with {workers} parallel workers...", flush=True)
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {ex.submit(_scan_one_subject_manifest, sd): sd for sd in subject_dirs}
+        pbar = tqdm(as_completed(futures), total=len(futures),
+                    desc="Scanning subjects", unit="subj", dynamic_ncols=True)
+        for fut in pbar:
+            sid, sessions, n_rec = fut.result()
+            n_records_total += n_rec
+            if sessions:
+                subjects[sid] = sessions
+            pbar.set_postfix(records=n_records_total, kept=len(subjects),
+                             refresh=False)
+        pbar.close()
+
+    return subjects, n_records_total
+
+
+# ── 시간선 intersection ─────────────────────────────────────────
+
+
+def _merge_overlapping_intervals(
+    intervals: list[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    """겹치는 [start, end) interval 들을 합침."""
+    if not intervals:
+        return []
+    intervals = sorted(intervals)
+    merged = [list(intervals[0])]
+    for s, e in intervals[1:]:
+        if s <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e])
+    return [(s, e) for s, e in merged]
+
+
+def _intersect_intervals(
+    intervals_by_sig: dict[str, list[tuple[int, int]]],
+) -> list[tuple[int, int]]:
+    """모든 signal 이 동시 valid 한 [start, end) 구간 sweep-line intersection."""
+    if not intervals_by_sig:
+        return []
+    n_required = len(intervals_by_sig)
+    events: list[tuple[int, int, str]] = []
+    # kind: 0 = start, 1 = end
+    for sig, intervals in intervals_by_sig.items():
+        for s, e in intervals:
+            events.append((s, 0, sig))
+            events.append((e, 1, sig))
+    # end 이벤트가 같은 시각의 start 보다 먼저 처리되도록 kind 가 작은 게 먼저
+    # → (time, kind) 정렬: start(0) 가 end(1) 보다 먼저 → 동시각 start/end 시 open 유지
+    events.sort(key=lambda x: (x[0], x[1]))
+
+    active: dict[str, int] = defaultdict(int)
+    n_active_sigs = 0
+    result: list[tuple[int, int]] = []
+    current_start: int | None = None
+    for t, kind, sig in events:
+        if kind == 0:
+            if active[sig] == 0:
+                n_active_sigs += 1
+                if n_active_sigs == n_required:
+                    current_start = t
+            active[sig] += 1
+        else:
+            active[sig] -= 1
+            if active[sig] == 0:
+                if n_active_sigs == n_required and current_start is not None:
+                    if t > current_start:
+                        result.append((current_start, t))
+                    current_start = None
+                n_active_sigs -= 1
+    return result
+
+
+def compute_aligned_intervals(
+    session_signals: dict[str, list[dict]],
+    required: list[tuple[str, set[int] | None]],
+) -> list[tuple[int, int]]:
+    """한 session 안에서 required signal 모두 동시 valid 한 구간 추출.
+
+    Returns: [(start_sample, end_sample), ...]
+    """
+    intervals_by_sig: dict[str, list[tuple[int, int]]] = {}
+    for sig_str, allowed_sids in required:
+        recs = session_signals.get(sig_str, [])
+        sig_intervals: list[tuple[int, int]] = []
+        for rec in recs:
+            if allowed_sids is not None and rec["spatial_id"] not in allowed_sids:
+                continue
+            s = rec["start_sample"]
+            e = s + rec["n_timesteps"]
+            sig_intervals.append((s, e))
+        if not sig_intervals:
+            return []
+        # 같은 signal_type 의 multi-lead/overlap 정리 (ECG 다중 lead 등)
+        sig_intervals = _merge_overlapping_intervals(sig_intervals)
+        intervals_by_sig[sig_str] = sig_intervals
+    return _intersect_intervals(intervals_by_sig)
+
 
 def _scan_one_subject(
     subj_dir: Path,
@@ -424,6 +620,64 @@ def check_segment_satisfies(
     return True
 
 
+def aggregate_task_cohort_intersection(
+    subjects_manifest: dict,  # {subject: {session: {sig_str: [records]}}}
+    task_id: int,
+    label_valid_subjects: set[str] | None = None,
+) -> dict:
+    """Manifest 의 start_sample/n_timesteps 로 required signal 시간선 intersection.
+
+    seg_key 매칭이 아닌 진짜 시간선 기반 → multi-modal alignment 의 실제 cohort 산출.
+    """
+    spec = TASK_SPECS[task_id]
+    required = spec["required"]
+
+    n_subjects_signals = 0
+    n_subjects_labeled = 0
+    n_segments_signals = 0
+    n_segments_labeled = 0
+    total_samples = 0
+    seg_records: list[tuple[str, float]] = []  # label-valid (or signal-only)
+    seg_records_signal_only: list[tuple[str, float]] = []
+
+    for sid, sessions in subjects_manifest.items():
+        labeled = label_valid_subjects is None or sid in label_valid_subjects
+        subj_has_signal = False
+        subj_has_labeled = False
+        for sess_id, sig_dict in sessions.items():
+            intervals = compute_aligned_intervals(sig_dict, required)
+            for start, end in intervals:
+                if end <= start:
+                    continue
+                dur_samples = end - start
+                if dur_samples <= 0:
+                    continue
+                dur_sec = dur_samples / TARGET_SR
+                seg_records_signal_only.append((sid, dur_sec))
+                n_segments_signals += 1
+                subj_has_signal = True
+                if labeled:
+                    seg_records.append((sid, dur_sec))
+                    total_samples += dur_samples
+                    n_segments_labeled += 1
+                    subj_has_labeled = True
+        if subj_has_signal:
+            n_subjects_signals += 1
+        if subj_has_labeled:
+            n_subjects_labeled += 1
+
+    return {
+        "n_subjects": n_subjects_signals,
+        "n_segments": n_segments_signals,
+        "n_subjects_labeled": n_subjects_labeled,
+        "n_segments_labeled": n_segments_labeled,
+        "label_check_applied": label_valid_subjects is not None,
+        "total_hours": total_samples / TARGET_SR / 3600.0,
+        "seg_records": seg_records,
+        "seg_records_signal_only": seg_records_signal_only,
+    }
+
+
 def aggregate_task_cohort(
     subjects: dict,
     task_id: int,
@@ -675,6 +929,9 @@ def main() -> int:
                     help="모든 (window, horizon) config 가 동일 cohort 사용 — "
                          "가장 긴 (max_win + max_horizon) 충족 segment 만 통과. "
                          "config 간 동등 비교 (paper-fair)")
+    ap.add_argument("--legacy-seg-key", action="store_true",
+                    help="(legacy) filename seg_key 매칭 — 매우 짧은 aligned segment 만 잡힘. "
+                         "기본은 manifest.json 의 start_sample 기반 시간선 intersection.")
     # Label 가용성 체크 (선택)
     ap.add_argument("--raw-dir", default=None,
                     help="raw .vital 디렉토리 (#5 EtCO₂, #6 Hypoxemia label 체크용)")
@@ -693,31 +950,47 @@ def main() -> int:
         return 1
 
     print(f"  Scanning {root}  (max_subjects={args.max_subjects})", flush=True)
-    subjects, n_files, n_bad = scan_subjects(
-        root, args.max_subjects, workers=args.workers,
-    )
-    print(f"  → {len(subjects)} subject(s), {n_files:,} .pt file(s),"
-          f" {n_bad:,} unparseable")
 
-    if not subjects:
-        print("ERROR: 스캔된 subject 가 없습니다.", file=sys.stderr)
-        return 1
+    subjects_manifest: dict | None = None
+    subjects_legacy: dict | None = None
+    overhead = 0
+    dtype_bytes = 4
 
-    # calibration: 첫 subject 의 첫 segment 첫 signal
-    first_pt = None
-    for _, seg_map in subjects.items():
-        for _, sigs in seg_map.items():
-            for _, (p, _, _) in sigs.items():
-                first_pt = p
-                break
+    if args.legacy_seg_key:
+        subjects_legacy, n_files, n_bad = scan_subjects(
+            root, args.max_subjects, workers=args.workers,
+        )
+        print(f"  → {len(subjects_legacy)} subject(s), {n_files:,} .pt file(s),"
+              f" {n_bad:,} unparseable")
+        if not subjects_legacy:
+            print("ERROR: 스캔된 subject 가 없습니다.", file=sys.stderr)
+            return 1
+        # calibration
+        first_pt = None
+        for _, seg_map in subjects_legacy.items():
+            for _, sigs in seg_map.items():
+                for _, (p, _, _) in sigs.items():
+                    first_pt = p
+                    break
+                if first_pt:
+                    break
             if first_pt:
                 break
-        if first_pt:
-            break
-    overhead, dtype_bytes = calibrate_bytes_per_sample(first_pt)
-    print(f"  Calibration ({first_pt.name}): overhead={overhead} B,"
-          f" {dtype_bytes} B/sample")
-    print(f"  (file-size 기반 duration 추정 — 정확도 ±1 sample)")
+        overhead, dtype_bytes = calibrate_bytes_per_sample(first_pt)
+        print(f"  Calibration ({first_pt.name}): overhead={overhead} B,"
+              f" {dtype_bytes} B/sample")
+        print(f"  (file-size 기반 duration 추정 — 정확도 ±1 sample)")
+        subjects_keys = subjects_legacy
+    else:
+        subjects_manifest, n_records = scan_subjects_manifest(
+            root, args.max_subjects, workers=args.workers,
+        )
+        print(f"  → {len(subjects_manifest)} subject(s), {n_records:,} record(s) in manifests")
+        if not subjects_manifest:
+            print("ERROR: manifest 가 로드되지 않았습니다.", file=sys.stderr)
+            return 1
+        subjects_keys = subjects_manifest
+        print(f"  Using TIMELINE INTERSECTION mode (manifest start_sample 기반)")
 
     # Label 가용성 사전 계산 (task 별 1회)
     label_valid_by_task: dict[int, set[str] | None] = {}
@@ -739,7 +1012,7 @@ def main() -> int:
             print(f"\n  [Task #{task_id}] Label check via raw .vital "
                   f"({'probe tracks' if args.probe_tracks else 'file exists only'})",
                   flush=True)
-            sids = list(subjects.keys())
+            sids = list(subjects_keys.keys())
             tracks = TASK_SPECS[task_id]["label_tracks"]
             valid, _reasons = check_raw_vital_labels(
                 sids, vital_path_map, tracks,
@@ -761,10 +1034,16 @@ def main() -> int:
             label_valid_by_task[task_id] = aki_valid
 
     for task_id in args.tasks:
-        cohort = aggregate_task_cohort(
-            subjects, task_id, overhead, dtype_bytes,
-            label_valid_subjects=label_valid_by_task[task_id],
-        )
+        if args.legacy_seg_key:
+            cohort = aggregate_task_cohort(
+                subjects_legacy, task_id, overhead, dtype_bytes,
+                label_valid_subjects=label_valid_by_task[task_id],
+            )
+        else:
+            cohort = aggregate_task_cohort_intersection(
+                subjects_manifest, task_id,
+                label_valid_subjects=label_valid_by_task[task_id],
+            )
         print_task_report(
             task_id, cohort,
             unified_cohort=args.unified_cohort,
@@ -774,9 +1053,13 @@ def main() -> int:
         )
 
     print("\n  Notes:")
+    mode = "legacy seg_key matching" if args.legacy_seg_key else "TIMELINE INTERSECTION (manifest)"
+    print(f"  • Mode: {mode}")
+    if not args.legacy_seg_key:
+        print("    → 같은 (subject, session) 의 모든 required signal 의 start_sample/n_timesteps "
+              "로 시간선 intersection. multi-modal alignment 의 실제 한계를 반영.")
     print("  • Signal-only N 은 input modality 가용성 상한.")
     print("  • Signal+label N 은 label source 도 같이 가용한 cohort (정확).")
-    print("  • Label source 미제공 task 는 signal-only 만 계산됨 (위에 표시).")
     print("  • Hypotension #1 : label = MAP from ABP → input 자체로 label OK.")
     print("  • EtCO₂ #5 / Hypoxemia #6 : --raw-dir 필요. --probe-tracks 면 track 실제 확인.")
     print("  • AKI #9 : --clinical-csv + --lab-csv 필요. patient-level 1 binary 라벨.")
