@@ -2,23 +2,28 @@
 """Task 1: Hypotension Prediction - 데이터 준비 스크립트.
 
 미래 5~15분 후 MAP<65 (≥1분 지속) 예측을 위한 (input_window, future_label) 쌍 생성.
-4가지 입력 모드: abp, ecg, ppg, ecg_ppg
-
 Label 소스: 항상 ABP (미래 구간의 MAP)
-Input 소스: 선택된 signal type의 현재 윈도우
+Input 소스: 선택된 signal type 의 현재 윈도우
 
-데이터 소스: 로컬 전처리된 .pt 파일 (vitaldb_pt_test/)
+Split: patient-level K-fold CV (clinical AI 표준, default n_folds=5)
+       각 fold i — train (n_folds-2 folds) / val (1 fold) / test (1 fold).
+       n_folds=5 면 60/20/20 ratio, 모든 환자가 정확히 1번씩 test.
 
 사용법:
-    # 단일 조합
+    # Canonical + 5-fold CV (default)
     python -m downstream.acute_event.hypotension.prepare_data \
-        --data-dir vitaldb_pt_test --input-signals abp \
-        --window-secs 60 --horizon-mins 5
+        --data-dir vitaldb_pt_test --input-signals ecg ppg abp \
+        --window-secs 300 --horizon-mins 15
 
-    # Sweep: window × horizon 전체 조합 생성
+    # Sweep ablation + 5-fold CV (appendix 용)
     python -m downstream.acute_event.hypotension.prepare_data \
-        --data-dir vitaldb_pt_test --input-signals abp \
+        --data-dir vitaldb_pt_test --input-signals ecg ppg abp \
         --window-secs 60 180 300 600 --horizon-mins 5 10 15
+
+    # Single split (legacy 60/20/20)
+    python -m downstream.acute_event.hypotension.prepare_data \
+        --data-dir vitaldb_pt_test --input-signals ecg ppg abp \
+        --window-secs 300 --horizon-mins 15 --n-folds 1
 """
 
 from __future__ import annotations
@@ -318,8 +323,13 @@ def save_dataset(
     window_sec: float,
     out_dir: str,
     signal_dtype: torch.dtype = torch.float16,
+    fold_idx: int | None = None,
+    n_folds: int = 1,
 ) -> Path:
-    """ForecastSample 리스트를 .pt로 저장한다 (train/val/test 3-way)."""
+    """ForecastSample 리스트를 .pt로 저장한다 (train/val/test 3-way).
+
+    fold_idx 가 주어지면 파일명에 _fold{i} 접미사 + metadata 에 fold 정보 기록.
+    """
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
@@ -372,13 +382,16 @@ def save_dataset(
             "n_val": n_val,
             "n_test": n_test,
             "signal_dtype": str(signal_dtype).replace("torch.", ""),
+            "fold_idx": fold_idx,
+            "n_folds": n_folds,
         },
     }
 
     mode_str = "_".join(input_signals)
     horizon_min = int(horizon_sec / 60)
     win_int = int(window_sec)
-    filename = f"task1_hypotension_{mode_str}_w{win_int}s_h{horizon_min}min.pt"
+    fold_suffix = f"_fold{fold_idx}" if fold_idx is not None else ""
+    filename = f"task1_hypotension_{mode_str}_w{win_int}s_h{horizon_min}min{fold_suffix}.pt"
     save_path = out_path / filename
     torch.save(save_dict, save_path)
 
@@ -416,24 +429,56 @@ def print_stats(
 # ---- 메인 ----
 
 
+def _kfold_patient_splits(
+    patient_ids: list[str],
+    n_folds: int,
+    seed: int = 42,
+) -> list[tuple[set[str], set[str], set[str]]]:
+    """Patient-level K-fold CV split (clinical AI 표준).
+
+    각 fold i: test = fold[i], val = fold[(i+1) % n_folds], train = 나머지 (n_folds-2) folds.
+    → n_folds=5 면 60/20/20, 모든 환자가 정확히 1번씩 test 에 등장.
+
+    Returns: [(train_set, val_set, test_set), ...]  길이 n_folds.
+    """
+    rng = np.random.default_rng(seed)
+    ids = list(patient_ids)
+    rng.shuffle(ids)
+
+    # 균등 분할
+    folds: list[list[str]] = [[] for _ in range(n_folds)]
+    for i, pid in enumerate(ids):
+        folds[i % n_folds].append(pid)
+
+    splits: list[tuple[set[str], set[str], set[str]]] = []
+    for i in range(n_folds):
+        test_set = set(folds[i])
+        val_set = set(folds[(i + 1) % n_folds])
+        train_set: set[str] = set()
+        for j in range(n_folds):
+            if j != i and j != (i + 1) % n_folds:
+                train_set.update(folds[j])
+        splits.append((train_set, val_set, test_set))
+    return splits
+
+
 def prepare_hypotension_sweep(
     data_dir: str,
     input_signals: list[str],
     window_secs: list[float],
     horizon_mins: list[float],
     stride_sec: float = 30.0,
-    train_ratio: float = 0.6,
-    val_ratio: float = 0.2,
+    n_folds: int = 5,
     max_subjects: int | None = None,
     out_dir: str = "outputs/downstream/hypotension",
     required_signals: list[str] | None = None,
     signal_dtype: torch.dtype = torch.float16,
+    seed: int = 42,
 ) -> list[Path]:
-    """(window, horizon) 조합을 sweep하여 데이터셋을 생성한다.
+    """(window, horizon) 조합 sweep + K-fold patient-level CV.
 
-    데이터 로딩과 train/val/test 분할은 한번만 수행하고,
-    윈도우 추출 + 라벨링만 조합별로 반복한다.
-    test_ratio = 1 - train_ratio - val_ratio.
+    각 (w, h) 조합 × 각 fold 마다 train/val/test .pt 1개 저장.
+    n_folds=1 이면 단일 split (60/20/20).
     """
     # ── 1. 데이터 로딩 (1회) ──
     # 가장 긴 window + horizon 기준으로 min_duration 설정
@@ -444,12 +489,13 @@ def prepare_hypotension_sweep(
     mode_str = " + ".join(s.upper() for s in input_signals)
     req_str = " + ".join(s.upper() for s in required_signals) if required_signals else "auto"
     print(f"\n{'=' * 60}")
-    print(f"  Task 1: Hypotension Forecast — Sweep")
+    print(f"  Task 1: Hypotension Forecast — Sweep × {n_folds}-fold CV")
     print(f"  Data:    {data_dir}")
     print(f"  Input:   {mode_str}")
     print(f"  Required: {req_str}")
     print(f"  Windows: {window_secs}")
     print(f"  Horizons: {horizon_mins}")
+    print(f"  N folds: {n_folds}")
     print(f"  Min duration: {min_duration_sec / 60:.1f} min")
     print(f"{'=' * 60}")
 
@@ -469,69 +515,77 @@ def prepare_hypotension_sweep(
         print("ERROR: No valid cases loaded.", file=sys.stderr)
         sys.exit(1)
 
-    # ── 2. Train/Val/Test 3-way patient-level 분할 (1회) ──
-    test_ratio = 1.0 - train_ratio - val_ratio
-    if test_ratio <= 0.0:
-        raise ValueError(
-            f"train_ratio + val_ratio must be < 1, got {train_ratio} + {val_ratio}"
-        )
-    print(
-        f"\n[2/3] Splitting by patient "
-        f"(train={train_ratio}, val={val_ratio}, test={test_ratio:.2f})..."
-    )
-    rng = np.random.default_rng(42)
-    patient_ids = list({c["patient_id"] for c in cases})
-    rng.shuffle(patient_ids)
-    n_total = len(patient_ids)
-    n_train = max(1, int(n_total * train_ratio))
-    n_val = max(1, int(n_total * val_ratio))
-    if n_train + n_val >= n_total:
-        n_val = max(1, n_total - n_train - 1)
-    train_patients = set(patient_ids[:n_train])
-    val_patients = set(patient_ids[n_train : n_train + n_val])
-    test_patients = set(patient_ids[n_train + n_val :])
+    # ── 2. K-fold patient-level 분할 (1회) ──
+    if n_folds < 1:
+        raise ValueError(f"n_folds must be >= 1, got {n_folds}")
+    patient_ids = sorted({c["patient_id"] for c in cases})
 
-    train_cases = [c for c in cases if c["patient_id"] in train_patients]
-    val_cases = [c for c in cases if c["patient_id"] in val_patients]
-    test_cases = [c for c in cases if c["patient_id"] in test_patients]
-    print(f"  Train: {len(train_cases)} cases ({len(train_patients)} patients)")
-    print(f"  Val:   {len(val_cases)} cases ({len(val_patients)} patients)")
-    print(f"  Test:  {len(test_cases)} cases ({len(test_patients)} patients)")
+    if n_folds == 1:
+        # 단일 split (60/20/20) backward compat
+        rng = np.random.default_rng(seed)
+        ids = list(patient_ids); rng.shuffle(ids)
+        n_total = len(ids)
+        n_train = max(1, int(n_total * 0.6))
+        n_val = max(1, int(n_total * 0.2))
+        if n_train + n_val >= n_total:
+            n_val = max(1, n_total - n_train - 1)
+        splits = [(set(ids[:n_train]),
+                   set(ids[n_train:n_train + n_val]),
+                   set(ids[n_train + n_val:]))]
+        print(f"\n[2/3] Single split (n_patients={n_total})")
+    else:
+        splits = _kfold_patient_splits(patient_ids, n_folds, seed=seed)
+        print(f"\n[2/3] {n_folds}-fold patient-level CV (n_patients={len(patient_ids)})")
+    for fi, (tr, va, te) in enumerate(splits):
+        print(f"  Fold {fi}: train={len(tr)} val={len(va)} test={len(te)} patients")
 
-    # ── 3. 조합별 윈도우 추출 + 저장 ──
+    # ── 3. 조합 × fold 윈도우 추출 + 저장 ──
     combos = [(w, h) for w in window_secs for h in horizon_mins]
-    print(f"\n[3/3] Generating {len(combos)} datasets...")
+    total_runs = len(combos) * n_folds
+    print(f"\n[3/3] Generating {len(combos)} combo × {n_folds} fold = {total_runs} datasets...")
 
     saved_paths: list[Path] = []
-    for i, (window_sec, horizon_min) in enumerate(combos, 1):
+    run_idx = 0
+    for window_sec, horizon_min in combos:
         horizon_sec = horizon_min * 60.0
-        print(f"\n  [{i}/{len(combos)}] window={window_sec}s, horizon={horizon_min}min")
+        for fold_idx, (train_patients, val_patients, test_patients) in enumerate(splits):
+            run_idx += 1
+            print(
+                f"\n  [{run_idx}/{total_runs}] "
+                f"window={window_sec}s, horizon={horizon_min}min, fold={fold_idx}"
+            )
 
-        train_samples = extract_forecast_samples(
-            train_cases, input_signals, window_sec, stride_sec, horizon_sec,
-        )
-        val_samples = extract_forecast_samples(
-            val_cases, input_signals, window_sec, stride_sec, horizon_sec,
-        )
-        test_samples = extract_forecast_samples(
-            test_cases, input_signals, window_sec, stride_sec, horizon_sec,
-        )
+            train_cases = [c for c in cases if c["patient_id"] in train_patients]
+            val_cases = [c for c in cases if c["patient_id"] in val_patients]
+            test_cases = [c for c in cases if c["patient_id"] in test_patients]
 
-        print_stats("    Train", train_samples)
-        print_stats("    Val", val_samples)
-        print_stats("    Test", test_samples)
+            train_samples = extract_forecast_samples(
+                train_cases, input_signals, window_sec, stride_sec, horizon_sec,
+            )
+            val_samples = extract_forecast_samples(
+                val_cases, input_signals, window_sec, stride_sec, horizon_sec,
+            )
+            test_samples = extract_forecast_samples(
+                test_cases, input_signals, window_sec, stride_sec, horizon_sec,
+            )
 
-        if not train_samples and not val_samples and not test_samples:
-            print("    SKIP: No samples extracted.")
-            continue
+            print_stats("    Train", train_samples)
+            print_stats("    Val", val_samples)
+            print_stats("    Test", test_samples)
 
-        save_path = save_dataset(
-            train_samples, val_samples, test_samples, input_signals,
-            horizon_sec, window_sec, out_dir,
-            signal_dtype=signal_dtype,
-        )
-        saved_paths.append(save_path)
-        gc.collect()
+            if not train_samples and not val_samples and not test_samples:
+                print("    SKIP: No samples extracted.")
+                continue
+
+            save_path = save_dataset(
+                train_samples, val_samples, test_samples, input_signals,
+                horizon_sec, window_sec, out_dir,
+                signal_dtype=signal_dtype,
+                fold_idx=fold_idx if n_folds > 1 else None,
+                n_folds=n_folds,
+            )
+            saved_paths.append(save_path)
+            gc.collect()
 
     print(f"\n{'=' * 60}")
     print(f"  Done! {len(saved_paths)}/{len(combos)} datasets saved to {out_dir}")
@@ -583,16 +637,16 @@ def main() -> None:
         help="Sliding window stride in seconds",
     )
     parser.add_argument(
-        "--train-ratio",
-        type=float,
-        default=0.6,
-        help="Train split ratio (patient-level). Default 0.6.",
+        "--n-folds",
+        type=int,
+        default=5,
+        help="Patient-level K-fold CV (default 5). Use 1 for single 60/20/20 split.",
     )
     parser.add_argument(
-        "--val-ratio",
-        type=float,
-        default=0.2,
-        help="Val split ratio (patient-level). Test = 1 - train - val. Default 0.2.",
+        "--seed",
+        type=int,
+        default=42,
+        help="RNG seed for fold/split shuffling.",
     )
     parser.add_argument(
         "--out-dir",
@@ -617,8 +671,8 @@ def main() -> None:
         window_secs=args.window_secs,
         horizon_mins=args.horizon_mins,
         stride_sec=args.stride_sec,
-        train_ratio=args.train_ratio,
-        val_ratio=args.val_ratio,
+        n_folds=args.n_folds,
+        seed=args.seed,
         max_subjects=args.max_subjects,
         out_dir=args.out_dir,
         required_signals=args.required_signals,
