@@ -38,6 +38,7 @@ from collections import defaultdict
 from pathlib import Path
 
 import torch
+from tqdm import tqdm
 
 TARGET_SR: float = 100.0  # parsed .pt 는 100Hz 통일 (CLAUDE.md 참조)
 
@@ -151,7 +152,13 @@ def scan_subjects(
     n_files = 0
     n_bad = 0
 
-    for subj_dir in subject_dirs:
+    pbar = tqdm(
+        subject_dirs,
+        desc="Scanning subjects",
+        unit="subj",
+        dynamic_ncols=True,
+    )
+    for subj_dir in pbar:
         sid = subj_dir.name
         seg_map: dict[tuple[int, int, int], dict[str, tuple[Path, int, int]]] = {}
         for pt in subj_dir.glob("*.pt"):
@@ -168,6 +175,8 @@ def scan_subjects(
             )
         if seg_map:
             subjects[sid] = seg_map
+        pbar.set_postfix(files=n_files, kept=len(subjects), refresh=False)
+    pbar.close()
 
     return subjects, n_files, n_bad
 
