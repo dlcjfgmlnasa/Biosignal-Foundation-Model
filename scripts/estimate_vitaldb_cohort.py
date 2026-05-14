@@ -144,7 +144,21 @@ def scan_subjects(
     n_files  : 스캔한 총 .pt 파일 수
     n_unparseable : 파일명 매칭 실패 수
     """
-    subject_dirs = sorted([d for d in root.iterdir() if d.is_dir()])
+    print(f"  Listing {root} ...", flush=True)
+    subject_dirs: list[Path] = []
+    list_pbar = tqdm(
+        root.iterdir(),
+        desc="  Listing entries",
+        unit="entry",
+        dynamic_ncols=True,
+    )
+    for entry in list_pbar:
+        if entry.is_dir():
+            subject_dirs.append(entry)
+        list_pbar.set_postfix(dirs=len(subject_dirs), refresh=False)
+    list_pbar.close()
+    subject_dirs.sort()
+    print(f"  → {len(subject_dirs)} subject directory(ies) found", flush=True)
     if max_subjects is not None:
         subject_dirs = subject_dirs[:max_subjects]
 
@@ -353,7 +367,7 @@ def main() -> int:
         print(f"ERROR: data-dir not found: {root}", file=sys.stderr)
         return 1
 
-    print(f"  Scanning {root}  (max_subjects={args.max_subjects})")
+    print(f"  Scanning {root}  (max_subjects={args.max_subjects})", flush=True)
     subjects, n_files, n_bad = scan_subjects(root, args.max_subjects)
     print(f"  → {len(subjects)} subject(s), {n_files:,} .pt file(s),"
           f" {n_bad:,} unparseable")
