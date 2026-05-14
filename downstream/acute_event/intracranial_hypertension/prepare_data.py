@@ -28,6 +28,7 @@ import numpy as np
 import torch
 
 from data.parser.mimic3_waveform import _apply_pipeline
+from downstream._kfold_utils import stratified_kfold_patient_splits, summarize_splits
 
 
 TARGET_SR: float = 100.0
@@ -281,17 +282,21 @@ def extract_forecast_samples(
 
 def save_dataset(
     train_samples: list[ICHSample],
+    val_samples: list[ICHSample],
     test_samples: list[ICHSample],
     input_signals: list[str],
     horizon_sec: float,
     window_sec: float,
     out_dir: str,
     signal_dtype: torch.dtype = torch.float16,
+    fold_idx: int | None = None,
+    n_folds: int = 1,
 ) -> Path:
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
     n_train_in = len(train_samples)
+    n_val_in = len(val_samples)
     n_test_in = len(test_samples)
 
     def _consume_to_tensors(samples: list[ICHSample]) -> dict:
@@ -339,13 +344,13 @@ def save_dataset(
             "subject_ids": subject_ids,
         }
 
-    train_dict = _consume_to_tensors(train_samples)
-    train_samples.clear()
-    test_dict = _consume_to_tensors(test_samples)
-    test_samples.clear()
+    train_dict = _consume_to_tensors(train_samples); train_samples.clear()
+    val_dict = _consume_to_tensors(val_samples); val_samples.clear()
+    test_dict = _consume_to_tensors(test_samples); test_samples.clear()
 
     save_dict = {
         "train": train_dict,
+        "val": val_dict,
         "test": test_dict,
         "metadata": {
             "task": "intracranial_hypertension_detection",
@@ -357,7 +362,10 @@ def save_dataset(
             "icp_threshold": ICP_THRESHOLD,
             "sustained_sec": SUSTAINED_SEC,
             "n_train": n_train_in,
+            "n_val": n_val_in,
             "n_test": n_test_in,
+            "fold_idx": fold_idx,
+            "n_folds": n_folds,
             "signal_dtype": str(signal_dtype).replace("torch.", ""),
         },
     }
@@ -365,7 +373,8 @@ def save_dataset(
     mode_str = "_".join(input_signals)
     horizon_min = int(horizon_sec / 60)
     win_int = int(window_sec)
-    filename = f"intracranial_hypertension_{mode_str}_w{win_int}s_h{horizon_min}min.pt"
+    fold_suffix = f"_fold{fold_idx}" if fold_idx is not None else ""
+    filename = f"intracranial_hypertension_{mode_str}_w{win_int}s_h{horizon_min}min{fold_suffix}.pt"
     save_path = out_path / filename
     torch.save(save_dict, save_path)
 
@@ -399,21 +408,43 @@ def print_stats(name: str, samples: list[ICHSample]) -> None:
 # ── Sweep ────────────────────────────────────────────────────
 
 
+def _patient_level_ich_labels(
+    cases: list[dict],
+    icp_threshold: float = ICP_THRESHOLD,
+) -> dict[str, list[int]]:
+    """환자별 case 레벨 ICH label (stratification 용).
+
+    각 case 의 ICP 시계열에 threshold 초과 샘플 존재 여부를 binary 로 기록.
+    """
+    patient_to_labels: dict[str, list[int]] = {}
+    for case in cases:
+        pid = case["patient_id"]
+        icp = case.get("signals", {}).get("icp")
+        if icp is None or len(icp) == 0:
+            patient_to_labels.setdefault(pid, []).append(0)
+            continue
+        valid = icp[~np.isnan(icp)] if hasattr(icp, "__len__") else icp
+        has_high = bool(np.any(valid > icp_threshold)) if len(valid) else False
+        patient_to_labels.setdefault(pid, []).append(1 if has_high else 0)
+    return patient_to_labels
+
+
 def prepare_ich_sweep(
     waveform_dir: str,
     input_signals: list[str],
     window_secs: list[float],
     horizon_mins: list[float],
     stride_sec: float = 30.0,
-    train_ratio: float = 0.7,
+    n_folds: int = 5,
     out_dir: str = "outputs/downstream/intracranial_hypertension",
-    split_mode: str = "random",
+    split_mode: str = "kfold",
     signal_dtype: torch.dtype = torch.float16,
+    seed: int = 42,
 ) -> list[Path]:
-    """(window, horizon) 조합을 sweep하여 데이터셋을 생성한다.
+    """(window, horizon) 조합 × stratified K-fold CV 데이터셋 생성.
 
     split_mode:
-        "random"       : train_ratio 비율로 환자 단위 random split.
+        "kfold"        : Stratified patient-level K-fold CV (default, n_folds=5).
         "loso_export"  : 모든 샘플을 train에 저장(test 비움) — subject_ids로
                          외부에서 LeaveOneSubjectOut CV 수행용.
     """
@@ -435,56 +466,68 @@ def prepare_ich_sweep(
         sys.exit(1)
 
     # 2. Patient-level split
-    patient_ids = list({c["patient_id"] for c in cases})
+    patient_ids = sorted({c["patient_id"] for c in cases})
     if split_mode == "loso_export":
         print(f"\n[2/3] LOSO export mode: all {len(patient_ids)} patients in train "
               "(test empty; subject_ids for external LOSO CV).")
-        train_cases = list(cases)
-        test_cases = []
+        splits = [(set(patient_ids), set(), set())]
     else:
-        print(f"\n[2/3] Splitting by patient (ratio={train_ratio})...")
-        rng = np.random.default_rng(42)
-        rng.shuffle(patient_ids)
-        n_train = max(1, int(len(patient_ids) * train_ratio))
-        train_patients = set(patient_ids[:n_train])
+        print(f"\n[2/3] Stratified {n_folds}-fold patient-level CV...")
+        patient_to_labels = _patient_level_ich_labels(cases)
+        pos_pts = sum(1 for pid in patient_ids if any(patient_to_labels.get(pid, [])))
+        print(
+            f"  Patient-level positive (any ICP>{ICP_THRESHOLD}): "
+            f"{pos_pts}/{len(patient_ids)} "
+            f"({100.0 * pos_pts / max(1, len(patient_ids)):.1f}%)"
+        )
+        splits = stratified_kfold_patient_splits(
+            patient_ids, patient_to_labels, n_folds=n_folds, seed=seed,
+        )
+        print(summarize_splits(splits, patient_to_labels))
 
-        train_cases = [c for c in cases if c["patient_id"] in train_patients]
-        test_cases = [c for c in cases if c["patient_id"] not in train_patients]
-        print(f"  Train: {len(train_cases)} records ({len(train_patients)} patients)")
-        print(f"  Test:  {len(test_cases)} records "
-              f"({len(patient_ids) - n_train} patients)")
-
-    # 3. 조합별 윈도우 추출 + 저장
+    # 3. 조합 × fold 윈도우 추출 + 저장
     combos = [(w, h) for w in window_secs for h in horizon_mins]
-    print(f"\n[3/3] Generating {len(combos)} datasets...")
+    total_runs = len(combos) * len(splits)
+    print(f"\n[3/3] Generating {len(combos)} combo × {len(splits)} fold = {total_runs} datasets...")
 
     saved_paths: list[Path] = []
-    for i, (window_sec, horizon_min) in enumerate(combos, 1):
+    run_idx = 0
+    for window_sec, horizon_min in combos:
         horizon_sec = horizon_min * 60.0
-        print(f"\n  [{i}/{len(combos)}] window={window_sec}s, horizon={horizon_min}min")
-
-        train_samples = extract_forecast_samples(
-            train_cases, input_signals, window_sec, stride_sec, horizon_sec,
-        )
-        test_samples = extract_forecast_samples(
-            test_cases, input_signals, window_sec, stride_sec, horizon_sec,
-        )
-
-        print_stats("    Train", train_samples)
-        print_stats("    Test", test_samples)
-
-        if not train_samples and not test_samples:
-            print("    SKIP: No samples extracted.")
-            continue
-
-        save_path = save_dataset(
-            train_samples, test_samples, input_signals,
-            horizon_sec, window_sec, out_dir,
-            signal_dtype=signal_dtype,
-        )
-        saved_paths.append(save_path)
-        # 다음 (window, horizon) 조합 시작 전에 GC 강제 실행해 600s 텐서를 회수
-        gc.collect()
+        for fold_idx, (train_pids, val_pids, test_pids) in enumerate(splits):
+            run_idx += 1
+            print(
+                f"\n  [{run_idx}/{total_runs}] "
+                f"window={window_sec}s, horizon={horizon_min}min, fold={fold_idx}"
+            )
+            train_cases = [c for c in cases if c["patient_id"] in train_pids]
+            val_cases = [c for c in cases if c["patient_id"] in val_pids]
+            test_cases = [c for c in cases if c["patient_id"] in test_pids]
+            train_samples = extract_forecast_samples(
+                train_cases, input_signals, window_sec, stride_sec, horizon_sec,
+            )
+            val_samples = extract_forecast_samples(
+                val_cases, input_signals, window_sec, stride_sec, horizon_sec,
+            )
+            test_samples = extract_forecast_samples(
+                test_cases, input_signals, window_sec, stride_sec, horizon_sec,
+            )
+            print_stats("    Train", train_samples)
+            print_stats("    Val", val_samples)
+            print_stats("    Test", test_samples)
+            if not (train_samples or val_samples or test_samples):
+                print("    SKIP: No samples extracted.")
+                continue
+            save_path = save_dataset(
+                train_samples, val_samples, test_samples, input_signals,
+                horizon_sec, window_sec, out_dir,
+                signal_dtype=signal_dtype,
+                fold_idx=fold_idx if len(splits) > 1 else None,
+                n_folds=len(splits),
+            )
+            saved_paths.append(save_path)
+            # fold 사이에 GC 강제 실행해 600s 텐서를 회수
+            gc.collect()
 
     print(f"\n{'=' * 60}")
     print(f"  Done! {len(saved_paths)}/{len(combos)} datasets saved to {out_dir}")
@@ -518,11 +561,17 @@ def main() -> None:
         "--window-secs", nargs="+", type=float, default=[30.0],
     )
     parser.add_argument("--stride-sec", type=float, default=30.0)
-    parser.add_argument("--train-ratio", type=float, default=0.7)
     parser.add_argument(
-        "--split-mode", type=str, default="random",
-        choices=["random", "loso_export"],
-        help="'random': patient-level random split. "
+        "--n-folds", type=int, default=5,
+        help="Stratified patient-level K-fold CV (default 5).",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42, help="RNG seed for fold shuffling.",
+    )
+    parser.add_argument(
+        "--split-mode", type=str, default="kfold",
+        choices=["kfold", "loso_export"],
+        help="'kfold': stratified patient-level K-fold CV. "
              "'loso_export': all in train, external LOSO CV via subject_ids.",
     )
     parser.add_argument(
@@ -545,7 +594,8 @@ def main() -> None:
         window_secs=args.window_secs,
         horizon_mins=args.horizon_mins,
         stride_sec=args.stride_sec,
-        train_ratio=args.train_ratio,
+        n_folds=args.n_folds,
+        seed=args.seed,
         out_dir=args.out_dir,
         split_mode=args.split_mode,
         signal_dtype=dtype_map[args.signal_dtype],

@@ -35,6 +35,7 @@ from data.parser.mimic3_waveform import (
     MIMIC3_NATIVE_SR,
     _apply_pipeline,
 )
+from downstream._kfold_utils import stratified_kfold_patient_splits, summarize_splits
 from downstream._save_utils import (
     add_signal_dtype_arg,
     stack_window_dicts_destructive,
@@ -155,9 +156,10 @@ def prepare_dataset(
     out_dir: str,
     window_sec: float = 600.0,
     stride_sec: float = 30.0,  # 30s sliding (Acute Event 표준 — hypotension/ICH와 일관)
-    train_ratio: float = 0.7,
+    n_folds: int = 5,
     max_patients: int | None = None,
     signal_dtype: torch.dtype = torch.float16,
+    seed: int = 42,
 ) -> None:
     """cardiac arrest prediction 데이터셋 준비 (환자 단위 그룹핑)."""
     wf_path = Path(waveform_dir)
@@ -237,27 +239,23 @@ def prepare_dataset(
     print(f"\nPatients: {len(patient_data)} (Cardiac Arrest+={n_pos}, Cardiac Arrest-={n_neg})")
     print(f"Total windows: {total_windows}, Avg per patient: {avg_windows:.1f}")
 
-    # 4. Patient-level train/test split
-    rng = np.random.default_rng(42)
-    sids = [p["subject_id"] for p in patient_data]
-    rng.shuffle(sids)
-    n_train = max(1, int(len(sids) * train_ratio))
-    train_sids = set(sids[:n_train])
+    # 4. Stratified patient-level K-fold CV
+    sid_to_label: dict[int, int] = {p["subject_id"]: int(p["cardiac_arrest"]) for p in patient_data}
+    patient_to_labels: dict[str, list[int]] = {str(s): [lb] for s, lb in sid_to_label.items()}
+    patient_ids = sorted(patient_to_labels.keys())
+    splits = stratified_kfold_patient_splits(
+        patient_ids, patient_to_labels, n_folds=n_folds, seed=seed,
+    )
+    print(f"\nStratified {n_folds}-fold patient-level CV:")
+    print(summarize_splits(splits, patient_to_labels))
 
-    train_patients = [p for p in patient_data if p["subject_id"] in train_sids]
-    test_patients = [p for p in patient_data if p["subject_id"] not in train_sids]
-
-    print(f"Split: {len(train_patients)} train, {len(test_patients)} test patients")
-
-    # 5. 환자 단위 .pt 저장
     def _pack_patients(plist: list[dict]) -> list[dict]:
         packed = []
         for p in plist:
             n_w = len(p["windows"])
             windows_per_type = stack_window_dicts_destructive(
-                p["windows"], signal_dtype
+                [dict(w) for w in p["windows"]], signal_dtype
             )
-            p["windows"] = []
             packed.append({
                 "subject_id": p["subject_id"],
                 "label": p["cardiac_arrest"],
@@ -266,44 +264,59 @@ def prepare_dataset(
             })
         return packed
 
-    input_signals_meta = sorted(train_patients[0]["windows"][0].keys())
-    n_pos_train = sum(1 for p in train_patients if p["cardiac_arrest"] == 1)
-    n_pos_test = sum(1 for p in test_patients if p["cardiac_arrest"] == 1)
-    n_train_p = len(train_patients)
-    n_test_p = len(test_patients)
+    input_signals_meta = sorted(patient_data[0]["windows"][0].keys())
 
-    data = {
-        "train": _pack_patients(train_patients),
-        "test": _pack_patients(test_patients),
-        "metadata": {
-            "task": "cardiac_arrest_prediction",
-            "source": "MIMIC-III Waveform Matched",
-            "label": "cardiac_arrest",
-            "aggregation": "patient_level",
-            "input_signals": input_signals_meta,
-            "window_sec": window_sec,
-            "stride_sec": stride_sec,
-            "sampling_rate": TARGET_SR,
-            "n_train_patients": n_train_p,
-            "n_test_patients": n_test_p,
-            "n_pos_train": n_pos_train,
-            "n_pos_test": n_pos_test,
-            "train_ratio": train_ratio,
-            "signal_dtype": str(signal_dtype).replace("torch.", ""),
-        },
-    }
+    for fold_idx, (train_sids, val_sids, test_sids) in enumerate(splits):
+        tr_int = {int(s) for s in train_sids}
+        va_int = {int(s) for s in val_sids}
+        te_int = {int(s) for s in test_sids}
+        train_patients = [p for p in patient_data if p["subject_id"] in tr_int]
+        val_patients = [p for p in patient_data if p["subject_id"] in va_int]
+        test_patients = [p for p in patient_data if p["subject_id"] in te_int]
+        n_train_p = len(train_patients)
+        n_val_p = len(val_patients)
+        n_test_p = len(test_patients)
+        n_pos_train = sum(1 for p in train_patients if p["cardiac_arrest"] == 1)
+        n_pos_val = sum(1 for p in val_patients if p["cardiac_arrest"] == 1)
+        n_pos_test = sum(1 for p in test_patients if p["cardiac_arrest"] == 1)
 
-    out_file = out_path / f"cardiac_arrest_w{int(window_sec)}s.pt"
-    torch.save(data, out_file)
+        data = {
+            "train": _pack_patients(train_patients),
+            "val": _pack_patients(val_patients),
+            "test": _pack_patients(test_patients),
+            "metadata": {
+                "task": "cardiac_arrest_prediction",
+                "source": "MIMIC-III Waveform Matched",
+                "label": "cardiac_arrest",
+                "aggregation": "patient_level",
+                "input_signals": input_signals_meta,
+                "window_sec": window_sec,
+                "stride_sec": stride_sec,
+                "sampling_rate": TARGET_SR,
+                "fold_idx": fold_idx,
+                "n_folds": n_folds,
+                "n_train_patients": n_train_p,
+                "n_val_patients": n_val_p,
+                "n_test_patients": n_test_p,
+                "n_pos_train": n_pos_train,
+                "n_pos_val": n_pos_val,
+                "n_pos_test": n_pos_test,
+                "signal_dtype": str(signal_dtype).replace("torch.", ""),
+            },
+        }
+        fold_suffix = f"_fold{fold_idx}" if n_folds > 1 else ""
+        out_file = out_path / f"cardiac_arrest_w{int(window_sec)}s{fold_suffix}.pt"
+        torch.save(data, out_file)
+        print(
+            f"  Fold {fold_idx}: train={n_train_p}(+={n_pos_train}) "
+            f"val={n_val_p}(+={n_pos_val}) test={n_test_p}(+={n_pos_test}) → {out_file}"
+        )
 
-    n_pos_train = data["metadata"]["n_pos_train"]
-    n_pos_test = data["metadata"]["n_pos_test"]
     print(f"\n{'=' * 60}")
-    print(f"  cardiac arrest prediction — Data Prepared (Patient-Level)")
-    print(f"  Output: {out_file}")
-    print(f"  Train: {len(train_patients)} patients (arrest+={n_pos_train})")
-    print(f"  Test:  {len(test_patients)} patients (arrest+={n_pos_test})")
-    print(f"  Signals: {data['metadata']['input_signals']}")
+    print(f"  Cardiac Arrest Prediction — Done")
+    print(f"  Output dir: {out_path}")
+    print(f"  Folds: {n_folds}")
+    print(f"  Signals: {input_signals_meta}")
     print(f"  Window: {window_sec}s, Stride: {stride_sec}s")
     print(f"  Avg windows/patient: {avg_windows:.1f}")
     print(f"{'=' * 60}")
@@ -321,7 +334,9 @@ def main() -> None:
     parser.add_argument("--stride-sec", type=float, default=30.0,
                         help="sliding window stride(초). 기본 30s "
                              "(Acute Event 표준 — Hypotension/ICH와 일관).")
-    parser.add_argument("--train-ratio", type=float, default=0.7)
+    parser.add_argument("--n-folds", type=int, default=5,
+                        help="Stratified patient-level K-fold CV (default 5).")
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-patients", type=int, default=None)
     dtype_map = add_signal_dtype_arg(parser)
     args = parser.parse_args()
@@ -332,7 +347,8 @@ def main() -> None:
         out_dir=args.out_dir,
         window_sec=args.window_sec,
         stride_sec=args.stride_sec,
-        train_ratio=args.train_ratio,
+        n_folds=args.n_folds,
+        seed=args.seed,
         max_patients=args.max_patients,
         signal_dtype=dtype_map(args.signal_dtype),
     )

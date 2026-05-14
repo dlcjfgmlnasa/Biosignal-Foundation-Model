@@ -41,6 +41,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from downstream._kfold_utils import stratified_kfold_patient_splits, summarize_splits
 from downstream._save_utils import (
     add_signal_dtype_arg,
     stack_window_dicts_destructive,
@@ -379,14 +380,14 @@ def prepare_aki_dataset(
     input_signals: list[str],
     window_sec: float = 600.0,
     stride_sec: float = 300.0,
-    train_ratio: float = 0.6,
-    val_ratio: float = 0.2,
+    n_folds: int = 5,
     label_mode: str = "binary",
     max_postop_days: float = 7.0,
     max_subjects: int | None = None,
     required_signals: list[str] | None = None,
     min_windows_per_patient: int = 3,
     signal_dtype: torch.dtype = torch.float16,
+    seed: int = 42,
 ) -> None:
     """AKI prediction 데이터셋을 패치(환자) 단위로 빌드."""
     if label_mode not in {"binary", "stage"}:
@@ -528,31 +529,15 @@ def prepare_aki_dataset(
         f"avg/patient: {total_windows / len(patient_data):.1f}"
     )
 
-    # ── 4. Patient-level train/val/test 3-way split + 저장 ──
-    test_ratio = 1.0 - train_ratio - val_ratio
-    if test_ratio <= 0.0:
-        raise ValueError(
-            f"train_ratio + val_ratio must be < 1, got {train_ratio} + {val_ratio}"
-        )
-    print(
-        f"\n[4/4] Patient-level split "
-        f"(train={train_ratio}, val={val_ratio}, test={test_ratio:.2f}) and save..."
+    # ── 4. Stratified patient-level K-fold CV + 저장 ──
+    print(f"\n[4/4] Stratified {n_folds}-fold patient-level CV...")
+    sid_to_label: dict[str, int] = {p["subject_id"]: int(p["label"]) for p in patient_data}
+    patient_to_labels: dict[str, list[int]] = {sid: [lb] for sid, lb in sid_to_label.items()}
+    patient_ids = sorted(patient_to_labels.keys())
+    splits = stratified_kfold_patient_splits(
+        patient_ids, patient_to_labels, n_folds=n_folds, seed=seed,
     )
-    rng = np.random.default_rng(42)
-    sids = [p["subject_id"] for p in patient_data]
-    rng.shuffle(sids)
-    n_total = len(sids)
-    n_train = max(1, int(n_total * train_ratio))
-    n_val = max(1, int(n_total * val_ratio))
-    if n_train + n_val >= n_total:
-        n_val = max(1, n_total - n_train - 1)
-    train_sids = set(sids[:n_train])
-    val_sids = set(sids[n_train : n_train + n_val])
-    test_sids = set(sids[n_train + n_val :])
-
-    train_p = [p for p in patient_data if p["subject_id"] in train_sids]
-    val_p = [p for p in patient_data if p["subject_id"] in val_sids]
-    test_p = [p for p in patient_data if p["subject_id"] in test_sids]
+    print(summarize_splits(splits, patient_to_labels))
 
     def _pack(plist: list[dict]) -> list[dict]:
         packed = []
@@ -561,7 +546,6 @@ def prepare_aki_dataset(
             sig_tensors = stack_window_dicts_destructive(
                 p["windows"], signal_dtype
             )
-            p["windows"] = []
             start_secs = torch.tensor(p["start_secs"], dtype=torch.float32)
             packed.append({
                 "subject_id": p["subject_id"],
@@ -570,65 +554,78 @@ def prepare_aki_dataset(
                 "preop_cr": p["preop_cr"],
                 "peak_postop_cr": p["peak_postop_cr"],
                 "n_windows": n_w,
-                "signals": sig_tensors,  # {sig_type: (K, win_samples)}
-                "start_secs": start_secs,  # (K,) seconds
+                "signals": sig_tensors,
+                "start_secs": start_secs,
             })
         return packed
 
-    n_train_p = len(train_p)
-    n_val_p = len(val_p)
-    n_test_p = len(test_p)
-    n_pos_train = sum(1 for p in train_p if p["label"] == 1)
-    n_pos_val = sum(1 for p in val_p if p["label"] == 1)
-    n_pos_test = sum(1 for p in test_p if p["label"] == 1)
-
-    save_dict = {
-        "train": _pack(train_p),
-        "val": _pack(val_p),
-        "test": _pack(test_p),
-        "metadata": {
-            "task": "postop_aki_prediction",
-            "source": "VitalDB intraop waveform + clinical/lab",
-            "label_mode": label_mode,
-            "kdigo_definition": (
-                "Stage based on postop peak Cr / preop Cr ratio "
-                "(≥1.5 = stage1, ≥2.0 = stage2, ≥3.0 or ≥4.0 mg/dL = stage3) "
-                "or absolute increase ≥0.3 mg/dL for stage 1."
-            ),
-            "input_signals": sorted(input_set),
-            "required_signals": sorted(required_set),
-            "window_sec": window_sec,
-            "stride_sec": stride_sec,
-            "sampling_rate": TARGET_SR,
-            "max_postop_days": max_postop_days,
-            "train_ratio": train_ratio,
-            "val_ratio": val_ratio,
-            "n_train_patients": n_train_p,
-            "n_val_patients": n_val_p,
-            "n_test_patients": n_test_p,
-            "signal_dtype": str(signal_dtype).replace("torch.", ""),
-        },
-    }
-    if label_mode == "binary":
-        save_dict["metadata"]["n_pos_train"] = n_pos_train
-        save_dict["metadata"]["n_pos_val"] = n_pos_val
-        save_dict["metadata"]["n_pos_test"] = n_pos_test
-
     sig_str = "_".join(sorted(input_signals))
-    out_file = out_path / f"aki_{label_mode}_{sig_str}_w{int(window_sec)}s.pt"
-    torch.save(save_dict, out_file)
+    for fold_idx, (train_sids, val_sids, test_sids) in enumerate(splits):
+        print(f"\n  [Fold {fold_idx}] Packing + saving...")
+        # 동일 patient_data 를 fold 마다 사용하므로 windows 가 destructive pack 으로
+        # 비워지지 않도록 deepcopy 가 필요. 대신 매 fold 마다 _pack 호출 후 windows 가
+        # 비워질 수 있으므로, windows 를 백업했다가 복원하는 패턴 사용.
+        train_p = [p for p in patient_data if p["subject_id"] in train_sids]
+        val_p = [p for p in patient_data if p["subject_id"] in val_sids]
+        test_p = [p for p in patient_data if p["subject_id"] in test_sids]
+
+        # destructive pack 회피: copy windows for each fold
+        def _shallow_copy(plist):
+            return [
+                {**p, "windows": [dict(w) for w in p["windows"]]}
+                for p in plist
+            ]
+
+        train_packed = _pack(_shallow_copy(train_p))
+        val_packed = _pack(_shallow_copy(val_p))
+        test_packed = _pack(_shallow_copy(test_p))
+
+        n_train_p = len(train_p)
+        n_val_p = len(val_p)
+        n_test_p = len(test_p)
+        n_pos_train = sum(1 for p in train_p if p["label"] == 1)
+        n_pos_val = sum(1 for p in val_p if p["label"] == 1)
+        n_pos_test = sum(1 for p in test_p if p["label"] == 1)
+
+        save_dict = {
+            "train": train_packed,
+            "val": val_packed,
+            "test": test_packed,
+            "metadata": {
+                "task": "postop_aki_prediction",
+                "source": "VitalDB intraop waveform + clinical/lab",
+                "label_mode": label_mode,
+                "kdigo_definition": (
+                    "Stage based on postop peak Cr / preop Cr ratio "
+                    "(≥1.5 = stage1, ≥2.0 = stage2, ≥3.0 or ≥4.0 mg/dL = stage3) "
+                    "or absolute increase ≥0.3 mg/dL for stage 1."
+                ),
+                "input_signals": sorted(input_set),
+                "required_signals": sorted(required_set),
+                "window_sec": window_sec,
+                "stride_sec": stride_sec,
+                "sampling_rate": TARGET_SR,
+                "max_postop_days": max_postop_days,
+                "fold_idx": fold_idx,
+                "n_folds": n_folds,
+                "n_train_patients": n_train_p,
+                "n_val_patients": n_val_p,
+                "n_test_patients": n_test_p,
+                "signal_dtype": str(signal_dtype).replace("torch.", ""),
+            },
+        }
+        if label_mode == "binary":
+            save_dict["metadata"]["n_pos_train"] = n_pos_train
+            save_dict["metadata"]["n_pos_val"] = n_pos_val
+            save_dict["metadata"]["n_pos_test"] = n_pos_test
+
+        fold_suffix = f"_fold{fold_idx}" if n_folds > 1 else ""
+        out_file = out_path / f"aki_{label_mode}_{sig_str}_w{int(window_sec)}s{fold_suffix}.pt"
+        torch.save(save_dict, out_file)
+        print(f"    Saved: {out_file} (train={n_train_p}, val={n_val_p}, test={n_test_p})")
 
     print(f"\n{'=' * 60}")
-    print(f"  Saved: {out_file}")
-    print(f"  Train: {len(train_p)} patients")
-    print(f"  Val:   {len(val_p)} patients")
-    print(f"  Test:  {len(test_p)} patients")
-    if label_mode == "binary":
-        print(
-            f"  Class balance — train: AKI={save_dict['metadata']['n_pos_train']}, "
-            f"val: AKI={save_dict['metadata']['n_pos_val']}, "
-            f"test: AKI={save_dict['metadata']['n_pos_test']}"
-        )
+    print(f"  Done: {n_folds} fold(s) saved to {out_path}")
     print(f"{'=' * 60}")
 
 
@@ -659,16 +656,12 @@ def main() -> None:
     parser.add_argument("--window-sec", type=float, default=600.0)
     parser.add_argument("--stride-sec", type=float, default=300.0)
     parser.add_argument(
-        "--train-ratio",
-        type=float,
-        default=0.6,
-        help="Train split ratio (patient-level). Default 0.6.",
+        "--n-folds", type=int, default=5,
+        help="Stratified patient-level K-fold CV (default 5).",
     )
     parser.add_argument(
-        "--val-ratio",
-        type=float,
-        default=0.2,
-        help="Val split ratio (patient-level). Test = 1 - train - val. Default 0.2.",
+        "--seed", type=int, default=42,
+        help="RNG seed for fold shuffling.",
     )
     parser.add_argument(
         "--label-mode", choices=["binary", "stage"], default="binary",
@@ -699,8 +692,8 @@ def main() -> None:
         input_signals=args.input_signals,
         window_sec=args.window_sec,
         stride_sec=args.stride_sec,
-        train_ratio=args.train_ratio,
-        val_ratio=args.val_ratio,
+        n_folds=args.n_folds,
+        seed=args.seed,
         label_mode=args.label_mode,
         max_postop_days=args.max_postop_days,
         max_subjects=args.max_subjects,

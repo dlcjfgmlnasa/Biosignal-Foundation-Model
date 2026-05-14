@@ -29,6 +29,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from downstream._kfold_utils import stratified_kfold_patient_splits, summarize_splits
 from downstream._save_utils import add_signal_dtype_arg, consume_input_signals
 
 TARGET_SR: float = 100.0
@@ -323,8 +324,13 @@ def save_dataset(
     window_sec: float,
     out_dir: str,
     signal_dtype: torch.dtype = torch.float16,
+    fold_idx: int | None = None,
+    n_folds: int = 1,
 ) -> Path:
-    """train/val/test 3-way 저장 (hypotension/aki 와 동일 schema)."""
+    """train/val/test 3-way 저장 (hypotension/aki 와 동일 schema).
+
+    fold_idx 주어지면 파일명에 _fold{i} 접미사 + metadata 기록.
+    """
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
@@ -378,13 +384,16 @@ def save_dataset(
             "n_val": n_val,
             "n_test": n_test,
             "signal_dtype": str(signal_dtype).replace("torch.", ""),
+            "fold_idx": fold_idx,
+            "n_folds": n_folds,
         },
     }
 
     mode_str = "_".join(input_signals)
     horizon_min = int(horizon_sec / 60)
     win_int = int(window_sec)
-    filename = f"etco2_{mode_str}_w{win_int}s_h{horizon_min}min.pt"
+    fold_suffix = f"_fold{fold_idx}" if fold_idx is not None else ""
+    filename = f"etco2_{mode_str}_w{win_int}s_h{horizon_min}min{fold_suffix}.pt"
     save_path = out_path / filename
     torch.save(save_dict, save_path)
 
@@ -412,6 +421,29 @@ def print_stats(name: str, samples: list[ForecastSample]) -> None:
 # ---- 메인 ----
 
 
+def _patient_level_etco2_labels(
+    cases: list[dict],
+    etco2_map: dict[str, np.ndarray],
+) -> dict[str, list[int]]:
+    """환자별 case 레벨 EtCO2 abnormality label (stratification 용).
+
+    각 case 의 EtCO2 trend 에 normal range 밖 1+ 샘플 존재 여부를 binary 로 기록.
+    """
+    patient_to_labels: dict[str, list[int]] = {}
+    for case in cases:
+        pid = case["patient_id"]
+        if pid not in etco2_map:
+            continue
+        et = etco2_map[pid]
+        valid = et[~np.isnan(et)] if et.size else et
+        if valid.size == 0:
+            has_abn = False
+        else:
+            has_abn = bool(np.any((valid < ETCO2_NORMAL_LOW) | (valid > ETCO2_NORMAL_HIGH)))
+        patient_to_labels.setdefault(pid, []).append(1 if has_abn else 0)
+    return patient_to_labels
+
+
 def prepare_etco2_sweep(
     data_dir: str,
     raw_dir: str,
@@ -419,12 +451,12 @@ def prepare_etco2_sweep(
     window_secs: list[float],
     horizon_mins: list[float],
     stride_sec: float = 30.0,
-    train_ratio: float = 0.6,
-    val_ratio: float = 0.2,
+    n_folds: int = 5,
     max_subjects: int | None = None,
     out_dir: str = "outputs/downstream/etco2_abnormal",
     required_signals: list[str] | None = None,
     signal_dtype: torch.dtype = torch.float16,
+    seed: int = 42,
 ) -> list[Path]:
     max_window = max(window_secs)
     max_horizon_sec = max(horizon_mins) * 60.0
@@ -475,60 +507,60 @@ def prepare_etco2_sweep(
     cases = [c for c in cases if c["patient_id"] in etco2_map]
     print(f"  EtCO2 가용 case: {len(cases)}")
 
-    print("\n[3/4] Patient-level train/val/test split...")
-    test_ratio = 1.0 - train_ratio - val_ratio
-    if test_ratio <= 0.0:
-        raise ValueError(f"train_ratio + val_ratio must be < 1")
-    rng = np.random.default_rng(42)
-    pids = list({c["patient_id"] for c in cases})
-    rng.shuffle(pids)
-    n_total = len(pids)
-    n_train = max(1, int(n_total * train_ratio))
-    n_val = max(1, int(n_total * val_ratio))
-    if n_train + n_val >= n_total:
-        n_val = max(1, n_total - n_train - 1)
-    train_pids = set(pids[:n_train])
-    val_pids = set(pids[n_train : n_train + n_val])
-    test_pids = set(pids[n_train + n_val :])
-    print(f"  Train: {len(train_pids)} / Val: {len(val_pids)} / Test: {len(test_pids)} patients")
-
-    train_cases = [c for c in cases if c["patient_id"] in train_pids]
-    val_cases = [c for c in cases if c["patient_id"] in val_pids]
-    test_cases = [c for c in cases if c["patient_id"] in test_pids]
+    print(f"\n[3/4] Stratified {n_folds}-fold patient-level CV split...")
+    patient_ids = sorted({c["patient_id"] for c in cases})
+    patient_to_labels = _patient_level_etco2_labels(cases, etco2_map)
+    pos_pts = sum(1 for pid in patient_ids if any(patient_to_labels.get(pid, [])))
+    print(
+        f"  Patient-level positive (any abnormal): {pos_pts}/{len(patient_ids)} "
+        f"({100.0 * pos_pts / max(1, len(patient_ids)):.1f}%)"
+    )
+    splits = stratified_kfold_patient_splits(
+        patient_ids, patient_to_labels, n_folds=n_folds, seed=seed,
+    )
+    print(summarize_splits(splits, patient_to_labels))
 
     combos = [(w, h) for w in window_secs for h in horizon_mins]
-    print(f"\n[4/4] Generating {len(combos)} datasets...")
+    total_runs = len(combos) * n_folds
+    print(f"\n[4/4] Generating {len(combos)} combo × {n_folds} fold = {total_runs} datasets...")
 
     saved_paths: list[Path] = []
-    for i, (window_sec, horizon_min) in enumerate(combos, 1):
+    run_idx = 0
+    for window_sec, horizon_min in combos:
         horizon_sec = horizon_min * 60.0
-        print(f"\n  [{i}/{len(combos)}] window={window_sec}s, horizon={horizon_min}min")
-
-        train_s = extract_forecast_samples(
-            train_cases, etco2_map, input_signals, window_sec, stride_sec, horizon_sec,
-        )
-        val_s = extract_forecast_samples(
-            val_cases, etco2_map, input_signals, window_sec, stride_sec, horizon_sec,
-        )
-        test_s = extract_forecast_samples(
-            test_cases, etco2_map, input_signals, window_sec, stride_sec, horizon_sec,
-        )
-
-        print_stats("    Train", train_s)
-        print_stats("    Val", val_s)
-        print_stats("    Test", test_s)
-
-        if not (train_s or val_s or test_s):
-            print("    SKIP: No samples.")
-            continue
-
-        save_path = save_dataset(
-            train_s, val_s, test_s, input_signals,
-            horizon_sec, window_sec, out_dir,
-            signal_dtype=signal_dtype,
-        )
-        saved_paths.append(save_path)
-        gc.collect()
+        for fold_idx, (train_pids, val_pids, test_pids) in enumerate(splits):
+            run_idx += 1
+            print(
+                f"\n  [{run_idx}/{total_runs}] "
+                f"window={window_sec}s, horizon={horizon_min}min, fold={fold_idx}"
+            )
+            train_cases = [c for c in cases if c["patient_id"] in train_pids]
+            val_cases = [c for c in cases if c["patient_id"] in val_pids]
+            test_cases = [c for c in cases if c["patient_id"] in test_pids]
+            train_s = extract_forecast_samples(
+                train_cases, etco2_map, input_signals, window_sec, stride_sec, horizon_sec,
+            )
+            val_s = extract_forecast_samples(
+                val_cases, etco2_map, input_signals, window_sec, stride_sec, horizon_sec,
+            )
+            test_s = extract_forecast_samples(
+                test_cases, etco2_map, input_signals, window_sec, stride_sec, horizon_sec,
+            )
+            print_stats("    Train", train_s)
+            print_stats("    Val", val_s)
+            print_stats("    Test", test_s)
+            if not (train_s or val_s or test_s):
+                print("    SKIP: No samples.")
+                continue
+            save_path = save_dataset(
+                train_s, val_s, test_s, input_signals,
+                horizon_sec, window_sec, out_dir,
+                signal_dtype=signal_dtype,
+                fold_idx=fold_idx if n_folds > 1 else None,
+                n_folds=n_folds,
+            )
+            saved_paths.append(save_path)
+            gc.collect()
 
     print(f"\n{'=' * 60}")
     print(f"  Done! {len(saved_paths)}/{len(combos)} datasets saved to {out_dir}")
@@ -549,8 +581,9 @@ def main() -> None:
     parser.add_argument("--horizon-mins", nargs="+", type=float, default=[5.0])
     parser.add_argument("--window-secs", nargs="+", type=float, default=[60.0])
     parser.add_argument("--stride-sec", type=float, default=30.0)
-    parser.add_argument("--train-ratio", type=float, default=0.6)
-    parser.add_argument("--val-ratio", type=float, default=0.2)
+    parser.add_argument("--n-folds", type=int, default=5,
+                        help="Stratified patient-level K-fold CV (default 5).")
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--out-dir", default="outputs/downstream/etco2_abnormal")
     dtype_map = add_signal_dtype_arg(parser)
     args = parser.parse_args()
@@ -562,8 +595,8 @@ def main() -> None:
         window_secs=args.window_secs,
         horizon_mins=args.horizon_mins,
         stride_sec=args.stride_sec,
-        train_ratio=args.train_ratio,
-        val_ratio=args.val_ratio,
+        n_folds=args.n_folds,
+        seed=args.seed,
         max_subjects=args.max_subjects,
         out_dir=args.out_dir,
         required_signals=args.required_signals,
