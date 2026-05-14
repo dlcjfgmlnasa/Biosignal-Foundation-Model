@@ -38,6 +38,7 @@ from downstream._gap_mask import (
 )
 from downstream._kfold_utils import stratified_kfold_patient_splits, summarize_splits
 from downstream._save_utils import add_signal_dtype_arg, consume_input_signals
+from downstream._seg_intersect import load_aligned_signals_intersection
 
 TARGET_SR: float = 100.0
 SPO2_TRACKS = [
@@ -504,10 +505,14 @@ def prepare_hypoxemia_sweep(
     print(f"  Min dur:   {min_duration_sec / 60:.1f} min")
     print(f"{'=' * 60}")
 
-    print("\n[1/4] Loading aligned multi-channel waveform...")
-    cases = _load_local_pt_aligned_signals(
-        data_dir, input_signals, min_duration_sec, max_subjects,
-        required_signals=required_signals,
+    print("\n[1/4] Loading aligned multi-channel waveform (manifest intersection)...")
+    # Manifest 기반 시간선 intersection — filename seg_key 매칭 대비 cohort 13-124× 회복
+    base_req = set(required_signals if required_signals else input_signals)
+    cases = load_aligned_signals_intersection(
+        data_dir,
+        required_signals=sorted(base_req),
+        min_duration_sec=min_duration_sec,
+        max_subjects=max_subjects,
     )
     if not cases:
         print("ERROR: No valid cases loaded.", file=sys.stderr)

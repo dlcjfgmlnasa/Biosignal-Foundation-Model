@@ -41,6 +41,12 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from downstream._gap_mask import (
+    DEFAULT_VALID_RATIO_THRESHOLD,
+    GapStats,
+    apply_gap_mask_multichannel,
+    compute_valid_ratio,
+)
 from downstream._kfold_utils import stratified_kfold_patient_splits, summarize_splits
 from downstream._save_utils import (
     add_signal_dtype_arg,
@@ -328,43 +334,48 @@ def extract_windows(
     window_sec: float,
     stride_sec: float,
     sr: float = TARGET_SR,
-    nan_ratio_threshold: float = 0.05,
-    gap_max_sec: float = 1.0,
-) -> list[tuple[float, dict[str, np.ndarray]]]:
-    """다채널 sliding window 추출. NaN 정책: 짧은 dropout 보간, 긴 dropout 차단.
+    valid_ratio_threshold: float = DEFAULT_VALID_RATIO_THRESHOLD,
+    gap_stats: GapStats | None = None,
+) -> list[tuple[float, dict[str, np.ndarray], dict[str, np.ndarray]]]:
+    """다채널 sliding window 추출 + gap drop+mask 정책.
+
+    정책 ([[project_downstream_gap_window_policy]]):
+      Step 1 — multi-channel valid_ratio < threshold 면 window drop
+      Step 2 — 통과 window 의 NaN 위치 → 0 fill + bool gap_mask
+
+    이전 interpolation 정책 폐기 — pretrain mask_token 과 일관성 위해 [MASK] 교체.
 
     Returns
     -------
-    list of (start_sec, {sig_type: (win_samples,)}). start_sec은 segment 내 절대시간 (초).
+    list of (start_sec, signals_filled, gap_masks).
     """
     win_samples = int(window_sec * sr)
     stride_samples = int(stride_sec * sr)
-    gap_max_samples = int(gap_max_sec * sr)
     min_len = min(len(v) for v in signals.values())
     if min_len < win_samples:
         return []
 
-    out: list[tuple[float, dict[str, np.ndarray]]] = []
+    out: list[tuple[float, dict[str, np.ndarray], dict[str, np.ndarray]]] = []
     start = 0
     while start + win_samples <= min_len:
         win = {k: v[start: start + win_samples] for k, v in signals.items()}
 
-        # 1) 채널별 NaN ratio threshold 검사
-        nan_ratios = [float(np.isnan(arr).mean()) for arr in win.values()]
-        if max(nan_ratios) > nan_ratio_threshold:
+        # Step 1: gap-policy window drop
+        valid_ratio = compute_valid_ratio(list(win.values()))
+        if valid_ratio < valid_ratio_threshold:
+            if gap_stats is not None:
+                gap_stats.add_drop()
             start += stride_samples
             continue
 
-        # 2) 채널별 단일 연속 NaN gap 길이 검사 (sensor blip만 허용)
-        max_gaps = [_max_consecutive_nan(arr) for arr in win.values()]
-        if max(max_gaps) > gap_max_samples:
-            start += stride_samples
-            continue
+        # Step 2: gap mask 적용 (NaN → 0 fill + bool mask)
+        filled, gap_mask = apply_gap_mask_multichannel(win)
+        if gap_stats is not None:
+            n_total_s = sum(arr.size for arr in filled.values())
+            n_gap_s = sum(int(m.sum()) for m in gap_mask.values())
+            gap_stats.add_window(n_total_s, n_gap_s)
 
-        # 3) 통과한 윈도우 → NaN 선형 보간
-        win = {k: _linear_interpolate_nan(v) for k, v in win.items()}
-
-        out.append((start / sr, win))
+        out.append((start / sr, filled, gap_mask))
         start += stride_samples
     return out
 
@@ -465,20 +476,24 @@ def prepare_aki_dataset(
         f"passing windows linearly interpolated"
     )
     patient_data: list[dict] = []
+    gap_stats_global = GapStats()
 
     for i, subj_dir in enumerate(matched_dirs):
         label = labels[subj_dir.name]
         segments = load_aligned_signals_for_subject(subj_dir, required_set)
 
         # 각 segment 내에서 sliding window 추출. seg_offset_sec로 segment간 시간 분리.
-        windowed: list[tuple[float, dict[str, np.ndarray]]] = []
+        # gap drop+mask 정책 적용 (NaN → 0 fill + bool gap_mask).
+        windowed: list[tuple[float, dict[str, np.ndarray], dict[str, np.ndarray]]] = []
         seg_offset_sec = 0.0
         for seg in segments:
             seg_len_sec = (
                 min(len(v) for v in seg.values()) / TARGET_SR if seg else 0.0
             )
-            for rel_sec, win in extract_windows(seg, window_sec, stride_sec):
-                windowed.append((seg_offset_sec + rel_sec, win))
+            for rel_sec, win, gap_mask in extract_windows(
+                seg, window_sec, stride_sec, gap_stats=gap_stats_global,
+            ):
+                windowed.append((seg_offset_sec + rel_sec, win, gap_mask))
             # segment끼리 인접 윈도우로 보이지 않도록 offset 누적 + window_sec margin
             seg_offset_sec += seg_len_sec + window_sec
 
@@ -488,8 +503,12 @@ def prepare_aki_dataset(
         # 출력은 input_signals만 — required ⊃ input일 수 있음
         if input_set != required_set:
             windowed = [
-                (t, {st: w[st] for st in w.keys() if st in input_set})
-                for t, w in windowed
+                (
+                    t,
+                    {st: w[st] for st in w.keys() if st in input_set},
+                    {st: gm[st] for st in gm.keys() if st in input_set},
+                )
+                for t, w, gm in windowed
             ]
 
         target = label.aki_stage if label_mode == "stage" else label.aki_binary
@@ -499,8 +518,9 @@ def prepare_aki_dataset(
             "label": target,
             "preop_cr": label.preop_cr,
             "peak_postop_cr": label.peak_postop_cr,
-            "start_secs": [t for t, _ in windowed],
-            "windows": [w for _, w in windowed],
+            "start_secs": [t for t, _, _ in windowed],
+            "windows": [w for _, w, _ in windowed],
+            "gap_masks": [gm for _, _, gm in windowed],
         })
 
         if (i + 1) % 50 == 0 or i == 0:
@@ -538,6 +558,7 @@ def prepare_aki_dataset(
         patient_ids, patient_to_labels, n_folds=n_folds, seed=seed,
     )
     print(summarize_splits(splits, patient_to_labels))
+    print(gap_stats_global.summary())
 
     def _pack(plist: list[dict]) -> list[dict]:
         packed = []
@@ -546,6 +567,12 @@ def prepare_aki_dataset(
             sig_tensors = stack_window_dicts_destructive(
                 p["windows"], signal_dtype
             )
+            # gap_masks 도 stack (bool, K x win_samples)
+            gap_tensors: dict[str, torch.Tensor] = {}
+            for stype in input_set:
+                arrs = [gm[stype] for gm in p["gap_masks"] if stype in gm]
+                if arrs:
+                    gap_tensors[stype] = torch.from_numpy(np.stack(arrs)).bool()
             start_secs = torch.tensor(p["start_secs"], dtype=torch.float32)
             packed.append({
                 "subject_id": p["subject_id"],
@@ -555,6 +582,7 @@ def prepare_aki_dataset(
                 "peak_postop_cr": p["peak_postop_cr"],
                 "n_windows": n_w,
                 "signals": sig_tensors,
+                "gap_masks": gap_tensors,
                 "start_secs": start_secs,
             })
         return packed
@@ -563,16 +591,19 @@ def prepare_aki_dataset(
     for fold_idx, (train_sids, val_sids, test_sids) in enumerate(splits):
         print(f"\n  [Fold {fold_idx}] Packing + saving...")
         # 동일 patient_data 를 fold 마다 사용하므로 windows 가 destructive pack 으로
-        # 비워지지 않도록 deepcopy 가 필요. 대신 매 fold 마다 _pack 호출 후 windows 가
-        # 비워질 수 있으므로, windows 를 백업했다가 복원하는 패턴 사용.
+        # 비워지지 않도록 매 fold 마다 shallow copy 후 pack.
         train_p = [p for p in patient_data if p["subject_id"] in train_sids]
         val_p = [p for p in patient_data if p["subject_id"] in val_sids]
         test_p = [p for p in patient_data if p["subject_id"] in test_sids]
 
-        # destructive pack 회피: copy windows for each fold
+        # destructive pack 회피: copy windows + gap_masks for each fold
         def _shallow_copy(plist):
             return [
-                {**p, "windows": [dict(w) for w in p["windows"]]}
+                {
+                    **p,
+                    "windows": [dict(w) for w in p["windows"]],
+                    "gap_masks": [dict(gm) for gm in p["gap_masks"]],
+                }
                 for p in plist
             ]
 
