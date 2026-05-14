@@ -32,9 +32,11 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import sys
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import torch
@@ -132,11 +134,47 @@ def estimate_n_samples(file_size: int, overhead: int, dtype_bytes: int) -> int:
 
 # ── 신호 가용성 + segment 집계 ──────────────────────────────────
 
+def _scan_one_subject(
+    subj_dir: Path,
+) -> tuple[str, dict[tuple[int, int, int], dict[str, tuple[Path, int, int]]], int, int]:
+    """한 subject 디렉토리 스캔 — worker thread 용.
+
+    os.scandir 를 쓰면 DirEntry 가 size 를 cache 하므로 별도 stat() 호출이
+    줄어든다 (Linux 에서도 다음 호출시 캐시 사용).
+    """
+    sid = subj_dir.name
+    seg_map: dict[tuple[int, int, int], dict[str, tuple[Path, int, int]]] = {}
+    n_files = 0
+    n_bad = 0
+    try:
+        with os.scandir(subj_dir) as it:
+            for entry in it:
+                name = entry.name
+                if not name.endswith(".pt"):
+                    continue
+                n_files += 1
+                meta = parse_pt_filename(name)
+                if meta is None:
+                    n_bad += 1
+                    continue
+                size = entry.stat().st_size  # DirEntry.stat caches
+                seg_key = (meta["session_id"], meta["seg_i"], meta["seg_j"])
+                seg_map.setdefault(seg_key, {})[meta["signal_type"]] = (
+                    Path(entry.path),
+                    size,
+                    meta["spatial_id"],
+                )
+    except OSError:
+        pass
+    return sid, seg_map, n_files, n_bad
+
+
 def scan_subjects(
     root: Path,
     max_subjects: int | None = None,
+    workers: int = 16,
 ) -> tuple[dict, int, int]:
-    """전체 .pt 디렉토리 스캔.
+    """전체 .pt 디렉토리 병렬 스캔.
 
     Returns
     -------
@@ -147,14 +185,14 @@ def scan_subjects(
     print(f"  Listing {root} ...", flush=True)
     subject_dirs: list[Path] = []
     list_pbar = tqdm(
-        root.iterdir(),
+        os.scandir(root),
         desc="  Listing entries",
         unit="entry",
         dynamic_ncols=True,
     )
     for entry in list_pbar:
         if entry.is_dir():
-            subject_dirs.append(entry)
+            subject_dirs.append(Path(entry.path))
         list_pbar.set_postfix(dirs=len(subject_dirs), refresh=False)
     list_pbar.close()
     subject_dirs.sort()
@@ -163,36 +201,31 @@ def scan_subjects(
         subject_dirs = subject_dirs[:max_subjects]
 
     subjects: dict[str, dict[tuple[int, int, int], dict[str, tuple[Path, int, int]]]] = {}
-    n_files = 0
-    n_bad = 0
+    n_files_total = 0
+    n_bad_total = 0
 
-    pbar = tqdm(
-        subject_dirs,
-        desc="Scanning subjects",
-        unit="subj",
-        dynamic_ncols=True,
-    )
-    for subj_dir in pbar:
-        sid = subj_dir.name
-        seg_map: dict[tuple[int, int, int], dict[str, tuple[Path, int, int]]] = {}
-        for pt in subj_dir.glob("*.pt"):
-            n_files += 1
-            meta = parse_pt_filename(pt.name)
-            if meta is None:
-                n_bad += 1
-                continue
-            seg_key = (meta["session_id"], meta["seg_i"], meta["seg_j"])
-            seg_map.setdefault(seg_key, {})[meta["signal_type"]] = (
-                pt,
-                pt.stat().st_size,
-                meta["spatial_id"],
+    print(f"  Scanning with {workers} parallel workers...", flush=True)
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {ex.submit(_scan_one_subject, sd): sd for sd in subject_dirs}
+        pbar = tqdm(
+            as_completed(futures),
+            total=len(futures),
+            desc="Scanning subjects",
+            unit="subj",
+            dynamic_ncols=True,
+        )
+        for fut in pbar:
+            sid, seg_map, n_files, n_bad = fut.result()
+            n_files_total += n_files
+            n_bad_total += n_bad
+            if seg_map:
+                subjects[sid] = seg_map
+            pbar.set_postfix(
+                files=n_files_total, kept=len(subjects), refresh=False,
             )
-        if seg_map:
-            subjects[sid] = seg_map
-        pbar.set_postfix(files=n_files, kept=len(subjects), refresh=False)
-    pbar.close()
+        pbar.close()
 
-    return subjects, n_files, n_bad
+    return subjects, n_files_total, n_bad_total
 
 
 # ── Task 별 cohort 추정 ──────────────────────────────────────────
@@ -360,6 +393,8 @@ def main() -> int:
                     help="prediction horizon (분) — sliding-window 카운트 grid")
     ap.add_argument("--stride", type=float, default=30.0,
                     help="sliding stride (초). 기본 30s (prepare_data.py 와 동일)")
+    ap.add_argument("--workers", type=int, default=16,
+                    help="병렬 scan thread 수 (default 16). 스토리지가 빠르면 8, 느리면 32~64")
     args = ap.parse_args()
 
     root = Path(args.data_dir)
@@ -368,7 +403,9 @@ def main() -> int:
         return 1
 
     print(f"  Scanning {root}  (max_subjects={args.max_subjects})", flush=True)
-    subjects, n_files, n_bad = scan_subjects(root, args.max_subjects)
+    subjects, n_files, n_bad = scan_subjects(
+        root, args.max_subjects, workers=args.workers,
+    )
     print(f"  → {len(subjects)} subject(s), {n_files:,} .pt file(s),"
           f" {n_bad:,} unparseable")
 
