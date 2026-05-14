@@ -450,29 +450,51 @@ def build_vital_path_map(raw_dir: Path, workers: int = 16) -> dict[int, Path]:
             pass
         return found
 
-    # top-level scandir 만 병렬화 (대부분 flat 구조)
+    # top-level scandir — entry 별 progress 표시 (네트워크 마운트에서 is_dir() stat 느림)
+    top_entries: list = []
     try:
-        top_entries = list(os.scandir(raw_dir))
+        list_pbar = tqdm(
+            os.scandir(raw_dir),
+            desc="  Listing raw entries",
+            unit="entry",
+            dynamic_ncols=True,
+        )
+        for entry in list_pbar:
+            top_entries.append(entry)
+            list_pbar.set_postfix(entries=len(top_entries), refresh=False)
+        list_pbar.close()
     except OSError:
         return out
 
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = []
-        # top-level files first
-        for e in top_entries:
-            if not e.is_dir() and e.name.endswith(".vital"):
-                digits = "".join(c for c in Path(e.name).stem if c.isdigit())
-                if digits:
-                    out[int(digits)] = Path(e.path)
-        # nested dir walks
-        for e in top_entries:
+    # entry 분류 — 각 entry 별 is_dir() 호출 (stat 발생할 수 있음)
+    file_entries: list = []
+    dir_entries: list = []
+    for e in tqdm(top_entries, desc="  Classifying entries",
+                  unit="entry", dynamic_ncols=True):
+        try:
             if e.is_dir():
-                futures.append(ex.submit(_walk_dir, Path(e.path)))
-        for fut in tqdm(as_completed(futures), total=len(futures),
-                        desc="  Walking nested dirs", unit="dir",
-                        dynamic_ncols=True):
-            for cid, p in fut.result():
-                out.setdefault(cid, p)
+                dir_entries.append(e)
+            elif e.name.endswith(".vital"):
+                file_entries.append(e)
+        except OSError:
+            continue
+
+    # top-level files 즉시 등록
+    for e in tqdm(file_entries, desc="  Indexing top-level .vital",
+                  unit="file", dynamic_ncols=True):
+        digits = "".join(c for c in Path(e.name).stem if c.isdigit())
+        if digits:
+            out[int(digits)] = Path(e.path)
+
+    # nested 디렉토리 병렬 walk
+    if dir_entries:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = [ex.submit(_walk_dir, Path(e.path)) for e in dir_entries]
+            for fut in tqdm(as_completed(futures), total=len(futures),
+                            desc="  Walking nested dirs", unit="dir",
+                            dynamic_ncols=True):
+                for cid, p in fut.result():
+                    out.setdefault(cid, p)
 
     print(f"  → {len(out):,} .vital file(s) indexed", flush=True)
     return out
