@@ -38,6 +38,12 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from downstream._gap_mask import (
+    DEFAULT_VALID_RATIO_THRESHOLD,
+    GapStats,
+    apply_gap_mask_multichannel,
+    compute_valid_ratio,
+)
 from downstream._kfold_utils import stratified_kfold_patient_splits, summarize_splits
 from downstream._save_utils import add_signal_dtype_arg, consume_input_signals
 from downstream._seg_intersect import load_aligned_signals_intersection
@@ -64,7 +70,8 @@ SIGNAL_TYPE_MAP: dict[int, str] = {
 class ForecastSample:
     """미래 저혈압 예측 샘플."""
 
-    input_signals: dict[str, np.ndarray]  # {"ecg": (win_samples,), ...}
+    input_signals: dict[str, np.ndarray]  # {"ecg": (win_samples,), ...}  NaN 은 0 으로 채워짐
+    input_gap_masks: dict[str, np.ndarray]  # 같은 shape, bool. True=원본이 NaN (gap)
     label: int  # 0=normal, 1=hypotension in future
     label_value: float  # future MAP (mmHg)
     case_id: str
@@ -213,6 +220,8 @@ def extract_forecast_samples(
     horizon_sec: float = 300.0,
     map_threshold: float = 65.0,
     sustained_sec: float = 60.0,
+    valid_ratio_threshold: float = DEFAULT_VALID_RATIO_THRESHOLD,
+    gap_stats: GapStats | None = None,
 ) -> list[ForecastSample]:
     """시간 정렬된 다채널 데이터에서 (input, future_label) 쌍을 추출한다.
 
@@ -263,6 +272,14 @@ def extract_forecast_samples(
             if not input_dict:
                 continue
 
+            # ── Step 1: gap-policy window drop ([[project_downstream_gap_window_policy]]) ──
+            #   input window 의 multi-channel valid_ratio < threshold → drop
+            valid_ratio = compute_valid_ratio(list(input_dict.values()))
+            if valid_ratio < valid_ratio_threshold:
+                if gap_stats is not None:
+                    gap_stats.add_drop()
+                continue
+
             # Future label: ABP의 [start + win_samples, start + win_samples + horizon_samples) 구간
             future_start = start + win_samples
             future_end = future_start + horizon_samples
@@ -282,6 +299,8 @@ def extract_forecast_samples(
 
             # artifact 제거 후 최소 min_consecutive의 절반은 남아야 신뢰 가능
             if len(future_maps) < max(1, min_consecutive // 2):
+                if gap_stats is not None:
+                    gap_stats.add_drop()
                 continue
 
             # ≥1분 지속 MAP<65 여부 확인
@@ -298,9 +317,17 @@ def extract_forecast_samples(
             # label_value: 미래 MAP의 최솟값 (참고용)
             min_future_map = min(future_maps)
 
+            # ── Step 2: gap mask 적용 (NaN → 0 fill + bool mask) ──
+            filled_dict, gap_mask_dict = apply_gap_mask_multichannel(input_dict)
+            if gap_stats is not None:
+                n_total_s = sum(arr.size for arr in filled_dict.values())
+                n_gap_s = sum(int(m.sum()) for m in gap_mask_dict.values())
+                gap_stats.add_window(n_total_s, n_gap_s)
+
             samples.append(
                 ForecastSample(
-                    input_signals=input_dict,
+                    input_signals=filled_dict,
+                    input_gap_masks=gap_mask_dict,
                     label=label,
                     label_value=min_future_map,
                     case_id=case["case_id"],
@@ -342,6 +369,7 @@ def save_dataset(
         if not samples:
             return {
                 "signals": {},
+                "gap_masks": {},
                 "labels": torch.tensor([]),
                 "label_values": torch.tensor([]),
                 "case_ids": [],
@@ -353,9 +381,17 @@ def save_dataset(
         )
         case_ids = [s.case_id for s in samples]
         sig_tensors = consume_input_signals(samples, input_signals, signal_dtype)
+        # Gap mask: sample-level bool (patch_size 무관). 학습 시 dataloader/model 이
+        # patch-level 로 downsample 후 [MASK] 토큰 적용.
+        gap_tensors: dict[str, torch.Tensor] = {}
+        for stype in input_signals:
+            arrs = [s.input_gap_masks[stype] for s in samples if stype in s.input_gap_masks]
+            if arrs:
+                gap_tensors[stype] = torch.from_numpy(np.stack(arrs)).bool()
 
         return {
             "signals": sig_tensors,
+            "gap_masks": gap_tensors,
             "labels": labels,
             "label_values": label_values,
             "case_ids": case_ids,
@@ -379,6 +415,8 @@ def save_dataset(
             "sampling_rate": TARGET_SR,
             "map_threshold": 65.0,
             "sustained_sec": 60.0,
+            "gap_policy": "drop+mask",
+            "valid_ratio_threshold": DEFAULT_VALID_RATIO_THRESHOLD,
             "n_train": n_train,
             "n_val": n_val,
             "n_test": n_test,
@@ -577,15 +615,20 @@ def prepare_hypotension_sweep(
             val_cases = [c for c in cases if c["patient_id"] in val_patients]
             test_cases = [c for c in cases if c["patient_id"] in test_patients]
 
+            gap_stats = GapStats()
             train_samples = extract_forecast_samples(
                 train_cases, input_signals, window_sec, stride_sec, horizon_sec,
+                gap_stats=gap_stats,
             )
             val_samples = extract_forecast_samples(
                 val_cases, input_signals, window_sec, stride_sec, horizon_sec,
+                gap_stats=gap_stats,
             )
             test_samples = extract_forecast_samples(
                 test_cases, input_signals, window_sec, stride_sec, horizon_sec,
+                gap_stats=gap_stats,
             )
+            print(gap_stats.summary())
 
             print_stats("    Train", train_samples)
             print_stats("    Val", val_samples)

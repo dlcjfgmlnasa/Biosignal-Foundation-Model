@@ -29,6 +29,12 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from downstream._gap_mask import (
+    DEFAULT_VALID_RATIO_THRESHOLD,
+    GapStats,
+    apply_gap_mask_multichannel,
+    compute_valid_ratio,
+)
 from downstream._kfold_utils import stratified_kfold_patient_splits, summarize_splits
 from downstream._save_utils import add_signal_dtype_arg, consume_input_signals
 
@@ -49,7 +55,8 @@ ETCO2_NORMAL_HIGH = 45.0  # mmHg, hypercapnia threshold
 class ForecastSample:
     """미래 EtCO2 abnormal 예측 샘플."""
 
-    input_signals: dict[str, np.ndarray]
+    input_signals: dict[str, np.ndarray]   # NaN → 0 fill
+    input_gap_masks: dict[str, np.ndarray] # bool, True=원본이 NaN (gap)
     label: int  # 0=normal, 1=abnormal (hypo or hyper) in future
     label_value: float  # future EtCO2 abnormal 정도 (가장 abnormal한 값과 normal 간 거리)
     case_id: str
@@ -234,6 +241,8 @@ def extract_forecast_samples(
     low_thr: float = ETCO2_NORMAL_LOW,
     high_thr: float = ETCO2_NORMAL_HIGH,
     sustained_sec: float = 60.0,
+    valid_ratio_threshold: float = DEFAULT_VALID_RATIO_THRESHOLD,
+    gap_stats: GapStats | None = None,
 ) -> list[ForecastSample]:
     """SpO2 trend + waveform window 정렬해서 (input, future_label) 쌍 추출.
 
@@ -271,12 +280,21 @@ def extract_forecast_samples(
             if not input_dict:
                 continue
 
+            # Step 1: gap-policy window drop
+            valid_ratio = compute_valid_ratio(list(input_dict.values()))
+            if valid_ratio < valid_ratio_threshold:
+                if gap_stats is not None:
+                    gap_stats.add_drop()
+                continue
+
             future_start_sec = (start + win_samples) / TARGET_SR
             future_end_sec = future_start_sec + horizon_sec
 
             f_start = int(future_start_sec)
             f_end = int(future_end_sec)
             if f_end > len(etco2):
+                if gap_stats is not None:
+                    gap_stats.add_drop()
                 continue
             future_etco2 = etco2[f_start:f_end]
             future_etco2 = future_etco2[~np.isnan(future_etco2)]
@@ -284,6 +302,8 @@ def extract_forecast_samples(
             future_etco2 = future_etco2[(future_etco2 >= 0.0) & (future_etco2 <= 80.0)]
 
             if len(future_etco2) < max(1, min_consecutive // 2):
+                if gap_stats is not None:
+                    gap_stats.add_drop()
                 continue
 
             label = (
@@ -298,9 +318,17 @@ def extract_forecast_samples(
             dev = np.abs(future_etco2 - mid).max()
             most_abn = future_etco2[np.argmax(np.abs(future_etco2 - mid))]
 
+            # Step 2: gap mask 적용
+            filled_dict, gap_mask_dict = apply_gap_mask_multichannel(input_dict)
+            if gap_stats is not None:
+                n_total_s = sum(arr.size for arr in filled_dict.values())
+                n_gap_s = sum(int(m.sum()) for m in gap_mask_dict.values())
+                gap_stats.add_window(n_total_s, n_gap_s)
+
             samples.append(
                 ForecastSample(
-                    input_signals=input_dict,
+                    input_signals=filled_dict,
+                    input_gap_masks=gap_mask_dict,
                     label=label,
                     label_value=float(most_abn),
                     case_id=case["case_id"],
@@ -342,6 +370,7 @@ def save_dataset(
         if not samples:
             return {
                 "signals": {},
+                "gap_masks": {},
                 "labels": torch.tensor([]),
                 "label_values": torch.tensor([]),
                 "case_ids": [],
@@ -353,9 +382,15 @@ def save_dataset(
         )
         case_ids = [s.case_id for s in samples]
         sig_tensors = consume_input_signals(samples, input_signals, signal_dtype)
+        gap_tensors: dict[str, torch.Tensor] = {}
+        for stype in input_signals:
+            arrs = [s.input_gap_masks[stype] for s in samples if stype in s.input_gap_masks]
+            if arrs:
+                gap_tensors[stype] = torch.from_numpy(np.stack(arrs)).bool()
 
         return {
             "signals": sig_tensors,
+            "gap_masks": gap_tensors,
             "labels": labels,
             "label_values": label_values,
             "case_ids": case_ids,
@@ -380,6 +415,8 @@ def save_dataset(
             "etco2_normal_low": ETCO2_NORMAL_LOW,
             "etco2_normal_high": ETCO2_NORMAL_HIGH,
             "sustained_sec": 60.0,
+            "gap_policy": "drop+mask",
+            "valid_ratio_threshold": DEFAULT_VALID_RATIO_THRESHOLD,
             "n_train": n_train,
             "n_val": n_val,
             "n_test": n_test,
@@ -537,15 +574,20 @@ def prepare_etco2_sweep(
             train_cases = [c for c in cases if c["patient_id"] in train_pids]
             val_cases = [c for c in cases if c["patient_id"] in val_pids]
             test_cases = [c for c in cases if c["patient_id"] in test_pids]
+            gap_stats = GapStats()
             train_s = extract_forecast_samples(
                 train_cases, etco2_map, input_signals, window_sec, stride_sec, horizon_sec,
+                gap_stats=gap_stats,
             )
             val_s = extract_forecast_samples(
                 val_cases, etco2_map, input_signals, window_sec, stride_sec, horizon_sec,
+                gap_stats=gap_stats,
             )
             test_s = extract_forecast_samples(
                 test_cases, etco2_map, input_signals, window_sec, stride_sec, horizon_sec,
+                gap_stats=gap_stats,
             )
+            print(gap_stats.summary())
             print_stats("    Train", train_s)
             print_stats("    Val", val_s)
             print_stats("    Test", test_s)
