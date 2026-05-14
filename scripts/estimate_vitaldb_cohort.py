@@ -60,22 +60,16 @@ TASK_SPECS: dict[int, dict] = {
     },
     5: {
         "name": "Intraop EtCO₂ Abnormality",
-        # ECG, PPG, AWP, RESP/Flow (spatial_id=2). 추가로 cohort: ventilated.
-        "required": [("ecg", None), ("ppg", None), ("awp", None), ("resp", {2})],
+        # 2026-05-14 v2: AWP only (RESP/Flow 제거 — VitalDB 0건 결과 반영)
+        "required": [("ecg", None), ("ppg", None), ("awp", None)],
         "label_note": "EtCO₂ trend from raw .vital required (--raw-dir)",
         "horizon_unit": "min",
         "default_horizons_min": (5, 10, 15),
     },
     6: {
         "name": "Intraop Hypoxemia (forecasting)",
-        # ECG, PPG, CO₂, AWP, RESP/Flow
-        "required": [
-            ("ecg", None),
-            ("ppg", None),
-            ("co2", None),
-            ("awp", None),
-            ("resp", {2}),
-        ],
+        # 2026-05-14 v2: AWP only (RESP/Flow 제거)
+        "required": [("ecg", None), ("ppg", None), ("co2", None), ("awp", None)],
         "label_note": "SpO₂ trend from raw .vital required (--raw-dir)",
         "horizon_unit": "min",
         "default_horizons_min": (5, 10, 15),
@@ -251,22 +245,29 @@ def aggregate_task_cohort(
     overhead: int,
     dtype_bytes: int,
 ) -> dict:
-    """task 의 required signal 을 만족하는 cohort 통계 집계."""
+    """task 의 required signal 을 만족하는 cohort 통계 집계.
+
+    Returns
+    -------
+    dict with:
+        n_subjects, n_segments, total_hours
+        seg_records: list of (subject_id, duration_sec)
+            → per-cell effective subject count + universal-cohort filter 에 사용
+    """
     spec = TASK_SPECS[task_id]
     required = spec["required"]
     req_types = [t for t, _ in required]
 
     n_subjects = 0
     n_segments = 0
-    total_samples = 0  # 100Hz 기준 sample 합 (가장 짧은 신호 기준)
-    seg_durations_sec: list[float] = []  # window 계산용
+    total_samples = 0
+    seg_records: list[tuple[str, float]] = []  # (subject_id, duration_sec)
 
     for sid, seg_map in subjects.items():
         subj_has_any = False
         for _, seg_signals in seg_map.items():
             if not check_segment_satisfies(seg_signals, required):
                 continue
-            # 가장 짧은 신호 기준 (aligned 자르기)
             min_samples = min(
                 estimate_n_samples(seg_signals[t][1], overhead, dtype_bytes)
                 for t in req_types
@@ -274,7 +275,7 @@ def aggregate_task_cohort(
             if min_samples <= 0:
                 continue
             seg_dur = min_samples / TARGET_SR
-            seg_durations_sec.append(seg_dur)
+            seg_records.append((sid, seg_dur))
             total_samples += min_samples
             n_segments += 1
             subj_has_any = True
@@ -285,29 +286,50 @@ def aggregate_task_cohort(
         "n_subjects": n_subjects,
         "n_segments": n_segments,
         "total_hours": total_samples / TARGET_SR / 3600.0,
-        "seg_durations_sec": seg_durations_sec,
+        "seg_records": seg_records,
     }
 
 
-def count_sliding_windows(
-    seg_durations_sec: list[float],
+def count_windows_with_subjects(
+    seg_records: list[tuple[str, float]],
     window_sec: float,
     horizon_sec: float,
     stride_sec: float,
-) -> int:
-    """segment 별 sliding window 샘플 수 합산.
+) -> tuple[int, int, int]:
+    """sliding window 수 + 유효 segment/subject 수.
 
-    유효 window 조건: win_start + window_sec + horizon_sec <= seg_dur
-        → n = floor((seg_dur - window_sec - horizon_sec) / stride_sec) + 1
+    Returns
+    -------
+    n_windows : 총 window 수
+    n_eff_segments : window 가 최소 1개 잡히는 segment 수
+    n_eff_subjects : window 가 최소 1개 잡히는 subject 수
     """
-    total = 0
     needed = window_sec + horizon_sec
-    for dur in seg_durations_sec:
+    n_windows = 0
+    n_eff_segments = 0
+    eff_subjects: set[str] = set()
+    for sid, dur in seg_records:
         if dur < needed:
             continue
         n = int((dur - needed) // stride_sec) + 1
-        total += max(n, 0)
-    return total
+        if n <= 0:
+            continue
+        n_windows += n
+        n_eff_segments += 1
+        eff_subjects.add(sid)
+    return n_windows, n_eff_segments, len(eff_subjects)
+
+
+def filter_records_universal(
+    seg_records: list[tuple[str, float]],
+    min_dur_sec: float,
+) -> tuple[list[tuple[str, float]], int]:
+    """universal cohort: 모든 segment 가 min_dur_sec 이상.
+
+    Returns (filtered_records, n_unique_subjects)
+    """
+    filtered = [(s, d) for s, d in seg_records if d >= min_dur_sec]
+    return filtered, len({s for s, _ in filtered})
 
 
 # ── 출력 ─────────────────────────────────────────────────────────
@@ -318,9 +340,10 @@ def print_task_report(
     windows_sec: list[float],
     horizons_min: list[float],
     stride_sec: float,
+    unified_cohort: bool = False,
 ) -> None:
     spec = TASK_SPECS[task_id]
-    bar = "─" * 92
+    bar = "─" * 100
     print(f"\n{bar}")
     print(f"  Task #{task_id}: {spec['name']}")
     print(f"{bar}")
@@ -332,45 +355,89 @@ def print_task_report(
     print(f"  Required input signals : {req_str}")
     print(f"  Label source           : {spec['label_note']}")
     print()
-    print(f"  Subjects (all signals present) : {cohort['n_subjects']:>10,}")
-    print(f"  Aligned segments               : {cohort['n_segments']:>10,}")
-    print(f"  Total duration                 : {cohort['total_hours']:>10,.1f} h"
+    print(f"  Subjects (signal availability only) : {cohort['n_subjects']:>10,}")
+    print(f"  Aligned segments                    : {cohort['n_segments']:>10,}")
+    print(f"  Total duration                      : {cohort['total_hours']:>10,.1f} h"
           f"  ({cohort['total_hours'] / 24:.1f} d)")
 
     if cohort["n_segments"] == 0:
         print("  ⚠ No aligned segments — required modality 가 한 case 도 없음.")
         return
 
+    seg_records = cohort["seg_records"]
+
     # window × horizon grid
     if task_id == 9:
         # AKI: horizon 없음, window/stride 만
         win = spec.get("default_window_sec", 600.0)
         strd = spec.get("default_stride_sec", 300.0)
-        n_win = count_sliding_windows(cohort["seg_durations_sec"], win, 0.0, strd)
+        n_win, n_seg, n_subj = count_windows_with_subjects(
+            seg_records, win, 0.0, strd,
+        )
         print()
-        print(f"  AKI sliding windows (win={int(win)}s, stride={int(strd)}s) :"
-              f" {n_win:>10,}")
+        print(f"  AKI sliding windows (win={int(win)}s, stride={int(strd)}s)")
+        print(f"    windows  : {n_win:>10,}")
+        print(f"    segments : {n_seg:>10,}")
+        print(f"    subjects : {n_subj:>10,}")
         print("    (라벨 KDIGO 는 patient-level → 각 환자당 1개 binary, "
               "window 는 representation aggregation 용)")
         return
 
+    # Universal cohort: 모든 config 가 동일 cohort 사용 (가장 긴 win+horizon 기준)
+    if unified_cohort:
+        max_needed = max(windows_sec) + max(horizons_min) * 60.0
+        filtered_records, n_filt_subj = filter_records_universal(
+            seg_records, max_needed,
+        )
+        n_filt_seg = len(filtered_records)
+        print()
+        print(f"  [UNIFIED COHORT] min duration ≥ {int(max_needed)} s "
+              f"(max win + max horizon = {int(max(windows_sec))}s "
+              f"+ {int(max(horizons_min))}min)")
+        print(f"    fixed subjects : {n_filt_subj:>10,}  "
+              f"({100 * n_filt_subj / max(cohort['n_subjects'], 1):.1f}%)")
+        print(f"    fixed segments : {n_filt_seg:>10,}  "
+              f"({100 * n_filt_seg / max(cohort['n_segments'], 1):.1f}%)")
+        use_records = filtered_records
+    else:
+        use_records = seg_records
+
     print()
-    print("  Sliding-window 샘플 수 (label 미포함, input 가용성만 기준)")
-    print(f"  stride = {int(stride_sec)} s")
+    print(f"  Sliding-window grid  (stride = {int(stride_sec)} s)")
+    print("  cell = windows / segments / subjects")
     print()
-    header = "    window\\horizon  |"
+    col_w = 24
+    header = "    win\\horizon |"
     for h in horizons_min:
-        header += f"  {int(h):>3} min      "
+        header += f" {int(h):>3} min".ljust(col_w) + "|"
     print(header)
     print("    " + "-" * (len(header) - 4))
     for w in windows_sec:
-        row = f"    {int(w):>4} s          |"
+        row = f"    {int(w):>4} s      |"
         for h in horizons_min:
-            n = count_sliding_windows(
-                cohort["seg_durations_sec"], w, h * 60.0, stride_sec,
+            n_win, n_seg, n_subj = count_windows_with_subjects(
+                use_records, w, h * 60.0, stride_sec,
             )
-            row += f"  {n:>10,}  "
+            cell = f" {n_win:,}/{n_seg:,}/{n_subj:,}"
+            row += cell.ljust(col_w) + "|"
         print(row)
+
+    if not unified_cohort:
+        # 경고: per-config cohort 차이
+        max_subj_cell = 0
+        min_subj_cell = 10**9
+        for w in windows_sec:
+            for h in horizons_min:
+                _, _, n_subj = count_windows_with_subjects(
+                    seg_records, w, h * 60.0, stride_sec,
+                )
+                max_subj_cell = max(max_subj_cell, n_subj)
+                min_subj_cell = min(min_subj_cell, n_subj)
+        if max_subj_cell - min_subj_cell > 0:
+            print()
+            print(f"  ⚠ config 간 subject 수 편차: {min_subj_cell:,} ~ {max_subj_cell:,} "
+                  f"(차이 {max_subj_cell - min_subj_cell:,})")
+            print(f"     → 동등 비교 원하면 --unified-cohort 옵션 권장")
 
 
 # ── 메인 ────────────────────────────────────────────────────────
@@ -395,6 +462,10 @@ def main() -> int:
                     help="sliding stride (초). 기본 30s (prepare_data.py 와 동일)")
     ap.add_argument("--workers", type=int, default=16,
                     help="병렬 scan thread 수 (default 16). 스토리지가 빠르면 8, 느리면 32~64")
+    ap.add_argument("--unified-cohort", action="store_true",
+                    help="모든 (window, horizon) config 가 동일 cohort 사용 — "
+                         "가장 긴 (max_win + max_horizon) 충족 segment 만 통과. "
+                         "config 간 동등 비교 (paper-fair)")
     args = ap.parse_args()
 
     root = Path(args.data_dir)
@@ -433,6 +504,7 @@ def main() -> int:
         cohort = aggregate_task_cohort(subjects, task_id, overhead, dtype_bytes)
         print_task_report(
             task_id, cohort,
+            unified_cohort=args.unified_cohort,
             windows_sec=args.windows,
             horizons_min=args.horizons,
             stride_sec=args.stride,
