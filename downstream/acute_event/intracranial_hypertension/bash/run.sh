@@ -36,7 +36,7 @@ echo "============================================================"
 
 for WIN in "${WINDOW_SECS[@]}"; do
     for HORIZON in "${HORIZON_MINS[@]}"; do
-        DATA_PATH="${DATA_DIR}/ich_icp_w${WIN}s_h${HORIZON}min.pt"
+        DATA_PATH="${DATA_DIR}/intracranial_hypertension_icp_w${WIN}s_h${HORIZON}min.pt"
 
         if [ ! -f "$DATA_PATH" ]; then
             echo "[SKIP] Not found: $DATA_PATH"

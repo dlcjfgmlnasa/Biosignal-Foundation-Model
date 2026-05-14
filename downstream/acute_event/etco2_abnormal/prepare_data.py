@@ -384,7 +384,7 @@ def save_dataset(
     mode_str = "_".join(input_signals)
     horizon_min = int(horizon_sec / 60)
     win_int = int(window_sec)
-    filename = f"task_etco2abn_{mode_str}_w{win_int}s_h{horizon_min}min.pt"
+    filename = f"etco2_{mode_str}_w{win_int}s_h{horizon_min}min.pt"
     save_path = out_path / filename
     torch.save(save_dict, save_path)
 

@@ -13,7 +13,7 @@ MIMIC-III ICP 기반 두개내 고혈압 탐지 — Foundation model representat
 사용법:
     python -m downstream.acute_event.intracranial_hypertension.run \
         --checkpoint best.pt \
-        --data-path datasets/processed/ich/ich_icp_w60s_h5min.pt \
+        --data-path datasets/processed/ich/intracranial_hypertension_icp_w60s_h5min.pt \
         --mode linear_probe --epochs 30
 """
 

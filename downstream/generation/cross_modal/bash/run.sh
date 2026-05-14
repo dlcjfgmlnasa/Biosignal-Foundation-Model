@@ -10,12 +10,12 @@ DEVICE="${DEVICE:-cuda}"
 OUT_DIR="${OUT_DIR:-outputs/downstream/any_to_any}"
 
 # Data files (output of prepare_data.sh)
-CARDIO_DATA="${CARDIO_DATA:-$OUT_DIR/task8_any_to_any_local_ecg_abp_ppg_w30s.pt}"
-RESP_DATA="${RESP_DATA:-$OUT_DIR/task8_any_to_any_vitaldb_co2_awp_w30s.pt}"
+CARDIO_DATA="${CARDIO_DATA:-$OUT_DIR/cross_modal_local_ecg_abp_ppg_w30s.pt}"
+RESP_DATA="${RESP_DATA:-$OUT_DIR/cross_modal_vitaldb_co2_awp_w30s.pt}"
 
 # Fallback: if local cardio data doesn't exist, try vitaldb version
 if [ ! -f "$CARDIO_DATA" ]; then
-    CARDIO_DATA="$OUT_DIR/task8_any_to_any_vitaldb_ecg_abp_ppg_cvp_w30s.pt"
+    CARDIO_DATA="$OUT_DIR/cross_modal_vitaldb_ecg_abp_ppg_cvp_w30s.pt"
 fi
 
 # LoRA config

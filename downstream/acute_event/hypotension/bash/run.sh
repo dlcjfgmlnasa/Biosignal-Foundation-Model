@@ -51,7 +51,7 @@ for SIGNALS in "${SIGNAL_COMBOS[@]}"; do
     for W in "${WINDOWS[@]}"; do
         for H in "${HORIZONS[@]}"; do
             # .pt 파일 경로
-            PT_FILE="${DATA_DIR}/task1_hypotension_${SIGNALS}_w${W}s_h${H}min.pt"
+            PT_FILE="${DATA_DIR}/hypotension_${SIGNALS}_w${W}s_h${H}min.pt"
 
             if [ ! -f "$PT_FILE" ]; then
                 echo "  SKIP: $PT_FILE not found"

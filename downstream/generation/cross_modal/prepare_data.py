@@ -504,7 +504,7 @@ def save_dataset(
 
     types_str = "_".join(signal_types)
     win_str = int(window_sec)
-    filename = f"task8_any_to_any_{source}_{types_str}_w{win_str}s.pt"
+    filename = f"cross_modal_{source}_{types_str}_w{win_str}s.pt"
     save_path = out_path / filename
     torch.save(save_dict, save_path)
 

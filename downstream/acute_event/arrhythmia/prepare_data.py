@@ -361,7 +361,7 @@ def save_dataset(
 
     mode_str = "_".join(input_signals)
     fold_suffix = f"_fold{fold_idx}" if fold_idx is not None else ""
-    filename = f"arrhythmia_mimic3extppg_5class_{mode_str}{fold_suffix}.pt"
+    filename = f"arrhythmia_{mode_str}{fold_suffix}.pt"
     save_path = out_path / filename
     torch.save(save_dict, save_path)
     size_mb = save_path.stat().st_size / (1024 * 1024)
