@@ -244,6 +244,7 @@ def extract_forecast_samples(
     sustained_sec: float = 60.0,
     valid_ratio_threshold: float = DEFAULT_VALID_RATIO_THRESHOLD,
     gap_stats: GapStats | None = None,
+    sample_dtype: str = "float16",  # OOM 회피
 ) -> list[ForecastSample]:
     """SpO2 trend + waveform window 정렬해서 (input, future_label) 쌍 추출.
 
@@ -319,8 +320,10 @@ def extract_forecast_samples(
             dev = np.abs(future_etco2 - mid).max()
             most_abn = future_etco2[np.argmax(np.abs(future_etco2 - mid))]
 
-            # Step 2: gap mask 적용
-            filled_dict, gap_mask_dict = apply_gap_mask_multichannel(input_dict)
+            # Step 2: gap mask + 즉시 float16 캐스팅
+            filled_dict, gap_mask_dict = apply_gap_mask_multichannel(
+                input_dict, output_dtype=sample_dtype,
+            )
             if gap_stats is not None:
                 n_total_s = sum(arr.size for arr in filled_dict.values())
                 n_gap_s = sum(int(m.sum()) for m in gap_mask_dict.values())

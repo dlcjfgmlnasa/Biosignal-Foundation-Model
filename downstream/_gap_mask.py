@@ -45,26 +45,36 @@ def compute_valid_ratio(arrs: Sequence[np.ndarray]) -> float:
     return float(np.mean(~nan_any))
 
 
-def apply_gap_mask(arr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def apply_gap_mask(
+    arr: np.ndarray,
+    output_dtype: np.dtype | str | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
     """NaN 위치를 0 으로 채우고 boolean gap mask 반환.
 
     Args:
         arr: 1-D 또는 N-D array
+        output_dtype: filled array 의 dtype.
+            None 이면 원본 dtype 유지. float16 등으로 지정 시 즉시 캐스팅 →
+            메모리 50% 절감 (sample list 누적 OOM 회피).
 
     Returns:
         (filled, gap_mask):
-            filled — NaN 위치가 0 으로 교체된 array (원본 dtype 유지)
+            filled — NaN 위치가 0 으로 교체된 array (지정 dtype)
             gap_mask — bool array, True 면 원본이 NaN 이었음
     """
     gap_mask = np.isnan(arr)
-    filled = np.where(gap_mask, 0.0, arr).astype(arr.dtype, copy=False)
+    target_dtype = arr.dtype if output_dtype is None else np.dtype(output_dtype)
+    filled = np.where(gap_mask, 0.0, arr).astype(target_dtype, copy=False)
     return filled, gap_mask
 
 
 def apply_gap_mask_multichannel(
     signals: dict[str, np.ndarray],
+    output_dtype: np.dtype | str | None = None,
 ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
     """Multi-channel dict 단위로 gap mask 적용.
+
+    output_dtype 지정 시 모든 채널 즉시 캐스팅 (OOM 회피용).
 
     Returns:
         (filled_signals, gap_masks) — 같은 key set 의 dict 쌍.
@@ -72,7 +82,7 @@ def apply_gap_mask_multichannel(
     filled: dict[str, np.ndarray] = {}
     masks: dict[str, np.ndarray] = {}
     for k, arr in signals.items():
-        f, m = apply_gap_mask(arr)
+        f, m = apply_gap_mask(arr, output_dtype=output_dtype)
         filled[k] = f
         masks[k] = m
     return filled, masks

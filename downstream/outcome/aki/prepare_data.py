@@ -336,6 +336,7 @@ def extract_windows(
     sr: float = TARGET_SR,
     valid_ratio_threshold: float = DEFAULT_VALID_RATIO_THRESHOLD,
     gap_stats: GapStats | None = None,
+    sample_dtype: str = "float16",  # OOM 회피
 ) -> list[tuple[float, dict[str, np.ndarray], dict[str, np.ndarray]]]:
     """다채널 sliding window 추출 + gap drop+mask 정책.
 
@@ -368,8 +369,8 @@ def extract_windows(
             start += stride_samples
             continue
 
-        # Step 2: gap mask 적용 (NaN → 0 fill + bool mask)
-        filled, gap_mask = apply_gap_mask_multichannel(win)
+        # Step 2: gap mask + 즉시 float16 캐스팅 (메모리 50% 절감)
+        filled, gap_mask = apply_gap_mask_multichannel(win, output_dtype=sample_dtype)
         if gap_stats is not None:
             n_total_s = sum(arr.size for arr in filled.values())
             n_gap_s = sum(int(m.sum()) for m in gap_mask.values())

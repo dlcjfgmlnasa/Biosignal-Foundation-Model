@@ -222,6 +222,7 @@ def extract_forecast_samples(
     sustained_sec: float = 60.0,
     valid_ratio_threshold: float = DEFAULT_VALID_RATIO_THRESHOLD,
     gap_stats: GapStats | None = None,
+    sample_dtype: str = "float16",  # OOM 회피: sample 누적 시 즉시 float16 캐스팅
 ) -> list[ForecastSample]:
     """시간 정렬된 다채널 데이터에서 (input, future_label) 쌍을 추출한다.
 
@@ -317,8 +318,10 @@ def extract_forecast_samples(
             # label_value: 미래 MAP의 최솟값 (참고용)
             min_future_map = min(future_maps)
 
-            # ── Step 2: gap mask 적용 (NaN → 0 fill + bool mask) ──
-            filled_dict, gap_mask_dict = apply_gap_mask_multichannel(input_dict)
+            # ── Step 2: gap mask 적용 + 즉시 float16 캐스팅 (메모리 50% 절감) ──
+            filled_dict, gap_mask_dict = apply_gap_mask_multichannel(
+                input_dict, output_dtype=sample_dtype,
+            )
             if gap_stats is not None:
                 n_total_s = sum(arr.size for arr in filled_dict.values())
                 n_gap_s = sum(int(m.sum()) for m in gap_mask_dict.values())
