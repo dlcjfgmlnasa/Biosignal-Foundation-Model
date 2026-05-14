@@ -34,17 +34,36 @@ def main() -> None:
         default="downstream/outcome/sepsis/RECORDS-to-download",
     )
     parser.add_argument("--pre-hours", type=float, default=24.0)
-    parser.add_argument("--post-hours", type=float, default=6.0)
+    parser.add_argument("--post-hours", type=float, default=0.0)
+    parser.add_argument(
+        "--horizons", type=float, nargs="+", default=[4, 6, 12, 24],
+        help="Sepsis multi-horizon (paper 1 표준 4/6/12/24h)",
+    )
+    parser.add_argument(
+        "--max-sepsis", type=int, default=None,
+    )
+    parser.add_argument(
+        "--max-nonsepsis", type=int, default=None,
+    )
+    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
     print("Loading waveform index...")
     wf_index = load_waveform_index(args.records_file)
     print(f"  {len(wf_index)} subjects with waveforms")
 
-    print("Loading cohort...")
-    sepsis_pos, sepsis_neg = load_cohort(args.cohort_csv, wf_index)
+    print(f"Loading cohort (seed={args.seed})...")
+    sepsis_pos, sepsis_neg = load_cohort(args.cohort_csv, wf_index, seed=args.seed)
     print(f"  Sepsis+ with waveform: {len(sepsis_pos)}")
     print(f"  Sepsis- with waveform: {len(sepsis_neg)}")
+
+    if args.max_sepsis is not None:
+        sepsis_pos = sepsis_pos[: args.max_sepsis]
+    if args.max_nonsepsis is not None:
+        sepsis_neg = sepsis_neg[: args.max_nonsepsis]
+
+    horizons = sorted(set(args.horizons))
+    print(f"Horizons: {horizons}")
 
     selected_records: set[str] = set()
     n_patients_with_records = 0
@@ -55,6 +74,7 @@ def main() -> None:
             patient, wf_index.get(sid, []),
             pre_hours=args.pre_hours,
             post_hours=args.post_hours,
+            horizons=horizons,
         )
         if recs:
             n_patients_with_records += 1
