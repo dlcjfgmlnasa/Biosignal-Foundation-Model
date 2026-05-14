@@ -32,6 +32,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import os
 import re
 import sys
@@ -55,22 +56,26 @@ TASK_SPECS: dict[int, dict] = {
         "name": "Intraoperative Hypotension",
         "required": [("abp", None), ("ecg", None), ("ppg", None)],
         "label_note": "MAP derived from ABP (already in input)",
+        "label_source": "input",  # 추가 체크 불필요
         "horizon_unit": "min",
         "default_horizons_min": (5, 10, 15),
     },
     5: {
         "name": "Intraop EtCO₂ Abnormality",
-        # 2026-05-14 v2: AWP only (RESP/Flow 제거 — VitalDB 0건 결과 반영)
         "required": [("ecg", None), ("ppg", None), ("awp", None)],
         "label_note": "EtCO₂ trend from raw .vital required (--raw-dir)",
+        "label_source": "raw_vital",
+        "label_tracks": ["Solar8000/ETCO2", "Intellivue/AWAY_CO2_ET", "Primus/ETCO2"],
         "horizon_unit": "min",
         "default_horizons_min": (5, 10, 15),
     },
     6: {
         "name": "Intraop Hypoxemia (forecasting)",
-        # 2026-05-14 v2: AWP only (RESP/Flow 제거)
         "required": [("ecg", None), ("ppg", None), ("co2", None), ("awp", None)],
         "label_note": "SpO₂ trend from raw .vital required (--raw-dir)",
+        "label_source": "raw_vital",
+        "label_tracks": ["Solar8000/PLETH_SPO2", "Intellivue/PLETH_SAT_O2",
+                         "Solar8000/PLETH_SAT_O2"],
         "horizon_unit": "min",
         "default_horizons_min": (5, 10, 15),
     },
@@ -78,8 +83,9 @@ TASK_SPECS: dict[int, dict] = {
         "name": "Postop AKI (KDIGO)",
         "required": [("abp", None), ("ecg", None), ("ppg", None)],
         "label_note": "preop_cr + postop Cr from clinical_data.csv + lab_data.csv",
-        "horizon_unit": None,  # AKI 는 horizon 없음 (whole intraop)
-        "default_horizons_min": (0,),  # placeholder
+        "label_source": "clinical_csv",
+        "horizon_unit": None,
+        "default_horizons_min": (0,),
         "default_window_sec": 600.0,
         "default_stride_sec": 300.0,
     },
@@ -222,6 +228,185 @@ def scan_subjects(
     return subjects, n_files_total, n_bad_total
 
 
+# ── Label 가용성 체크 ────────────────────────────────────────────
+
+
+def build_vital_path_map(raw_dir: Path, workers: int = 16) -> dict[int, Path]:
+    """raw .vital 디렉토리를 한 번 스캔 → {caseid_int: path}.
+
+    subject 별 glob 반복 회피. nested 디렉토리도 처리.
+    """
+    print(f"  Indexing raw .vital files in {raw_dir} ...", flush=True)
+    out: dict[int, Path] = {}
+
+    def _walk_dir(d: Path) -> list[tuple[int, Path]]:
+        found = []
+        try:
+            with os.scandir(d) as it:
+                for entry in it:
+                    if entry.is_dir():
+                        found.extend(_walk_dir(Path(entry.path)))
+                    elif entry.name.endswith(".vital"):
+                        digits = "".join(c for c in Path(entry.name).stem if c.isdigit())
+                        if digits:
+                            found.append((int(digits), Path(entry.path)))
+        except OSError:
+            pass
+        return found
+
+    # top-level scandir 만 병렬화 (대부분 flat 구조)
+    try:
+        top_entries = list(os.scandir(raw_dir))
+    except OSError:
+        return out
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = []
+        # top-level files first
+        for e in top_entries:
+            if not e.is_dir() and e.name.endswith(".vital"):
+                digits = "".join(c for c in Path(e.name).stem if c.isdigit())
+                if digits:
+                    out[int(digits)] = Path(e.path)
+        # nested dir walks
+        for e in top_entries:
+            if e.is_dir():
+                futures.append(ex.submit(_walk_dir, Path(e.path)))
+        for fut in tqdm(as_completed(futures), total=len(futures),
+                        desc="  Walking nested dirs", unit="dir",
+                        dynamic_ncols=True):
+            for cid, p in fut.result():
+                out.setdefault(cid, p)
+
+    print(f"  → {len(out):,} .vital file(s) indexed", flush=True)
+    return out
+
+
+def _subject_to_caseid(subject_id: str) -> int | None:
+    digits = "".join(c for c in subject_id if c.isdigit())
+    return int(digits) if digits else None
+
+
+def probe_vital_track(vital_path: Path, candidate_tracks: list[str]) -> bool:
+    """raw .vital 파일에서 후보 track 중 하나라도 존재하는지 (header-level 확인)."""
+    try:
+        import vitaldb  # type: ignore
+    except ImportError:
+        return False
+    try:
+        vf = vitaldb.VitalFile(str(vital_path))
+        avail = set(vf.get_track_names())
+    except Exception:
+        return False
+    return any(t in avail for t in candidate_tracks)
+
+
+def check_raw_vital_labels(
+    subject_ids: list[str],
+    vital_paths: dict[int, Path],
+    candidate_tracks: list[str],
+    probe_tracks: bool,
+    workers: int = 16,
+) -> tuple[set[str], dict[str, str]]:
+    """raw .vital 가용성 체크.
+
+    probe_tracks=False : 파일 존재만 확인 (빠름, label 존재 가정)
+    probe_tracks=True  : track 실제 존재 확인 (느림, 정확)
+
+    Returns: (valid_subject_ids, reason_per_excluded_subject)
+    """
+    valid: set[str] = set()
+    reasons: dict[str, str] = {}
+
+    # 1단계: .vital 파일 매칭
+    sid_to_path: dict[str, Path] = {}
+    for sid in subject_ids:
+        cid = _subject_to_caseid(sid)
+        if cid is None or cid not in vital_paths:
+            reasons[sid] = "no .vital file"
+            continue
+        sid_to_path[sid] = vital_paths[cid]
+
+    if not probe_tracks:
+        valid.update(sid_to_path.keys())
+        return valid, reasons
+
+    # 2단계: track 실제 존재 확인 (병렬)
+    def _check(sid: str, path: Path) -> tuple[str, bool]:
+        return sid, probe_vital_track(path, candidate_tracks)
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {ex.submit(_check, sid, p): sid for sid, p in sid_to_path.items()}
+        pbar = tqdm(as_completed(futures), total=len(futures),
+                    desc="  Probing tracks", unit="subj", dynamic_ncols=True)
+        for fut in pbar:
+            sid, ok = fut.result()
+            if ok:
+                valid.add(sid)
+            else:
+                reasons[sid] = "track absent"
+    return valid, reasons
+
+
+def check_aki_labels(
+    clinical_csv: Path,
+    lab_csv: Path,
+    max_postop_days: float = 7.0,
+) -> set[str]:
+    """clinical + lab CSV → valid AKI label 가진 subject_id (VDB_NNNN) 집합.
+
+    AKI prepare_data.py 의 logic 차용:
+      clinical: caseid, preop_cr, opend
+      lab: caseid, dt (case-file-relative), name=='cr', result
+      postop 구간: opend < dt < opend + 7d
+    """
+    case_meta: dict[int, tuple[float, float]] = {}
+    with open(clinical_csv, encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        for col in ("caseid", "preop_cr", "opend"):
+            if col not in reader.fieldnames:
+                print(f"  ERROR: clinical CSV must have {col}", file=sys.stderr)
+                return set()
+        for row in reader:
+            try:
+                cid = int(row["caseid"])
+                pre = float(row["preop_cr"])
+                opend = float(row["opend"])
+            except (ValueError, TypeError):
+                continue
+            if pre <= 0 or pre > 20 or opend <= 0:
+                continue
+            case_meta[cid] = (pre, opend)
+    print(f"    clinical: {len(case_meta):,} case(s) with valid preop_cr+opend")
+
+    valid_caseids: set[int] = set()
+    max_postop_sec = max_postop_days * 86400.0
+    with open(lab_csv, encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        for col in ("caseid", "dt", "name", "result"):
+            if col not in reader.fieldnames:
+                print(f"  ERROR: lab CSV must have {col}", file=sys.stderr)
+                return set()
+        for row in reader:
+            if str(row["name"]).strip().lower() != "cr":
+                continue
+            try:
+                cid = int(row["caseid"])
+                dt_sec = float(row["dt"])
+                cr = float(row["result"])
+            except (ValueError, TypeError):
+                continue
+            if cid not in case_meta:
+                continue
+            if cr <= 0 or cr > 20:
+                continue
+            _, opend = case_meta[cid]
+            if opend < dt_sec <= opend + max_postop_sec:
+                valid_caseids.add(cid)
+    print(f"    lab     : {len(valid_caseids):,} case(s) with postop Cr (within {max_postop_days}d)")
+    return {f"VDB_{c:04d}" for c in valid_caseids}
+
+
 # ── Task 별 cohort 추정 ──────────────────────────────────────────
 
 def check_segment_satisfies(
@@ -244,27 +429,28 @@ def aggregate_task_cohort(
     task_id: int,
     overhead: int,
     dtype_bytes: int,
+    label_valid_subjects: set[str] | None = None,
 ) -> dict:
     """task 의 required signal 을 만족하는 cohort 통계 집계.
 
-    Returns
-    -------
-    dict with:
-        n_subjects, n_segments, total_hours
-        seg_records: list of (subject_id, duration_sec)
-            → per-cell effective subject count + universal-cohort filter 에 사용
+    label_valid_subjects: 제공 시 label source 가 valid 한 subject 만 집계.
     """
     spec = TASK_SPECS[task_id]
     required = spec["required"]
     req_types = [t for t, _ in required]
 
-    n_subjects = 0
-    n_segments = 0
+    n_subjects_signals = 0
+    n_subjects_labeled = 0
+    n_segments_signals = 0
+    n_segments_labeled = 0
     total_samples = 0
-    seg_records: list[tuple[str, float]] = []  # (subject_id, duration_sec)
+    seg_records: list[tuple[str, float]] = []  # label-valid only (or signal-only if no label check)
+    seg_records_signal_only: list[tuple[str, float]] = []  # signal-only (전체)
 
     for sid, seg_map in subjects.items():
-        subj_has_any = False
+        subj_has_signal = False
+        subj_has_labeled = False
+        labeled = label_valid_subjects is None or sid in label_valid_subjects
         for _, seg_signals in seg_map.items():
             if not check_segment_satisfies(seg_signals, required):
                 continue
@@ -275,18 +461,28 @@ def aggregate_task_cohort(
             if min_samples <= 0:
                 continue
             seg_dur = min_samples / TARGET_SR
-            seg_records.append((sid, seg_dur))
-            total_samples += min_samples
-            n_segments += 1
-            subj_has_any = True
-        if subj_has_any:
-            n_subjects += 1
+            seg_records_signal_only.append((sid, seg_dur))
+            n_segments_signals += 1
+            subj_has_signal = True
+            if labeled:
+                seg_records.append((sid, seg_dur))
+                total_samples += min_samples
+                n_segments_labeled += 1
+                subj_has_labeled = True
+        if subj_has_signal:
+            n_subjects_signals += 1
+        if subj_has_labeled:
+            n_subjects_labeled += 1
 
     return {
-        "n_subjects": n_subjects,
-        "n_segments": n_segments,
+        "n_subjects": n_subjects_signals,
+        "n_segments": n_segments_signals,
+        "n_subjects_labeled": n_subjects_labeled,
+        "n_segments_labeled": n_segments_labeled,
+        "label_check_applied": label_valid_subjects is not None,
         "total_hours": total_samples / TARGET_SR / 3600.0,
-        "seg_records": seg_records,
+        "seg_records": seg_records,  # label-valid (label check 미적용 시 == signal-only)
+        "seg_records_signal_only": seg_records_signal_only,
     }
 
 
@@ -355,13 +551,26 @@ def print_task_report(
     print(f"  Required input signals : {req_str}")
     print(f"  Label source           : {spec['label_note']}")
     print()
-    print(f"  Subjects (signal availability only) : {cohort['n_subjects']:>10,}")
-    print(f"  Aligned segments                    : {cohort['n_segments']:>10,}")
-    print(f"  Total duration                      : {cohort['total_hours']:>10,.1f} h"
+    print(f"  Subjects (signal availability only)   : {cohort['n_subjects']:>10,}")
+    print(f"  Aligned segments (signal only)        : {cohort['n_segments']:>10,}")
+    if cohort["label_check_applied"]:
+        keep_pct_subj = (
+            100 * cohort["n_subjects_labeled"] / max(cohort["n_subjects"], 1)
+        )
+        keep_pct_seg = (
+            100 * cohort["n_segments_labeled"] / max(cohort["n_segments"], 1)
+        )
+        print(f"  Subjects (signal + label valid)       : "
+              f"{cohort['n_subjects_labeled']:>10,}  ({keep_pct_subj:.1f}% of signal-only)")
+        print(f"  Aligned segments (signal + label)     : "
+              f"{cohort['n_segments_labeled']:>10,}  ({keep_pct_seg:.1f}% of signal-only)")
+    else:
+        print(f"  Label check                           :  not applied (no source provided)")
+    print(f"  Total duration (label-valid)          : {cohort['total_hours']:>10,.1f} h"
           f"  ({cohort['total_hours'] / 24:.1f} d)")
 
-    if cohort["n_segments"] == 0:
-        print("  ⚠ No aligned segments — required modality 가 한 case 도 없음.")
+    if not cohort["seg_records"]:
+        print("  ⚠ No label-valid segments — required modality 또는 label 미존재.")
         return
 
     seg_records = cohort["seg_records"]
@@ -466,6 +675,16 @@ def main() -> int:
                     help="모든 (window, horizon) config 가 동일 cohort 사용 — "
                          "가장 긴 (max_win + max_horizon) 충족 segment 만 통과. "
                          "config 간 동등 비교 (paper-fair)")
+    # Label 가용성 체크 (선택)
+    ap.add_argument("--raw-dir", default=None,
+                    help="raw .vital 디렉토리 (#5 EtCO₂, #6 Hypoxemia label 체크용)")
+    ap.add_argument("--probe-tracks", action="store_true",
+                    help="raw .vital 안에서 ETCO₂/SPO₂ track 실제 존재 여부도 확인 "
+                         "(미설정 시 파일 존재만 확인, 빠름)")
+    ap.add_argument("--clinical-csv", default=None,
+                    help="VitalDB clinical_data.csv 경로 (#9 AKI label 체크용)")
+    ap.add_argument("--lab-csv", default=None,
+                    help="VitalDB lab_data.csv 경로 (#9 AKI label 체크용)")
     args = ap.parse_args()
 
     root = Path(args.data_dir)
@@ -500,8 +719,52 @@ def main() -> int:
           f" {dtype_bytes} B/sample")
     print(f"  (file-size 기반 duration 추정 — 정확도 ±1 sample)")
 
+    # Label 가용성 사전 계산 (task 별 1회)
+    label_valid_by_task: dict[int, set[str] | None] = {}
+    vital_path_map: dict[int, Path] | None = None
+    aki_valid: set[str] | None = None
+
     for task_id in args.tasks:
-        cohort = aggregate_task_cohort(subjects, task_id, overhead, dtype_bytes)
+        src = TASK_SPECS[task_id]["label_source"]
+        if src == "input":
+            label_valid_by_task[task_id] = None  # 체크 불필요
+        elif src == "raw_vital":
+            if args.raw_dir is None:
+                label_valid_by_task[task_id] = None
+                continue
+            if vital_path_map is None:
+                vital_path_map = build_vital_path_map(
+                    Path(args.raw_dir), workers=args.workers,
+                )
+            print(f"\n  [Task #{task_id}] Label check via raw .vital "
+                  f"({'probe tracks' if args.probe_tracks else 'file exists only'})",
+                  flush=True)
+            sids = list(subjects.keys())
+            tracks = TASK_SPECS[task_id]["label_tracks"]
+            valid, _reasons = check_raw_vital_labels(
+                sids, vital_path_map, tracks,
+                probe_tracks=args.probe_tracks, workers=args.workers,
+            )
+            label_valid_by_task[task_id] = valid
+            print(f"    → {len(valid):,} / {len(sids):,} subjects pass label check")
+        elif src == "clinical_csv":
+            if args.clinical_csv is None or args.lab_csv is None:
+                label_valid_by_task[task_id] = None
+                continue
+            if aki_valid is None:
+                print(f"\n  [Task #{task_id}] Loading AKI labels from "
+                      f"{args.clinical_csv} + {args.lab_csv}", flush=True)
+                aki_valid = check_aki_labels(
+                    Path(args.clinical_csv), Path(args.lab_csv),
+                )
+                print(f"    → {len(aki_valid):,} caseids with valid AKI label")
+            label_valid_by_task[task_id] = aki_valid
+
+    for task_id in args.tasks:
+        cohort = aggregate_task_cohort(
+            subjects, task_id, overhead, dtype_bytes,
+            label_valid_subjects=label_valid_by_task[task_id],
+        )
         print_task_report(
             task_id, cohort,
             unified_cohort=args.unified_cohort,
@@ -511,11 +774,12 @@ def main() -> int:
         )
 
     print("\n  Notes:")
-    print("  • 본 추정은 input modality 가용성 기준의 상한이다.")
-    print("  • 실제 N 은 label (raw .vital trend / clinical CSV) 가용성으로 추가 감소한다.")
-    print("  • Hypotension : Invasive ABP 환자 cohort 와 거의 일치 (ABP 자체가 invasive)")
-    print("  • EtCO₂ / Hypoxemia : ventilated cohort 는 AWP+RESP/Flow 가용성으로 proxy")
-    print("  • AKI : patient-level 1 binary label — 위 window 수는 representation 용")
+    print("  • Signal-only N 은 input modality 가용성 상한.")
+    print("  • Signal+label N 은 label source 도 같이 가용한 cohort (정확).")
+    print("  • Label source 미제공 task 는 signal-only 만 계산됨 (위에 표시).")
+    print("  • Hypotension #1 : label = MAP from ABP → input 자체로 label OK.")
+    print("  • EtCO₂ #5 / Hypoxemia #6 : --raw-dir 필요. --probe-tracks 면 track 실제 확인.")
+    print("  • AKI #9 : --clinical-csv + --lab-csv 필요. patient-level 1 binary 라벨.")
     return 0
 
 
