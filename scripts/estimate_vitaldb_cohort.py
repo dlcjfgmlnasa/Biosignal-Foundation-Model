@@ -506,13 +506,17 @@ def _subject_to_caseid(subject_id: str) -> int | None:
 
 
 def probe_vital_track(vital_path: Path, candidate_tracks: list[str]) -> bool:
-    """raw .vital 파일에서 후보 track 중 하나라도 존재하는지 (header-level 확인)."""
+    """raw .vital 파일에서 후보 track 중 하나라도 존재하는지 (header-level 확인).
+
+    header_only=True 로 호출하면 vitaldb 가 track 메타데이터만 읽고 raw waveform 은
+    스킵 → 네트워크 마운트에서 파일당 IO 가 수십 배 줄어듦.
+    """
     try:
         import vitaldb  # type: ignore
     except ImportError:
         return False
     try:
-        vf = vitaldb.VitalFile(str(vital_path))
+        vf = vitaldb.VitalFile(str(vital_path), header_only=True)
         avail = set(vf.get_track_names())
     except Exception:
         return False
