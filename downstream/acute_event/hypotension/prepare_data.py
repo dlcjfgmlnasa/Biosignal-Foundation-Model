@@ -38,6 +38,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from downstream._kfold_utils import stratified_kfold_patient_splits, summarize_splits
 from downstream._save_utils import add_signal_dtype_arg, consume_input_signals
 from downstream._seg_intersect import load_aligned_signals_intersection
 
@@ -429,37 +430,42 @@ def print_stats(
 # ---- 메인 ----
 
 
-def _kfold_patient_splits(
-    patient_ids: list[str],
-    n_folds: int,
-    seed: int = 42,
-) -> list[tuple[set[str], set[str], set[str]]]:
-    """Patient-level K-fold CV split (clinical AI 표준).
+def _patient_level_hypo_labels(
+    cases: list[dict],
+    map_threshold: float = 65.0,
+    sustained_sec: float = 60.0,
+) -> dict[str, list[int]]:
+    """환자별 case 레벨 hypotension 라벨 (stratification 용).
 
-    각 fold i: test = fold[i], val = fold[(i+1) % n_folds], train = 나머지 (n_folds-2) folds.
-    → n_folds=5 면 60/20/20, 모든 환자가 정확히 1번씩 test 에 등장.
+    각 case 의 ABP 신호 전체를 스캔하여 ≥1분 지속 MAP<65 episode 존재 여부를 binary 로 기록.
+    동일 환자의 여러 case 들이 모두 모여 patient_to_labels[pid] = [0, 1, 0, ...] 형태로 반환.
 
-    Returns: [(train_set, val_set, test_set), ...]  길이 n_folds.
+    Note: prediction horizon 과 무관한 patient-level positivity → 모든 (w, h) combo 에서
+    동일한 fold 분할이 가능.
     """
-    rng = np.random.default_rng(seed)
-    ids = list(patient_ids)
-    rng.shuffle(ids)
+    map_win_sec = 10.0
+    map_win = int(map_win_sec * TARGET_SR)
+    min_consecutive = max(1, int(sustained_sec / map_win_sec))
 
-    # 균등 분할
-    folds: list[list[str]] = [[] for _ in range(n_folds)]
-    for i, pid in enumerate(ids):
-        folds[i % n_folds].append(pid)
-
-    splits: list[tuple[set[str], set[str], set[str]]] = []
-    for i in range(n_folds):
-        test_set = set(folds[i])
-        val_set = set(folds[(i + 1) % n_folds])
-        train_set: set[str] = set()
-        for j in range(n_folds):
-            if j != i and j != (i + 1) % n_folds:
-                train_set.update(folds[j])
-        splits.append((train_set, val_set, test_set))
-    return splits
+    patient_to_labels: dict[str, list[int]] = {}
+    for case in cases:
+        pid = case["patient_id"]
+        abp = case["signals"]["abp"]
+        # 10s MAP windows 전체
+        future_maps: list[float] = []
+        for j in range(0, len(abp) - map_win + 1, map_win):
+            w = abp[j : j + map_win]
+            if np.isnan(w).any():
+                continue
+            m = float(np.mean(w))
+            if m < 30.0 or m > 200.0:
+                continue
+            future_maps.append(m)
+        has_hypo = _has_sustained_hypotension(
+            future_maps, map_threshold, min_consecutive
+        ) if future_maps else False
+        patient_to_labels.setdefault(pid, []).append(1 if has_hypo else 0)
+    return patient_to_labels
 
 
 def prepare_hypotension_sweep(
@@ -515,13 +521,24 @@ def prepare_hypotension_sweep(
         print("ERROR: No valid cases loaded.", file=sys.stderr)
         sys.exit(1)
 
-    # ── 2. K-fold patient-level 분할 (1회) ──
+    # ── 2. Stratified K-fold patient-level 분할 (1회) ──
     if n_folds < 1:
         raise ValueError(f"n_folds must be >= 1, got {n_folds}")
     patient_ids = sorted({c["patient_id"] for c in cases})
 
+    # Patient-level hypotension label 계산 (stratification 용)
+    print(f"\n[2/3] Computing patient-level hypotension labels for stratification...")
+    patient_to_labels = _patient_level_hypo_labels(cases)
+    pos_pts = sum(
+        1 for pid in patient_ids if any(patient_to_labels.get(pid, []))
+    )
+    print(
+        f"  Patient-level positive: {pos_pts}/{len(patient_ids)} "
+        f"({100.0 * pos_pts / max(1, len(patient_ids)):.1f}%)"
+    )
+
     if n_folds == 1:
-        # 단일 split (60/20/20) backward compat
+        # 단일 split (60/20/20) backward compat — non-stratified
         rng = np.random.default_rng(seed)
         ids = list(patient_ids); rng.shuffle(ids)
         n_total = len(ids)
@@ -532,12 +549,13 @@ def prepare_hypotension_sweep(
         splits = [(set(ids[:n_train]),
                    set(ids[n_train:n_train + n_val]),
                    set(ids[n_train + n_val:]))]
-        print(f"\n[2/3] Single split (n_patients={n_total})")
+        print(f"  Single split (n_patients={n_total})")
     else:
-        splits = _kfold_patient_splits(patient_ids, n_folds, seed=seed)
-        print(f"\n[2/3] {n_folds}-fold patient-level CV (n_patients={len(patient_ids)})")
-    for fi, (tr, va, te) in enumerate(splits):
-        print(f"  Fold {fi}: train={len(tr)} val={len(va)} test={len(te)} patients")
+        splits = stratified_kfold_patient_splits(
+            patient_ids, patient_to_labels, n_folds=n_folds, seed=seed,
+        )
+        print(f"  Stratified {n_folds}-fold CV (n_patients={len(patient_ids)})")
+    print(summarize_splits(splits, patient_to_labels))
 
     # ── 3. 조합 × fold 윈도우 추출 + 저장 ──
     combos = [(w, h) for w in window_secs for h in horizon_mins]

@@ -14,14 +14,14 @@
 입력 신호: PPG(PLETH) + ECG(II) — MIMIC-III-Ext-PPG native 125Hz → 100Hz 리샘플.
 (Task #2 Arrhythmia: ECG = gold standard, PPG 보조. ABP 제거로 cohort↑)
 
-분할 (strat_fold 0-9):
-    fold 0-5 → train (60%)
-    fold 6-7 → val   (20%)
-    fold 8-9 → test  (20%)
+분할: Stratified patient-level 5-fold CV (clinical AI 표준)
+    각 fold i — train (n_folds-2 folds=60%) / val (1 fold=20%) / test (1 fold=20%)
+    환자 majority class 로 stratify, 모든 환자 정확히 1번씩 test.
+    predefined strat_fold (0-9) 는 무시 — patient_id 기반 새 KFold.
 
 사용법:
     python -m downstream.acute_event.arrhythmia.prepare_data \
-        --data-dir "C:/Users/SNUH_VitalLab_LEGION/Downloads/physionet.org/files/mimic-iii-ext-ppg/1.1.0" \
+        --data-dir "C:/Users/SNUH_VitalLab_LEGION/Desktop/MIMIC-3/raw/mimic3-ext-ppg-arrhythmia" \
         --metadata "C:/.../metadata.csv" \
         --subset-csv downstream/acute_event/arrhythmia/arrhythmia_subset_labels.csv \
         --out-dir outputs/downstream/arrhythmia \
@@ -40,6 +40,7 @@ import numpy as np
 import torch
 
 from data.parser._common import resample_to_target
+from downstream._kfold_utils import stratified_kfold_patient_splits, summarize_splits
 
 
 TARGET_SR: float = 100.0
@@ -282,18 +283,21 @@ def build_samples(
 # ---- 분할 & 저장 ----
 
 
-def split_by_fold(
+def split_by_patient_fold(
     samples: list[ArrhythmiaSample],
+    train_patients: set[str],
+    val_patients: set[str],
+    test_patients: set[str],
 ) -> tuple[list, list, list]:
-    """strat_fold 기반 분할: 0-5 train, 6-7 val, 8-9 test."""
+    """Patient ID 기반 train/val/test 분할 (stratified 5-fold CV 와 함께 사용)."""
     train, val, test = [], [], []
     for s in samples:
-        if s.strat_fold <= 5:
-            train.append(s)
-        elif s.strat_fold <= 7:
-            val.append(s)
-        else:
+        if s.patient in test_patients:
             test.append(s)
+        elif s.patient in val_patients:
+            val.append(s)
+        elif s.patient in train_patients:
+            train.append(s)
     return train, val, test
 
 
@@ -303,8 +307,13 @@ def save_dataset(
     test: list[ArrhythmiaSample],
     input_signals: tuple[str, ...],
     out_dir: str,
+    fold_idx: int | None = None,
+    n_folds: int = 1,
 ) -> Path:
-    """저장 포맷: spec대로 list[dict] (Sample마다 dict 하나)."""
+    """저장 포맷: spec대로 list[dict] (Sample마다 dict 하나).
+
+    fold_idx 주어지면 파일명에 _fold{i} 접미사 + metadata 기록.
+    """
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
@@ -321,6 +330,13 @@ def save_dataset(
             for s in split
         ]
 
+    split_desc = (
+        f"stratified patient-level 5-fold CV: fold {fold_idx} test, "
+        f"{(fold_idx + 1) % 5} val, rest train"
+        if fold_idx is not None
+        else "single 60/20/20 patient-level split"
+    )
+
     save_dict = {
         "train": _to_list(train),
         "val": _to_list(val),
@@ -334,14 +350,18 @@ def save_dataset(
             "signal_type_map": SIGNAL_TYPE_MAP,
             "sampling_rate": TARGET_SR,
             "segment_sec": SEGMENT_SEC,
-            "split": "fold 0-5 train, 6-7 val, 8-9 test",
+            "split": split_desc,
             "n_train": len(train),
             "n_val": len(val),
             "n_test": len(test),
+            "fold_idx": fold_idx,
+            "n_folds": n_folds,
         },
     }
 
-    filename = "arrhythmia_mimic3extppg_5class.pt"
+    mode_str = "_".join(input_signals)
+    fold_suffix = f"_fold{fold_idx}" if fold_idx is not None else ""
+    filename = f"arrhythmia_mimic3extppg_5class_{mode_str}{fold_suffix}.pt"
     save_path = out_path / filename
     torch.save(save_dict, save_path)
     size_mb = save_path.stat().st_size / (1024 * 1024)
@@ -390,6 +410,11 @@ def main() -> None:
                         help="사용할 신호 타입 (Task #2: ECG, PPG)")
     parser.add_argument("--max-segments-per-class", type=int, default=None,
                         help="class당 segment 상한 (balance 강화)")
+    parser.add_argument("--n-folds", type=int, default=5,
+                        help="Stratified patient-level K-fold CV (default 5). "
+                             "Use 1 for legacy predefined strat_fold split.")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="RNG seed for fold shuffling.")
     args = parser.parse_args()
 
     input_signals = tuple(args.input_signals)
@@ -431,16 +456,37 @@ def main() -> None:
         print("ERROR: no samples loaded.", file=sys.stderr)
         sys.exit(1)
 
-    # 4. 분할 + 저장
-    print("\n[4/4] Splitting by strat_fold + saving...")
-    train, val, test = split_by_fold(samples)
-    print_split_stats("Train (folds 0-5)", train)
-    print_split_stats("Val   (folds 6-7)", val)
-    print_split_stats("Test  (folds 8-9)", test)
+    # 4. Stratified patient-level K-fold split + per-fold save
+    print(f"\n[4/4] Stratified {args.n_folds}-fold patient-level CV + saving...")
 
-    save_path = save_dataset(train, val, test, input_signals, args.out_dir)
+    # 환자별 라벨 (multi-class label list) 수집
+    patient_to_labels: dict[str, list[int]] = defaultdict(list)
+    for s in samples:
+        patient_to_labels[s.patient].append(s.label)
+    patient_ids = sorted(patient_to_labels.keys())
+    print(f"  Total patients: {len(patient_ids)}")
+
+    splits = stratified_kfold_patient_splits(
+        patient_ids, dict(patient_to_labels),
+        n_folds=args.n_folds, seed=args.seed,
+    )
+    print(summarize_splits(splits, dict(patient_to_labels)))
+
+    saved_paths: list[Path] = []
+    for fold_idx, (tr_pids, va_pids, te_pids) in enumerate(splits):
+        print(f"\n  [Fold {fold_idx}]")
+        train, val, test = split_by_patient_fold(samples, tr_pids, va_pids, te_pids)
+        print_split_stats(f"    Train", train)
+        print_split_stats(f"    Val", val)
+        print_split_stats(f"    Test", test)
+        path = save_dataset(
+            train, val, test, input_signals, args.out_dir,
+            fold_idx=fold_idx, n_folds=args.n_folds,
+        )
+        saved_paths.append(path)
+
     print("\n" + "=" * 60)
-    print(f"  Done: {save_path}")
+    print(f"  Done: {len(saved_paths)} fold(s) saved to {args.out_dir}")
     print("=" * 60)
 
 
