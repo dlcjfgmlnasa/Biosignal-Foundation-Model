@@ -185,6 +185,7 @@ class DownstreamModelWrapper(nn.Module):
         self,
         batch: PackedBatch,
         pool: str = "mean",
+        gap_mask_patch: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Downstream task용 feature 추출.
 
@@ -195,6 +196,10 @@ class DownstreamModelWrapper(nn.Module):
         pool:
             풀링 방식. ``"mean"``이면 patch_mask 기반 mean pool,
             ``"none"``이면 (B, N, d_model) 그대로 반환.
+        gap_mask_patch:
+            ``(B, N)`` bool — True=gap (mask_token 으로 교체할 patch).
+            ``downstream._gap_mask.sample_to_patch_mask`` 로 생성.
+            None 이면 gap 처리 없음 (기존 동작).
 
         Returns
         -------
@@ -204,7 +209,9 @@ class DownstreamModelWrapper(nn.Module):
         self.model.eval()
         batch = self.batch_to_device(batch)
 
-        out = self.model(batch, task="masked")
+        out = self.model(
+            batch, task="masked", extra_content_mask=gap_mask_patch,
+        )
         encoded = out["encoded"]  # (B, N, d_model)
         patch_mask = out["patch_mask"]  # (B, N) bool — True=유효 패치
 

@@ -195,7 +195,7 @@ class BiosignalFoundationModel(nn.Module):
 
         # 5. Loc/Scale AdaLN Conditioning (환자별 절대 레벨 정보 보존)
         # (loc, scale) 2D scalar → d_cond conditioning vector → encoder 모든 layer의
-        # AdaRMSNorm modulation 입력. MLP(2 → d_cond → d_cond) — non-linearity로
+        # LSCNorm modulation 입력. MLP(2 → d_cond → d_cond) — non-linearity로
         # expressiveness 확보.
         self.cond_proj = nn.Sequential(
             nn.Linear(2, self.d_cond),
@@ -290,6 +290,7 @@ class BiosignalFoundationModel(nn.Module):
         block_size_max: int = 8,
         variate_mask_prob: float = 0.0,
         variate_drop_prob: float = 0.0,
+        extra_content_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """공통 인코딩 파이프라인: Scaler → Patchify → Project → SpatialEmbed → LocScale → Encoder.
 
@@ -390,7 +391,7 @@ class BiosignalFoundationModel(nn.Module):
         patch_loc = loc[:, patch_starts, :]  # (B, N, 1)
         patch_scale = scale[:, patch_starts, :]  # (B, N, 1)
 
-        # AdaLN: loc/scale을 cond_proj로 → encoder 모든 layer의 AdaRMSNorm modulation 입력
+        # AdaLN: loc/scale을 cond_proj로 → encoder 모든 layer의 LSCNorm modulation 입력
         loc_scale = torch.cat([patch_loc, patch_scale], dim=-1)  # (B, N, 2)
         ada_cond = self.cond_proj(loc_scale)  # (B, N, d_cond)
         ada_cond = ada_cond * valid_token  # 패딩 위치는 0으로
@@ -473,6 +474,13 @@ class BiosignalFoundationModel(nn.Module):
             bi_content_mask = (
                 pred_mask if bi_content_mask is None else (pred_mask | bi_content_mask)
             )
+        # Downstream gap masking: 데이터 prep 단계에서 NaN→0 채운 patch 위치를
+        # mask_token 으로 교체 (downstream finetune 전용 통로).
+        if extra_content_mask is not None:
+            bi_content_mask = (
+                extra_content_mask if bi_content_mask is None
+                else (extra_content_mask | bi_content_mask)
+            )
 
         if task == "both":
             result["encoded"] = self.encoder(
@@ -514,6 +522,7 @@ class BiosignalFoundationModel(nn.Module):
         block_size_max: int = 8,
         variate_mask_prob: float = 0.0,
         variate_drop_prob: float = 0.0,
+        extra_content_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         enc = self._encode(
             batch,
@@ -524,6 +533,7 @@ class BiosignalFoundationModel(nn.Module):
             block_size_max=block_size_max,
             variate_mask_prob=variate_mask_prob,
             variate_drop_prob=variate_drop_prob,
+            extra_content_mask=extra_content_mask,
         )
 
         encoded = enc["encoded"]  # bidirectional (or sole encoding for single-task)

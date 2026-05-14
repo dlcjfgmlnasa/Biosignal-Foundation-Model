@@ -78,6 +78,42 @@ def apply_gap_mask_multichannel(
     return filled, masks
 
 
+def sample_to_patch_mask(
+    sample_mask,  # torch.Tensor (B, T) bool, or (T,) for unbatched
+    patch_size: int,
+    gap_threshold: float = 0.5,
+):
+    """Sample-level gap_mask → patch-level mask.
+
+    Patch 내 gap 비율 ≥ gap_threshold 면 그 patch 는 mask 됨 (True).
+    학습 시점에서 dataloader/model 이 patch_size 알 때 호출.
+
+    Args:
+        sample_mask: (B, T) bool tensor 또는 (T,) bool. True=gap.
+        patch_size: patch 당 sample 수.
+        gap_threshold: patch 마스크 임계 (0~1). 기본 0.5 — 절반 이상 gap 이면 mask.
+
+    Returns:
+        torch.Tensor (B, n_patches) bool — patch-level mask. True=gap (mask 대상).
+        T 가 patch_size 로 안 나누어떨어지면 끝 부분 잘림.
+    """
+    import torch  # 지연 import — numpy-only 환경에서도 _gap_mask import 가능
+
+    is_1d = sample_mask.dim() == 1
+    if is_1d:
+        sample_mask = sample_mask.unsqueeze(0)
+    b, t = sample_mask.shape
+    n_patches = t // patch_size
+    if n_patches == 0:
+        return torch.zeros(b, 0, dtype=torch.bool, device=sample_mask.device)
+    truncated = sample_mask[:, : n_patches * patch_size]
+    reshaped = truncated.reshape(b, n_patches, patch_size).float()
+    patch_mask = reshaped.mean(dim=-1) >= gap_threshold
+    if is_1d:
+        patch_mask = patch_mask.squeeze(0)
+    return patch_mask
+
+
 class GapStats:
     """Window drop / gap masking 통계 누적기.
 
