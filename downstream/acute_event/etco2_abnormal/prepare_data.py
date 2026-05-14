@@ -573,10 +573,10 @@ def main() -> None:
     parser.add_argument("--data-dir", required=True, help="parsed .pt 디렉토리")
     parser.add_argument("--raw-dir", required=True, help="raw vitaldb .vital 디렉토리 (EtCO2 라벨 추출용)")
     # Task #5 EtCO2 Abnormality: CO2, ECG, ABP (PPG 제거로 cohort↑)
-    parser.add_argument("--input-signals", nargs="+", default=["co2", "ecg", "abp"],
-                        choices=["abp", "ecg", "co2"])
+    parser.add_argument("--input-signals", nargs="+", default=["ecg", "ppg", "awp"],
+                        choices=["abp", "ecg", "ppg", "co2", "awp"])
     parser.add_argument("--required-signals", nargs="+", default=None,
-                        choices=["abp", "ecg", "co2"])
+                        choices=["abp", "ecg", "ppg", "co2", "awp"])
     parser.add_argument("--max-subjects", type=int, default=None)
     parser.add_argument("--horizon-mins", nargs="+", type=float, default=[5.0])
     parser.add_argument("--window-secs", nargs="+", type=float, default=[60.0])
