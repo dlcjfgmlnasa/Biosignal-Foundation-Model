@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gc
 import json
 import sys
 from pathlib import Path
@@ -300,52 +301,61 @@ def prepare_dataset(
 
     input_signals_meta = sorted(patient_data[0]["windows"][0].keys())
 
+    PATIENTS_PER_CHUNK = 100  # patient packed 이라 case 보다 적게
+
     for fold_idx, (train_sids, val_sids, test_sids) in enumerate(splits):
-        train_sids_int = {int(s) for s in train_sids}
-        val_sids_int = {int(s) for s in val_sids}
-        test_sids_int = {int(s) for s in test_sids}
-        train_patients = [p for p in patient_data if p["subject_id"] in train_sids_int]
-        val_patients = [p for p in patient_data if p["subject_id"] in val_sids_int]
-        test_patients = [p for p in patient_data if p["subject_id"] in test_sids_int]
+        # OOM 회피 (Stage 5) — patient-batch chunked save
+        for split_name, split_sids in (
+            ("train", train_sids), ("val", val_sids), ("test", test_sids),
+        ):
+            sids_int = {int(s) for s in split_sids}
+            split_p_all = [p for p in patient_data if p["subject_id"] in sids_int]
+            if not split_p_all:
+                continue
+            chunk_idx = 0
+            total_pat = 0
+            total_dead = 0
+            for bstart in range(0, len(split_p_all), PATIENTS_PER_CHUNK):
+                p_batch = split_p_all[bstart:bstart + PATIENTS_PER_CHUNK]
+                n_p = len(p_batch)
+                n_dead = sum(1 for p in p_batch if p["mortality"] == 1)
+                split_packed = _pack_patients(p_batch)
+                del p_batch; gc.collect()
 
-        n_train_p = len(train_patients)
-        n_val_p = len(val_patients)
-        n_test_p = len(test_patients)
-        n_dead_train = sum(1 for p in train_patients if p["mortality"] == 1)
-        n_dead_val = sum(1 for p in val_patients if p["mortality"] == 1)
-        n_dead_test = sum(1 for p in test_patients if p["mortality"] == 1)
-
-        data = {
-            "train": _pack_patients(train_patients),
-            "val": _pack_patients(val_patients),
-            "test": _pack_patients(test_patients),
-            "metadata": {
-                "task": "icu_mortality_prediction",
-                "source": "MIMIC-III Waveform Matched",
-                "label": "hospital_expire_flag",
-                "aggregation": "patient_level",
-                "input_signals": input_signals_meta,
-                "window_sec": window_sec,
-                "stride_sec": stride_sec,
-                "sampling_rate": TARGET_SR,
-                "fold_idx": fold_idx,
-                "n_folds": n_folds,
-                "n_train_patients": n_train_p,
-                "n_val_patients": n_val_p,
-                "n_test_patients": n_test_p,
-                "n_dead_train": n_dead_train,
-                "n_dead_val": n_dead_val,
-                "n_dead_test": n_dead_test,
-                "signal_dtype": str(signal_dtype).replace("torch.", ""),
-            },
-        }
-        fold_suffix = f"_fold{fold_idx}" if n_folds > 1 else ""
-        out_file = out_path / f"mortality_w{int(window_sec)}s{fold_suffix}.pt"
-        torch.save(data, out_file)
-        print(
-            f"  Fold {fold_idx}: train={n_train_p}(dead={n_dead_train}) "
-            f"val={n_val_p}(dead={n_dead_val}) test={n_test_p}(dead={n_dead_test}) → {out_file}"
-        )
+                data = {
+                    "split": split_name,
+                    "data": split_packed,
+                    "metadata": {
+                        "task": "icu_mortality_prediction",
+                        "source": "MIMIC-III Waveform Matched",
+                        "label": "hospital_expire_flag",
+                        "aggregation": "patient_level",
+                        "input_signals": input_signals_meta,
+                        "window_sec": window_sec,
+                        "stride_sec": stride_sec,
+                        "sampling_rate": TARGET_SR,
+                        "fold_idx": fold_idx,
+                        "n_folds": n_folds,
+                        "split": split_name,
+                        "chunk_idx": chunk_idx,
+                        "n_patients": n_p,
+                        "n_dead": n_dead,
+                        "signal_dtype": str(signal_dtype).replace("torch.", ""),
+                    },
+                }
+                fold_suffix = f"_fold{fold_idx}" if n_folds > 1 else ""
+                out_file = out_path / (
+                    f"mortality_w{int(window_sec)}s{fold_suffix}_{split_name}_chunk{chunk_idx}.pt"
+                )
+                torch.save(data, out_file)
+                total_pat += n_p
+                total_dead += n_dead
+                chunk_idx += 1
+                del data, split_packed; gc.collect()
+            print(
+                f"  Fold {fold_idx} {split_name}: {chunk_idx} chunk(s), "
+                f"{total_pat} patients (dead={total_dead})"
+            )
 
     print(f"\n{'=' * 60}")
     print(f"  Done: {n_folds} fold(s) saved to {out_path}")

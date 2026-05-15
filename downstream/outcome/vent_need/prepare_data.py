@@ -291,51 +291,61 @@ def prepare_dataset(
 
     input_signals_meta = sorted(patient_data[0]["windows"][0].keys())
 
-    for fold_idx, (train_sids, val_sids, test_sids) in enumerate(splits):
-        tr_int = {int(s) for s in train_sids}
-        va_int = {int(s) for s in val_sids}
-        te_int = {int(s) for s in test_sids}
-        train_patients = [p for p in patient_data if p["subject_id"] in tr_int]
-        val_patients = [p for p in patient_data if p["subject_id"] in va_int]
-        test_patients = [p for p in patient_data if p["subject_id"] in te_int]
-        n_train_p = len(train_patients)
-        n_val_p = len(val_patients)
-        n_test_p = len(test_patients)
-        n_pos_train = sum(1 for p in train_patients if p["vent_need"] == 1)
-        n_pos_val = sum(1 for p in val_patients if p["vent_need"] == 1)
-        n_pos_test = sum(1 for p in test_patients if p["vent_need"] == 1)
+    PATIENTS_PER_CHUNK = 100
 
-        data = {
-            "train": _pack_patients(train_patients),
-            "val": _pack_patients(val_patients),
-            "test": _pack_patients(test_patients),
-            "metadata": {
-                "task": "icu_vent_need_prediction",
-                "source": "MIMIC-III Waveform Matched",
-                "label": "vent_within_24h",
-                "aggregation": "patient_level",
-                "input_signals": input_signals_meta,
-                "window_sec": window_sec,
-                "stride_sec": stride_sec,
-                "sampling_rate": TARGET_SR,
-                "fold_idx": fold_idx,
-                "n_folds": n_folds,
-                "n_train_patients": n_train_p,
-                "n_val_patients": n_val_p,
-                "n_test_patients": n_test_p,
-                "n_pos_train": n_pos_train,
-                "n_pos_val": n_pos_val,
-                "n_pos_test": n_pos_test,
-                "signal_dtype": str(signal_dtype).replace("torch.", ""),
-            },
-        }
-        fold_suffix = f"_fold{fold_idx}" if n_folds > 1 else ""
-        out_file = out_path / f"vent_need_w{int(window_sec)}s{fold_suffix}.pt"
-        torch.save(data, out_file)
-        print(
-            f"  Fold {fold_idx}: train={n_train_p}(+={n_pos_train}) "
-            f"val={n_val_p}(+={n_pos_val}) test={n_test_p}(+={n_pos_test}) → {out_file}"
-        )
+    for fold_idx, (train_sids, val_sids, test_sids) in enumerate(splits):
+        # OOM 회피 (Stage 5) — patient-batch chunked save
+        for split_name, split_sids in (
+            ("train", train_sids), ("val", val_sids), ("test", test_sids),
+        ):
+            sids_int = {int(s) for s in split_sids}
+            split_p_all = [p for p in patient_data if p["subject_id"] in sids_int]
+            if not split_p_all:
+                continue
+            chunk_idx = 0
+            total_pat = 0
+            total_pos = 0
+            for bstart in range(0, len(split_p_all), PATIENTS_PER_CHUNK):
+                p_batch = split_p_all[bstart:bstart + PATIENTS_PER_CHUNK]
+                n_p = len(p_batch)
+                n_pos = sum(1 for p in p_batch if p["vent_need"] == 1)
+                split_packed = _pack_patients(p_batch)
+                del p_batch; gc.collect()
+
+                data = {
+                    "split": split_name,
+                    "data": split_packed,
+                    "metadata": {
+                        "task": "icu_vent_need_prediction",
+                        "source": "MIMIC-III Waveform Matched",
+                        "label": "vent_within_24h",
+                        "aggregation": "patient_level",
+                        "input_signals": input_signals_meta,
+                        "window_sec": window_sec,
+                        "stride_sec": stride_sec,
+                        "sampling_rate": TARGET_SR,
+                        "fold_idx": fold_idx,
+                        "n_folds": n_folds,
+                        "split": split_name,
+                        "chunk_idx": chunk_idx,
+                        "n_patients": n_p,
+                        "n_pos": n_pos,
+                        "signal_dtype": str(signal_dtype).replace("torch.", ""),
+                    },
+                }
+                fold_suffix = f"_fold{fold_idx}" if n_folds > 1 else ""
+                out_file = out_path / (
+                    f"vent_need_w{int(window_sec)}s{fold_suffix}_{split_name}_chunk{chunk_idx}.pt"
+                )
+                torch.save(data, out_file)
+                total_pat += n_p
+                total_pos += n_pos
+                chunk_idx += 1
+                del data, split_packed; gc.collect()
+            print(
+                f"  Fold {fold_idx} {split_name}: {chunk_idx} chunk(s), "
+                f"{total_pat} patients (+={total_pos})"
+            )
 
     print(f"\n{'=' * 60}")
     print(f"  ICU Mech Vent Need Prediction — Done")

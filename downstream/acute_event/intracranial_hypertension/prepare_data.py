@@ -280,10 +280,59 @@ def extract_forecast_samples(
 # ── 저장 ─────────────────────────────────────────────────────
 
 
-def save_dataset(
-    train_samples: list[ICHSample],
-    val_samples: list[ICHSample],
-    test_samples: list[ICHSample],
+def _consume_to_tensors_ich(
+    samples: list[ICHSample],
+    input_signals: list[str],
+    signal_dtype: torch.dtype,
+) -> dict:
+    """ICH samples → packed dict (in-place, samples 비워짐).
+
+    torch.stack 의 2× peak 회피 — 출력 텐서를 미리 할당 + numpy ref pop.
+    """
+    if not samples:
+        return {"signals": {}, "labels": torch.tensor([], dtype=torch.long),
+                "label_values": torch.tensor([], dtype=torch.float32),
+                "case_ids": [], "subject_ids": []}
+
+    labels = torch.tensor([s.label for s in samples], dtype=torch.long)
+    label_values = torch.tensor(
+        [s.label_value for s in samples], dtype=torch.float32
+    )
+    case_ids = [s.case_id for s in samples]
+    subject_ids = [s.patient_id for s in samples]
+
+    sig_tensors: dict[str, torch.Tensor] = {}
+    for stype in input_signals:
+        T = next(
+            (int(s.input_signals[stype].shape[0])
+             for s in samples if stype in s.input_signals),
+            None,
+        )
+        if T is None:
+            continue
+        n = sum(1 for s in samples if stype in s.input_signals)
+        out = torch.empty((n, T), dtype=signal_dtype)
+        i = 0
+        for s in samples:
+            arr = s.input_signals.pop(stype, None)
+            if arr is None:
+                continue
+            out[i].copy_(torch.from_numpy(arr))
+            i += 1
+        sig_tensors[stype] = out
+
+    return {
+        "signals": sig_tensors,
+        "labels": labels,
+        "label_values": label_values,
+        "case_ids": case_ids,
+        "subject_ids": subject_ids,
+    }
+
+
+def save_split_dataset(
+    split_dict: dict,
+    split_name: str,
     input_signals: list[str],
     horizon_sec: float,
     window_sec: float,
@@ -291,67 +340,16 @@ def save_dataset(
     signal_dtype: torch.dtype = torch.float16,
     fold_idx: int | None = None,
     n_folds: int = 1,
+    chunk_idx: int | None = None,
 ) -> Path:
+    """Single split chunk packed dict → 별도 .pt (OOM 회피 Stage 5)."""
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
-
-    n_train_in = len(train_samples)
-    n_val_in = len(val_samples)
-    n_test_in = len(test_samples)
-
-    def _consume_to_tensors(samples: list[ICHSample]) -> dict:
-        # torch.stack 은 중간 list + contiguous 출력 두 벌을 잡아 600s
-        # window 에서 ~70 GB 피크가 발생한다. 출력 텐서를 미리 할당하고
-        # numpy 참조를 pop 하면서 채워 피크를 절반으로 낮춘다.
-        if not samples:
-            return {"signals": {}, "labels": torch.tensor([], dtype=torch.long),
-                    "label_values": torch.tensor([], dtype=torch.float32),
-                    "case_ids": [], "subject_ids": []}
-
-        labels = torch.tensor([s.label for s in samples], dtype=torch.long)
-        label_values = torch.tensor(
-            [s.label_value for s in samples], dtype=torch.float32
-        )
-        case_ids = [s.case_id for s in samples]
-        subject_ids = [s.patient_id for s in samples]
-
-        sig_tensors: dict[str, torch.Tensor] = {}
-        for stype in input_signals:
-            T = next(
-                (int(s.input_signals[stype].shape[0])
-                 for s in samples if stype in s.input_signals),
-                None,
-            )
-            if T is None:
-                continue
-            n = sum(1 for s in samples if stype in s.input_signals)
-            out = torch.empty((n, T), dtype=signal_dtype)
-            i = 0
-            for s in samples:
-                arr = s.input_signals.pop(stype, None)
-                if arr is None:
-                    continue
-                # in-place copy + cast; numpy ref 는 pop 으로 즉시 해제됨
-                out[i].copy_(torch.from_numpy(arr))
-                i += 1
-            sig_tensors[stype] = out
-
-        return {
-            "signals": sig_tensors,
-            "labels": labels,
-            "label_values": label_values,
-            "case_ids": case_ids,
-            "subject_ids": subject_ids,
-        }
-
-    train_dict = _consume_to_tensors(train_samples); train_samples.clear()
-    val_dict = _consume_to_tensors(val_samples); val_samples.clear()
-    test_dict = _consume_to_tensors(test_samples); test_samples.clear()
+    n_samples = int(split_dict.get("labels", torch.tensor([])).numel())
 
     save_dict = {
-        "train": train_dict,
-        "val": val_dict,
-        "test": test_dict,
+        "split": split_name,
+        "data": split_dict,
         "metadata": {
             "task": "intracranial_hypertension_detection",
             "source": "MIMIC-III Waveform",
@@ -361,11 +359,11 @@ def save_dataset(
             "sampling_rate": TARGET_SR,
             "icp_threshold": ICP_THRESHOLD,
             "sustained_sec": SUSTAINED_SEC,
-            "n_train": n_train_in,
-            "n_val": n_val_in,
-            "n_test": n_test_in,
+            "split": split_name,
+            "n_samples": n_samples,
             "fold_idx": fold_idx,
             "n_folds": n_folds,
+            "chunk_idx": chunk_idx,
             "signal_dtype": str(signal_dtype).replace("torch.", ""),
         },
     }
@@ -374,7 +372,11 @@ def save_dataset(
     horizon_min = int(horizon_sec / 60)
     win_int = int(window_sec)
     fold_suffix = f"_fold{fold_idx}" if fold_idx is not None else ""
-    filename = f"intracranial_hypertension_{mode_str}_w{win_int}s_h{horizon_min}min{fold_suffix}.pt"
+    chunk_suffix = f"_chunk{chunk_idx}" if chunk_idx is not None else ""
+    filename = (
+        f"intracranial_hypertension_{mode_str}_w{win_int}s_h{horizon_min}min"
+        f"{fold_suffix}_{split_name}{chunk_suffix}.pt"
+    )
     save_path = out_path / filename
     torch.save(save_dict, save_path)
 
@@ -503,31 +505,43 @@ def prepare_ich_sweep(
             train_cases = [c for c in cases if c["patient_id"] in train_pids]
             val_cases = [c for c in cases if c["patient_id"] in val_pids]
             test_cases = [c for c in cases if c["patient_id"] in test_pids]
-            train_samples = extract_forecast_samples(
-                train_cases, input_signals, window_sec, stride_sec, horizon_sec,
-            )
-            val_samples = extract_forecast_samples(
-                val_cases, input_signals, window_sec, stride_sec, horizon_sec,
-            )
-            test_samples = extract_forecast_samples(
-                test_cases, input_signals, window_sec, stride_sec, horizon_sec,
-            )
-            print_stats("    Train", train_samples)
-            print_stats("    Val", val_samples)
-            print_stats("    Test", test_samples)
-            if not (train_samples or val_samples or test_samples):
-                print("    SKIP: No samples extracted.")
-                continue
-            save_path = save_dataset(
-                train_samples, val_samples, test_samples, input_signals,
-                horizon_sec, window_sec, out_dir,
-                signal_dtype=signal_dtype,
-                fold_idx=fold_idx if len(splits) > 1 else None,
-                n_folds=len(splits),
-            )
-            saved_paths.append(save_path)
-            # fold 사이에 GC 강제 실행해 600s 텐서를 회수
-            gc.collect()
+            # OOM 회피 (Stage 5) — case-batch chunked save
+            cur_fold_idx = fold_idx if len(splits) > 1 else None
+            CASES_PER_CHUNK = 200
+
+            for split_name, split_cases in (
+                ("train", train_cases),
+                ("val", val_cases),
+                ("test", test_cases),
+            ):
+                if not split_cases:
+                    continue
+                chunk_idx = 0
+                total = 0
+                for batch_start in range(0, len(split_cases), CASES_PER_CHUNK):
+                    case_batch = split_cases[batch_start:batch_start + CASES_PER_CHUNK]
+                    samples = extract_forecast_samples(
+                        case_batch, input_signals, window_sec, stride_sec, horizon_sec,
+                    )
+                    if not samples:
+                        continue
+                    packed = _consume_to_tensors_ich(samples, input_signals, signal_dtype)
+                    samples.clear()
+                    del samples; gc.collect()
+                    n_in_chunk = int(packed.get("labels", torch.tensor([])).numel())
+                    save_path = save_split_dataset(
+                        packed, split_name, input_signals,
+                        horizon_sec, window_sec, out_dir,
+                        signal_dtype=signal_dtype,
+                        fold_idx=cur_fold_idx,
+                        n_folds=len(splits),
+                        chunk_idx=chunk_idx,
+                    )
+                    saved_paths.append(save_path)
+                    total += n_in_chunk
+                    chunk_idx += 1
+                    del packed; gc.collect()
+                print(f"    {split_name.capitalize()}: {chunk_idx} chunk(s), {total} samples")
 
     print(f"\n{'=' * 60}")
     print(f"  Done! {len(saved_paths)}/{len(combos)} datasets saved to {out_dir}")
