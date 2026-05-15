@@ -392,13 +392,15 @@ def save_split_dataset(
     signal_dtype: torch.dtype = torch.float16,
     fold_idx: int | None = None,
     n_folds: int = 1,
+    chunk_idx: int | None = None,
 ) -> Path:
-    """단일 split (train/val/test) 의 packed dict 를 별도 .pt 로 저장.
+    """단일 split chunk 의 packed dict 를 별도 .pt 로 저장.
 
-    OOM 회피: 3 split 을 한 .pt 에 묶지 않고 별도 파일 → save 시 1 dict 만
-    메모리에 유지. Loader 는 split 별로 따로 load.
+    OOM 회피 (Stage 5): split 자체도 chunk 로 나눠 저장.
+    Loader 는 같은 (fold, split) 의 모든 chunk* 파일을 glob 으로 찾아 concat.
 
-    파일명: {task}_{...}_{fold}_{split}.pt
+    파일명: {task}_{...}_{fold}_{split}_chunk{i}.pt  (chunk_idx 주어진 경우)
+            {task}_{...}_{fold}_{split}.pt           (chunk 미사용 시)
     """
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
@@ -423,6 +425,7 @@ def save_split_dataset(
             "signal_dtype": str(signal_dtype).replace("torch.", ""),
             "fold_idx": fold_idx,
             "n_folds": n_folds,
+            "chunk_idx": chunk_idx,
         },
     }
 
@@ -430,15 +433,16 @@ def save_split_dataset(
     horizon_min = int(horizon_sec / 60)
     win_int = int(window_sec)
     fold_suffix = f"_fold{fold_idx}" if fold_idx is not None else ""
+    chunk_suffix = f"_chunk{chunk_idx}" if chunk_idx is not None else ""
     filename = (
         f"hypotension_{mode_str}_w{win_int}s_h{horizon_min}min"
-        f"{fold_suffix}_{split_name}.pt"
+        f"{fold_suffix}_{split_name}{chunk_suffix}.pt"
     )
     save_path = out_path / filename
     torch.save(save_dict, save_path)
 
     file_size_mb = save_path.stat().st_size / (1024 * 1024)
-    print(f"  Saved: {save_path} ({file_size_mb:.2f} MB, n={n_samples})")
+    print(f"    Saved: {save_path.name} ({file_size_mb:.1f} MB, n={n_samples})")
     return save_path
 
 
@@ -618,36 +622,50 @@ def prepare_hypotension_sweep(
             val_cases = [c for c in cases if c["patient_id"] in val_patients]
             test_cases = [c for c in cases if c["patient_id"] in test_patients]
 
-            # OOM 회피 — split 별 extract → pack → save → free 즉시
-            # 3 split 을 별도 .pt 로 저장 → save 시 1 dict 만 메모리 유지
+            # OOM 회피 (Stage 5) — case-batch chunked save:
+            # 한 split 안에서 case 를 N개씩 batch → extract → pack → save chunk → free
+            # → peak memory = cases(30 GB) + 1 chunk(~10 GB) = 안전
             gap_stats = GapStats()
             cur_fold_idx = fold_idx if n_folds > 1 else None
+            CASES_PER_CHUNK = 200  # ~5-10K windows per chunk
 
             for split_name, split_cases in (
                 ("train", train_cases),
                 ("val", val_cases),
                 ("test", test_cases),
             ):
-                samples = extract_forecast_samples(
-                    split_cases, input_signals, window_sec, stride_sec, horizon_sec,
-                    gap_stats=gap_stats,
-                )
-                print_stats(f"    {split_name.capitalize()}", samples)
-                if not samples:
-                    print(f"    SKIP {split_name}: No samples extracted.")
+                if not split_cases:
                     continue
-                packed = pack_samples_to_dict(samples, input_signals, signal_dtype)
-                del samples; gc.collect()
-
-                save_path = save_split_dataset(
-                    packed, split_name, input_signals,
-                    horizon_sec, window_sec, out_dir,
-                    signal_dtype=signal_dtype,
-                    fold_idx=cur_fold_idx,
-                    n_folds=n_folds,
+                chunk_idx = 0
+                total_in_split = 0
+                # case-batch 순회
+                for batch_start in range(0, len(split_cases), CASES_PER_CHUNK):
+                    case_batch = split_cases[batch_start:batch_start + CASES_PER_CHUNK]
+                    samples = extract_forecast_samples(
+                        case_batch, input_signals, window_sec, stride_sec, horizon_sec,
+                        gap_stats=gap_stats,
+                    )
+                    if not samples:
+                        continue
+                    packed = pack_samples_to_dict(samples, input_signals, signal_dtype)
+                    del samples; gc.collect()
+                    n_in_chunk = int(packed.get("labels", torch.tensor([])).numel())
+                    save_path = save_split_dataset(
+                        packed, split_name, input_signals,
+                        horizon_sec, window_sec, out_dir,
+                        signal_dtype=signal_dtype,
+                        fold_idx=cur_fold_idx,
+                        n_folds=n_folds,
+                        chunk_idx=chunk_idx,
+                    )
+                    saved_paths.append(save_path)
+                    total_in_split += n_in_chunk
+                    chunk_idx += 1
+                    del packed; gc.collect()
+                print(
+                    f"    {split_name.capitalize()}: {chunk_idx} chunk(s), "
+                    f"{total_in_split} total samples"
                 )
-                saved_paths.append(save_path)
-                del packed; gc.collect()
 
             print(gap_stats.summary())
 
