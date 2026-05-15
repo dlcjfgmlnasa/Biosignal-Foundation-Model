@@ -186,7 +186,9 @@ class DownstreamModelWrapper(nn.Module):
         batch: PackedBatch,
         pool: str = "mean",
         gap_mask_patch: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        max_mask_ratio: float | None = 0.5,
+        return_validity: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Downstream task용 feature 추출.
 
         Parameters
@@ -200,11 +202,20 @@ class DownstreamModelWrapper(nn.Module):
             ``(B, N)`` bool — True=gap (mask_token 으로 교체할 patch).
             ``downstream._gap_mask.sample_to_patch_mask`` 로 생성.
             None 이면 gap 처리 없음 (기존 동작).
+        max_mask_ratio:
+            Option B input-level mask gate. valid patches 중 gap ratio 가
+            이 임계 초과인 sample 은 모델 출력 신뢰 어렵다고 판단 (pretrain
+            mask 분포 OOD). 기본 0.5 (50%). None 으로 끄면 모든 sample 통과.
+            invalid sample 의 feature 는 zero 로 채워 반환.
+        return_validity:
+            True 면 (features, validity) 두 tensor 반환. validity[b]=True 면
+            그 sample 이 mask gate 통과 (신뢰 가능). aggregation 시 weight 로
+            사용 가능.
 
         Returns
         -------
-        ``pool="mean"``: ``(B, d_model)`` — 윈도우 레벨 feature.
-        ``pool="none"``: ``(B, N, d_model)`` — 패치 레벨 feature.
+        features: ``(B, d_model)`` (pool="mean") 또는 ``(B, N, d_model)`` (pool="none").
+        validity: ``(B,)`` bool — return_validity=True 시.
         """
         self.model.eval()
         batch = self.batch_to_device(batch)
@@ -215,15 +226,34 @@ class DownstreamModelWrapper(nn.Module):
         encoded = out["encoded"]  # (B, N, d_model)
         patch_mask = out["patch_mask"]  # (B, N) bool — True=유효 패치
 
+        # Option B — Input-level mask gate:
+        # valid patches 중 gap 비율 > max_mask_ratio 면 sample 단위로 신뢰 어렵.
+        # validity flag 로 표시, invalid sample 의 feature 는 0 으로 마스킹.
+        validity: torch.Tensor | None = None
+        if max_mask_ratio is not None and gap_mask_patch is not None:
+            # valid_patches 안에서 gap 비율
+            gap_in_valid = (gap_mask_patch & patch_mask).float().sum(dim=1)
+            n_valid = patch_mask.float().sum(dim=1).clamp(min=1.0)
+            mask_ratio_per_sample = gap_in_valid / n_valid  # (B,)
+            validity = mask_ratio_per_sample <= max_mask_ratio  # (B,) bool
+
         if pool == "none":
-            return encoded
+            features = encoded
+            if validity is not None:
+                # invalid sample 의 features = 0
+                features = features * validity.view(-1, 1, 1).float()
+            return (features, validity) if return_validity else features
 
         # Mean pooling over valid patches
         mask_f = patch_mask.unsqueeze(-1).float()  # (B, N, 1)
         pooled = (encoded * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp(
             min=1.0
         )  # (B, d_model)
-        return pooled
+
+        if validity is not None:
+            pooled = pooled * validity.unsqueeze(-1).float()
+
+        return (pooled, validity) if return_validity else pooled
 
     @torch.no_grad()
     def forward_masked(
