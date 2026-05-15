@@ -45,7 +45,7 @@ from downstream._gap_mask import (
     compute_valid_ratio,
 )
 from downstream._kfold_utils import stratified_kfold_patient_splits, summarize_splits
-from downstream._save_utils import add_signal_dtype_arg, consume_input_signals
+from downstream._save_utils import add_signal_dtype_arg, consume_gap_masks, consume_input_signals
 from downstream._seg_intersect import load_aligned_signals_intersection
 
 TARGET_SR: float = 100.0
@@ -345,10 +345,47 @@ def extract_forecast_samples(
 # ---- 저장 ----
 
 
-def save_dataset(
-    train_samples: list[ForecastSample],
-    val_samples: list[ForecastSample],
-    test_samples: list[ForecastSample],
+def pack_samples_to_dict(
+    samples: list[ForecastSample],
+    input_signals: list[str],
+    signal_dtype: torch.dtype = torch.float16,
+) -> dict:
+    """ForecastSample list → packed dict, samples in-place 해제.
+
+    OOM 회피: 호출 후 samples 가 모두 비워져 caller 가 즉시 free 가능.
+    consume_input_signals + consume_gap_masks 가 numpy array 를 pop 하면서
+    in-place 로 tensor 에 복사 → peak memory 2× 회피.
+    """
+    if not samples:
+        return {
+            "signals": {},
+            "gap_masks": {},
+            "labels": torch.tensor([]),
+            "label_values": torch.tensor([]),
+            "case_ids": [],
+        }
+    labels = torch.tensor([s.label for s in samples], dtype=torch.long)
+    label_values = torch.tensor(
+        [s.label_value for s in samples], dtype=torch.float32
+    )
+    case_ids = [s.case_id for s in samples]
+    sig_tensors = consume_input_signals(samples, input_signals, signal_dtype)
+    gap_tensors = consume_gap_masks(samples, input_signals, attr="input_gap_masks")
+    samples.clear()
+    gc.collect()
+    return {
+        "signals": sig_tensors,
+        "gap_masks": gap_tensors,
+        "labels": labels,
+        "label_values": label_values,
+        "case_ids": case_ids,
+    }
+
+
+def save_packed_dataset(
+    train_dict: dict,
+    val_dict: dict,
+    test_dict: dict,
     input_signals: list[str],
     horizon_sec: float,
     window_sec: float,
@@ -357,53 +394,15 @@ def save_dataset(
     fold_idx: int | None = None,
     n_folds: int = 1,
 ) -> Path:
-    """ForecastSample 리스트를 .pt로 저장한다 (train/val/test 3-way).
+    """Pre-packed dict 들을 .pt 로 저장 (train/val/test 3-way).
 
-    fold_idx 가 주어지면 파일명에 _fold{i} 접미사 + metadata 에 fold 정보 기록.
+    pack_samples_to_dict 와 짝 — caller 가 split 별 순차 pack 후 호출.
     """
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
-
-    n_train = len(train_samples)
-    n_val = len(val_samples)
-    n_test = len(test_samples)
-
-    def _to_tensors(samples: list[ForecastSample]) -> dict:
-        if not samples:
-            return {
-                "signals": {},
-                "gap_masks": {},
-                "labels": torch.tensor([]),
-                "label_values": torch.tensor([]),
-                "case_ids": [],
-            }
-
-        labels = torch.tensor([s.label for s in samples], dtype=torch.long)
-        label_values = torch.tensor(
-            [s.label_value for s in samples], dtype=torch.float32
-        )
-        case_ids = [s.case_id for s in samples]
-        sig_tensors = consume_input_signals(samples, input_signals, signal_dtype)
-        # Gap mask: sample-level bool (patch_size 무관). 학습 시 dataloader/model 이
-        # patch-level 로 downsample 후 [MASK] 토큰 적용.
-        gap_tensors: dict[str, torch.Tensor] = {}
-        for stype in input_signals:
-            arrs = [s.input_gap_masks[stype] for s in samples if stype in s.input_gap_masks]
-            if arrs:
-                gap_tensors[stype] = torch.from_numpy(np.stack(arrs)).bool()
-
-        return {
-            "signals": sig_tensors,
-            "gap_masks": gap_tensors,
-            "labels": labels,
-            "label_values": label_values,
-            "case_ids": case_ids,
-        }
-
-    train_dict = _to_tensors(train_samples); train_samples.clear()
-    val_dict = _to_tensors(val_samples); val_samples.clear()
-    test_dict = _to_tensors(test_samples); test_samples.clear()
-    gc.collect()
+    n_train = int(train_dict.get("labels", torch.tensor([])).numel())
+    n_val = int(val_dict.get("labels", torch.tensor([])).numel())
+    n_test = int(test_dict.get("labels", torch.tensor([])).numel())
 
     save_dict = {
         "train": train_dict,
@@ -618,37 +617,56 @@ def prepare_hypotension_sweep(
             val_cases = [c for c in cases if c["patient_id"] in val_patients]
             test_cases = [c for c in cases if c["patient_id"] in test_patients]
 
+            # OOM 회피 — split 별 순차 extract → pack → free
+            # 이전: 3 samples list 동시 보유 (~66 GB) + tensor 빌드 → ~100 GB
+            # 현재: 1 samples list + 이미 packed 된 tensor → peak ~50 GB
             gap_stats = GapStats()
+
+            print_stats("    Train (extracting)", [])
             train_samples = extract_forecast_samples(
                 train_cases, input_signals, window_sec, stride_sec, horizon_sec,
                 gap_stats=gap_stats,
             )
+            print_stats("    Train", train_samples)
+            train_dict = pack_samples_to_dict(train_samples, input_signals, signal_dtype)
+            del train_samples; gc.collect()
+
             val_samples = extract_forecast_samples(
                 val_cases, input_signals, window_sec, stride_sec, horizon_sec,
                 gap_stats=gap_stats,
             )
+            print_stats("    Val", val_samples)
+            val_dict = pack_samples_to_dict(val_samples, input_signals, signal_dtype)
+            del val_samples; gc.collect()
+
             test_samples = extract_forecast_samples(
                 test_cases, input_signals, window_sec, stride_sec, horizon_sec,
                 gap_stats=gap_stats,
             )
+            print_stats("    Test", test_samples)
+            test_dict = pack_samples_to_dict(test_samples, input_signals, signal_dtype)
+            del test_samples; gc.collect()
+
             print(gap_stats.summary())
 
-            print_stats("    Train", train_samples)
-            print_stats("    Val", val_samples)
-            print_stats("    Test", test_samples)
-
-            if not train_samples and not val_samples and not test_samples:
+            n_total = (
+                int(train_dict.get("labels", torch.tensor([])).numel())
+                + int(val_dict.get("labels", torch.tensor([])).numel())
+                + int(test_dict.get("labels", torch.tensor([])).numel())
+            )
+            if n_total == 0:
                 print("    SKIP: No samples extracted.")
                 continue
 
-            save_path = save_dataset(
-                train_samples, val_samples, test_samples, input_signals,
+            save_path = save_packed_dataset(
+                train_dict, val_dict, test_dict, input_signals,
                 horizon_sec, window_sec, out_dir,
                 signal_dtype=signal_dtype,
                 fold_idx=fold_idx if n_folds > 1 else None,
                 n_folds=n_folds,
             )
             saved_paths.append(save_path)
+            del train_dict, val_dict, test_dict
             gc.collect()
 
     print(f"\n{'=' * 60}")

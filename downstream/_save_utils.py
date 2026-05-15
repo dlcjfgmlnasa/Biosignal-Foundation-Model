@@ -99,6 +99,42 @@ def stack_window_dicts_destructive(
     return sig_tensors
 
 
+def consume_gap_masks(
+    samples: list[Any],
+    input_signals: Iterable[str],
+    attr: str = "input_gap_masks",
+) -> dict[str, torch.Tensor]:
+    """consume_input_signals 의 gap_mask 버전.
+
+    np.stack 의 2x peak 없이 (N, T) bool 텐서 생성. 각 sample 의 attr 에서
+    pop 하여 numpy 즉시 해제.
+    """
+    sig_tensors: dict[str, torch.Tensor] = {}
+    for stype in input_signals:
+        T = None
+        for s in samples:
+            d = getattr(s, attr, None) or {}
+            if stype in d:
+                T = int(d[stype].shape[0])
+                break
+        if T is None:
+            continue
+        n = sum(1 for s in samples
+                if stype in (getattr(s, attr, None) or {}))
+        out = torch.empty((n, T), dtype=torch.bool)
+        i = 0
+        for s in samples:
+            d = getattr(s, attr, None) or {}
+            arr = d.pop(stype, None)
+            if arr is None:
+                continue
+            out[i].copy_(torch.from_numpy(arr))
+            i += 1
+        sig_tensors[stype] = out
+    gc.collect()
+    return sig_tensors
+
+
 def stack_attr_destructive(
     samples: list[Any],
     attr: str,
