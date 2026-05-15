@@ -589,72 +589,62 @@ def prepare_aki_dataset(
         return packed
 
     sig_str = "_".join(sorted(input_signals))
+
+    def _shallow_copy(plist):
+        return [
+            {
+                **p,
+                "windows": [dict(w) for w in p["windows"]],
+                "gap_masks": [dict(gm) for gm in p["gap_masks"]],
+            }
+            for p in plist
+        ]
+
     for fold_idx, (train_sids, val_sids, test_sids) in enumerate(splits):
-        print(f"\n  [Fold {fold_idx}] Packing + saving...")
-        # 동일 patient_data 를 fold 마다 사용하므로 windows 가 destructive pack 으로
-        # 비워지지 않도록 매 fold 마다 shallow copy 후 pack.
-        train_p = [p for p in patient_data if p["subject_id"] in train_sids]
-        val_p = [p for p in patient_data if p["subject_id"] in val_sids]
-        test_p = [p for p in patient_data if p["subject_id"] in test_sids]
+        print(f"\n  [Fold {fold_idx}] Per-split packing + saving (OOM 회피)...")
+        for split_name, split_sids in (
+            ("train", train_sids), ("val", val_sids), ("test", test_sids),
+        ):
+            split_p = [p for p in patient_data if p["subject_id"] in split_sids]
+            n_split_p = len(split_p)
+            n_pos = sum(1 for p in split_p if p["label"] == 1)
+            split_packed = _pack(_shallow_copy(split_p))
+            del split_p; gc.collect()
 
-        # destructive pack 회피: copy windows + gap_masks for each fold
-        def _shallow_copy(plist):
-            return [
-                {
-                    **p,
-                    "windows": [dict(w) for w in p["windows"]],
-                    "gap_masks": [dict(gm) for gm in p["gap_masks"]],
-                }
-                for p in plist
-            ]
-
-        train_packed = _pack(_shallow_copy(train_p))
-        val_packed = _pack(_shallow_copy(val_p))
-        test_packed = _pack(_shallow_copy(test_p))
-
-        n_train_p = len(train_p)
-        n_val_p = len(val_p)
-        n_test_p = len(test_p)
-        n_pos_train = sum(1 for p in train_p if p["label"] == 1)
-        n_pos_val = sum(1 for p in val_p if p["label"] == 1)
-        n_pos_test = sum(1 for p in test_p if p["label"] == 1)
-
-        save_dict = {
-            "train": train_packed,
-            "val": val_packed,
-            "test": test_packed,
-            "metadata": {
-                "task": "postop_aki_prediction",
-                "source": "VitalDB intraop waveform + clinical/lab",
-                "label_mode": label_mode,
-                "kdigo_definition": (
-                    "Stage based on postop peak Cr / preop Cr ratio "
-                    "(≥1.5 = stage1, ≥2.0 = stage2, ≥3.0 or ≥4.0 mg/dL = stage3) "
-                    "or absolute increase ≥0.3 mg/dL for stage 1."
-                ),
-                "input_signals": sorted(input_set),
-                "required_signals": sorted(required_set),
-                "window_sec": window_sec,
-                "stride_sec": stride_sec,
-                "sampling_rate": TARGET_SR,
-                "max_postop_days": max_postop_days,
-                "fold_idx": fold_idx,
-                "n_folds": n_folds,
-                "n_train_patients": n_train_p,
-                "n_val_patients": n_val_p,
-                "n_test_patients": n_test_p,
-                "signal_dtype": str(signal_dtype).replace("torch.", ""),
-            },
-        }
-        if label_mode == "binary":
-            save_dict["metadata"]["n_pos_train"] = n_pos_train
-            save_dict["metadata"]["n_pos_val"] = n_pos_val
-            save_dict["metadata"]["n_pos_test"] = n_pos_test
-
-        fold_suffix = f"_fold{fold_idx}" if n_folds > 1 else ""
-        out_file = out_path / f"aki_{label_mode}_{sig_str}_w{int(window_sec)}s{fold_suffix}.pt"
-        torch.save(save_dict, out_file)
-        print(f"    Saved: {out_file} (train={n_train_p}, val={n_val_p}, test={n_test_p})")
+            save_dict = {
+                "split": split_name,
+                "data": split_packed,
+                "metadata": {
+                    "task": "postop_aki_prediction",
+                    "source": "VitalDB intraop waveform + clinical/lab",
+                    "label_mode": label_mode,
+                    "kdigo_definition": (
+                        "Stage based on postop peak Cr / preop Cr ratio "
+                        "(≥1.5 = stage1, ≥2.0 = stage2, ≥3.0 or ≥4.0 mg/dL = stage3) "
+                        "or absolute increase ≥0.3 mg/dL for stage 1."
+                    ),
+                    "input_signals": sorted(input_set),
+                    "required_signals": sorted(required_set),
+                    "window_sec": window_sec,
+                    "stride_sec": stride_sec,
+                    "sampling_rate": TARGET_SR,
+                    "max_postop_days": max_postop_days,
+                    "fold_idx": fold_idx,
+                    "n_folds": n_folds,
+                    "split": split_name,
+                    "n_patients": n_split_p,
+                    "n_pos": n_pos if label_mode == "binary" else None,
+                    "signal_dtype": str(signal_dtype).replace("torch.", ""),
+                },
+            }
+            fold_suffix = f"_fold{fold_idx}" if n_folds > 1 else ""
+            out_file = (
+                out_path / f"aki_{label_mode}_{sig_str}_w{int(window_sec)}s"
+                f"{fold_suffix}_{split_name}.pt"
+            )
+            torch.save(save_dict, out_file)
+            print(f"    Saved: {out_file} ({split_name}: {n_split_p} patients, +={n_pos})")
+            del save_dict, split_packed; gc.collect()
 
     print(f"\n{'=' * 60}")
     print(f"  Done: {n_folds} fold(s) saved to {out_path}")

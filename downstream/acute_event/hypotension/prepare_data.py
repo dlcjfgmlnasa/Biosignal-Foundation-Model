@@ -382,10 +382,9 @@ def pack_samples_to_dict(
     }
 
 
-def save_packed_dataset(
-    train_dict: dict,
-    val_dict: dict,
-    test_dict: dict,
+def save_split_dataset(
+    split_dict: dict,
+    split_name: str,
     input_signals: list[str],
     horizon_sec: float,
     window_sec: float,
@@ -394,20 +393,20 @@ def save_packed_dataset(
     fold_idx: int | None = None,
     n_folds: int = 1,
 ) -> Path:
-    """Pre-packed dict 들을 .pt 로 저장 (train/val/test 3-way).
+    """단일 split (train/val/test) 의 packed dict 를 별도 .pt 로 저장.
 
-    pack_samples_to_dict 와 짝 — caller 가 split 별 순차 pack 후 호출.
+    OOM 회피: 3 split 을 한 .pt 에 묶지 않고 별도 파일 → save 시 1 dict 만
+    메모리에 유지. Loader 는 split 별로 따로 load.
+
+    파일명: {task}_{...}_{fold}_{split}.pt
     """
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
-    n_train = int(train_dict.get("labels", torch.tensor([])).numel())
-    n_val = int(val_dict.get("labels", torch.tensor([])).numel())
-    n_test = int(test_dict.get("labels", torch.tensor([])).numel())
+    n_samples = int(split_dict.get("labels", torch.tensor([])).numel())
 
     save_dict = {
-        "train": train_dict,
-        "val": val_dict,
-        "test": test_dict,
+        "split": split_name,
+        "data": split_dict,
         "metadata": {
             "task": "hypotension_forecast",
             "source": "vitaldb_pt",
@@ -419,9 +418,8 @@ def save_packed_dataset(
             "sustained_sec": 60.0,
             "gap_policy": "drop+mask",
             "valid_ratio_threshold": DEFAULT_VALID_RATIO_THRESHOLD,
-            "n_train": n_train,
-            "n_val": n_val,
-            "n_test": n_test,
+            "split": split_name,
+            "n_samples": n_samples,
             "signal_dtype": str(signal_dtype).replace("torch.", ""),
             "fold_idx": fold_idx,
             "n_folds": n_folds,
@@ -432,12 +430,15 @@ def save_packed_dataset(
     horizon_min = int(horizon_sec / 60)
     win_int = int(window_sec)
     fold_suffix = f"_fold{fold_idx}" if fold_idx is not None else ""
-    filename = f"hypotension_{mode_str}_w{win_int}s_h{horizon_min}min{fold_suffix}.pt"
+    filename = (
+        f"hypotension_{mode_str}_w{win_int}s_h{horizon_min}min"
+        f"{fold_suffix}_{split_name}.pt"
+    )
     save_path = out_path / filename
     torch.save(save_dict, save_path)
 
     file_size_mb = save_path.stat().st_size / (1024 * 1024)
-    print(f"  Saved: {save_path} ({file_size_mb:.2f} MB)")
+    print(f"  Saved: {save_path} ({file_size_mb:.2f} MB, n={n_samples})")
     return save_path
 
 
@@ -617,57 +618,38 @@ def prepare_hypotension_sweep(
             val_cases = [c for c in cases if c["patient_id"] in val_patients]
             test_cases = [c for c in cases if c["patient_id"] in test_patients]
 
-            # OOM 회피 — split 별 순차 extract → pack → free
-            # 이전: 3 samples list 동시 보유 (~66 GB) + tensor 빌드 → ~100 GB
-            # 현재: 1 samples list + 이미 packed 된 tensor → peak ~50 GB
+            # OOM 회피 — split 별 extract → pack → save → free 즉시
+            # 3 split 을 별도 .pt 로 저장 → save 시 1 dict 만 메모리 유지
             gap_stats = GapStats()
+            cur_fold_idx = fold_idx if n_folds > 1 else None
 
-            print_stats("    Train (extracting)", [])
-            train_samples = extract_forecast_samples(
-                train_cases, input_signals, window_sec, stride_sec, horizon_sec,
-                gap_stats=gap_stats,
-            )
-            print_stats("    Train", train_samples)
-            train_dict = pack_samples_to_dict(train_samples, input_signals, signal_dtype)
-            del train_samples; gc.collect()
+            for split_name, split_cases in (
+                ("train", train_cases),
+                ("val", val_cases),
+                ("test", test_cases),
+            ):
+                samples = extract_forecast_samples(
+                    split_cases, input_signals, window_sec, stride_sec, horizon_sec,
+                    gap_stats=gap_stats,
+                )
+                print_stats(f"    {split_name.capitalize()}", samples)
+                if not samples:
+                    print(f"    SKIP {split_name}: No samples extracted.")
+                    continue
+                packed = pack_samples_to_dict(samples, input_signals, signal_dtype)
+                del samples; gc.collect()
 
-            val_samples = extract_forecast_samples(
-                val_cases, input_signals, window_sec, stride_sec, horizon_sec,
-                gap_stats=gap_stats,
-            )
-            print_stats("    Val", val_samples)
-            val_dict = pack_samples_to_dict(val_samples, input_signals, signal_dtype)
-            del val_samples; gc.collect()
-
-            test_samples = extract_forecast_samples(
-                test_cases, input_signals, window_sec, stride_sec, horizon_sec,
-                gap_stats=gap_stats,
-            )
-            print_stats("    Test", test_samples)
-            test_dict = pack_samples_to_dict(test_samples, input_signals, signal_dtype)
-            del test_samples; gc.collect()
+                save_path = save_split_dataset(
+                    packed, split_name, input_signals,
+                    horizon_sec, window_sec, out_dir,
+                    signal_dtype=signal_dtype,
+                    fold_idx=cur_fold_idx,
+                    n_folds=n_folds,
+                )
+                saved_paths.append(save_path)
+                del packed; gc.collect()
 
             print(gap_stats.summary())
-
-            n_total = (
-                int(train_dict.get("labels", torch.tensor([])).numel())
-                + int(val_dict.get("labels", torch.tensor([])).numel())
-                + int(test_dict.get("labels", torch.tensor([])).numel())
-            )
-            if n_total == 0:
-                print("    SKIP: No samples extracted.")
-                continue
-
-            save_path = save_packed_dataset(
-                train_dict, val_dict, test_dict, input_signals,
-                horizon_sec, window_sec, out_dir,
-                signal_dtype=signal_dtype,
-                fold_idx=fold_idx if n_folds > 1 else None,
-                n_folds=n_folds,
-            )
-            saved_paths.append(save_path)
-            del train_dict, val_dict, test_dict
-            gc.collect()
 
     print(f"\n{'=' * 60}")
     print(f"  Done! {len(saved_paths)}/{len(combos)} datasets saved to {out_dir}")
