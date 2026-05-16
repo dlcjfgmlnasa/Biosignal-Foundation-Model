@@ -4,13 +4,16 @@
 # 2. Arrhythmia 데이터셋 생성 (3가지 신호 조합)
 #
 # 사용법:
-#   bash downstream/classification/arrhythmia/bash/prepare_data.sh
+#   bash downstream/acute_event/arrhythmia/bash/prepare_data.sh
+#
+# env override:
+#   RAW_DIR=... PARSED_DIR=... OUT_DIR=... bash downstream/acute_event/arrhythmia/bash/prepare_data.sh
 
 set -e
 
-RAW_DIR=/home/coder/workspace/datasets/mimic-iii-ext-ppg/1.1.0
-PARSED_DIR=/home/coder/workspace/updown/bio_fm/data/processed/mimic3_ext_ppg
-OUT_DIR=/home/coder/workspace/updown/bio_fm/data/downstream/arrhythmia
+RAW_DIR="${RAW_DIR:-/home/coder/workspace/datasets/mimic-iii-ext-ppg/1.1.0}"
+PARSED_DIR="${PARSED_DIR:-/home/coder/workspace/updown/bio_fm/data/processed/mimic3_ext_ppg}"
+OUT_DIR="${OUT_DIR:-/home/coder/workspace/updown/bio_fm/data/downstream/arrhythmia}"
 
 echo "============================================================"
 echo "  Arrhythmia Classification — Data Preparation"
