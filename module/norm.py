@@ -59,7 +59,7 @@ class RMSNorm(nn.Module):
         )
 
 
-class AdaRMSNorm(nn.Module):
+class LSCNorm(nn.Module):
     """RMSNorm + AdaLN-style affine modulation conditioned on `cond`.
 
     Output: ``norm(x) * (1 + γ(cond)) + β(cond)`` where γ, β are predicted by

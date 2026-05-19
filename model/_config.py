@@ -78,7 +78,7 @@ class ModelConfig:
     contrastive_proj_dim: int = 0  # 0=비활성, >0=projection head 출력 차원
 
     # AdaLN conditioning (loc/scale을 multiplicative gate로 모든 layer에 주입)
-    # AdaRMSNorm은 항상 활성화 — additive embedding은 ablation에서 열등 확인됨.
+    # LSCNorm은 항상 활성화 — additive embedding은 ablation에서 열등 확인됨.
     d_cond: int = 16  # AdaLN cond vector 차원 (ablation에서 16 채택, override 가능)
 
     def to_dict(self) -> dict:

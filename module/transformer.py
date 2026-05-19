@@ -17,7 +17,7 @@ from torch import nn
 
 from .attention import GroupedQueryAttention
 from .ffn import FeedForward, GatedLinearUnitFeedForward, MoEFeedForward
-from .norm import AdaRMSNorm, RMSNorm
+from .norm import LSCNorm, RMSNorm
 from .position import AttentionBias, QueryKeyProjection
 
 
@@ -63,9 +63,9 @@ class TransformerEncoderLayer(nn.Module):
         self.dropout = nn.Dropout(post_attn_dropout_p)
 
     def _norm(self, n: nn.Module, x: torch.Tensor, cond: torch.Tensor | None) -> torch.Tensor:
-        """AdaRMSNorm일 때만 cond를 전달, 그 외엔 plain norm."""
-        if isinstance(n, AdaRMSNorm):
-            assert cond is not None, "AdaRMSNorm requires cond"
+        """LSCNorm일 때만 cond를 전달, 그 외엔 plain norm."""
+        if isinstance(n, LSCNorm):
+            assert cond is not None, "LSCNorm requires cond"
             return n(x, cond)
         return n(x)
 
@@ -230,10 +230,10 @@ class TransformerEncoder(nn.Module):
                 bias=False,
                 ffn_dropout_p=dropout_p,
             )
-        assert d_cond > 0, "AdaRMSNorm requires d_cond > 0"
-        get_encoder_layer_norm = partial(AdaRMSNorm, d_model, d_cond=d_cond)
-        # 최종 norm도 AdaRMSNorm 적용 — encoder 출력이 cond에 의존하도록
-        final_norm = AdaRMSNorm(d_model, d_cond=d_cond)
+        assert d_cond > 0, "LSCNorm requires d_cond > 0"
+        get_encoder_layer_norm = partial(LSCNorm, d_model, d_cond=d_cond)
+        # 최종 norm도 LSCNorm 적용 — encoder 출력이 cond에 의존하도록
+        final_norm = LSCNorm(d_model, d_cond=d_cond)
 
         self.layers = nn.ModuleList(
             [
@@ -280,7 +280,7 @@ class TransformerEncoder(nn.Module):
                 x, attn_mask, var_id=var_id, time_id=time_id,
                 token_mask=token_mask, cond=cond,
             )
-        if isinstance(self.norm, AdaRMSNorm):
+        if isinstance(self.norm, LSCNorm):
             assert cond is not None
             return self.norm(x, cond)
         return self.norm(x)

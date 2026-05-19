@@ -38,9 +38,9 @@ main.py     # Entry point / training orchestration
 
 ### Implemented Components
 
-**`module/norm.py`**: `RMSNorm` (Root Mean Square Layer Normalization) + `AdaRMSNorm` (RMSNorm + AdaLN-style affine modulation conditioned on `cond` vector, zero-init for safe pretrain swap-in). Encoder의 모든 layer norm은 AdaRMSNorm을 사용한다.
+**`module/norm.py`**: `RMSNorm` (Root Mean Square Layer Normalization) + `LSCNorm` (RMSNorm + AdaLN-style affine modulation conditioned on `cond` vector, zero-init for safe pretrain swap-in). Encoder의 모든 layer norm은 LSCNorm을 사용한다.
 
-**`module/transformer.py`**: TransformerEncoder / TransformerEncoderLayer with GQA, GLU FFN, MoE, RoPE, AdaRMSNorm modulation 지원. 모든 layer가 `cond` 벡터를 받아 per-channel scale·shift gating 적용.
+**`module/transformer.py`**: TransformerEncoder / TransformerEncoderLayer with GQA, GLU FFN, MoE, RoPE, LSCNorm modulation 지원. 모든 layer가 `cond` 벡터를 받아 per-channel scale·shift gating 적용.
 
 **`module/attention.py`**: GroupedQueryAttention, MultiHeadAttention, MultiQueryAttention.
 
@@ -50,13 +50,13 @@ main.py     # Entry point / training orchestration
 
 **`data/dataset.py`**: BiosignalDataset (Channel-Independent, lazy-loading, sliding window).
 
-**`data/collate.py`**: PackCollate (FFD bin-packing collate). `patch_size`/`stride` 정렬 패딩, `patch_sizes`/`target_patch_duration_ms` 다중 해상도 지원. `spatial_ids` 전역 spatial_id 전달.
+**`data/collate.py`**: PackCollate (FFD bin-packing collate). `patch_size`/`stride` 정렬 패딩. `spatial_ids` 전역 spatial_id 전달.
 
 **`data/spatial_map.py`**: signal_type(대분류) + spatial_id(소분류) 이중 인코딩 매핑 테이블. `get_global_spatial_id()`, `TOTAL_SPATIAL_IDS`, `CHANNEL_NAME_TO_SPATIAL`.
 
-**`module/patch.py`**: PatchEmbedding (고정/overlapping 패치 토큰화), MultiResolutionPatchEmbedding (MOIRAI 스타일 다중 해상도).
+**`module/patch.py`**: PatchEmbedding (고정/overlapping 패치 토큰화) — Residual MLP projection (TimesFM 스타일). 단일 해상도.
 
-**`model/biosignal_model.py`**: BiosignalFoundationModel — Scaler → PatchEmbedding → SpatialEmbedding → TransformerEncoder(AdaRMSNorm) → Head 파이프라인. signal_type + spatial_id 이중 임베딩(Dual Additive Embedding) 지원. (loc, scale)은 `cond_proj`(MLP 2→d_cond→d_cond)를 거쳐 모든 layer의 AdaRMSNorm modulation으로 주입됨 (per-patch loc/scale conditioning). `task="masked"` (양방향 attention → reconstruction head + cross_head) / `task="next_pred"` (causal attention → next-patch head) 단일 encoder 기반 멀티태스크. forward 출력에 `time_id`, `cross_pred` 포함. `d_cond` (default=16)는 hyperparameter로 조정 가능.
+**`model/biosignal_model.py`**: BiosignalFoundationModel — Scaler → PatchEmbedding → SpatialEmbedding → TransformerEncoder(LSCNorm) → Head 파이프라인. signal_type + spatial_id 이중 임베딩(Dual Additive Embedding) 지원. (loc, scale)은 `cond_proj`(MLP 2→d_cond→d_cond)를 거쳐 모든 layer의 LSCNorm modulation으로 주입됨 (per-patch loc/scale conditioning). `task="masked"` (양방향 attention → reconstruction head + cross_head) / `task="next_pred"` (causal attention → next-patch head) 단일 encoder 기반 멀티태스크. forward 출력에 `time_id`, `cross_pred` 포함. `d_cond` (default=16)는 hyperparameter로 조정 가능.
 
 **`loss/masked_mse_loss.py`**: MaskedPatchLoss (마스킹된 패치 MSE) + create_patch_mask (랜덤/variate-level 마스킹). Phase 2에서 variate_mask_prob로 전체 variate 마스킹 지원.
 
