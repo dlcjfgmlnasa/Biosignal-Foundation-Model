@@ -56,6 +56,9 @@ obsidian/
 # BigQuery cohort exports (may contain PHI)
 bquxjob_*.csv
 
+# wget commands with embedded PhysioNet credentials (local-only, never commit)
+wget_commands.txt
+
 # MIMIC-III derived queries and exports (PHI / DUA risk)
 downstream/**/sql/
 
