@@ -24,7 +24,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from data import BiosignalDataset, create_dataloader
-from data.sampler import RecordingLocalitySampler
+from data.sampler import ModalityBalancedRecordingSampler, RecordingLocalitySampler
 from loss.criterion import CombinedLoss
 from model import BiosignalFoundationModel, ModelConfig
 from .train_utils import (
@@ -320,15 +320,30 @@ def main():
     if rank0:
         print(f"Train dataset: {len(dataset)} windows")
 
-    # Recording-locality sampler: 같은 레코딩의 윈도우를 연속 yield하여
-    # LRU 캐시 히트율을 극대화한다. 네트워크 디스크 I/O 병목 해소.
-    sampler = RecordingLocalitySampler(
-        dataset,
-        num_replicas=world_size if use_ddp else None,
-        rank=local_rank if use_ddp else None,
-        shuffle=True,
-        seed=config.seed,
-    )
+    # Sampler 선택:
+    #   modality_balanced_alpha=0  → RecordingLocalitySampler (uniform)
+    #   modality_balanced_alpha>0  → ModalityBalancedRecordingSampler
+    #     (√-inverse weighted, sparse modality 보정. val 에는 미적용.)
+    if config.modality_balanced_alpha > 0:
+        sampler = ModalityBalancedRecordingSampler(
+            dataset,
+            alpha=config.modality_balanced_alpha,
+            w_max_ratio=config.modality_balanced_w_max_ratio,
+            num_replicas=world_size if use_ddp else None,
+            rank=local_rank if use_ddp else None,
+            shuffle=True,
+            seed=config.seed,
+        )
+        if rank0:
+            sampler.log_multiplicity_summary()
+    else:
+        sampler = RecordingLocalitySampler(
+            dataset,
+            num_replicas=world_size if use_ddp else None,
+            rank=local_rank if use_ddp else None,
+            shuffle=True,
+            seed=config.seed,
+        )
     shuffle = False  # sampler가 셔플 담당
 
     dataloader = create_dataloader(

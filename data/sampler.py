@@ -11,9 +11,14 @@ from __future__ import annotations
 - GroupedBatchSampler: any_variate 모드를 위한 배치 샘플러.
   같은 (session_id, physical_time_ms)의 채널들을 항상 같은 배치에 넣어서
   PackCollate의 any_variate 그루핑이 제대로 동작하도록 보장한다.
+
+- ModalityBalancedRecordingSampler: 희소 modality(ICP/PAP/rare-ECG-lead) 보정용.
+  RecordingLocalitySampler 의 shard-aware locality 를 그대로 유지하면서,
+  (signal_type, spatial_id) 빈도의 √-inverse 로 recording 별 multiplicity 를
+  부여하여 expanded list 를 만든다. α=0 이면 RecordingLocalitySampler 와 동치.
 """
 import math
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Iterator
 
 import torch
@@ -455,3 +460,277 @@ class GroupedBatchSampler(Sampler[list[int]]):
             return per_rank_samples // self.batch_size
         else:
             return (per_rank_samples + self.batch_size - 1) // self.batch_size
+
+
+class ModalityBalancedRecordingSampler(Sampler[int]):
+    """√-inverse modality-balanced recording sampler (DDP + shard-aware locality 보존).
+
+    RecordingLocalitySampler 와 동일한 cache-locality 보장 (recording 단위 연속
+    yield + shard-aware shuffle) 을 유지하면서, 희소 modality 의 recording 을
+    multiplicity > 1 로 expand 하여 학습 분포를 평탄화한다.
+
+    가중치 공식:
+        f[(st, sp)] = manifest 전체에서 해당 (signal_type, local_spatial_id) recording 수
+        w_r = (1 / f[(st_r, sp_r)]) ** alpha
+        w_r ← min(w_r, w_max_ratio * mean(w))    # 상한 cap
+        multiplicity_r = max(1, round(w_r * N / sum(w)))
+
+    alpha 권장값:
+        - 0.0  : uniform (RecordingLocalitySampler 와 동치)
+        - 0.5  : √-inverse (희소 modality 4-10배 oversample, 권장)
+        - 1.0  : full inverse (aggressive)
+
+    Parameters
+    ----------
+    dataset:
+        BiosignalDataset 인스턴스. ``_manifest[i].signal_type`` / ``.spatial_ids[0]``
+        에서 (st, sp) 추출.
+    alpha:
+        √-inverse 지수 (default 0.5). 0 이면 uniform.
+    w_max_ratio:
+        가중치 cap = ``w_max_ratio * mean(w)``. None 이면 cap 없음.
+    num_replicas, rank, shuffle, seed:
+        ``RecordingLocalitySampler`` 와 동일 의미.
+    """
+
+    def __init__(
+        self,
+        dataset: BiosignalDataset,
+        alpha: float = 0.5,
+        w_max_ratio: float | None = 5.0,
+        num_replicas: int | None = None,
+        rank: int | None = None,
+        shuffle: bool = True,
+        seed: int = 0,
+    ) -> None:
+        if alpha < 0:
+            raise ValueError(f"alpha must be >= 0, got {alpha}")
+        self.dataset = dataset
+        self.alpha = alpha
+        self.w_max_ratio = w_max_ratio
+        self.num_replicas = num_replicas if num_replicas is not None else 1
+        self.rank = rank if rank is not None else 0
+        self.shuffle = shuffle
+        self.seed = seed
+        self.epoch = 0
+
+        n_recs = len(dataset._manifest)
+
+        # 실제 windows 가 있는 recording 만 후보로
+        self._real_rec_ranges: list[tuple[int, int]] = []
+        for r in range(n_recs):
+            start = dataset._rec_offsets[r]
+            end = dataset._rec_offsets[r + 1]
+            if end > start:
+                self._real_rec_ranges.append((r, start, end))
+
+        # ── multiplicity 계산 ──
+        multiplicities = self._compute_multiplicities()
+
+        # virtual list: 각 entry = (real_rec_idx, start, end)
+        # multiplicity > 1 이면 동일 entry 가 그 횟수만큼 등장 (셔플은 외부에서)
+        self._virtual_entries: list[tuple[int, int, int]] = []
+        for (real_idx, start, end), m in zip(self._real_rec_ranges, multiplicities):
+            for _ in range(m):
+                self._virtual_entries.append((real_idx, start, end))
+
+        self._n_virtual = len(self._virtual_entries)
+        self._n_virtual_padded = (
+            math.ceil(self._n_virtual / self.num_replicas) * self.num_replicas
+        )
+
+        # 통계 (디버그/로깅용)
+        self._multiplicity_stats = self._summarize_stats(multiplicities)
+
+    def _compute_multiplicities(self) -> list[int]:
+        """recording 별 multiplicity 정수 리스트 반환 (real_rec_ranges 와 같은 길이)."""
+        # (st, sp) 빈도
+        st_sp_pairs: list[tuple[int, int]] = []
+        for real_idx, _, _ in self._real_rec_ranges:
+            entry = self.dataset._manifest[real_idx]
+            st = entry.signal_type
+            sp_list = entry.spatial_ids or [0]
+            sp = sp_list[0] if sp_list else 0
+            st_sp_pairs.append((st, sp))
+
+        freq = Counter(st_sp_pairs)
+
+        # raw weight
+        n_recs = len(self._real_rec_ranges)
+        if self.alpha == 0.0:
+            # uniform — 모든 multiplicity = 1
+            return [1] * n_recs
+
+        raw_w = [(1.0 / freq[pair]) ** self.alpha for pair in st_sp_pairs]
+
+        # cap
+        if self.w_max_ratio is not None and len(raw_w) > 0:
+            mean_w = sum(raw_w) / len(raw_w)
+            cap = self.w_max_ratio * mean_w
+            raw_w = [min(w, cap) for w in raw_w]
+
+        # normalize so that sum(multiplicity) ≈ n_recs (학습 epoch 길이 보존)
+        sum_w = sum(raw_w)
+        if sum_w <= 0:
+            return [1] * n_recs
+
+        scale = n_recs / sum_w
+        multiplicities = [max(1, round(w * scale)) for w in raw_w]
+        return multiplicities
+
+    def _summarize_stats(self, multiplicities: list[int]) -> dict:
+        """(st, sp) 별 평균 multiplicity 통계 — 로깅용."""
+        pair_to_mults: dict[tuple[int, int], list[int]] = defaultdict(list)
+        for (real_idx, _, _), m in zip(self._real_rec_ranges, multiplicities):
+            entry = self.dataset._manifest[real_idx]
+            sp_list = entry.spatial_ids or [0]
+            pair = (entry.signal_type, sp_list[0] if sp_list else 0)
+            pair_to_mults[pair].append(m)
+        summary = {}
+        for pair, mults in pair_to_mults.items():
+            summary[pair] = {
+                "n_recs": len(mults),
+                "mult_mean": sum(mults) / len(mults),
+                "mult_max": max(mults),
+                "expanded_total": sum(mults),
+            }
+        return summary
+
+    def log_multiplicity_summary(self, print_fn=print) -> None:
+        """(st, sp) 별 multiplicity 분포를 보기 좋게 출력 (training 시작 시 1회 권장)."""
+        from data.spatial_map import SPATIAL_MAP
+
+        SIGNAL_NAMES = {
+            0: "ECG", 1: "ABP", 2: "PPG", 3: "CVP",
+            4: "CO2", 5: "AWP", 6: "PAP", 7: "ICP", 8: "RESP",
+        }
+        print_fn(
+            f"\n[ModalityBalancedSampler] alpha={self.alpha} "
+            f"w_max_ratio={self.w_max_ratio}"
+        )
+        print_fn(
+            f"  total recordings: {len(self._real_rec_ranges)} → "
+            f"virtual entries: {self._n_virtual} "
+            f"(expansion {self._n_virtual / max(len(self._real_rec_ranges), 1):.2f}x)"
+        )
+        print_fn(f"  {'st':>3} {'sp':>3} {'name':<22} {'recs':>8} {'mult':>6} {'expanded':>10}")
+        for (st, sp), stats in sorted(self._multiplicity_stats.items()):
+            name_map = {v: k for k, v in SPATIAL_MAP.get(st, {}).items()}
+            sp_name = name_map.get(sp, "?")
+            full = f"{SIGNAL_NAMES.get(st, '?')}/{sp_name}"
+            print_fn(
+                f"  {st:>3} {sp:>3} {full:<22} "
+                f"{stats['n_recs']:>8} {stats['mult_mean']:>6.2f} "
+                f"{stats['expanded_total']:>10}"
+            )
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def __iter__(self) -> Iterator[int]:
+        g = torch.Generator()
+        g.manual_seed(self.seed + self.epoch)
+
+        rec_to_shard = getattr(self.dataset, "_rec_to_shard", None)
+        path_map = getattr(self.dataset, "_path_to_shard_key", None)
+
+        # virtual entry 의 셔플 순서 결정 (shard-aware)
+        order = self._make_virtual_order(rec_to_shard, path_map, g)
+
+        # 패딩 (DDP rank 균등 분배)
+        if self._n_virtual_padded > self._n_virtual:
+            order = order + order[: self._n_virtual_padded - self._n_virtual]
+
+        per_rank = self._n_virtual_padded // self.num_replicas
+        my_entries = order[self.rank * per_rank : (self.rank + 1) * per_rank]
+
+        # 각 virtual entry 의 windows 를 (셔플 후) 연속 yield
+        indices: list[int] = []
+        for v_idx in my_entries:
+            if v_idx >= self._n_virtual:
+                continue
+            real_idx, start, end = self._virtual_entries[v_idx]
+            local = list(range(start, end))
+            if self.shuffle:
+                # 재현성: epoch + virtual idx 시드 (같은 recording 의 다중 출현은 다른 셔플)
+                lg = torch.Generator()
+                lg.manual_seed(self.seed + self.epoch * 100003 + v_idx)
+                perm = torch.randperm(len(local), generator=lg).tolist()
+                local = [local[p] for p in perm]
+            indices.extend(local)
+
+        return iter(indices)
+
+    def _make_virtual_order(
+        self,
+        rec_to_shard: dict[str, int] | None,
+        path_map: dict[str, str] | None,
+        generator: torch.Generator,
+    ) -> list[int]:
+        """virtual entry 순서 결정. shard-aware shuffle 우선."""
+        if not self.shuffle:
+            if rec_to_shard is not None:
+                return self._shard_grouped_virtual_order(rec_to_shard, path_map)
+            return list(range(self._n_virtual))
+
+        if rec_to_shard is not None:
+            return self._shard_aware_virtual_shuffle(rec_to_shard, path_map, generator)
+
+        # file backend — 순수 permutation
+        return torch.randperm(self._n_virtual, generator=generator).tolist()
+
+    def _virtual_to_shard(
+        self,
+        v_idx: int,
+        rec_to_shard: dict[str, int],
+        path_map: dict[str, str] | None,
+    ) -> int:
+        real_idx = self._virtual_entries[v_idx][0]
+        if path_map is not None:
+            shard_key = path_map.get(self.dataset._manifest[real_idx].path, str(real_idx))
+        else:
+            shard_key = str(real_idx)
+        return rec_to_shard.get(shard_key, 0)
+
+    def _shard_grouped_virtual_order(
+        self,
+        rec_to_shard: dict[str, int],
+        path_map: dict[str, str] | None,
+    ) -> list[int]:
+        shard_to_vs: dict[int, list[int]] = defaultdict(list)
+        for v_idx in range(self._n_virtual):
+            sid = self._virtual_to_shard(v_idx, rec_to_shard, path_map)
+            shard_to_vs[sid].append(v_idx)
+        order: list[int] = []
+        for sid in sorted(shard_to_vs.keys()):
+            order.extend(shard_to_vs[sid])
+        return order
+
+    def _shard_aware_virtual_shuffle(
+        self,
+        rec_to_shard: dict[str, int],
+        path_map: dict[str, str] | None,
+        generator: torch.Generator,
+    ) -> list[int]:
+        shard_to_vs: dict[int, list[int]] = defaultdict(list)
+        for v_idx in range(self._n_virtual):
+            sid = self._virtual_to_shard(v_idx, rec_to_shard, path_map)
+            shard_to_vs[sid].append(v_idx)
+
+        shard_ids = list(shard_to_vs.keys())
+        shard_perm = torch.randperm(len(shard_ids), generator=generator).tolist()
+        order: list[int] = []
+        for sp in shard_perm:
+            sid = shard_ids[sp]
+            vs = shard_to_vs[sid]
+            inner = torch.randperm(len(vs), generator=generator).tolist()
+            order.extend(vs[i] for i in inner)
+        return order
+
+    def __len__(self) -> int:
+        # 정확한 sample 수 = sum(end-start) over virtual entries
+        # 비용 절감 위해 평균 windows/recording 으로 근사
+        if not self._virtual_entries:
+            return 0
+        total_windows = sum(end - start for _, start, end in self._virtual_entries)
+        return math.ceil(total_windows / self.num_replicas)

@@ -97,6 +97,13 @@ class TrainConfig:
     use_length_aware_batching: bool = False
     length_overpack: int = 8  # buffer = batch_size × overpack (4~16 권장)
 
+    # Modality-balanced sampling (Phase 1 CI 전용, sparse modality 보정)
+    # alpha=0 이면 RecordingLocalitySampler (uniform), alpha>0 이면
+    # ModalityBalancedRecordingSampler 사용. 0.5=√-inverse 권장.
+    # 적용 정책: train 만, val 은 자연 분포 유지.
+    modality_balanced_alpha: float = 0.0
+    modality_balanced_w_max_ratio: float = 5.0  # cap = w_max_ratio * mean(w)
+
     # Validation & Early Stopping
     val_ratio: float = 0.2  # subject 단위 validation 비율
     patience: int = 10  # early stopping patience (0=비활성)
