@@ -496,6 +496,9 @@ def main() -> None:
         "class_distribution": metrics["class_distribution"],
         "y_true": metrics["y_true"].tolist(),
         "y_probs": metrics["y_probs"].tolist(),
+        # patient-level grouping id (test_windows 순서 = y_true 순서).
+        # 멀티클래스라 eval_protocol OOF 집계는 one-vs-rest 별도 처리 필요.
+        "patient_ids": [str(w.patient) for w in test_windows],
         "train_losses": train_losses,
         "config": {
             "mode": args.mode,

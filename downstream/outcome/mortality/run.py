@@ -310,6 +310,9 @@ def main() -> None:
 
     y_true = metrics.pop("y_true")
     y_score = metrics.pop("y_score")
+    # patient-level grouping id (test_patients 순서 = 예측 순서). 환자당 1 예측이라
+    # bootstrap 은 이미 patient-level 이지만, eval_protocol 통합 인터페이스용으로 저장.
+    patient_ids = [str(p["subject_id"]) for p in test_patients]
 
     print(f"\n{'=' * 60}")
     print(f"  ICU Mortality — {args.mode} (Transformer Aggregator)")
@@ -332,6 +335,7 @@ def main() -> None:
         **metrics,
         "y_true": y_true.tolist(),
         "y_score": y_score.tolist(),
+        "patient_ids": patient_ids,
         "train_losses": train_losses,
         "config": {
             "task": "icu_mortality_prediction",

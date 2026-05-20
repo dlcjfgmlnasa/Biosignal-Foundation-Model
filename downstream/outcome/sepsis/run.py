@@ -275,6 +275,8 @@ def main() -> None:
 
     y_true = metrics.pop("y_true")
     y_score = metrics.pop("y_score")
+    # patient-level grouping id (test_patients 순서 = 예측 순서).
+    patient_ids = [str(p["subject_id"]) for p in test_patients]
 
     print(f"\n{'=' * 60}")
     print(f"  Sepsis Prediction — {args.mode} (Transformer Aggregator)")
@@ -296,6 +298,7 @@ def main() -> None:
         **metrics,
         "y_true": y_true.tolist(),
         "y_score": y_score.tolist(),
+        "patient_ids": patient_ids,
         "train_losses": train_losses,
         "config": {
             "task": "sepsis_prediction", "mode": args.mode,

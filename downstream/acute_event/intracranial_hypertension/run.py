@@ -493,6 +493,7 @@ def run_loso(
         "aggregate": aggregate,
         "y_true": y_true.tolist(),
         "y_score": y_score.tolist(),
+        "patient_ids": [str(s) for s in all_sid],  # subject-level grouping (all_sid 순서 = y_true)
         "config": {
             "task": "intracranial_hypertension_detection",
             "mode": args.mode,
@@ -598,6 +599,8 @@ def main() -> None:
 
     y_true = metrics.pop("y_true")
     y_score = metrics.pop("y_score")
+    # subject-level grouping id (test_windows 순서 = 예측 순서).
+    patient_ids = [str(w.get("subject_id", "unknown")) for w in test_windows]
 
     print(f"\n{'=' * 60}")
     print(f"  Intracranial Hypertension Detection - {args.mode}")
@@ -620,6 +623,7 @@ def main() -> None:
         **metrics,
         "y_true": y_true.tolist(),
         "y_score": y_score.tolist(),
+        "patient_ids": patient_ids,
         "train_losses": train_losses,
         "config": {
             "task": "intracranial_hypertension_detection",

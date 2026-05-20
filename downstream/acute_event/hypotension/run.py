@@ -702,6 +702,9 @@ def main() -> None:
     # ── 결과 출력 ──
     y_true = metrics.pop("y_true")
     y_score = metrics.pop("y_score")
+    # patient(=case)-level grouping id, y_true/y_score 와 동일 순서 (test_labeled 순서).
+    # eval_protocol.patient_bootstrap_ci 에서 환자 단위 resampling 에 사용.
+    patient_ids = [str(w.case_id) for w in test_labeled]
 
     # Patch D: bootstrap 95% CI on test AUROC/AUPRC/F1 (1000 iter).
     thr = metrics["optimal_threshold"]
@@ -757,6 +760,7 @@ def main() -> None:
         **metrics,
         "y_true": y_true.tolist(),
         "y_score": y_score.tolist(),
+        "patient_ids": patient_ids,
         "val_auroc_best": float(best_val_auroc),
         "best_epoch": int(best_epoch),
         "auroc_ci": [float(auroc_ci[0]), float(auroc_ci[1])],

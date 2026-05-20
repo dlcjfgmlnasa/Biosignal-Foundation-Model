@@ -509,6 +509,8 @@ def main() -> None:
 
     y_true = metrics.pop("y_true")
     y_score = metrics.pop("y_score")
+    # patient-level grouping id (test_patients 순서 = 예측 순서).
+    patient_ids = [str(p["subject_id"]) for p in test_patients]
 
     # ── Bootstrap CI on test metrics ──
     print(f"Computing {args.bootstrap_iters}-iter bootstrap 95% CI...")
@@ -589,6 +591,7 @@ def main() -> None:
         **metrics,
         "y_true": y_true.tolist(),
         "y_score": y_score.tolist(),
+        "patient_ids": patient_ids,
         "train_losses": train_losses,
         "val_aurocs": val_aurocs,
         "val_auroc_best": val_auroc_best,
