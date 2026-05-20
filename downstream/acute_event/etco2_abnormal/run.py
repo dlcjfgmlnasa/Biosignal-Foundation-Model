@@ -45,6 +45,7 @@ from downstream.metrics import (
 )
 from downstream.viz import plot_roc_curve
 from downstream.model_wrapper import LinearProbe
+from downstream._eval_utils import dump_fold_predictions
 
 
 # ── 설정 ──────────────────────────────────────────────────────
@@ -508,6 +509,9 @@ def main() -> None:
     parser.add_argument("--patch-size", type=int, default=DEFAULT_PATCH_SIZE)
     parser.add_argument("--train-ratio", type=float, default=0.7)
     parser.add_argument("--out-dir", type=str, default=".")
+    parser.add_argument("--fold", type=int, default=0,
+                        help="현재 fold 인덱스 (run_eval OOF 집계용 .npz 라벨)")
+    parser.add_argument("--n-folds", type=int, default=1, help="전체 fold 수")
     parser.add_argument("--dummy", action="store_true")
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--data-path", type=str, default=None)
@@ -703,7 +707,7 @@ def main() -> None:
     y_true = metrics.pop("y_true")
     y_score = metrics.pop("y_score")
     # patient(=case)-level grouping id, y_true/y_score 와 동일 순서 (test_labeled 순서).
-    # eval_protocol.patient_bootstrap_ci 에서 환자 단위 resampling 에 사용.
+    # _eval_utils.bootstrap_ci 에서 환자 단위 resampling 에 사용.
     patient_ids = [str(w.case_id) for w in test_labeled]
 
     # Patch D: bootstrap 95% CI on test AUROC/AUPRC/F1 (1000 iter).
@@ -787,6 +791,13 @@ def main() -> None:
     with open(results_path, "w") as f:
         json.dump(results, f, indent=2)
     print(f"Results saved: {results_path}")
+
+    # fold prediction(.npz) — downstream.run_eval 가 OOF 집계에 사용.
+    npz_path = dump_fold_predictions(
+        out_dir, task="etco2_abnormal", fold_idx=args.fold, n_folds=args.n_folds,
+        y_true=y_true, y_score=y_score, patient_ids=patient_ids,
+    )
+    print(f"Fold predictions: {npz_path}")
 
 
 if __name__ == "__main__":

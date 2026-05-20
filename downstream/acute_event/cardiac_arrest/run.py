@@ -34,6 +34,7 @@ from downstream.metrics import (
 )
 from downstream.viz import plot_roc_curve
 from downstream.model_wrapper import LinearProbe
+from downstream._eval_utils import dump_fold_predictions
 from downstream.aggregator import (
     SIGNAL_TYPE_INT,
     TransformerAggregator,
@@ -222,6 +223,9 @@ def main() -> None:
     parser.add_argument("--agg-layers", type=int, default=2)
     parser.add_argument("--agg-heads", type=int, default=4)
     parser.add_argument("--out-dir", type=str, default=".")
+    parser.add_argument("--fold", type=int, default=0,
+                        help="현재 fold 인덱스 (run_eval OOF 집계용 .npz 라벨)")
+    parser.add_argument("--n-folds", type=int, default=1, help="전체 fold 수")
     parser.add_argument("--device", type=str, default="cpu")
     args = parser.parse_args()
 
@@ -311,6 +315,12 @@ def main() -> None:
     with open(results_path, "w") as f:
         json.dump(results, f, indent=2, default=str)
     print(f"Results: {results_path}")
+
+    npz_path = dump_fold_predictions(
+        out_dir, task="cardiac_arrest", fold_idx=args.fold, n_folds=args.n_folds,
+        y_true=y_true, y_score=y_score, patient_ids=patient_ids,
+    )
+    print(f"Fold predictions: {npz_path}")
 
 
 if __name__ == "__main__":

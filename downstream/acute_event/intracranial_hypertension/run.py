@@ -41,6 +41,7 @@ from downstream.metrics import (
 )
 from downstream.viz import plot_roc_curve
 from downstream.model_wrapper import LinearProbe
+from downstream._eval_utils import dump_fold_predictions
 
 
 DEFAULT_PATCH_SIZE = 100
@@ -511,6 +512,14 @@ def run_loso(
         json.dump(results, f, indent=2, default=str)
     print(f"Results: {results_path}")
 
+    # LOSO 는 내부에서 이미 OOF 집계 — 단일 OOF .npz 로 저장 (fold_idx=-1).
+    npz_path = dump_fold_predictions(
+        out_dir, task="intracranial_hypertension", fold_idx=-1,
+        n_folds=len(per_fold), y_true=y_true, y_score=y_score,
+        patient_ids=[str(s) for s in all_sid],
+    )
+    print(f"Fold predictions: {npz_path}")
+
     pred_path = out_dir / "loso_predictions.csv"
     with open(pred_path, "w", newline="") as f:
         w = csv.writer(f)
@@ -543,6 +552,9 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--patch-size", type=int, default=DEFAULT_PATCH_SIZE)
     parser.add_argument("--out-dir", type=str, default=".")
+    parser.add_argument("--fold", type=int, default=0,
+                        help="standard 모드 fold 인덱스 (run_eval OOF 집계용)")
+    parser.add_argument("--n-folds", type=int, default=1, help="전체 fold 수")
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--eval-mode", type=str, default="standard",
                         choices=["standard", "loso"],
@@ -636,6 +648,13 @@ def main() -> None:
     with open(results_path, "w") as f:
         json.dump(results, f, indent=2, default=str)
     print(f"Results: {results_path}")
+
+    npz_path = dump_fold_predictions(
+        out_dir, task="intracranial_hypertension", fold_idx=args.fold,
+        n_folds=args.n_folds, y_true=y_true, y_score=y_score,
+        patient_ids=patient_ids,
+    )
+    print(f"Fold predictions: {npz_path}")
 
 
 if __name__ == "__main__":

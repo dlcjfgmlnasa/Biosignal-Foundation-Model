@@ -43,6 +43,7 @@ from downstream.metrics import (
     compute_sensitivity_specificity,
 )
 from downstream.model_wrapper import LinearProbe
+from downstream._eval_utils import dump_fold_predictions
 
 # ── 설정 ──────────────────────────────────────────────────────
 
@@ -389,6 +390,9 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--patch-size", type=int, default=DEFAULT_PATCH_SIZE)
     parser.add_argument("--out-dir", type=str, default=".")
+    parser.add_argument("--fold", type=int, default=0,
+                        help="현재 fold 인덱스 (run_eval OOF 집계용 .npz 라벨)")
+    parser.add_argument("--n-folds", type=int, default=1, help="전체 fold 수")
     parser.add_argument("--dummy", action="store_true")
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--data-path", type=str, required=True)
@@ -497,7 +501,7 @@ def main() -> None:
         "y_true": metrics["y_true"].tolist(),
         "y_probs": metrics["y_probs"].tolist(),
         # patient-level grouping id (test_windows 순서 = y_true 순서).
-        # 멀티클래스라 eval_protocol OOF 집계는 one-vs-rest 별도 처리 필요.
+        # 멀티클래스 — run_eval 가 auroc_macro/auprc_macro (OvR) 로 집계.
         "patient_ids": [str(w.patient) for w in test_windows],
         "train_losses": train_losses,
         "config": {
@@ -512,6 +516,14 @@ def main() -> None:
     with open(results_path, "w") as f:
         json.dump(results, f, indent=2, default=str)
     print(f"Results saved: {results_path}")
+
+    # fold prediction(.npz) — multi-class (y_probs (N,K) + classes).
+    npz_path = dump_fold_predictions(
+        out_dir, task="arrhythmia", fold_idx=args.fold, n_folds=args.n_folds,
+        y_true=metrics["y_true"], y_score=metrics["y_probs"],
+        patient_ids=[str(w.patient) for w in test_windows], classes=CLASS_NAMES,
+    )
+    print(f"Fold predictions: {npz_path}")
 
 
 if __name__ == "__main__":

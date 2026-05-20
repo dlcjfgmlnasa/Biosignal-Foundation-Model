@@ -42,6 +42,7 @@ from downstream.metrics import (
 )
 from downstream.viz import plot_roc_curve
 from downstream.model_wrapper import LinearProbe
+from downstream._eval_utils import dump_fold_predictions
 from downstream.aggregator import (
     TransformerAggregator,
     collate_patients,
@@ -402,6 +403,9 @@ def main() -> None:
     parser.add_argument("--agg-layers", type=int, default=2)
     parser.add_argument("--agg-heads", type=int, default=4)
     parser.add_argument("--out-dir", type=str, default=".")
+    parser.add_argument("--fold", type=int, default=0,
+                        help="현재 fold 인덱스 (run_eval OOF 집계용 .npz 라벨)")
+    parser.add_argument("--n-folds", type=int, default=1, help="전체 fold 수")
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument(
         "--val-split-seed",
@@ -615,6 +619,14 @@ def main() -> None:
     with open(results_path, "w") as f:
         json.dump(results, f, indent=2, default=str)
     print(f"Results: {results_path}")
+
+    # binary: y_score (N,1); stage: (N,4) multi-class → run_eval 가 자동 판별.
+    npz_path = dump_fold_predictions(
+        out_dir, task=f"aki_{label_mode}", fold_idx=args.fold, n_folds=args.n_folds,
+        y_true=y_true, y_score=y_score, patient_ids=patient_ids,
+        classes=["0", "1", "2", "3"] if label_mode == "stage" else None,
+    )
+    print(f"Fold predictions: {npz_path}")
 
 
 if __name__ == "__main__":

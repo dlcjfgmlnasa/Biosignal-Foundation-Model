@@ -61,6 +61,38 @@ def save_predictions(
     return p
 
 
+def dump_fold_predictions(
+    out_dir: str | Path,
+    task: str,
+    fold_idx: int,
+    n_folds: int,
+    y_true,
+    y_score,
+    patient_ids,
+    classes: list[str] | None = None,
+    extra: dict | None = None,
+) -> Path:
+    """run.py 공용 편의 함수: fold prediction 을 ``preds_fold{idx}.npz`` 로 저장.
+
+    각 task run.py 가 eval 직후 y_true/y_score/patient_ids 를 그대로 넘기면 된다.
+    binary 면 y_score 는 (N,) 또는 (N,1), multi-class 면 (N,K).
+    """
+    path = Path(out_dir) / f"preds_fold{fold_idx}.npz"
+    return save_predictions(
+        path,
+        FoldPredictions(
+            y_true=np.asarray(y_true),
+            y_score=np.asarray(y_score),
+            patient_id=np.asarray(patient_ids, dtype=str),
+            fold_idx=int(fold_idx),
+            n_folds=int(n_folds),
+            task=task,
+            classes=classes,
+            extra=extra,
+        ),
+    )
+
+
 def load_predictions(path: str | Path) -> FoldPredictions:
     """save_predictions 로 저장된 .npz 로드."""
     data = np.load(path, allow_pickle=False)
@@ -104,6 +136,18 @@ def concat_oof(fold_paths: Sequence[str | Path]) -> FoldPredictions:
             raise ValueError(f"Task mismatch: {task} vs {fp.task}")
         if fp.n_folds != n_folds:
             raise ValueError(f"n_folds mismatch: {n_folds} vs {fp.n_folds}")
+
+    # CV leakage 검출: 한 환자가 2개 이상 fold 의 test 에 등장하면 안 됨
+    # (stratified k-fold 는 각 환자가 정확히 1번씩 test). 위반 시 OOF 가정 깨짐.
+    seen_pid_fold: dict = {}
+    for fp in fold_preds:
+        for pid in np.unique(fp.patient_id):
+            if pid in seen_pid_fold and seen_pid_fold[pid] != fp.fold_idx:
+                raise ValueError(
+                    f"patient {pid!r} appears in fold {seen_pid_fold[pid]} and "
+                    f"fold {fp.fold_idx} test sets — CV leakage"
+                )
+            seen_pid_fold[pid] = fp.fold_idx
 
     y_true = np.concatenate([fp.y_true for fp in fold_preds])
     y_score = np.concatenate([fp.y_score for fp in fold_preds])
