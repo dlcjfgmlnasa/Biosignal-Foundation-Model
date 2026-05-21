@@ -104,11 +104,13 @@ class BiosignalFoundationModel(nn.Module):
     dropout_p:
         드롭아웃 확률.
     num_signal_types:
-        신호 타입 수 (ecg=0, abp=1, ppg=2, cvp=3, co2=4, awp=5, pap=6, icp=7).
-    num_spatial_ids:
-        글로벌 spatial ID 수.
+        신호 타입(modality) 수. v2: 10
+        (ecg=0, abp=1, ppg=2, cvp=3, co2=4, awp=5, pap=6, icp=7,
+        resp_impedance=8, resp_flow=9).
     use_spatial_embed:
-        signal_type + spatial_id 이중 임베딩 사용 여부.
+        단일 modality(signal_type) 임베딩 사용 여부.
+        (이름은 하위 호환을 위해 유지 — v2에서 의미를 "modality embedding"으로
+        재정의. spatial_id 소분류 임베딩은 폐지됨.)
     next_block_size:
         Block Next Prediction에서 각 position이 병렬 예측하는 future patch 수 (K).
         각 position n에서 encoded_causal[n]으로부터 n+1, n+2, ..., n+K 시점의 raw patch를
@@ -133,8 +135,9 @@ class BiosignalFoundationModel(nn.Module):
         use_var_attn_bias: bool = True,
         scaler: PackedScaler | None = None,
         dropout_p: float = 0.0,
-        num_signal_types: int = 8,  # ECG(0),ABP(1),PPG(2),CVP(3),CO2(4),AWP(5),PAP(6),ICP(7)
-        num_spatial_ids: int = 13,  # TOTAL_SPATIAL_IDS (8 types × 가변 spatial IDs)
+        # v2 단일 modality embedding: ECG0,ABP1,PPG2,CVP3,CO24,AWP5,PAP6,ICP7,
+        # RESP_Impedance8, RESP_Flow9.
+        num_signal_types: int = 10,
         use_spatial_embed: bool = True,
         next_block_size: int = 4,
         next_head_d_inner: int | None = None,
@@ -187,11 +190,12 @@ class BiosignalFoundationModel(nn.Module):
             d_cond=self.d_cond,
         )
 
-        # 4. Spatial Positional Encoding (Dual Embedding)
+        # 4. Modality Embedding (v2: 단일 signal_type 임베딩)
+        # spatial_id 소분류 임베딩은 폐지 — modality(signal_type) 단위 단일 임베딩만 사용.
+        # (use_spatial_embed 이름은 하위 호환을 위해 유지, 의미는 modality embedding으로 재정의.)
         self.use_spatial_embed = use_spatial_embed
         if use_spatial_embed:
             self.signal_type_embed = nn.Embedding(num_signal_types, d_model)
-            self.spatial_id_embed = nn.Embedding(num_spatial_ids, d_model)
 
         # 5. Loc/Scale AdaLN Conditioning (환자별 절대 레벨 정보 보존)
         # (loc, scale) 2D scalar → d_cond conditioning vector → encoder 모든 layer의
@@ -336,8 +340,10 @@ class BiosignalFoundationModel(nn.Module):
         b = patches.shape[0]
         device = patches.device
 
-        # 3. global_var_idx 계산 — CNN stem과 dual embedding 모두에서 재사용
+        # 3. global_var_idx 계산 — CNN stem과 modality embedding 모두에서 재사용
         patch_signal_types: torch.Tensor | None = None
+        # v2: spatial_id 임베딩은 폐지됐으나, data/downstream 호환을 위해 plumbing은 유지.
+        # patch_spatial_ids는 출력 dict에만 실려 downstream에서 참조 가능 (모델 내부 미사용).
         patch_spatial_ids: torch.Tensor | None = None
 
         if hasattr(batch, "spatial_ids") and batch.spatial_ids is not None:
@@ -349,6 +355,7 @@ class BiosignalFoundationModel(nn.Module):
             global_var_idx = global_var_idx.clamp(min=0)
 
             patch_signal_types = batch.signal_types.to(device)[global_var_idx]  # (B, N)
+            # spatial_ids는 v2에서 [0] 보존 필드 — 임베딩에 쓰지 않고 plumbing만 유지.
             patch_spatial_ids = batch.spatial_ids.to(device)[global_var_idx]  # (B, N)
 
             # 절대 시간 기반 abs_time_id 계산 (cross-modal 매칭 전용)
@@ -375,14 +382,14 @@ class BiosignalFoundationModel(nn.Module):
         # 패딩 마스크 (p_vid==0은 패딩 토큰)
         valid_token = (p_vid > 0).unsqueeze(-1)  # (B, N, 1)
 
-        # 5-6. Conditioning Embedding 계산 (signal_type + spatial_id + loc + scale)
+        # 5-6. Conditioning Embedding 계산 (signal_type modality + loc + scale)
         # mask_token이 patch content를 덮어써도 conditioning은 살아남도록 별도 계산.
         # 이후 mask 적용 후 합산하여 마스킹된 위치도 자기 신호 종류/레벨 정보를 유지.
         cond = torch.zeros_like(patch_embed)
         if self.use_spatial_embed and patch_signal_types is not None:
+            # v2: 단일 modality(signal_type) 임베딩만 더함. spatial_id 임베딩 폐지.
             sig_emb = self.signal_type_embed(patch_signal_types)  # (B, N, d_model)
-            spa_emb = self.spatial_id_embed(patch_spatial_ids)  # (B, N, d_model)
-            cond = cond + sig_emb + spa_emb
+            cond = cond + sig_emb
 
         n = patch_embed.shape[1]
         stride = self.patch_embed.stride

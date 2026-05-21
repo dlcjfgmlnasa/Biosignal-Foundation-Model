@@ -19,8 +19,7 @@ model_config:
   stride: null               # non-overlapping (= patch_size)
   num_heads: 8               # head_dim = 256/8 = 32
   num_groups: null            # MHA (= num_heads)
-  num_signal_types: 9        # ECG(0)~ICP(7), RESP(8) — 2026-05-01         # ECG(0)~ICP(7) — K-MIMIC ICP 포함 유지 (향후 호환)
-  num_spatial_ids: 26        # ECG 12-lead + RESP          # TOTAL_SPATIAL_IDS (spatial_map.py 기준)
+  num_signal_types: 10       # v2 단일 modality 10종 (ECG0~RESP_Flow9, PAP6 슬롯 유지)
   use_glu: true
   use_moe: false              # Phase 1 CI에서는 off
   use_rope: true
@@ -35,7 +34,7 @@ model_config:
 # ── 데이터 (VitalDB OR 전용) ──
 data_dir:
   - /home/coder/workspace/updown/bio_fm/data/train/vitaldb/
-signal_types: [0, 1, 2, 3, 4, 5, 6]  # ECG, ABP, PPG, CVP, CO2, AWP, PAP (ICP 없음)
+signal_types: [0, 1, 2, 3, 4, 5, 7, 8, 9]  # ECG ABP PPG CVP CO2 AWP ICP RESP_Imp RESP_Flow (PAP=6 데이터 제외)
 max_subjects: null              # 전체 ~5,111 subjects
 window_seconds: 600.0          # 10분 윈도우 — 최대값
 max_length: 64000              # CI: 10분 윈도우(60000) + patch 정렬 여유

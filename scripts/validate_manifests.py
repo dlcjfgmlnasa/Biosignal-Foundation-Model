@@ -1,21 +1,27 @@
-"""Sharding 전 manifest 무결성·spec 적합성 검증.
+"""Sharding 전 manifest 무결성·spec 적합성 검증 (v2 단일 modality spec).
 
 본 sharding (수 시간~수십 시간) 들어가기 전에, processed/ 디렉토리의
 모든 subject manifest.json 을 빠르게 스캔하여 다음 항목을 확인한다.
 
-검증 항목:
-  1. signal_type ∈ {0..8} (현 spec, ECG~RESP 9종)
-  2. (signal_type, spatial_id) 페어가 ``data/spatial_map.SPATIAL_MAP`` 범위 내
-  3. ``n_channels == len(spatial_ids)``
+⚠️ v2 (단일 modality embedding, 2026-05-21):
+  디스크 manifest 는 구 9종 spec(signal_type 0~8 + spatial_ids) 그대로 보존한다.
+  본 validator 는 각 raw record 를 ``remap_record_v2`` 로 변환한 *결과* 기준으로
+  통계·검증한다. 따라서 validator 통과 == load-time remap 후 학습 파이프라인이
+  보게 될 데이터의 spec 적합성을 의미한다.
+
+검증 항목 (remap 후 기준):
+  1. signal_type ∈ {0..9} (v2 10종, PAP 6 은 remap 단계에서 drop)
+  2. spatial_id 검사는 v2 에서 폐지 (remap 후 항상 0) — skip
+  3. ``n_channels == len(spatial_ids)`` (remap 후 [0]*n 이므로 길이 보존)
   4. ``sampling_rate == 100`` (CLAUDE.md TARGET_SR)
   5. ``n_timesteps > 0``
   6. ``recordings`` 비어있지 않음
 
 리포트:
-  - signal_type 분포 (전체 recording / 전체 duration[h] / unique subject 수)
-  - (signal_type, spatial_id) 분포
+  - signal_type 분포 (remap 후, RESP 는 Impedance(8)/Flow(9) 2행으로 분리)
+  - PAP drop 카운트 (제외량 확인용)
   - violation 카운트 + 첫 N개 예시
-  - 예상 전체 토큰 수 (patch_size=200 가정)
+  - 예상 전체 토큰 수 (patch_size=200 가정, PAP 샘플 제외)
 
 사용법:
     python -m scripts.validate_manifests \\
@@ -37,14 +43,13 @@ from tqdm import tqdm
 
 # spec import — repo root 가 cwd 라고 가정
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from data.spatial_map import SPATIAL_MAP  # noqa: E402
+from data.spatial_map import (  # noqa: E402
+    SIGNAL_TYPE_NAMES,
+    remap_record_v2,
+)
 
 
 EXPECTED_SR = 100
-SIGNAL_TYPE_NAMES = {
-    0: "ECG", 1: "ABP", 2: "PPG", 3: "CVP",
-    4: "CO2", 5: "AWP", 6: "PAP", 7: "ICP", 8: "RESP",
-}
 
 
 def _scan_subject_dirs(processed: Path) -> list[Path]:
@@ -138,28 +143,48 @@ def main() -> None:
         print("\n[ERROR] no recordings to validate")
         sys.exit(1)
 
-    # ── Spec violation 검사 ──
+    # ── Spec violation 검사 (v2: remap-first) ──
+    # 디스크 record 는 구 spec(0~8 + spatial). remap_record_v2 로 변환한 결과를
+    # 검증·집계한다. PAP(6)은 None 반환 → drop (별도 카운트).
     violations: dict[str, list[str]] = defaultdict(list)
-    st_counter: Counter = Counter()
-    st_sp_counter: Counter = Counter()
+    st_counter: Counter = Counter()                       # remap 후 signal_type 분포
     st_subjects: dict[int, set[str]] = defaultdict(set)
     st_duration_s: dict[int, float] = defaultdict(float)
     total_samples = 0
+    n_pap_dropped = 0
+    pap_dropped_samples = 0
+    pap_dropped_seconds = 0.0
 
     for entry in all_records:
         rec = entry["rec"]
         subj = entry["subject_id"]
         sess = entry["session_id"]
-        st = rec.get("signal_type")
+        old_st = rec.get("signal_type")
         sp_list = rec.get("spatial_ids") or []
         n_ch = rec.get("n_channels")
         sr = rec.get("sampling_rate")
         n_t = rec.get("n_timesteps")
         loc = f"{subj}/{sess}/{rec.get('file')}"
 
-        if st not in SPATIAL_MAP:
+        # v2 remap: 구 (signal_type, spatial_ids) → 새 (signal_type, [0]*n) | None
+        remapped = remap_record_v2(old_st, sp_list)
+        if remapped is None:
+            # PAP drop — 데이터 제외, 슬롯만 유지. 제외량 집계.
+            n_pap_dropped += 1
+            if isinstance(n_t, int) and n_t > 0:
+                pap_dropped_samples += n_t * (n_ch or 1)
+                if isinstance(sr, (int, float)) and sr > 0:
+                    pap_dropped_seconds += n_t / sr
+            continue
+
+        st, new_sp_list = remapped
+
+        # remap 결과 signal_type 이 v2 범위(0~9) 밖이면 violation
+        if st not in SIGNAL_TYPE_NAMES:
             if len(violations["signal_type_oor"]) < args.max_examples:
-                violations["signal_type_oor"].append(f"{loc}: signal_type={st}")
+                violations["signal_type_oor"].append(
+                    f"{loc}: old_signal_type={old_st} → remapped={st} (v2 범위 밖)"
+                )
             continue
 
         st_counter[st] += 1
@@ -169,22 +194,13 @@ def main() -> None:
             st_duration_s[st] += dur
             total_samples += n_t * (n_ch or 1)
 
-        # spatial_id 범위
-        valid_local_ids = set(SPATIAL_MAP[st].values())
-        for sp in sp_list:
-            if sp not in valid_local_ids:
-                if len(violations["spatial_id_oor"]) < args.max_examples:
-                    violations["spatial_id_oor"].append(
-                        f"{loc}: signal_type={st}({SIGNAL_TYPE_NAMES.get(st)}), "
-                        f"spatial_id={sp}, valid={sorted(valid_local_ids)}"
-                    )
-            st_sp_counter[(st, sp)] += 1
+        # v2: spatial_id 검사 폐지 (remap 후 항상 0). spatial_id_oor skip.
 
-        # n_channels ↔ spatial_ids 길이 매칭
-        if isinstance(n_ch, int) and n_ch != len(sp_list):
+        # n_channels ↔ spatial_ids(remap 후 [0]*n) 길이 매칭
+        if isinstance(n_ch, int) and n_ch != len(new_sp_list):
             if len(violations["n_channels_mismatch"]) < args.max_examples:
                 violations["n_channels_mismatch"].append(
-                    f"{loc}: n_channels={n_ch}, len(spatial_ids)={len(sp_list)}"
+                    f"{loc}: n_channels={n_ch}, len(spatial_ids)={len(new_sp_list)}"
                 )
 
         # sampling_rate
@@ -203,29 +219,31 @@ def main() -> None:
 
     # ── 리포트 ──
     print(f"\n=== Recording stats ===")
-    print(f"  total recordings: {len(all_records)}")
+    print(f"  total recordings (raw): {len(all_records)}")
+    print(f"  PAP dropped (v2 제외):  {n_pap_dropped}")
 
-    print(f"\n=== Signal type distribution ===")
-    print(f"  {'st':>3} {'name':<6} {'recs':>10} {'subjects':>9} {'duration[h]':>13}")
+    print(f"\n=== Signal type distribution (remap 후, v2) ===")
+    print(f"  {'st':>3} {'name':<16} {'recs':>10} {'subjects':>9} {'duration[h]':>13}")
     for st in sorted(st_counter):
         print(
-            f"  {st:>3} {SIGNAL_TYPE_NAMES.get(st, '?'):<6} "
+            f"  {st:>3} {SIGNAL_TYPE_NAMES.get(st, '?'):<16} "
             f"{st_counter[st]:>10} {len(st_subjects[st]):>9} "
             f"{st_duration_s[st]/3600:>13.1f}"
         )
-    missing_types = sorted(set(SPATIAL_MAP.keys()) - set(st_counter.keys()))
+    # v2 활성 타입: 0~9 중 PAP(6) 제외 (데이터 drop 정책)
+    expected_active = set(SIGNAL_TYPE_NAMES.keys()) - {6}
+    missing_types = sorted(expected_active - set(st_counter.keys()))
     if missing_types:
-        print(f"  [WARN] signal types not seen at all: {missing_types}")
+        names = [SIGNAL_TYPE_NAMES.get(t, "?") for t in missing_types]
+        print(f"  [WARN] signal types not seen at all: {missing_types} ({names})")
 
-    print(f"\n=== (signal_type, spatial_id) distribution ===")
-    print(f"  {'st':>3} {'sp':>3} {'name':<22} {'count':>12}")
-    for (st, sp), n in sorted(st_sp_counter.items()):
-        name_map = {v: k for k, v in SPATIAL_MAP.get(st, {}).items()}
-        sp_name = name_map.get(sp, "?")
-        full = f"{SIGNAL_TYPE_NAMES.get(st, '?')}/{sp_name}"
-        print(f"  {st:>3} {sp:>3} {full:<22} {n:>12}")
+    if n_pap_dropped > 0:
+        print(f"\n=== PAP drop 상세 (참고) ===")
+        print(f"  recordings: {n_pap_dropped:,}")
+        print(f"  samples:    {pap_dropped_samples:,}")
+        print(f"  duration:   {pap_dropped_seconds/3600:.1f} h")
 
-    print(f"\n=== Token estimate (patch_size={args.patch_size}) ===")
+    print(f"\n=== Token estimate (patch_size={args.patch_size}, PAP 제외) ===")
     est_tokens = total_samples // args.patch_size
     print(f"  total samples (n_ch * n_t):  {total_samples:,}")
     print(f"  estimated tokens:            {est_tokens:,} ({est_tokens/1e9:.2f}B)")

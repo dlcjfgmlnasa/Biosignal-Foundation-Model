@@ -126,8 +126,8 @@ class DownstreamModelWrapper(nn.Module):
     def freeze_encoder(self) -> None:
         """Encoder 전체 파라미터를 freeze한다 (requires_grad=False).
 
-        Freeze 범위: scaler, patch_embed, encoder, signal_type_embed,
-        spatial_id_embed, cond_proj.
+        Freeze 범위: scaler, patch_embed, encoder, signal_type_embed, cond_proj.
+        (v2: spatial_id_embed 폐지 — 단일 modality embedding.)
         """
         self.model.requires_grad_(False)
 

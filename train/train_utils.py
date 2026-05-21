@@ -25,6 +25,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.lr_scheduler import LambdaLR
 
 from data import RecordingManifest
+from data.spatial_map import remap_record_v2
 from loss.criterion import CombinedLoss
 from loss.masked_mse_loss import create_patch_mask  # noqa: F401 — downstream에서 re-import 가능
 from model.checkpoint import save_checkpoint
@@ -43,7 +44,12 @@ class TrainConfig:
 
     # 데이터
     data_dir: str | list[str] = "datasets/processed"
-    signal_types: list[int] = field(default_factory=lambda: [0, 1, 2, 3, 4, 5, 6])
+    # v2 signal_type (remap 후 기준): 0 ECG / 1 ABP / 2 PPG / 3 CVP / 4 CO2 /
+    # 5 AWP / 6 PAP(데이터 제외) / 7 ICP / 8 RESP_Impedance / 9 RESP_Flow.
+    # PAP(6)은 remap 단계에서 drop 되므로 명시적으로 제외한다.
+    signal_types: list[int] = field(
+        default_factory=lambda: [0, 1, 2, 3, 4, 5, 7, 8, 9]
+    )
     max_subjects: int | None = None
     window_seconds: float = 30.0
     max_length: int = 50000
@@ -208,7 +214,16 @@ def _parse_manifest_files(
         for session in meta["sessions"]:
             session_id = session["session_id"]
             for rec in session["recordings"]:
-                if signal_types is not None and rec["signal_type"] not in signal_types:
+                # v2 load-time remap (remap-first → 새 번호로 필터).
+                # 디스크 manifest 는 구 9종 spec 그대로이므로, 여기서 v2 번호 체계로
+                # 변환한다. None 이면 drop (PAP 데이터 제외). spatial_id 는 [0]*n 평탄화.
+                remapped = remap_record_v2(
+                    rec["signal_type"], rec.get("spatial_ids")
+                )
+                if remapped is None:
+                    continue  # PAP drop
+                new_signal_type, new_spatial_ids = remapped
+                if signal_types is not None and new_signal_type not in signal_types:
                     continue
                 file_ref = rec["file"]
                 if "#" in file_ref:
@@ -222,9 +237,9 @@ def _parse_manifest_files(
                         n_channels=rec["n_channels"],
                         n_timesteps=rec["n_timesteps"],
                         sampling_rate=rec["sampling_rate"],
-                        signal_type=rec["signal_type"],
+                        signal_type=new_signal_type,
                         session_id=session_id,
-                        spatial_ids=rec.get("spatial_ids"),
+                        spatial_ids=new_spatial_ids,
                         start_sample=rec.get("start_sample", 0),
                     )
                 )
@@ -285,7 +300,14 @@ def _parse_manifest_full_jsonl(
             for session in meta.get("sessions", []):
                 session_id = session.get("session_id", "")
                 for rec in session.get("recordings", []):
-                    if signal_types is not None and rec["signal_type"] not in signal_types:
+                    # v2 load-time remap (remap-first → 새 번호로 필터).
+                    remapped = remap_record_v2(
+                        rec["signal_type"], rec.get("spatial_ids")
+                    )
+                    if remapped is None:
+                        continue  # PAP drop
+                    new_signal_type, new_spatial_ids = remapped
+                    if signal_types is not None and new_signal_type not in signal_types:
                         continue
                     file_ref = rec["file"]
                     if "#" in file_ref:
@@ -299,9 +321,9 @@ def _parse_manifest_full_jsonl(
                             n_channels=rec["n_channels"],
                             n_timesteps=rec["n_timesteps"],
                             sampling_rate=rec["sampling_rate"],
-                            signal_type=rec["signal_type"],
+                            signal_type=new_signal_type,
                             session_id=session_id,
-                            spatial_ids=rec.get("spatial_ids"),
+                            spatial_ids=new_spatial_ids,
                             start_sample=rec.get("start_sample", 0),
                         )
                     )

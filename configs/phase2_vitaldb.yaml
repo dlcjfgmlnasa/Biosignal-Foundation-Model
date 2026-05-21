@@ -22,8 +22,7 @@ model_config:
   stride: null                 # non-overlapping (= patch_size)
   num_heads: 8                 # head_dim = 256/8 = 32
   num_groups: null             # MHA (= num_heads)
-  num_signal_types: 9        # ECG(0)~ICP(7), RESP(8) — 2026-05-01          # ECG(0)~ICP(7) — Phase 1과 호환
-  num_spatial_ids: 26        # ECG 12-lead + RESP          # TOTAL_SPATIAL_IDS
+  num_signal_types: 10       # v2 단일 modality 10종 (ECG0~RESP_Flow9, PAP6 슬롯 유지)
   use_glu: true
   use_moe: false
   use_rope: true
@@ -38,7 +37,7 @@ model_config:
 # ── 데이터 (VitalDB OR 전용) ──
 data_dir:
   - /home/coder/workspace/updown/bio_fm/data/train/vitaldb/
-signal_types: [0, 1, 2, 3, 4, 5, 6]  # ECG, ABP, PPG, CVP, CO2, AWP, PAP (ICP 없음)
+signal_types: [0, 1, 2, 3, 4, 5, 7, 8, 9]  # ECG ABP PPG CVP CO2 AWP ICP RESP_Imp RESP_Flow (PAP=6 데이터 제외)
 max_subjects: null               # 전체 ~5,111 subjects
 window_seconds: 600.0            # 10분 윈도우 — 다변량 세션
 max_length: 180000               # row당 다수 unit packing 지원 (cross-session neg 풍부)

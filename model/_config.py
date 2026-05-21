@@ -37,13 +37,15 @@ class ModelConfig:
     use_var_attn_bias:
         BinaryAttentionBias (variate 간 bias) 사용 여부.
     use_spatial_embed:
-        signal_type + spatial_id 이중 임베딩 사용 여부.
+        단일 modality(signal_type) 임베딩 사용 여부.
+        (이름은 하위 호환을 위해 유지 — v2에서 의미를 "modality embedding"으로
+        재정의. spatial_id 소분류 임베딩은 폐지됨.)
     dropout_p:
         드롭아웃 확률.
     num_signal_types:
-        신호 타입 수 (ECG, ABP, PPG, CVP, CO2, AWP, PAP, ICP).
-    num_spatial_ids:
-        글로벌 spatial ID 수.
+        신호 타입(modality) 수. v2: 10
+        (ECG0, ABP1, PPG2, CVP3, CO24, AWP5, PAP6(슬롯 유지), ICP7,
+        RESP_Impedance8, RESP_Flow9).
     next_block_size:
         Block Next Prediction에서 각 position이 병렬 예측하는 future patch 수 (K).
     """
@@ -66,9 +68,12 @@ class ModelConfig:
     use_spatial_embed: bool = True
     dropout_p: float = 0.0
 
-    # Signal types
-    num_signal_types: int = 9  # ECG(0)~ICP(7), RESP(8) — 2026-05-01 RESP 추가
-    num_spatial_ids: int = 26  # TOTAL_SPATIAL_IDS (spatial_map.py): ECG 12-lead + RESP 추가
+    # Signal types (v2: single modality embedding)
+    # ECG0, ABP1, PPG2, CVP3, CO24, AWP5, PAP6(슬롯 유지), ICP7,
+    # RESP_Impedance8, RESP_Flow9 — 2026-05-21 Option A 단일 modality 전환.
+    num_signal_types: int = 10
+    # NOTE: num_spatial_ids는 v2에서 폐지됨 (spatial_id 소분류 임베딩 제거).
+    # 구 yaml/checkpoint에 남은 num_spatial_ids 키는 from_dict가 무시한다.
 
     # Task
     next_block_size: int = 4  # Block Next Prediction (K future patches per position)

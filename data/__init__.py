@@ -10,7 +10,8 @@ from data.spatial_map import (
     SPATIAL_MAP,
     TOTAL_SPATIAL_IDS,
     get_global_spatial_id,
-    CHANNEL_NAME_TO_SPATIAL,
+    CHANNEL_NAME_TO_SIGNAL_TYPE,
+    remap_record_v2,
 )
 
 __all__ = [
@@ -26,5 +27,6 @@ __all__ = [
     "SPATIAL_MAP",
     "TOTAL_SPATIAL_IDS",
     "get_global_spatial_id",
-    "CHANNEL_NAME_TO_SPATIAL",
+    "CHANNEL_NAME_TO_SIGNAL_TYPE",
+    "remap_record_v2",
 ]

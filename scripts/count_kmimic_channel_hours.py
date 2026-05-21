@@ -1,15 +1,22 @@
 # -*- coding: utf-8 -*-
-"""K-MIMIC 파싱 결과의 채널별 누적 시간 집계.
+"""K-MIMIC 파싱 결과의 modality(signal_type)별 누적 시간 집계 (v2 단일 modality).
 
 `manifest_full.jsonl` (없으면 per-subject `manifest.json`) 을 스트리밍 파싱하여,
-(signal_type, spatial_id) 단위로 아래 항목을 누적한다.
+signal_type 단위로 아래 항목을 누적한다.
 
   - recording 수
   - subject 수 (unique)
   - 총 sample 수
   - 총 hours (sampling_rate 기반)
 
-채널명은 `data/spatial_map.py` 의 SPATIAL_MAP 으로 역매핑한다.
+⚠️ v2 (단일 modality embedding, 2026-05-21):
+  디스크 manifest 는 구 9종 spec(0~8 + spatial_ids) 그대로이므로, 각 record 를
+  `remap_record_v2` 로 변환한 결과 기준으로 집계한다. 따라서:
+    - 구 RESP(8) 가 RESP_Impedance(8) / RESP_Flow(9) 2개 행으로 분리됨
+    - PAP(6) 는 drop (집계 제외). `--show-dropped` 로 raw PAP 시간만 별도 출력 가능
+    - spatial_id 폐지 → 집계 키는 (signal_type, 0) 로 평탄화
+
+signal_type 이름은 `data/spatial_map.SIGNAL_TYPE_NAMES` (SOT) 를 사용한다.
 sampling_rate 는 manifest record 의 `sampling_rate` 필드를 사용하며,
 누락 시 `--default-sr` (기본 100Hz) 로 대체한다.
 
@@ -35,7 +42,7 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-from data.spatial_map import SPATIAL_MAP
+from data.spatial_map import SIGNAL_TYPE_NAMES, remap_record_v2
 
 try:
     from tqdm import tqdm
@@ -47,25 +54,14 @@ except ImportError:
         return it
 
 
-SIGNAL_NAMES: dict[int, str] = {
-    0: "ECG",
-    1: "ABP",
-    2: "PPG",
-    3: "CVP",
-    4: "CO2",
-    5: "AWP",
-    6: "PAP",
-    7: "ICP",
-    8: "RESP",
-}
+# v2: signal_type 이름 SOT 는 data/spatial_map.SIGNAL_TYPE_NAMES.
+# RESP 는 Impedance(8)/Flow(9) 2개로 분리됨.
+SIGNAL_NAMES: dict[int, str] = dict(SIGNAL_TYPE_NAMES)
 
 
 def _local_name(signal_type: int, spatial_id: int) -> str:
-    mapping = SPATIAL_MAP.get(signal_type, {})
-    for name, lid in mapping.items():
-        if lid == spatial_id:
-            return name
-    return f"local_{spatial_id}"
+    # v2: spatial_id 폐지 → 항상 0(Unknown). signal_type 이름만 의미를 갖는다.
+    return SIGNAL_NAMES.get(signal_type, f"st_{signal_type}")
 
 
 # ── Manifest 로더 ─────────────────────────────────────────────
@@ -145,9 +141,18 @@ def _iter_records(subject_manifest: dict):
         yield from _expand_record(r, subject_key)
 
 
+# PAP drop 신호용 sentinel signal_type (집계에서 별도 추적).
+DROPPED_PAP_ST = -6
+
+
 def _expand_record(r: dict, subject_key: str):
-    """record 1건 → (multi-channel 가능) (stype, spatial_id, n_ts, sr, subj) 시퀀스."""
-    stype = int(r.get("signal_type", 0))
+    """record 1건 → v2 remap 후 (stype, spatial_id, n_ts, sr, subj) 시퀀스.
+
+    구 spec record 를 ``remap_record_v2`` 로 변환한 결과를 yield 한다.
+    spatial_id 는 폐지되어 항상 0. PAP(구 6)은 drop 대상이므로
+    ``DROPPED_PAP_ST`` sentinel 로 yield 하여 caller 가 raw 시간을 별도 집계한다.
+    """
+    old_stype = int(r.get("signal_type", 0))
     n_ts = int(r.get("n_timesteps", r.get("length", 0)))
     sr = r.get("sampling_rate", None)
     spatial_ids = r.get("spatial_ids")
@@ -155,8 +160,17 @@ def _expand_record(r: dict, subject_key: str):
         # spatial_ids 누락 시 local 0(Unknown) 단일 채널로 가정
         n_ch = int(r.get("n_channels", 1))
         spatial_ids = [0] * n_ch
-    for sid in spatial_ids:
-        yield stype, int(sid), n_ts, sr, subject_key
+
+    remapped = remap_record_v2(old_stype, [int(s) for s in spatial_ids])
+    if remapped is None:
+        # PAP drop — sentinel 로 raw 채널 수만큼 yield (제외량 추적용)
+        for _ in spatial_ids:
+            yield DROPPED_PAP_ST, 0, n_ts, sr, subject_key
+        return
+
+    new_stype, new_spatial_ids = remapped
+    for sid in new_spatial_ids:
+        yield new_stype, int(sid), n_ts, sr, subject_key
 
 
 # ── 집계 ──────────────────────────────────────────────────────
@@ -167,7 +181,8 @@ def scan(
     signal_filter: set[int] | None,
     default_sr: float,
     max_subjects: int | None = None,
-) -> tuple[dict, dict, dict, dict]:
+    show_dropped: bool = False,
+) -> tuple[dict, dict, dict, dict, dict]:
     """
     Returns
     -------
@@ -175,11 +190,13 @@ def scan(
     per_channel_count   : (stype, sid) → n_records
     per_channel_subjects: (stype, sid) → set(subject_key)
     per_channel_seconds : (stype, sid) → total_seconds  (sampling_rate 반영)
+    dropped             : {"count","samples","seconds"} — PAP drop 집계 (v2 제외량)
     """
     per_samples: dict[tuple[int, int], int] = defaultdict(int)
     per_count: dict[tuple[int, int], int] = defaultdict(int)
     per_subjects: dict[tuple[int, int], set] = defaultdict(set)
     per_seconds: dict[tuple[int, int], float] = defaultdict(float)
+    dropped = {"count": 0, "samples": 0, "seconds": 0.0}
 
     full = data_dir / "manifest_full.jsonl"
     if full.exists():
@@ -203,6 +220,13 @@ def scan(
         for stype, sid, n_ts, sr, subj in _iter_records(sm):
             if n_ts <= 0:
                 continue
+            srate = float(sr) if sr else default_sr
+            # PAP drop sentinel — 정상 집계에서 제외, 별도 추적 (v2 제외량).
+            if stype == DROPPED_PAP_ST:
+                dropped["count"] += 1
+                dropped["samples"] += n_ts
+                dropped["seconds"] += n_ts / srate
+                continue
             if signal_filter is not None and stype not in signal_filter:
                 continue
             key = (stype, sid)
@@ -210,7 +234,6 @@ def scan(
             per_count[key] += 1
             if subj:
                 per_subjects[key].add(subj)
-            srate = float(sr) if sr else default_sr
             per_seconds[key] += n_ts / srate
 
     print(
@@ -218,7 +241,7 @@ def scan(
         f"{sum(per_count.values())} recording(s)",
         file=sys.stderr,
     )
-    return per_samples, per_count, per_subjects, per_seconds
+    return per_samples, per_count, per_subjects, per_seconds, dropped
 
 
 # ── 출력 ──────────────────────────────────────────────────────
@@ -334,7 +357,8 @@ def write_csv(
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="K-MIMIC processed 데이터의 채널별(spatial_id 단위) 누적 시간 집계"
+        description="K-MIMIC processed 데이터의 modality(signal_type)별 누적 시간 "
+                    "집계 (v2 remap 적용: RESP→Imp/Flow 분리, PAP drop)"
     )
     ap.add_argument(
         "--data-dir", "-d", type=str, required=True,
@@ -342,7 +366,8 @@ def main() -> None:
     )
     ap.add_argument(
         "--signals", type=int, nargs="*", default=None,
-        help="signal_type 필터 (0=ECG, 1=ABP, ..., 8=RESP). 미지정 시 전체.",
+        help="signal_type 필터 (v2 remap 후 번호: 0=ECG ... 8=RESP_Impedance, "
+             "9=RESP_Flow). 미지정 시 전체. PAP=6 은 항상 drop.",
     )
     ap.add_argument(
         "--default-sr", type=float, default=100.0,
@@ -357,6 +382,10 @@ def main() -> None:
         help="테스트용: 처음 N개 subject manifest만 스캔하고 종료. "
              "미지정 시 전체 스캔.",
     )
+    ap.add_argument(
+        "--show-dropped", action="store_true",
+        help="v2 에서 drop 되는 PAP 의 raw 누적 시간을 별도 출력 (참고용).",
+    )
     args = ap.parse_args()
 
     data_dir = Path(args.data_dir)
@@ -366,8 +395,9 @@ def main() -> None:
 
     signal_filter = set(args.signals) if args.signals else None
 
-    per_samples, per_count, per_subjects, per_seconds = scan(
-        data_dir, signal_filter, args.default_sr, max_subjects=args.max_subjects
+    per_samples, per_count, per_subjects, per_seconds, dropped = scan(
+        data_dir, signal_filter, args.default_sr,
+        max_subjects=args.max_subjects, show_dropped=args.show_dropped,
     )
 
     if not per_samples:
@@ -375,6 +405,16 @@ def main() -> None:
         sys.exit(1)
 
     print_table(per_samples, per_count, per_subjects, per_seconds)
+
+    if args.show_dropped and dropped["count"] > 0:
+        print()
+        print("  " + "-" * 90)
+        print(
+            f"  [DROPPED] PAP (v2 제외): "
+            f"recs={_fmt_si(dropped['count'])}, "
+            f"samples={_fmt_si(dropped['samples'])}, "
+            f"duration={_fmt_hr(dropped['seconds'])}"
+        )
 
     if args.csv:
         write_csv(Path(args.csv), per_samples, per_count, per_subjects, per_seconds)
