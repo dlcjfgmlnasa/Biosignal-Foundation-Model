@@ -61,7 +61,13 @@ MIMIC_SIGNAL_MAP: dict[str, str] = {
     # AWP / Airway Pressure
     "AWP": "awp",
     # RESP / Respiration
-    "RESP": "resp",
+    # v2 결정(2026-05-21): #10 임상 정의는 RESP-Flow(ventilator flow)이나,
+    # 데이터 소스 MIMIC-III matched waveform 에는 flow 채널이 없고 RESP=impedance
+    # plethysmography 만 존재한다. VitalDB 전환은 재삽관(extubation failure) 라벨
+    # 부재로 불가 판정. 따라서 RESP-Impedance(8) 를 proxy 로 사용한다.
+    # (flow 미사용 한계는 paper limitation 으로 기술. SOT: docs/paper_task_modality.md.)
+    # string→int SSOT 는 data.spatial_map.SIGNAL_KEY_TO_TYPE (signal_type=8).
+    "RESP": "resp_impedance",
 }
 
 

@@ -37,11 +37,14 @@ from downstream._save_utils import (
 
 TARGET_SR: float = 100.0
 
-# Task #13 Waveform Forecasting: All 9 modality.
+# Task #13 Waveform Forecasting: All modality.
 # Main paper: ECG, ABP, PPG, CO2 (universal coverage).
-# Appendix: RESP, AWP, CVP, ICP, PAP (rare/specialized cohorts).
+# Appendix: RESP_Impedance, AWP, CVP, ICP, PAP (rare/specialized cohorts).
+# v2: RESP → resp_impedance(8). RESP_Flow(9)는 다운스트림 데이터 소스 부재
+# (MIMIC-III=impedance only, VitalDB Open=resp 없음, flow는 K-MIMIC pretrain 전용)
+# 이므로 forecast 타깃에서 제외. SSOT: data.spatial_map.SIGNAL_KEY_TO_TYPE.
 MAIN_SIGNAL_TYPES = ["ecg", "abp", "ppg", "co2"]
-APPENDIX_SIGNAL_TYPES = ["resp", "awp", "cvp", "icp", "pap"]
+APPENDIX_SIGNAL_TYPES = ["resp_impedance", "awp", "cvp", "icp", "pap"]
 ALL_SIGNAL_TYPES = MAIN_SIGNAL_TYPES + APPENDIX_SIGNAL_TYPES
 
 

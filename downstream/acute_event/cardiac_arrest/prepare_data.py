@@ -53,7 +53,8 @@ MIMIC_SIGNAL_MAP: dict[str, str] = {
     "ABP": "abp",
     "ART": "abp",
     "PLETH": "ppg",
-    "RESP": "resp",
+    # v2: RESP=impedance plethysmography → resp_impedance(8). SSOT: data.spatial_map.
+    "RESP": "resp_impedance",
 }
 
 

@@ -48,19 +48,11 @@ from torch import nn
 
 from data.collate import PackCollate, PackedBatch
 from data.dataset import BiosignalSample
+from data.spatial_map import SIGNAL_KEY_TO_TYPE
 
-# signal_type_key -> signal_type_id (data/spatial_map.py 와 정합)
-SIGNAL_TYPE_IDS: dict[str, int] = {
-    "ecg": 0,
-    "abp": 1,
-    "ppg": 2,
-    "cvp": 3,
-    "co2": 4,
-    "awp": 5,
-    "pap": 6,
-    "icp": 7,
-    "resp": 8,
-}
+# signal_type_key -> signal_type_id : data.spatial_map 의 SSOT(v2) 사용.
+# (10 signal_type, spatial_id 폐지, resp_impedance=8 / resp_flow=9.)
+SIGNAL_TYPE_IDS: dict[str, int] = SIGNAL_KEY_TO_TYPE
 
 # Mechanism groups for analysis
 MECHANISM_GROUPS: dict[str, str] = {
@@ -70,7 +62,8 @@ MECHANISM_GROUPS: dict[str, str] = {
     "cvp": "cardiovascular",
     "co2": "respiratory",
     "awp": "respiratory",
-    "resp": "respiratory",
+    "resp_impedance": "respiratory",
+    "resp_flow": "respiratory",
     "pap": "cardiovascular",
     "icp": "neurological",
 }
@@ -122,11 +115,14 @@ def parse_scenario(scenario_str: str) -> Scenario:
 def get_default_scenarios() -> list[Scenario]:
     """Task #12 Cross-Modal Reconstruction default scenarios.
 
-    Paper-confirmed pair definition (docs/paper_task_modality.md):
+    Paper-confirmed pair definition (docs/paper_task_modality.md).
+    v2 (RESP 분리) — respiratory pair 를 spatial_map CROSS_PRED_ALLOWED_PAIRS
+    (4,8)=CO2↔RESP_Impedance, (5,9)=AWP↔RESP_Flow 와 동기화:
       - ECG → ABP (baseline cardiac cycle)
       - ECG → PPG (cardiac → peripheral)
       - ABP → PPG (arterial pulse wave)
-      - CO2 → RESP (respiratory coupling)
+      - CO2 → RESP_Impedance (호흡 effort coupling, capnography ↔ 흉부 임피던스)
+      - AWP → RESP_Flow (ventilator P–Q 인과, airway pressure ↔ flow waveform)
       - ABP → ICP (virtual ICP probe — non-invasive ICP estimation)
       - ABP → PAP (virtual Swan-Ganz — non-invasive PA pressure)
       - CVP → PAP (right heart hemodynamics)
@@ -136,8 +132,9 @@ def get_default_scenarios() -> list[Scenario]:
         Scenario("ECG->ABP", ["ecg"], "abp", "intra", 1),
         Scenario("ECG->PPG", ["ecg"], "ppg", "intra", 1),
         Scenario("ABP->PPG", ["abp"], "ppg", "intra", 1),
-        # Respiratory coupling
-        Scenario("CO2->RESP", ["co2"], "resp", "intra", 1),
+        # Respiratory coupling (spatial_map (4,8)/(5,9) 와 동기화)
+        Scenario("CO2->RESP_IMPEDANCE", ["co2"], "resp_impedance", "intra", 1),
+        Scenario("AWP->RESP_FLOW", ["awp"], "resp_flow", "intra", 1),
         # Rare-modality virtual probes (primary novelty)
         Scenario("ABP->ICP", ["abp"], "icp", "inter", 1),
         Scenario("ABP->PAP", ["abp"], "pap", "intra", 1),
@@ -304,6 +301,8 @@ _SYNTH_FREQS: dict[str, float] = {
     "awp": 0.3,
     "pap": 1.0,
     "icp": 0.15,
+    "resp_impedance": 0.25,  # 호흡 effort (~15 bpm)
+    "resp_flow": 0.25,       # ventilator flow (~15 bpm)
 }
 
 

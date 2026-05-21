@@ -686,10 +686,12 @@ def main() -> None:
     parser.add_argument(
         "--signal-types",
         nargs="+",
-        default=["ecg", "abp", "ppg", "cvp", "co2", "resp", "icp", "pap"],
-        choices=["ecg", "abp", "ppg", "cvp", "co2", "awp", "resp", "pap", "icp"],
+        default=["ecg", "abp", "ppg", "cvp", "co2", "resp_impedance", "icp", "pap"],
+        choices=["ecg", "abp", "ppg", "cvp", "co2", "awp",
+                 "resp_impedance", "resp_flow", "pap", "icp"],
         help="Signal types to extract (Task #12 default: 8 modality — "
-             "ECG, ABP, PPG, CVP, CO2, RESP, ICP, PAP)",
+             "ECG, ABP, PPG, CVP, CO2, RESP_Impedance, ICP, PAP). "
+             "v2: RESP 가 resp_impedance / resp_flow 로 분리됨.",
     )
     parser.add_argument(
         "--n-cases", type=int, default=10, help="Number of cases to load"

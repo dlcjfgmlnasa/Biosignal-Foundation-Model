@@ -64,8 +64,8 @@ MIMIC_SIGNAL_MAP: dict[str, str] = {
     "PAP": "pap",
     # ICP / Intracranial Pressure (TBI / neuro 환자)
     "ICP": "icp",
-    # RESP / Respiration (impedance)
-    "RESP": "resp",
+    # RESP / Respiration (impedance) — v2: resp_impedance(8). SSOT: data.spatial_map.
+    "RESP": "resp_impedance",
 }
 
 

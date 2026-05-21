@@ -75,6 +75,28 @@ SIGNAL_TYPE_NAMES: dict[int, str] = {
 }
 
 
+# 소문자 task-facing key → signal_type 번호 (downstream/eval 공용 SSOT, v2).
+# master_plan §7.1 번호 체계의 유일 소스. downstream 각 스크립트는 자체 dict 를
+# 두지 말고 이 표(또는 ``SIGNAL_TYPE_TO_KEY``)를 import 해 사용한다.
+#   - 구 단일 "resp"(8) 는 v2 에서 "resp_impedance"(8) / "resp_flow"(9) 로 분리.
+#   - "pap"(6) 은 pretrain 데이터 제외이나 슬롯/번호는 유지(renumber 회피).
+SIGNAL_KEY_TO_TYPE: dict[str, int] = {
+    "ecg": 0,
+    "abp": 1,
+    "ppg": 2,
+    "cvp": 3,
+    "co2": 4,
+    "awp": 5,
+    "pap": 6,
+    "icp": 7,
+    "resp_impedance": 8,
+    "resp_flow": 9,
+}
+
+# signal_type 번호 → 소문자 key (역방향, intersection/forecast 등에서 사용)
+SIGNAL_TYPE_TO_KEY: dict[int, str] = {v: k for k, v in SIGNAL_KEY_TO_TYPE.items()}
+
+
 def get_global_spatial_id(signal_type: int, local_id: int) -> int:
     """(signal_type, local_spatial_id) → 전역 고유 spatial_id 변환.
 

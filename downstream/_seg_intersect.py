@@ -26,12 +26,13 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
+from data.spatial_map import SIGNAL_TYPE_TO_KEY
+
 TARGET_SR: float = 100.0
 
-SIGNAL_TYPE_STR: dict[int, str] = {
-    0: "ecg", 1: "abp", 2: "ppg", 3: "cvp",
-    4: "co2", 5: "awp", 6: "pap", 7: "icp", 8: "resp",
-}
+# signal_type 번호 → 소문자 key : data.spatial_map 의 SSOT(v2) 사용.
+# (10 signal_type, spatial_id 폐지, 8=resp_impedance / 9=resp_flow.)
+SIGNAL_TYPE_STR: dict[int, str] = SIGNAL_TYPE_TO_KEY
 
 
 @dataclass
@@ -39,7 +40,6 @@ class _SegmentRef:
     """Parser manifest 의 한 recording 메타."""
     start_sample: int  # 절대 시작 (TARGET_SR 기준)
     n_timesteps: int
-    spatial_id: int
     file: str          # subject_dir 기준 상대 파일명
 
 
@@ -95,30 +95,13 @@ def _intersect_intervals(
     return result
 
 
-def _normalize_required(
-    required_signals,
-) -> list[tuple[str, set[int] | None]]:
-    """str 또는 (str, allowed_sids) 형태 입력을 (str, set|None) 으로 통일."""
-    out: list[tuple[str, set[int] | None]] = []
-    for item in required_signals:
-        if isinstance(item, tuple):
-            sig, sids = item
-            out.append((sig, None if sids is None else set(sids)))
-        else:
-            out.append((item, None))
-    return out
-
-
 def _find_containing_seg(
     segs: list[_SegmentRef],
-    allowed_sids: set[int] | None,
     start: int,
     end: int,
 ) -> _SegmentRef | None:
     """[start, end) 를 fully 포함하는 segment 탐색."""
     for s in segs:
-        if allowed_sids is not None and s.spatial_id not in allowed_sids:
-            continue
         s_end = s.start_sample + s.n_timesteps
         if s.start_sample <= start and s_end >= end:
             return s
@@ -127,7 +110,7 @@ def _find_containing_seg(
 
 def _load_one_subject(
     subj_dir: Path,
-    required: list[tuple[str, set[int] | None]],
+    required: list[str],
     min_duration_samples: int,
 ) -> list[dict]:
     """Subject manifest 로드 → 시간선 intersection → 각 interval 의 신호 slice."""
@@ -152,18 +135,15 @@ def _load_one_subject(
             st_int = rec.get("signal_type")
             ss = rec.get("start_sample")
             nt = rec.get("n_timesteps")
-            sp_ids = rec.get("spatial_ids", [])
             fname = rec.get("file")
             if st_int is None or ss is None or nt is None or not fname:
                 continue
             st_str = SIGNAL_TYPE_STR.get(int(st_int))
             if st_str is None:
                 continue
-            sp_id = int(sp_ids[0]) if sp_ids else 0
             sig_segs[st_str].append(_SegmentRef(
                 start_sample=int(ss),
                 n_timesteps=int(nt),
-                spatial_id=sp_id,
                 file=str(fname),
             ))
         for k in sig_segs:
@@ -172,12 +152,10 @@ def _load_one_subject(
         # required signal 별 intervals (overlap 병합)
         intervals_by_sig: dict[str, list[tuple[int, int]]] = {}
         skip = False
-        for sig_str, allowed_sids in required:
+        for sig_str in required:
             recs = sig_segs.get(sig_str, [])
             sig_intervals: list[tuple[int, int]] = []
             for seg in recs:
-                if allowed_sids is not None and seg.spatial_id not in allowed_sids:
-                    continue
                 sig_intervals.append((seg.start_sample, seg.start_sample + seg.n_timesteps))
             if not sig_intervals:
                 skip = True
@@ -197,9 +175,9 @@ def _load_one_subject(
 
             signals: dict[str, np.ndarray] = {}
             ok = True
-            for sig_str, allowed_sids in required:
+            for sig_str in required:
                 seg = _find_containing_seg(
-                    sig_segs[sig_str], allowed_sids, i_start, i_end,
+                    sig_segs[sig_str], i_start, i_end,
                 )
                 if seg is None:
                     # multi-lead overlap 으로 intersection 이 잡혔으나 단일 seg 로
@@ -247,7 +225,7 @@ def _load_one_subject(
 
 def load_aligned_signals_intersection(
     data_dir: str,
-    required_signals,  # list of str 또는 list of (str, allowed_spatial_ids_or_None)
+    required_signals: list[str],
     *,
     min_duration_sec: float = 60.0,
     max_subjects: int | None = None,
@@ -260,11 +238,11 @@ def load_aligned_signals_intersection(
     Parameters
     ----------
     data_dir : 파싱된 .pt 디렉토리 (각 subject_dir 안에 manifest.json 존재).
-    required_signals : 필수 signal type 리스트.
-        - ``["abp", "ecg", "ppg"]`` : spatial_id 무관
-        - ``[("resp", [2]), "ecg"]`` : resp 는 spatial_id=2(Flow) 만 허용 등
-        - 본 함수가 자동으로 abp 를 추가하지 않으니, label 계산에 필요하면
-          호출자가 명시적으로 포함시킬 것.
+    required_signals : 필수 signal type 문자열 리스트 (예: ``["abp", "ecg", "ppg"]``).
+        v2 (single-modality embedding) 부터 spatial_id 폐지 — RESP 는 signal_type
+        레벨에서 ``"resp_impedance"`` / ``"resp_flow"`` 로 직접 구분한다.
+        본 함수가 자동으로 abp 를 추가하지 않으니, label 계산에 필요하면
+        호출자가 명시적으로 포함시킬 것.
     min_duration_sec : intersection interval 최소 길이 (초).
     max_subjects : 처리 subject 상한 (디버깅용).
     workers : 병렬 worker 수.
@@ -279,7 +257,7 @@ def load_aligned_signals_intersection(
         "signals": {sig_str: np.ndarray (T,)},  # 한 case 의 모든 신호 같은 길이 T
     }
     """
-    required = _normalize_required(required_signals)
+    required = list(required_signals)
     root = Path(data_dir)
     if not root.is_dir():
         print(f"  ERROR: Data directory not found: {root}")
@@ -290,10 +268,7 @@ def load_aligned_signals_intersection(
         subject_dirs = subject_dirs[:max_subjects]
 
     min_samples = int(min_duration_sec * TARGET_SR)
-    req_str = ", ".join(
-        f"{s}{'' if a is None else '(' + ','.join(map(str, sorted(a))) + ')'}"
-        for s, a in required
-    )
+    req_str = ", ".join(required)
     print(f"  Loading aligned signals via timeline intersection")
     print(f"    data_dir : {root}")
     print(f"    required : {req_str}")

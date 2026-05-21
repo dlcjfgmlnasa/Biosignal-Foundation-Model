@@ -14,8 +14,9 @@ TRAIN_RATIO="${TRAIN_RATIO:-0.7}"
 PARSED_MIMIC3_PPG="${PARSED_MIMIC3_PPG:-}"
 
 # Task #12 Cross-Modal Recon (2026-05-13 확정): 8 modality
-#   ECG, ABP, PPG, CVP, CO2, RESP, ICP, PAP
-# Pairs: ECG→ABP, ECG→PPG, ABP→PPG, CO2→RESP, ABP→ICP, ABP→PAP, CVP→PAP
+#   ECG, ABP, PPG, CVP, CO2, RESP_Impedance, ICP, PAP
+# Pairs: ECG→ABP, ECG→PPG, ABP→PPG, CO2→RESP_Impedance, ABP→ICP, ABP→PAP, CVP→PAP
+# v2: RESP → resp_impedance(8). RESP_Flow(9)는 downstream 데이터 소스 부재로 제외.
 
 # ── Cardiovascular core (MIMIC-III-Ext-PPG, local .pt) ──────
 if [ -n "$PARSED_MIMIC3_PPG" ] && [ -d "$PARSED_MIMIC3_PPG" ]; then
@@ -54,13 +55,16 @@ python -m downstream.generation.cross_modal.prepare_data \
     --train-ratio "$TRAIN_RATIO" \
     --out-dir "$OUT_DIR"
 
-# ── Respiratory: VitalDB ────────────────────────────────────
-# CO2→RESP scenario 위한 CO2+RESP windows
+# ── Respiratory ─────────────────────────────────────────────
+# CO2→RESP_Impedance scenario 위한 CO2+RESP_Impedance windows.
+# ⚠️ source 주의: VitalDB Open(SNUADC)에는 RESP 매핑이 0건이라 vitaldb 소스로는
+#    resp_impedance 가 비어 시나리오가 skip 된다. impedance 는 MIMIC-III 만 보유 —
+#    이 pair 는 MIMIC-III 소스로 돌려야 데이터가 잡힌다(generation-task 소스 점검 필요).
 echo ""
-echo "=== Respiratory (VitalDB) ==="
+echo "=== Respiratory (CO2 + RESP_Impedance) ==="
 python -m downstream.generation.cross_modal.prepare_data \
     --source vitaldb \
-    --signal-types co2 resp \
+    --signal-types co2 resp_impedance \
     --n-cases "$N_CASES" \
     --window-sec "$WINDOW_SEC" \
     --stride-sec "$STRIDE_SEC" \

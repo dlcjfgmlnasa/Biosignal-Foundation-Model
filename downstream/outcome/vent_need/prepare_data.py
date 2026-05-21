@@ -56,7 +56,11 @@ MIMIC_SIGNAL_MAP: dict[str, str] = {
     # PPG
     "PLETH": "ppg",
     # RESP / Respiration (impedance, non-invasive)
-    "RESP": "resp",
+    # v2: Task #11 은 RESP-Impedance(삽관 전 비침습 흉부 임피던스) 가 임상 정의.
+    # MIMIC-III matched waveform 의 RESP 채널 = impedance plethysmography 이므로
+    # signal_type 8(resp_impedance) 로 직접 매핑. string→int SSOT 는
+    # data.spatial_map.SIGNAL_KEY_TO_TYPE (aggregator.SIGNAL_TYPE_INT) 사용.
+    "RESP": "resp_impedance",
 }
 
 

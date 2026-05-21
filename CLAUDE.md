@@ -50,13 +50,13 @@ main.py     # Entry point / training orchestration
 
 **`data/dataset.py`**: BiosignalDataset (Channel-Independent, lazy-loading, sliding window).
 
-**`data/collate.py`**: PackCollate (FFD bin-packing collate). `patch_size`/`stride` 정렬 패딩. `spatial_ids` 전역 spatial_id 전달.
+**`data/collate.py`**: PackCollate (FFD bin-packing collate). `patch_size`/`stride` 정렬 패딩. `spatial_ids` 전달 (v2: spatial_id 폐지로 값이 signal_type과 동일, 모델 미사용 — plumbing 유지).
 
-**`data/spatial_map.py`**: signal_type(대분류) + spatial_id(소분류) 이중 인코딩 매핑 테이블. `get_global_spatial_id()`, `TOTAL_SPATIAL_IDS`, `CHANNEL_NAME_TO_SPATIAL`.
+**`data/spatial_map.py`**: signal_type 매핑 테이블 (v2: 단일 modality embedding, 10종 — RESP를 Impedance(8)/Flow(9)로 분리, ECG lead 통합, PAP(6) 슬롯 유지·데이터 제외, spatial_id 소분류 폐지). `SIGNAL_TYPE_NAMES`, `CHANNEL_NAME_TO_SIGNAL_TYPE`, `remap_record_v2()` (load-time remap: PAP drop · RESP 8/9 분기 · spatial 평탄화), `MECHANISM_GROUP`, `CROSS_PRED_ALLOWED_PAIRS`. `get_global_spatial_id()`/`TOTAL_SPATIAL_IDS`는 하위호환용 유지(반환값 = signal_type).
 
 **`module/patch.py`**: PatchEmbedding (고정/overlapping 패치 토큰화) — Residual MLP projection (TimesFM 스타일). 단일 해상도.
 
-**`model/biosignal_model.py`**: BiosignalFoundationModel — Scaler → PatchEmbedding → SpatialEmbedding → TransformerEncoder(LSCNorm) → Head 파이프라인. signal_type + spatial_id 이중 임베딩(Dual Additive Embedding) 지원. (loc, scale)은 `cond_proj`(MLP 2→d_cond→d_cond)를 거쳐 모든 layer의 LSCNorm modulation으로 주입됨 (per-patch loc/scale conditioning). `task="masked"` (양방향 attention → reconstruction head + cross_head) / `task="next_pred"` (causal attention → next-patch head) 단일 encoder 기반 멀티태스크. forward 출력에 `time_id`, `cross_pred` 포함. `d_cond` (default=16)는 hyperparameter로 조정 가능.
+**`model/biosignal_model.py`**: BiosignalFoundationModel — Scaler → PatchEmbedding → ModalityEmbedding(signal_type) → TransformerEncoder(LSCNorm) → Head 파이프라인. signal_type 단일 modality embedding (v2: num_signal_types=10, spatial_id 이중 임베딩 폐지 — RESP Impedance/Flow는 별도 signal_type). (loc, scale)은 `cond_proj`(MLP 2→d_cond→d_cond)를 거쳐 모든 layer의 LSCNorm modulation으로 주입됨 (per-patch loc/scale conditioning). `task="masked"` (양방향 attention → reconstruction head + cross_head) / `task="next_pred"` (causal attention → next-patch head) 단일 encoder 기반 멀티태스크. forward 출력에 `time_id`, `cross_pred` 포함. `d_cond` (default=16)는 hyperparameter로 조정 가능.
 
 **`loss/masked_mse_loss.py`**: MaskedPatchLoss (마스킹된 패치 MSE) + create_patch_mask (랜덤/variate-level 마스킹). Phase 2에서 variate_mask_prob로 전체 variate 마스킹 지원.
 

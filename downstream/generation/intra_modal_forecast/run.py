@@ -37,7 +37,9 @@ import torch
 
 from data.collate import PackCollate, PackedBatch
 from data.dataset import BiosignalSample
-from data.parser.vitaldb import SIGNAL_TYPES
+# v2: parser-local v1 dict 대신 data.spatial_map 의 SSOT 사용
+# (resp_impedance=8 / resp_flow=9 포함, .get(...,0) ECG 폴백 위험 제거).
+from data.spatial_map import SIGNAL_KEY_TO_TYPE as SIGNAL_TYPES
 
 PATCH_SIZE = 100
 TARGET_SR = 100.0
@@ -279,11 +281,15 @@ def main() -> None:
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--model-version", type=str, default="v1")
     parser.add_argument("--data-path", type=str, default=None)
+    # v2: SSOT(data.spatial_map.SIGNAL_KEY_TO_TYPE) 와 choices 동기화.
+    # 구 단일 "resp" → "resp_impedance"/"resp_flow" 로 분리.
     parser.add_argument(
         "--signal-type", type=str, default="ecg",
-        choices=["ecg", "abp", "ppg", "co2", "resp", "awp", "cvp", "icp", "pap"],
+        choices=["ecg", "abp", "ppg", "co2", "resp_impedance", "resp_flow",
+                 "awp", "cvp", "icp", "pap"],
         help="Task #13 Forecasting target signal. Main paper: ecg/abp/ppg/co2. "
-             "Appendix: resp/awp/cvp/icp/pap (rare/specialized cohorts).",
+             "Appendix: resp_impedance/resp_flow/awp/cvp/icp/pap "
+             "(rare/specialized cohorts).",
     )
     parser.add_argument("--dummy", action="store_true")
     parser.add_argument("--out-dir", type=str, default="outputs/downstream/forecasting")

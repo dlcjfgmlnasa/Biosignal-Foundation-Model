@@ -31,7 +31,7 @@ from torch import nn
 
 from data.collate import PackCollate, PackedBatch
 from data.dataset import BiosignalSample
-from data.spatial_map import get_global_spatial_id
+from data.spatial_map import SIGNAL_KEY_TO_TYPE, get_global_spatial_id
 
 from downstream.metrics import (
     compute_auroc,
@@ -47,14 +47,9 @@ from downstream._eval_utils import dump_fold_predictions
 DEFAULT_PATCH_SIZE = 100
 DEFAULT_SR = 100.0
 
-SIGNAL_TYPE_INT: dict[str, int] = {
-    "ecg": 0,
-    "abp": 1,
-    "ppg": 2,
-    "cvp": 3,
-    "pap": 6,
-    "icp": 7,
-}
+# v2: data.spatial_map 의 SSOT(SIGNAL_KEY_TO_TYPE) 사용. ICH 는 ECG/ABP/PPG/
+# CVP/PAP/ICP 만 입력하지만, 번호 정의는 단일 소스로 통일한다(로컬 dict drift 방지).
+SIGNAL_TYPE_INT: dict[str, int] = SIGNAL_KEY_TO_TYPE
 
 
 # ── 배치 생성 ─────────────────────────────────────────────────

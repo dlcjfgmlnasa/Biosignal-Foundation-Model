@@ -25,16 +25,16 @@ from torch import nn
 
 from data.collate import PackCollate
 from data.dataset import BiosignalSample
-from data.spatial_map import get_global_spatial_id
+from data.spatial_map import SIGNAL_KEY_TO_TYPE, get_global_spatial_id
 
 
 DEFAULT_SR = 100.0
 
-# 환자 단위 task에서 공통으로 쓰는 signal_type 매핑
-SIGNAL_TYPE_INT: dict[str, int] = {
-    "ecg": 0, "abp": 1, "ppg": 2, "cvp": 3,
-    "co2": 4, "awp": 5, "pap": 6, "icp": 7,
-}
+# 환자 단위 task에서 공통으로 쓰는 signal_type 매핑.
+# v2: data.spatial_map 의 SSOT(SIGNAL_KEY_TO_TYPE) 를 그대로 사용한다.
+# 구 로컬 dict 는 0~7 만 있어 "resp"/"resp_impedance"/"resp_flow" 가
+# .get(...,0) → ECG 로 조용히 폴백되는 잠재 버그가 있었다(8/9 누락).
+SIGNAL_TYPE_INT: dict[str, int] = SIGNAL_KEY_TO_TYPE
 
 
 def _time_sinusoidal_embedding(
