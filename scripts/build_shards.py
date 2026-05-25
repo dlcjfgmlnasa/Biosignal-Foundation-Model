@@ -16,7 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import time
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from pathlib import Path
 
 import torch
@@ -153,7 +153,16 @@ def main() -> None:
         type=int,
         default=8,
         help="병렬 torch.load worker 수 (기본 8). 0=직렬. "
-             "디스크 IO bound면 4-16이 sweet spot, CPU 코어 수보다 더 안 빠름.",
+             "process 백엔드는 4-16, thread 백엔드는 NAS latency 숨김용으로 64-256 권장.",
+    )
+    p.add_argument(
+        "--io-backend",
+        choices=["process", "thread"],
+        default="process",
+        help="torch.load 병렬 백엔드. NAS 의 작은 파일 다수(latency-bound)면 "
+             "'thread' 권장 — torch.load 의 파일 read 가 GIL 을 풀어 thread 가 "
+             "round-trip 지연을 겹쳐 숨기고, 프로세스당 torch 메모리도 없음. "
+             "'process' 는 CPU-bound deserialization 용 (기본, 하위호환).",
     )
     p.add_argument(
         "--incremental",
@@ -240,11 +249,15 @@ def main() -> None:
     # workers > 0이면 ProcessPoolExecutor를 단일 pool로 유지 (shard마다
     # fork 오버헤드 회피). 단일 pool이 모든 shard에서 재사용됨.
     use_parallel = args.workers > 0
-    pool: ProcessPoolExecutor | None = None
+    pool: ProcessPoolExecutor | ThreadPoolExecutor | None = None
     if use_parallel:
-        pool = ProcessPoolExecutor(max_workers=args.workers)
+        if args.io_backend == "thread":
+            pool = ThreadPoolExecutor(max_workers=args.workers)
+        else:
+            pool = ProcessPoolExecutor(max_workers=args.workers)
         print(
-            f"  Using {args.workers} parallel workers for torch.load (single pool)"
+            f"  Using {args.workers} parallel {args.io_backend} workers "
+            f"for torch.load (single pool)"
         )
 
     def _build_one_shard(shard_id: int, shard: list[dict]) -> None:
