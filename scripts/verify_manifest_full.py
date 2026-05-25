@@ -33,7 +33,14 @@ import os
 import sys
 import time
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+try:
+    from tqdm import tqdm
+except ImportError:  # tqdm 없으면 no-op (진행바만 생략)
+    def tqdm(it=None, **_kwargs):  # type: ignore[no-redef]
+        return it if it is not None else []
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from data.spatial_map import (  # noqa: E402
@@ -56,20 +63,35 @@ def _count_lines(path: Path) -> int:
     return n
 
 
-def _count_subject_dirs(data_dir: Path) -> int:
+def _count_subject_dirs(data_dir: Path, workers: int) -> int:
     """<data_dir>/*/manifest.json 이 존재하는 subject 디렉토리 수.
 
-    NAS 에서도 os.scandir 단일 listing + per-dir stat 1회로 충분히 빠르다.
+    os.scandir 로 후보 디렉토리를 한 번에 나열한 뒤, per-dir ``.exists()`` stat
+    을 ThreadPool 로 병렬화한다. 네트워크 마운트(NAS)에서 stat 1회가 수 ms 라
+    10만+ 디렉토리는 순차 시 수 분 → 병렬로 단축.
     """
-    n = 0
+    dirs: list[str] = []
     with os.scandir(data_dir) as it:
-        for entry in it:
+        for entry in tqdm(it, desc="Enumerating dirs", unit="dir", mininterval=0.5):
             try:
-                if not entry.is_dir(follow_symlinks=False):
-                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    dirs.append(entry.path)
             except OSError:
                 continue
-            if (Path(entry.path) / "manifest.json").exists():
+
+    def _has_manifest(d: str) -> bool:
+        return (Path(d) / "manifest.json").exists()
+
+    n = 0
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for ok in tqdm(
+            ex.map(_has_manifest, dirs),
+            total=len(dirs),
+            desc="Checking manifest.json",
+            unit="dir",
+            mininterval=0.5,
+        ):
+            if ok:
                 n += 1
     return n
 
@@ -117,6 +139,8 @@ def main() -> None:
                    help=f"duration 계산용 fallback SR (default {DEFAULT_SR})")
     p.add_argument("--skip-dir-scan", action="store_true",
                    help="subject 디렉토리 스캔(c) 생략 — manifest_full 만 집계")
+    p.add_argument("--workers", type=int, default=32,
+                   help="디렉토리 스캔(c) stat 병렬 thread 수 (NAS I/O bound, default 32)")
     args = p.parse_args()
 
     data_dir: Path = args.data_dir
@@ -144,7 +168,7 @@ def main() -> None:
 
     n_dirs = -1
     if not args.skip_dir_scan:
-        n_dirs = _count_subject_dirs(data_dir)
+        n_dirs = _count_subject_dirs(data_dir, args.workers)
         print(f"  (c) */manifest.json dirs      : {n_dirs:>12,}")
     else:
         print(f"  (c) */manifest.json dirs      : (skip)")
@@ -180,7 +204,10 @@ def main() -> None:
     total_samples = 0
 
     with open(full_path, encoding="utf-8") as f:
-        for line in f:
+        for line in tqdm(
+            f, total=n_full, desc="Aggregating tokens", unit="subj",
+            mininterval=0.5,
+        ):
             line = line.strip()
             if not line:
                 continue
