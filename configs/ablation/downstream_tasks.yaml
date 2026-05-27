@@ -1,0 +1,150 @@
+# Ablation downstream task catalog
+# ─────────────────────────────────────────────────────────────────────
+# CARMEN ablation (configs/ablation/variants.yaml) × 4 downstream task
+# 를 자동 실행하기 위한 task 정의. scripts/run_ablation_downstream.py 가
+# 본 파일을 읽어 (variant × task × fold × mode) 큐를 만들고 각 task 의
+# run.py 를 subprocess 로 호출한다.
+#
+# 매트릭스:
+#   - 15 variants (variants.yaml) × 3 dense tasks × 5 folds × 2 modes
+#   - + sparse 1 (ich) × `sampling` 그룹만 × 5 folds × 1 mode (linear_probe)
+#
+# 본 파일은 task 카탈로그만 담는다. variants × task 매트릭스 확장,
+# (variant.ablation_group) ∈ task.applies_to_groups 필터링, 실제
+# subprocess 호출은 runner 스크립트의 책임.
+#
+# ─────────────────────────────────────────────────────────────────────
+# 인자 시그니처 (각 run.py 의 argparse grep 결과)
+# ─────────────────────────────────────────────────────────────────────
+#                       hypo    mort    fcst    ich
+#   --checkpoint        opt     req     opt     req
+#   --model-version     v1/v2   v1/v2   str     v1/v2
+#   --data-path         opt     req     opt     req
+#   --data-dir          opt     -       -       -
+#   --mode              y       y       -       y
+#   --lora-rank         y       y       -       y
+#   --lora-alpha        y       y       -       y
+#   --epochs            y(20)   y(30)   -       y(30)
+#   --lr                y       y       -       y
+#   --batch-size        y       y       -       y
+#   --patch-size        y       y       -       y
+#   --out-dir           y       y       y       y
+#   --fold              y       y       -       y
+#   --n-folds           y       y       -       y
+#   --device            y       y       -       y
+#
+#   task-specific:
+#     hypo: --n-cases --window-sec --stride-sec --train-ratio
+#           --input-signals --val-split-seed --bootstrap-iters --dummy
+#     mort: --max-windows --agg-layers --agg-heads
+#     fcst: --signal-type --target-sec --dummy
+#     ich:  --eval-mode (standard|loso)
+#
+# Forecasting (intra_modal_forecast/run.py) 는 fold/n_folds/mode/lora 인자가
+# 없다 — eval-only (autoregressive rollout) 이라 linear_probe/lora 구분
+# 자체가 없음. ablation runner 는 forecasting 에 대해서는 modes 를 무시
+# (혹은 1회만 실행) 하고 fold loop 도 단일 호출로 처리해야 한다.
+#
+# ─────────────────────────────────────────────────────────────────────
+# 데이터 경로
+# ─────────────────────────────────────────────────────────────────────
+# `${env:DOWNSTREAM_DATA_ROOT}` 는 prepare_data.py 의 결과 .pt 가 모인
+# 루트 (server: /data/downstream, local: ./datasets/processed 등 환경별
+# 상이). runner 가 env 치환을 수행한다.
+#
+# prepare_data.py 의 파일명 컨벤션 (확인 결과):
+#   hypo: hypotension_{signals}_w{W}s_h{H}min[_fold{F}]_{split}[_chunk{C}].pt
+#   mort: mortality_w{W}s[_fold{F}]_{split}_chunk{C}.pt
+#   fcst: forecasting_{source}_{signal}_ctx{C}s_tgt{T}s.pt
+#   ich:  intracranial_hypertension_{signals}_w{W}s_h{H}min[_fold{F}]_{split}[_chunk{C}].pt
+#
+# task별 canonical (window, horizon) 은 paper_task_modality.md FINAL spec
+# 을 따른다 (project_paper_task_modality.md memory 참조).
+#
+# ─────────────────────────────────────────────────────────────────────
+
+defaults:
+  n_folds: 5
+  seed: 42
+  device: cuda
+  batch_size: 8                # task별 override 가능
+  patch_size: 200              # 100Hz × 2s/token (project_patch_sr_decision)
+  model_version: v2            # spec v2 SSOT (RESP→Imp/Flow 분리)
+  epochs:
+    linear_probe: 30
+    lora: 30
+  lr:
+    linear_probe: 1.0e-3
+    lora: 1.0e-4
+  lora:
+    rank: 8
+    alpha: 16.0
+
+tasks:
+  # ── 1. Hypotension Prediction (Acute) ────────────────────────────
+  - name: hypotension
+    category: acute_event
+    module: downstream.acute_event.hypotension.run
+    data_path: "${env:DOWNSTREAM_DATA_ROOT}/hypotension/hypotension_abp_w600s_h5min"
+    # ↑ runner 가 fold suffix + split 을 붙여 prepared .pt 를 찾는다.
+    #   예: ..._fold0_train.pt / ..._fold0_val.pt / ..._fold0_test.pt
+    modes: [linear_probe, lora]
+    applies_to_groups: [baseline, loss_component, lscnorm, cross_modal,
+                        phase_stage, sampling, attn_bias]
+    epochs:
+      linear_probe: 20         # run.py 기본값
+      lora: 20
+    extra_args:
+      window-sec: 600.0        # 10 min
+      stride-sec: 60.0
+      train-ratio: 0.7
+      input-signals: [abp]     # paper canonical
+      bootstrap-iters: 1000
+
+  # ── 2. Mortality Prediction (Outcome) ────────────────────────────
+  - name: mortality
+    category: outcome
+    module: downstream.outcome.mortality.run
+    data_path: "${env:DOWNSTREAM_DATA_ROOT}/mortality/mortality_w600s"
+    # 실제 파일은 mortality_w600s_fold{F}_{split}_chunk{C}.pt — runner 가
+    # fold/chunk 패턴 expand.
+    modes: [linear_probe, lora]
+    applies_to_groups: [baseline, loss_component, lscnorm, cross_modal,
+                        phase_stage, sampling, attn_bias]
+    batch_size: 8              # run.py 기본 (max-windows × patch 큼)
+    extra_args:
+      max-windows: 24          # session 당 최대 window 수
+      agg-layers: 2
+      agg-heads: 4
+
+  # ── 3. Waveform Forecasting (Generation) ─────────────────────────
+  - name: waveform_forecasting
+    category: generation
+    module: downstream.generation.intra_modal_forecast.run
+    data_path: "${env:DOWNSTREAM_DATA_ROOT}/forecasting/forecasting_vitaldb_ecg_ctx30s_tgt10s.pt"
+    # eval-only: fold/mode 인자 없음. runner 가 단일 호출.
+    modes: [linear_probe]      # placeholder — run.py 가 mode 인자 미사용
+    applies_to_groups: [baseline, loss_component, lscnorm, cross_modal,
+                        phase_stage, sampling, attn_bias]
+    eval_only: true            # runner hint: fold/mode loop skip
+    no_mode_arg: true          # runner hint: --mode 전달 금지
+    no_fold_arg: true          # runner hint: --fold/--n-folds 전달 금지
+    no_lora_arg: true          # runner hint: --lora-* 전달 금지
+    no_epochs_arg: true        # runner hint: --epochs/--lr 전달 금지
+    no_batch_arg: true         # runner hint: --batch-size 전달 금지
+    no_patch_arg: true         # runner hint: --patch-size 전달 금지
+    extra_args:
+      signal-type: ecg         # paper canonical (main); appendix 는 abp/ppg/co2
+      target-sec: [10]         # 단일 horizon
+
+  # ── 4. ICH Sparse Variant (Sampling group only) ──────────────────
+  - name: ich_sparse
+    category: acute_event
+    module: downstream.acute_event.intracranial_hypertension.run
+    data_path: "${env:DOWNSTREAM_DATA_ROOT}/ich/intracranial_hypertension_icp_w300s_h0min"
+    # 실제 파일: ..._fold{F}_{split}[_chunk{C}].pt — runner expand.
+    modes: [linear_probe]      # sparse cohort: LoRA 학습 분산 큼 → linear_probe 만
+    applies_to_groups: [sampling]
+    batch_size: 32             # run.py 기본 (window 작음)
+    extra_args:
+      eval-mode: standard      # loso 는 별도 ablation 필요 시 추가

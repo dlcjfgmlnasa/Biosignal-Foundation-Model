@@ -1,0 +1,105 @@
+# Ablation Phase 2 base — K-MIMIC 25% subset, CARMEN full settings.
+# ──────────────────────────────────────────────────────────────
+# Phase 1 ablation checkpoint 에서 resume. variant 별 resume 경로 override 필수.
+#
+# Usage (2-GPU DDP):
+#   torchrun --nproc_per_node=2 -m train.2_any_variate \
+#       --config configs/ablation/<variant>_phase2.yaml
+
+# ── Resume (variant 별 override) ──
+resume: outputs/ablation/ablation_phase1_base/checkpoints/best.pt
+
+# ── 모델 (Phase 1 과 동일) ──
+model_config:
+  d_model: 256
+  num_layers: 12
+  patch_size: 200
+  stride: null
+  num_heads: 8
+  num_groups: null
+  num_signal_types: 10
+  use_glu: true
+  use_moe: false
+  use_rope: true
+  use_var_attn_bias: true          # ablation #6 에서 false override
+  use_spatial_embed: true
+  use_lscnorm: true                # ablation #2 에서 false override
+  d_cond: 16
+  dropout_p: 0.1
+  next_block_size: 2
+  contrastive_proj_dim: 128        # Phase 2 contrastive head 활성
+
+# ── 데이터 ──
+data_dir:
+  - /home/coder/workspace/k-mimic-/bio_fm/data/train/k_mimic/
+signal_types: [0, 1, 2, 3, 4, 5, 7, 8, 9]
+max_subjects: null
+subject_ids_file: configs/ablation/subset_25pct_subjects.txt
+window_seconds: 600.0
+max_length: 180000
+cache_size: 16
+crop_ratio_min: 0.01
+crop_ratio_max: 1.0
+min_patches: 5
+
+# ── Shard backend ──
+shard_index_path: /home/coder/workspace/k-mimic-/bio_fm/data/train/k_mimic_shard/shard_index.json
+shard_cache_size: 1
+
+# ── 학습 ──
+batch_size: 64
+lr: 2.0e-4
+n_epochs: 50
+warmup_epochs: 3
+min_lr_ratio: 0.1
+mask_ratio: 0.4
+gradient_clip: 1.0
+seed: 42
+collate_mode: any_variate
+max_batches: 4000
+
+# ── Loss 가중치 (Phase 2: MPM + Next + Cross + Contrastive) ──
+# variant 별 override (#1 Loss, #3 Cross-modal):
+#   -MPM:        alpha=0
+#   -Next:       beta=0
+#   -CrossNext:  gamma=0
+#   -Contrastive: delta=0
+#   #3 same-var only: gamma=0, delta=0
+#   #3 +cross only:   gamma=0.15, delta=0
+alpha: 0.7
+beta: 0.3
+gamma: 0.15
+delta: 0.5
+peak_alpha: 1.0
+lambda_spec: 0.2
+spec_n_ffts: [32, 64, 128]
+aux_loss_weight: 0.01
+contrastive_temperature: 0.07
+learnable_temperature: true
+
+# ── Masking ──
+variate_mask_prob: 0.3
+variate_drop_prob: 0.1
+block_mask: true
+block_size_min: 2
+block_size_max: 3
+
+# ── Modality-balanced sampling (Phase 2 는 any_variate 이므로 일반적으로 미적용) ──
+modality_balanced_alpha: 0.0
+modality_balanced_w_max_ratio: 5.0
+
+# ── Mixed Precision ──
+use_amp: true
+
+# ── Validation & Early Stopping ──
+val_ratio: 0.05
+val_max_batches: 500
+patience: 15
+
+# ── 시스템 ──
+device: auto
+num_workers: 4
+output_dir: outputs/ablation
+checkpoint_every: 5
+viz_every: 0
+exp_name: ablation_phase2_base

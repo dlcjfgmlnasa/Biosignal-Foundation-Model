@@ -1,0 +1,150 @@
+# Ablation variants — 6 ablation × 14 variant (baseline 포함).
+# ────────────────────────────────────────────────────────────────
+# 각 variant 는 base yaml(_phase1_base.yaml, _phase2_base.yaml) 위에
+# selective override 만 가한다. scripts/run_ablation.py 가 base + overrides
+# 를 merge 하여 임시 config 를 만들고 train 스크립트를 invoke 한다.
+#
+# run_phase2: false 면 Phase 2 skip (예: ablation #4 Phase 1 only).
+# phase1.reuse: <variant_name> 이면 해당 variant 의 Phase 1 ckpt 를 그대로
+# 사용 (예: ablation #3/#4 — Phase 1 baseline 공유).
+
+variants:
+  # ── #0 Baseline (CARMEN full) ────────────────────────────────
+  - name: "00_full"
+    description: "CARMEN full (α=0.5 sampler, all losses on, LSCNorm on, Phase 1+2, var_attn_bias on)"
+    ablation_group: "baseline"
+    phase1:
+      overrides:
+        exp_name: ablation_00_full_p1
+    phase2:
+      overrides:
+        exp_name: ablation_00_full_p2
+
+  # ── #1 Loss component ────────────────────────────────────────
+  - name: "01a_no_mpm"
+    description: "−MPM (alpha=0): masked reconstruction off"
+    ablation_group: "loss_component"
+    phase1:
+      overrides:
+        alpha: 0.0
+        exp_name: ablation_01a_no_mpm_p1
+    phase2:
+      overrides:
+        alpha: 0.0
+        exp_name: ablation_01a_no_mpm_p2
+
+  - name: "01b_no_next"
+    description: "−Next (beta=0): next-pred off"
+    ablation_group: "loss_component"
+    phase1:
+      overrides:
+        beta: 0.0
+        exp_name: ablation_01b_no_next_p1
+    phase2:
+      overrides:
+        beta: 0.0
+        exp_name: ablation_01b_no_next_p2
+
+  - name: "01c_no_crossnext"
+    description: "−CrossNext (gamma=0): cross-modal prediction off (Phase 2 only)"
+    ablation_group: "loss_component"
+    phase1:
+      reuse: "00_full"               # Phase 1 baseline 재사용
+    phase2:
+      overrides:
+        gamma: 0.0
+        exp_name: ablation_01c_no_crossnext_p2
+
+  - name: "01d_no_contrastive"
+    description: "−Contrastive (delta=0): contrastive off (Phase 2 only)"
+    ablation_group: "loss_component"
+    phase1:
+      reuse: "00_full"
+    phase2:
+      overrides:
+        delta: 0.0
+        exp_name: ablation_01d_no_contrastive_p2
+
+  # ── #2 LSCNorm conditioning ──────────────────────────────────
+  - name: "02_no_lscnorm"
+    description: "LSCNorm off (plain RMSNorm — cond_proj/modulation zero-freeze)"
+    ablation_group: "lscnorm"
+    phase1:
+      overrides:
+        model_config:
+          use_lscnorm: false
+        exp_name: ablation_02_no_lscnorm_p1
+    phase2:
+      overrides:
+        model_config:
+          use_lscnorm: false
+        exp_name: ablation_02_no_lscnorm_p2
+
+  # ── #3 Cross-modal objective ─────────────────────────────────
+  - name: "03a_samevar_only"
+    description: "Same-variate next only (gamma=0, delta=0)"
+    ablation_group: "cross_modal"
+    phase1:
+      reuse: "00_full"
+    phase2:
+      overrides:
+        gamma: 0.0
+        delta: 0.0
+        exp_name: ablation_03a_samevar_p2
+
+  - name: "03b_cross_only"
+    description: "+cross next only (gamma=0.15, delta=0): contrastive off"
+    ablation_group: "cross_modal"
+    phase1:
+      reuse: "00_full"
+    phase2:
+      overrides:
+        gamma: 0.15
+        delta: 0.0
+        exp_name: ablation_03b_cross_p2
+
+  # ── #4 Pretraining stage ─────────────────────────────────────
+  - name: "04_phase1_only"
+    description: "Phase 1 only (no Any-Variate phase)"
+    ablation_group: "phase_stage"
+    phase1:
+      reuse: "00_full"
+    run_phase2: false                # Phase 2 skip
+
+  # ── #5 Modality-balanced sampling ────────────────────────────
+  - name: "05a_samp_a0"
+    description: "Modality-balanced sampling α=0 (uniform)"
+    ablation_group: "sampling"
+    phase1:
+      overrides:
+        modality_balanced_alpha: 0.0
+        exp_name: ablation_05a_samp_a0_p1
+    phase2:
+      overrides:
+        exp_name: ablation_05a_samp_a0_p2
+
+  - name: "05b_samp_a1"
+    description: "Modality-balanced sampling α=1.0 (full inverse)"
+    ablation_group: "sampling"
+    phase1:
+      overrides:
+        modality_balanced_alpha: 1.0
+        exp_name: ablation_05b_samp_a1_p1
+    phase2:
+      overrides:
+        exp_name: ablation_05b_samp_a1_p2
+
+  # ── #6 Variate attention bias ────────────────────────────────
+  - name: "06_no_attnbias"
+    description: "Variate attention bias off (use_var_attn_bias=false)"
+    ablation_group: "attn_bias"
+    phase1:
+      overrides:
+        model_config:
+          use_var_attn_bias: false
+        exp_name: ablation_06_no_attnbias_p1
+    phase2:
+      overrides:
+        model_config:
+          use_var_attn_bias: false
+        exp_name: ablation_06_no_attnbias_p2

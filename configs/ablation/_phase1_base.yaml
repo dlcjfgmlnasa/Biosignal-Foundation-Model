@@ -1,0 +1,109 @@
+# Ablation Phase 1 base — K-MIMIC 25% subset, CARMEN full settings.
+# ──────────────────────────────────────────────────────────────
+# 모든 ablation variant 의 공통 base. variant yaml 은 본 파일과 동일한
+# 키 위에 selective override 만 가한다.
+#
+# 데이터 축소: K-MIMIC subject 의 25% (subject_ids_file) — FM 논문 표준 관행.
+# Epoch 은 main result 와 동일하게 유지하여 ablation 비교 fairness 확보.
+#
+# 사전 작업:
+#   python -m scripts.make_ablation_subset \
+#       --manifest /home/coder/workspace/k-mimic-/bio_fm/data/train/k_mimic/manifest_full.jsonl \
+#       --out configs/ablation/subset_25pct_subjects.txt \
+#       --ratio 0.25 --seed 42
+#
+# Usage (2-GPU DDP):
+#   torchrun --nproc_per_node=2 -m train.1_channel_independency \
+#       --config configs/ablation/<variant>.yaml
+
+# ── 모델 (Base: d=256, L=12, ~10M params — main 과 동일) ──
+model_config:
+  d_model: 256
+  num_layers: 12
+  patch_size: 200
+  stride: null
+  num_heads: 8
+  num_groups: null
+  num_signal_types: 10
+  use_glu: true
+  use_moe: false
+  use_rope: true
+  use_var_attn_bias: true          # ablation #6 에서 false override
+  use_spatial_embed: true
+  use_lscnorm: true                # ablation #2 에서 false override
+  d_cond: 16
+  dropout_p: 0.1
+  next_block_size: 2
+  contrastive_proj_dim: 0
+
+# ── 데이터 ──
+data_dir:
+  - /home/coder/workspace/k-mimic-/bio_fm/data/train/k_mimic/
+signal_types: [0, 1, 2, 3, 4, 5, 7, 8, 9]
+max_subjects: null
+subject_ids_file: configs/ablation/subset_25pct_subjects.txt  # ★ 25% subset 핵심
+window_seconds: 600.0
+max_length: 64000
+cache_size: 16
+crop_ratio_min: 0.01
+crop_ratio_max: 1.0
+min_patches: 5
+
+# ── Shard backend ──
+shard_index_path: /home/coder/workspace/k-mimic-/bio_fm/data/train/k_mimic_shard/shard_index.json
+shard_cache_size: 1
+
+# ── 학습 ──
+batch_size: 128
+lr: 8.0e-4
+n_epochs: 80
+warmup_epochs: 8
+min_lr_ratio: 0.1
+mask_ratio: 0.4
+gradient_clip: 1.0
+seed: 42
+collate_mode: ci
+max_batches: 10000
+
+# ── Loss 가중치 (Phase 1: MPM + Next-Pred) ──
+# variant 별 override:
+#   #1 Loss component:
+#     -MPM: alpha=0
+#     -Next: beta=0
+#   (-CrossNext, -Contrastive 는 Phase 2 만 영향, Phase 1 yaml 에서는 변화 없음)
+alpha: 1.0
+beta: 0.8
+gamma: 0.0
+delta: 0.0
+lambda_spec: 0.2
+peak_alpha: 1.0
+aux_loss_weight: 0.01
+contrastive_temperature: 0.07
+learnable_temperature: true
+
+# ── Masking ──
+variate_mask_prob: 0.0
+block_mask: true
+block_size_min: 3
+block_size_max: 8
+
+# ── Modality-balanced sampling (ablation #5) ──
+# variant 별 override: alpha=0.0/0.5/1.0
+modality_balanced_alpha: 0.5
+modality_balanced_w_max_ratio: 5.0
+
+# ── Mixed Precision ──
+use_amp: true
+
+# ── Validation & Early Stopping ──
+val_ratio: 0.05
+val_max_batches: 500
+patience: 15
+
+# ── 시스템 ──
+device: auto
+num_workers: 4
+output_dir: outputs/ablation
+checkpoint_every: 5
+viz_every: 0                       # ablation 에서는 viz 비활성 (compute 절약)
+exp_name: ablation_phase1_base
