@@ -43,7 +43,7 @@ signal_types: [0, 1, 2, 3, 4, 5, 7, 8, 9]
 max_subjects: null
 subject_ids_file: configs/ablation/subset_25pct_subjects.txt  # ★ 25% subset 핵심
 window_seconds: 600.0
-max_length: 64000
+max_length: 256000   # PackCollate n_rows 변동 → 한 rank OOM/NCCL timeout 방지 ([[project_packcollate_oom]])
 cache_size: 16
 crop_ratio_min: 0.01
 crop_ratio_max: 1.0
