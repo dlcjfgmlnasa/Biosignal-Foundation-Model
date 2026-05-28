@@ -598,12 +598,9 @@ class ModalityBalancedRecordingSampler(Sampler[int]):
 
     def log_multiplicity_summary(self, print_fn=print) -> None:
         """(st, sp) 별 multiplicity 분포를 보기 좋게 출력 (training 시작 시 1회 권장)."""
-        from data.spatial_map import SPATIAL_MAP
+        from data.spatial_map import SPATIAL_MAP, SIGNAL_TYPE_NAMES
 
-        SIGNAL_NAMES = {
-            0: "ECG", 1: "ABP", 2: "PPG", 3: "CVP",
-            4: "CO2", 5: "AWP", 6: "PAP", 7: "ICP", 8: "RESP",
-        }
+        SIGNAL_NAMES = SIGNAL_TYPE_NAMES  # SSOT (v2: 10종, RESP→Imp/Flow 분리)
         print_fn(
             f"\n[ModalityBalancedSampler] alpha={self.alpha} "
             f"w_max_ratio={self.w_max_ratio}"

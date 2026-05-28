@@ -137,13 +137,23 @@ def evaluate_forecasting(
     signal_type: str,
     patch_size: int,
     device: str = "cpu",
+    patient_ids: list[str] | None = None,
+    collect_raw: bool = False,
 ) -> dict:
-    """Forecasting 평가: generated vs target waveform의 MSE/MAE/Pearson r."""
+    """Forecasting 평가: generated vs target waveform의 MSE/MAE/Pearson r.
+
+    collect_raw=True 일 때 결과 dict 에 ``raw_y_true`` `(M, L)`,
+    ``raw_y_score`` `(M, L)`, ``raw_patient_id`` `(M,)` 를 추가로 담아
+    분류 task 와 동일한 ``preds_fold{idx}.npz`` 포맷으로 dump 가능.
+    """
     n_target_patches = targets.shape[1] // patch_size
     if n_target_patches < 1:
         return {"mse": 0, "mae": 0, "pearson_r": 0, "n_samples": 0}
 
     all_mse, all_mae, all_r = [], [], []
+    raw_true: list[np.ndarray] = []
+    raw_pred: list[np.ndarray] = []
+    raw_pid: list[str] = []
 
     for i in range(contexts.shape[0]):
         batch = _context_to_batch(contexts[i], signal_type, patch_size)
@@ -176,12 +186,27 @@ def evaluate_forecasting(
         all_mae.append(mae)
         all_r.append(r)
 
-    return {
+        if collect_raw:
+            raw_true.append(target_wave.astype(np.float32))
+            raw_pred.append(gen_wave.astype(np.float32))
+            if patient_ids is not None and i < len(patient_ids):
+                raw_pid.append(str(patient_ids[i]))
+            else:
+                raw_pid.append(f"sample_{i}")
+
+    out: dict = {
         "mse": float(np.mean(all_mse)) if all_mse else 0.0,
         "mae": float(np.mean(all_mae)) if all_mae else 0.0,
         "pearson_r": float(np.mean(all_r)) if all_r else 0.0,
         "n_samples": len(all_mse),
     }
+    if collect_raw and raw_true:
+        # 가변 길이 방지: 모든 sample 동일 길이로 truncate (min)
+        min_l = int(min(arr.shape[0] for arr in raw_true))
+        out["raw_y_true"] = np.stack([a[:min_l] for a in raw_true], axis=0)
+        out["raw_y_score"] = np.stack([a[:min_l] for a in raw_pred], axis=0)
+        out["raw_patient_id"] = np.asarray(raw_pid, dtype=str)
+    return out
 
 
 @torch.no_grad()
@@ -193,6 +218,8 @@ def evaluate_multi_input_forecasting(
     target_signal_type: str,
     patch_size: int,
     device: str = "cpu",
+    patient_ids: list[str] | None = None,
+    collect_raw: bool = False,
 ) -> dict:
     """Multi-input forecasting 평가.
 
@@ -209,6 +236,9 @@ def evaluate_multi_input_forecasting(
     target_stype_int = SIGNAL_TYPES.get(target_signal_type, 0)
 
     all_mse, all_mae, all_r = [], [], []
+    raw_true: list[np.ndarray] = []
+    raw_pred: list[np.ndarray] = []
+    raw_pid: list[str] = []
 
     for i in range(contexts.shape[0]):
         batch = _multi_context_to_batch(
@@ -264,13 +294,27 @@ def evaluate_multi_input_forecasting(
         all_mae.append(mae)
         all_r.append(r)
 
-    return {
+        if collect_raw:
+            raw_true.append(target_wave.astype(np.float32))
+            raw_pred.append(gen_wave.astype(np.float32))
+            if patient_ids is not None and i < len(patient_ids):
+                raw_pid.append(str(patient_ids[i]))
+            else:
+                raw_pid.append(f"sample_{i}")
+
+    out: dict = {
         "mse": float(np.mean(all_mse)) if all_mse else 0.0,
         "mae": float(np.mean(all_mae)) if all_mae else 0.0,
         "pearson_r": float(np.mean(all_r)) if all_r else 0.0,
         "n_samples": len(all_mse),
         "max_generated_sec": float(max_gen_samples / TARGET_SR),
     }
+    if collect_raw and raw_true:
+        min_l = int(min(arr.shape[0] for arr in raw_true))
+        out["raw_y_true"] = np.stack([a[:min_l] for a in raw_true], axis=0)
+        out["raw_y_score"] = np.stack([a[:min_l] for a in raw_pred], axis=0)
+        out["raw_patient_id"] = np.asarray(raw_pid, dtype=str)
+    return out
 
 
 # ---- Main ----
@@ -298,6 +342,18 @@ def main() -> None:
         help="평가할 target horizon 초 단위 리스트 (예: --target-sec 10 30 60 300). "
              "지정하지 않으면 --data-path의 tgt_sec를 단일 평가.",
     )
+    parser.add_argument(
+        "--fold", type=int, default=0,
+        help="Ablation aggregator 와 동일한 fold 인덱스 (zero-shot 1-shot 평가는 보통 0).",
+    )
+    parser.add_argument(
+        "--n-folds", type=int, default=1,
+        help="총 fold 수 (zero-shot eval-only 는 1).",
+    )
+    parser.add_argument(
+        "--no-dump-preds", action="store_true",
+        help="preds_fold{idx}.npz raw waveform dump 생략 (기본은 dump).",
+    )
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -321,6 +377,7 @@ def main() -> None:
     # Data
     is_multi_input = False
     context_signal_types: list[str] | None = None
+    patient_ids: list[str] | None = None
     if args.data_path and Path(args.data_path).exists():
         print(f"Loading prepared data: {args.data_path}")
         data = torch.load(args.data_path, weights_only=False)
@@ -345,6 +402,12 @@ def main() -> None:
             tgt_sec = meta["target_sec"]
             print(f"  Signal: {signal_type}, Test: {contexts.shape[0]} samples")
             print(f"  Context: {ctx_sec}s, Target: {tgt_sec}s")
+        # patient_id 후보: data["test"]["patient_id"] / "case_id" / "subject_id" 등
+        for key in ("patient_id", "case_id", "subject_id", "patient_ids"):
+            v = data.get("test", {}).get(key)
+            if v is not None:
+                patient_ids = [str(x) for x in (v.tolist() if hasattr(v, "tolist") else v)]
+                break
     elif args.dummy:
         signal_type = args.signal_type
         contexts = torch.randn(20, 3000)  # 20 x 30s
@@ -373,12 +436,19 @@ def main() -> None:
 
     print(f"\nForecasting: {signal_type.upper()} at horizons {horizons_sec}s...")
 
+    # Primary horizon = 가장 긴 horizon (가장 어려운 task — raw dump 대상).
+    # 분류 task 와 동일한 preds_fold{idx}.npz 하나에 raw waveform 저장.
+    primary_tgt_sec = max(horizons_sec) if horizons_sec else None
+
     sweep: list[dict] = []
+    primary_raw: dict | None = None
     for tgt_sec in horizons_sec:
         n_samples = int(round(tgt_sec * TARGET_SR))
         n_samples = min(n_samples, max_target_samples)
         targets_trunc = targets[:, :n_samples]
         n_target_patches = n_samples // PATCH_SIZE
+
+        collect_raw = (not args.no_dump_preds) and (tgt_sec == primary_tgt_sec)
 
         if is_multi_input:
             metrics = evaluate_multi_input_forecasting(
@@ -389,6 +459,8 @@ def main() -> None:
                 target_signal_type=signal_type,
                 patch_size=PATCH_SIZE,
                 device=device,
+                patient_ids=patient_ids,
+                collect_raw=collect_raw,
             )
             tag = f"{'+'.join(context_signal_types)}→{signal_type.upper()}"
         else:
@@ -399,8 +471,18 @@ def main() -> None:
                 signal_type,
                 patch_size=PATCH_SIZE,
                 device=device,
+                patient_ids=patient_ids,
+                collect_raw=collect_raw,
             )
             tag = signal_type.upper()
+
+        if collect_raw and "raw_y_true" in metrics:
+            primary_raw = {
+                "y_true": metrics.pop("raw_y_true"),
+                "y_score": metrics.pop("raw_y_score"),
+                "patient_id": metrics.pop("raw_patient_id"),
+                "target_sec": float(tgt_sec),
+            }
 
         metrics["target_sec"] = float(tgt_sec)
         metrics["n_patches"] = int(n_target_patches)
@@ -427,6 +509,60 @@ def main() -> None:
     with open(results_path, "w") as f:
         json.dump({"signal_type": signal_type, "sweep": sweep}, f, indent=2)
     print(f"\nResults saved: {results_path}")
+
+    # ── Raw prediction dump (ablation aggregator 호환) ──────────────
+    # scripts/aggregate_ablation_results.py 가
+    #   <out_dir>/preds_fold{idx}.npz 를 glob 으로 발견.
+    # 분류 task 와 동일한 키 구조 (y_true / y_score / patient_id 등) 유지.
+    if not args.no_dump_preds:
+        if primary_raw is None:
+            print("[dump] WARN: no raw predictions collected (empty eval) — skip npz.",
+                  file=sys.stderr)
+        else:
+            preds_path = out_dir / f"preds_fold{int(args.fold)}.npz"
+            task_tag = (
+                f"forecasting_{'+'.join(context_signal_types)}_to_{signal_type}"
+                if is_multi_input and context_signal_types
+                else f"forecasting_{signal_type}"
+            )
+            payload = {
+                # generation: y_true / y_score 는 float waveform (N, L).
+                # _eval_utils.save_predictions 는 y_true 를 int64 로 캐스팅하므로 사용 불가.
+                # raw np.savez_compressed 로 직접 저장 (load_predictions 와 호환되는 키 셋).
+                "y_true": primary_raw["y_true"].astype(np.float32),
+                "y_score": primary_raw["y_score"].astype(np.float32),
+                "patient_id": primary_raw["patient_id"].astype(str),
+                "fold_idx": np.int64(int(args.fold)),
+                "n_folds": np.int64(int(args.n_folds)),
+                "task": str(task_tag),
+                "classes": np.array([], dtype=str),
+                # 메타: 스칼라/리스트 → N-row array 로 broadcast 해야
+                # _eval_utils.concat_oof 의 extra concat 이 안전.
+                # (concat_oof 가 모든 fold extra 를 np.concatenate 로 합치므로,
+                #  per-sample row 형태여야 OOF 후에도 의미 유지.)
+                "extra__signal_type": np.full(
+                    (primary_raw["y_true"].shape[0],), str(signal_type), dtype=object,
+                ).astype(str),
+                "extra__target_sec": np.full(
+                    (primary_raw["y_true"].shape[0],),
+                    float(primary_raw["target_sec"]),
+                    dtype=np.float64,
+                ),
+                "extra__is_multi_input": np.full(
+                    (primary_raw["y_true"].shape[0],), bool(is_multi_input), dtype=bool,
+                ),
+            }
+            if is_multi_input and context_signal_types:
+                payload["extra__context_signal_types"] = np.full(
+                    (primary_raw["y_true"].shape[0],),
+                    "+".join(context_signal_types),
+                    dtype=object,
+                ).astype(str)
+            np.savez_compressed(preds_path, **payload)
+            print(f"Predictions saved: {preds_path} "
+                  f"(y_true={primary_raw['y_true'].shape}, "
+                  f"y_score={primary_raw['y_score'].shape}, "
+                  f"patients={len(primary_raw['patient_id'])})")
 
 
 if __name__ == "__main__":

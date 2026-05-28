@@ -417,6 +417,7 @@ def main():
         config.data_dir,
         signal_types=config.signal_types,
         max_subjects=config.max_subjects,
+        subject_ids_file=config.subject_ids_file,
     )
     if rank0:
         print(f"Loaded {len(manifest)} recordings")

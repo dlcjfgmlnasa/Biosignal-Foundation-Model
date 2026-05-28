@@ -45,7 +45,7 @@ ABL_DIR = REPO_ROOT / "configs" / "ablation"
 PHASE1_BASE = ABL_DIR / "_phase1_base.yaml"
 PHASE2_BASE = ABL_DIR / "_phase2_base.yaml"
 VARIANTS_FILE = ABL_DIR / "variants.yaml"
-OUTPUT_ROOT = REPO_ROOT / "outputs" / "ablation"
+OUTPUT_ROOT = Path("/home/coder/workspace/k-mimic-/bio_fm/outputs/ablation")
 
 
 def deep_merge(base: dict, override: dict) -> dict:

@@ -7,7 +7,7 @@
 #       --config configs/ablation/<variant>_phase2.yaml
 
 # ── Resume (variant 별 override) ──
-resume: outputs/ablation/ablation_phase1_base/checkpoints/best.pt
+resume: /home/coder/workspace/k-mimic-/bio_fm/outputs/ablation/ablation_phase1_base/checkpoints/best.pt
 
 # ── 모델 (Phase 1 과 동일) ──
 model_config:
@@ -99,7 +99,7 @@ patience: 15
 # ── 시스템 ──
 device: auto
 num_workers: 4
-output_dir: outputs/ablation
+output_dir: /home/coder/workspace/k-mimic-/bio_fm/outputs/ablation
 checkpoint_every: 5
 viz_every: 0
 exp_name: ablation_phase2_base

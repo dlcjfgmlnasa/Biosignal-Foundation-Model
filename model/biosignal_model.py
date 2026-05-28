@@ -143,6 +143,7 @@ class BiosignalFoundationModel(nn.Module):
         next_head_d_inner: int | None = None,
         contrastive_proj_dim: int = 0,
         d_cond: int = 16,
+        use_lscnorm: bool = True,
     ) -> None:
         super().__init__()
         self.d_model = d_model
@@ -239,6 +240,33 @@ class BiosignalFoundationModel(nn.Module):
 
         # 10. Learnable [MASK] Token
         self.mask_token = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+
+        # 11. (Ablation) LSCNorm 비활성화 — cond_proj + 모든 LSCNorm.modulation 을
+        # zero-freeze 하여 plain RMSNorm 과 forward 동등 (gamma=0, beta=0 고정).
+        # 모델 구조는 그대로 두고 파라미터만 동결하여 checkpoint 호환성 유지.
+        self.use_lscnorm = use_lscnorm
+        if not use_lscnorm:
+            self._disable_lscnorm_modulation()
+
+    def _disable_lscnorm_modulation(self) -> None:
+        """Ablation: cond_proj 와 모든 LSCNorm.modulation 을 0 으로 고정.
+
+        결과: encoder LSCNorm 출력 = norm(x) * (1+0) + 0 = norm(x) = plain RMSNorm.
+        """
+        from module.norm import LSCNorm
+
+        # cond_proj 출력을 항상 0 으로 (Linear(0)=bias=0, SiLU(0)=0, Linear(0)=bias=0)
+        for p in self.cond_proj.parameters():
+            p.data.zero_()
+            p.requires_grad = False
+
+        # 모든 LSCNorm.modulation 을 0 으로 freeze
+        for m in self.modules():
+            if isinstance(m, LSCNorm):
+                m.modulation.weight.data.zero_()
+                m.modulation.bias.data.zero_()
+                m.modulation.weight.requires_grad = False
+                m.modulation.bias.requires_grad = False
 
     @staticmethod
     def _sample_variate_drop(

@@ -51,6 +51,10 @@ class TrainConfig:
         default_factory=lambda: [0, 1, 2, 3, 4, 5, 7, 8, 9]
     )
     max_subjects: int | None = None
+    # 특정 subject 만 학습에 사용. None 이면 전체.
+    # 형식: 텍스트 파일, 한 줄에 subject_id 하나. K-MIMIC ablation 의 25% subset
+    # 같은 재현 가능한 stratified subset 지정에 사용.
+    subject_ids_file: str | None = None
     window_seconds: float = 30.0
     max_length: int = 50000
     cache_size: int = 16
@@ -275,6 +279,7 @@ def _parse_manifest_full_jsonl(
     full_jsonl: Path,
     signal_types: list[int] | None,
     max_subjects: int | None = None,
+    subject_filter: set[str] | None = None,
 ) -> list[RecordingManifest]:
     """manifest_full.jsonl (통합 manifest)에서 RecordingManifest를 직접 생성한다.
 
@@ -295,6 +300,8 @@ def _parse_manifest_full_jsonl(
 
             meta = json.loads(line)
             subject_id = meta.get("subject_id", "")
+            if subject_filter is not None and subject_id not in subject_filter:
+                continue
             subject_dir = base_dir / subject_id if subject_id else base_dir
 
             for session in meta.get("sessions", []):
@@ -336,6 +343,7 @@ def load_manifest_from_processed(
     data_dir: str | Path | list[str | Path],
     signal_types: list[int] | None = None,
     max_subjects: int | None = None,
+    subject_ids_file: str | Path | None = None,
 ) -> list[RecordingManifest]:
     """processed 디렉토리에서 manifest를 읽어 RecordingManifest 목록을 반환한다.
 
@@ -352,6 +360,14 @@ def load_manifest_from_processed(
         data_dirs = [Path(data_dir)]
     else:
         data_dirs = [Path(d) for d in data_dir]
+
+    # subject filter 로드 (재현 가능한 stratified subset 지정)
+    subject_filter: set[str] | None = None
+    if subject_ids_file is not None:
+        sf_path = Path(subject_ids_file)
+        with open(sf_path, encoding="utf-8") as f:
+            subject_filter = {line.strip() for line in f if line.strip()}
+        print(f"  Subject filter: {len(subject_filter)} ids ({sf_path.name})")
 
     # ── 1) 캐시 또는 manifest_full.jsonl 확인 ──
     # fingerprint 소스 결정 (stat 1회로 충분한 파일)
@@ -383,6 +399,14 @@ def load_manifest_from_processed(
             h.update(json.dumps(sorted(signal_types)).encode())
         if max_subjects is not None:
             h.update(str(max_subjects).encode())
+        if subject_filter is not None:
+            # subject set hash (순서 무관) — 같은 subset 파일이면 동일 fp
+            sf_hash = hashlib.sha256()
+            for s in sorted(subject_filter):
+                sf_hash.update(s.encode())
+                sf_hash.update(b"\n")
+            h.update(b"|subject_filter:")
+            h.update(sf_hash.hexdigest().encode())
         fp = h.hexdigest()[:16]
         cache_dir = data_dirs[0] / ".manifest_cache"
         cache_path = cache_dir / f"{fp}.pkl"
@@ -403,7 +427,10 @@ def load_manifest_from_processed(
             for d in data_dirs:
                 full_jsonl = d / "manifest_full.jsonl"
                 if full_jsonl.exists():
-                    parsed = _parse_manifest_full_jsonl(full_jsonl, signal_types, max_subjects)
+                    parsed = _parse_manifest_full_jsonl(
+                        full_jsonl, signal_types, max_subjects,
+                        subject_filter=subject_filter,
+                    )
                     entries.extend(parsed)
                     print(f"  Using manifest_full.jsonl: {full_jsonl} ({len(parsed)} recordings)")
             # 캐시 저장
@@ -454,6 +481,15 @@ def load_manifest_from_processed(
             pass
 
     entries = _parse_manifest_files(manifest_files, signal_types)
+
+    # Fallback 경로의 subject_filter — entries 의 path 에서 subject_dir 이름 추출
+    if subject_filter is not None:
+        before = len(entries)
+        entries = [
+            e for e in entries
+            if Path(str(e.path).split("#", 1)[0]).parent.name in subject_filter
+        ]
+        print(f"  subject_filter applied: {before} → {len(entries)} recordings")
 
     try:
         cache_dir.mkdir(parents=True, exist_ok=True)

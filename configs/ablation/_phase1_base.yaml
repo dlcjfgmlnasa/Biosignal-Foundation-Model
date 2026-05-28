@@ -103,7 +103,7 @@ patience: 15
 # ── 시스템 ──
 device: auto
 num_workers: 4
-output_dir: outputs/ablation
+output_dir: /home/coder/workspace/k-mimic-/bio_fm/outputs/ablation
 checkpoint_every: 5
 viz_every: 0                       # ablation 에서는 viz 비활성 (compute 절약)
 exp_name: ablation_phase1_base
