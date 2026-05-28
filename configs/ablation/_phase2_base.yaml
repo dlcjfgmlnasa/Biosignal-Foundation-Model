@@ -98,7 +98,7 @@ patience: 15
 
 # ── 시스템 ──
 device: auto
-num_workers: 4
+num_workers: 2     # 4→2: DataLoader subprocess RAM 누적 줄여 Pod OOM/다운 방지 (학습 결과 무관)
 output_dir: /home/coder/workspace/k-mimic-/bio_fm/outputs/ablation
 checkpoint_every: 5
 viz_every: 0
