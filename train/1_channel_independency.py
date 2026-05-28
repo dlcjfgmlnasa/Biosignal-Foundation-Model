@@ -356,8 +356,8 @@ def main():
         collate_mode=config.collate_mode,
         patch_size=config.model_config.patch_size,
         pin_memory=True,
-        prefetch_factor=8,
-        persistent_workers=True,
+        prefetch_factor=2,        # 8→2: DataLoader queue 메모리 ~4배 감소 (Pod OOM 방지)
+        persistent_workers=False, # epoch마다 worker 재생성 → leak 누적 reset
         sampler=sampler,
         use_length_aware_batching=config.use_length_aware_batching,
         length_overpack=config.length_overpack,

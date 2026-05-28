@@ -17,6 +17,7 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
+import gc
 import torch
 import torch.distributed as dist
 import yaml
@@ -806,6 +807,12 @@ def train_one_epoch(
             if is_main_process():
                 print(f"  [{phase_name}] dry-run: 1 batch 완료, 종료.")
             break
+
+        # 주기적 GC + CUDA 캐시 해제 (Pod RAM leak 누적 방지, 500 batch 마다)
+        if n_batches % 500 == 0:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         # max_batches 제한
         if config.max_batches > 0 and n_batches >= config.max_batches:

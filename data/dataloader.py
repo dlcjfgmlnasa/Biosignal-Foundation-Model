@@ -17,8 +17,8 @@ def create_dataloader(
     num_workers: int = 4,
     drop_last: bool = False,
     pin_memory: bool = True,
-    persistent_workers: bool = True,
-    prefetch_factor: int | None = None,
+    persistent_workers: bool = False,   # epoch마다 worker 재생성 → leak 누적 reset (Pod OOM 방지)
+    prefetch_factor: int | None = 2,    # 큰 batch fetch queue 방지
     collate_mode: str = "any_variate",
     patch_size: int | None = None,
     stride: int | None = None,
