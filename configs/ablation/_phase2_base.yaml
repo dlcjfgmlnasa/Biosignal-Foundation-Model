@@ -36,7 +36,7 @@ signal_types: [0, 1, 2, 3, 4, 5, 7, 8, 9]
 max_subjects: null
 subject_ids_file: configs/ablation/subset_25pct_subjects.txt
 window_seconds: 600.0
-max_length: 256000   # PackCollate n_rows 변동 → 한 rank OOM/NCCL timeout 방지 ([[project_packcollate_oom]])
+max_length: 128000   # Phase 1 OOM 처방 일치 — per-row memory ½
 cache_size: 16
 crop_ratio_min: 0.01
 crop_ratio_max: 1.0
@@ -47,7 +47,7 @@ shard_index_path: /home/coder/workspace/k-mimic-/bio_fm/data/train/k_mimic_shard
 shard_cache_size: 1
 
 # ── 학습 ──
-batch_size: 64
+batch_size: 32       # 64→32: Phase 1 처방과 동일 비율 절반
 lr: 2.0e-4
 n_epochs: 50
 warmup_epochs: 3

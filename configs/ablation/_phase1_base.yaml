@@ -43,7 +43,7 @@ signal_types: [0, 1, 2, 3, 4, 5, 7, 8, 9]
 max_subjects: null
 subject_ids_file: configs/ablation/subset_25pct_subjects.txt  # ★ 25% subset 핵심
 window_seconds: 600.0
-max_length: 256000   # PackCollate n_rows 변동 → 한 rank OOM/NCCL timeout 방지 ([[project_packcollate_oom]])
+max_length: 128000   # batch 1050 시점 +38GB RAM 폭증으로 Pod OOM — per-row memory ½ 처방
 cache_size: 16
 crop_ratio_min: 0.01
 crop_ratio_max: 1.0
@@ -54,7 +54,7 @@ shard_index_path: /home/coder/workspace/k-mimic-/bio_fm/data/train/k_mimic_shard
 shard_cache_size: 1
 
 # ── 학습 ──
-batch_size: 128
+batch_size: 64       # 128→64: per-step memory ½, step 수 2배 (wall clock 동일)
 lr: 8.0e-4
 n_epochs: 80
 warmup_epochs: 8
