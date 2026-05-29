@@ -820,8 +820,8 @@ def train_one_epoch(
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-        # 진단: 100 batch마다 process RSS 출력 (RAM leak 추적용)
-        if _HAVE_PSUTIL and is_main_process() and n_batches % 100 == 0:
+        # 진단: 5000 batch마다만 출력 (이전 100마다는 plateau 확정 후 비활성)
+        if _HAVE_PSUTIL and is_main_process() and n_batches % 5000 == 0:
             rss_gb = psutil.Process().memory_info().rss / 1024**3
             gpu_gb = (
                 torch.cuda.memory_allocated() / 1024**3
