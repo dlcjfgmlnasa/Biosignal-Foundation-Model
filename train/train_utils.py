@@ -19,6 +19,11 @@ from typing import Any
 
 import gc
 from datetime import timedelta
+try:
+    import psutil
+    _HAVE_PSUTIL = True
+except ImportError:
+    _HAVE_PSUTIL = False
 import torch
 import torch.distributed as dist
 import yaml
@@ -107,7 +112,7 @@ class TrainConfig:
     # Length-aware batching (FFD packing memory variance 완화 → OOM 방지)
     # ci collate_mode 에서만 작동 (any_variate 는 GroupedBatchSampler 사용).
     use_length_aware_batching: bool = False
-    length_overpack: int = 8  # buffer = batch_size × overpack (4~16 권장)
+    length_overpack: int = 2  # 8→2: sorting buffer 메모리 1/4 (RAM 누적 방지)
 
     # Modality-balanced sampling (Phase 1 CI 전용, sparse modality 보정)
     # alpha=0 이면 RecordingLocalitySampler (uniform), alpha>0 이면
@@ -814,6 +819,18 @@ def train_one_epoch(
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+        # 진단: 100 batch마다 process RSS 출력 (RAM leak 추적용)
+        if _HAVE_PSUTIL and is_main_process() and n_batches % 100 == 0:
+            rss_gb = psutil.Process().memory_info().rss / 1024**3
+            gpu_gb = (
+                torch.cuda.memory_allocated() / 1024**3
+                if torch.cuda.is_available() else 0.0
+            )
+            print(
+                f"  [mem] batch {n_batches}: "
+                f"process RSS={rss_gb:.1f}GB  GPU alloc={gpu_gb:.1f}GB"
+            )
 
         # max_batches 제한
         if config.max_batches > 0 and n_batches >= config.max_batches:

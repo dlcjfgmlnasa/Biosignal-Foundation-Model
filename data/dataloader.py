@@ -16,7 +16,7 @@ def create_dataloader(
     shuffle: bool = True,
     num_workers: int = 4,
     drop_last: bool = False,
-    pin_memory: bool = True,
+    pin_memory: bool = False,           # pinned RAM 누적 방지 (NCCL stuck 시 leak 회피)
     persistent_workers: bool = False,   # epoch마다 worker 재생성 → leak 누적 reset (Pod OOM 방지)
     prefetch_factor: int | None = 2,    # 큰 batch fetch queue 방지
     collate_mode: str = "any_variate",
@@ -25,7 +25,7 @@ def create_dataloader(
     sampler: Sampler | None = None,
     min_patches: int = 5,
     use_length_aware_batching: bool = False,
-    length_overpack: int = 8,
+    length_overpack: int = 2,           # 8→2: sorting buffer 메모리 1/4 (RAM 누적 방지)
 ) -> DataLoader:
     """PackCollate가 적용된 DataLoader를 생성한다."""
     # slot_size: cross-modal 그루핑 단위 (같은 슬롯 = 같은 sample_id)

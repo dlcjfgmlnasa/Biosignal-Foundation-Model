@@ -355,7 +355,7 @@ def main():
         num_workers=config.num_workers,
         collate_mode=config.collate_mode,
         patch_size=config.model_config.patch_size,
-        pin_memory=True,
+        pin_memory=False,         # pinned RAM 누적 방지 (NCCL stuck 시 leak 회피)
         prefetch_factor=2,        # 8→2: DataLoader queue 메모리 ~4배 감소 (Pod OOM 방지)
         persistent_workers=False, # epoch마다 worker 재생성 → leak 누적 reset
         sampler=sampler,

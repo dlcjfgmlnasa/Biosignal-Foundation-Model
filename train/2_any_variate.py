@@ -467,7 +467,7 @@ def main():
         batch_size=config.batch_size,
         shuffle=True,
         num_workers=config.num_workers,
-        pin_memory=True,
+        pin_memory=False,         # pinned RAM 누적 방지 (NCCL stuck 시 leak 회피)
         collate_mode=config.collate_mode,
         patch_size=config.model_config.patch_size,
         min_patches=config.min_patches,
