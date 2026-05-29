@@ -8,7 +8,7 @@ import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import lru_cache
-from multiprocessing import Value
+import multiprocessing as _mp
 from pathlib import Path
 
 import torch
@@ -111,9 +111,11 @@ class BiosignalDataset(Dataset[BiosignalSample]):
         # 공유 epoch counter — DataLoader worker(자식 프로세스)에서도 보임
         # train loop의 set_epoch(epoch)으로 갱신 → __getitem__의 crop seed에
         # 섞여 동일 (rec, win) 샘플도 epoch마다 다른 crop을 받게 한다.
-        # mp.Value는 shared memory라 persistent_workers와도 호환.
-        self._epoch_value: Value | None = (
-            Value("q", 0) if crop_ratio_range is not None else None
+        # forkserver context로 명시 생성 — DataLoader가 forkserver 모드일 때
+        # SemLock 호환 문제 방지 ("fork context vs spawn context" 에러 회피).
+        self._epoch_value = (
+            _mp.get_context("forkserver").Value("q", 0)
+            if crop_ratio_range is not None else None
         )
 
         # ── Shard backend (Option D) — file open() 폭증 방지 ──
