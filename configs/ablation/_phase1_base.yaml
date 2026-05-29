@@ -56,8 +56,8 @@ shard_cache_size: 2     # 1→2: leak 해결됐으니 cache hit ratio ↑ (IO �
 # ── 학습 ──
 batch_size: 128      # leak 해결됐으니 원래 batch 복원 (step 수 ½ — throughput +30-50%)
 lr: 8.0e-4
-n_epochs: 50          # 80→50: ablation budget 단축 (12 variant × wall clock)
-warmup_epochs: 8
+n_epochs: 25          # 50→25 (B' 옵션): epoch_sec 1.86h × 25 = 47h ≈ 2일 per P1
+warmup_epochs: 5      # 8→5: n_epochs 25 short — warmup 짧게 해야 decay 20 epoch 충분
 min_lr_ratio: 0.1
 mask_ratio: 0.4
 gradient_clip: 1.0
@@ -98,7 +98,7 @@ use_amp: true
 # ── Validation & Early Stopping ──
 val_ratio: 0.05
 val_max_batches: 500
-patience: 10          # 15→10: early stopping 빠르게
+patience: 6           # 10→6 (B' 옵션): early stop 더 빠르게
 
 # ── 시스템 ──
 device: auto
