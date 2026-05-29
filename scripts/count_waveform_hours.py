@@ -51,6 +51,8 @@ for _stream in (sys.stdout, sys.stderr):
     except (AttributeError, ValueError):
         pass
 
+from data.spatial_map import SIGNAL_TYPE_NAMES, remap_record_v2
+
 try:
     from tqdm import tqdm
     _HAS_TQDM = True
@@ -61,20 +63,9 @@ except ImportError:
         return it
 
 
-# signal_type int → 이름 (count_tokens.py 와 동기화한 구 spec 테이블).
-# 시간 집계는 signal_type remap 여부와 무관하므로 raw signal_type 기준으로 본다.
-SIGNAL_NAMES: dict[int, str] = {
-    0: "ECG",
-    1: "ABP",
-    2: "PPG",
-    3: "CVP",
-    4: "CO2",
-    5: "AWP",
-    6: "PAP",
-    7: "ICP",
-    8: "RESP",
-    9: "RESP_Flow",
-}
+# v2 signal_type 이름 SOT (data/spatial_map). PAP(6)은 v2 에서 drop 되므로
+# 집계에서 제외되고, RESP 는 Impedance(8)/Flow(9) 로 분리된다.
+SIGNAL_NAMES: dict[int, str] = dict(SIGNAL_TYPE_NAMES)
 
 DEFAULT_SR = 100.0  # project-wide resampling target
 
@@ -92,6 +83,8 @@ class Stats:
     per_signal_seconds: dict[int, float] = field(default_factory=lambda: defaultdict(float))
     per_signal_count: dict[int, int] = field(default_factory=lambda: defaultdict(int))
     subjects: set = field(default_factory=set)
+    dropped_pap_seconds: float = 0.0   # v2 에서 제외되는 PAP raw 시간 (참고용)
+    dropped_pap_count: int = 0
 
     @property
     def n_subjects(self) -> int:
@@ -214,14 +207,27 @@ def scan_dataset(
                 n_ts = int(r.get("n_timesteps", r.get("length", 0)))
                 if n_ts <= 0:
                     continue
-                stype = int(r.get("signal_type", 0))
-                if signal_filter is not None and stype not in signal_filter:
-                    continue
                 sr = r.get("sampling_rate", None)
                 srate = float(sr) if sr else default_sr
+                rec_seconds = n_ts / srate * n_ch
+
+                # v2 remap: PAP(구 6) drop, RESP(8) → Impedance(8)/Flow(9) 분기.
+                old_stype = int(r.get("signal_type", 0))
+                spatial_ids = r.get("spatial_ids")
+                remapped = remap_record_v2(
+                    old_stype, [int(s) for s in spatial_ids] if spatial_ids else None
+                )
+                if remapped is None:
+                    # PAP drop — 집계 제외, raw 시간만 별도 추적.
+                    stats.dropped_pap_seconds += rec_seconds
+                    stats.dropped_pap_count += 1
+                    continue
+                stype = remapped[0]
+
+                if signal_filter is not None and stype not in signal_filter:
+                    continue
 
                 # 1) 신호 시간 합계 (채널 합산)
-                rec_seconds = n_ts / srate * n_ch
                 stats.n_recordings += 1
                 stats.signal_seconds += rec_seconds
                 stats.per_signal_seconds[stype] += rec_seconds
@@ -310,6 +316,14 @@ def print_summary(total: Stats, per_dataset: dict[str, Stats]) -> None:
             f"{hrs:>14,.1f} {pct:>6.1f}%"
         )
 
+    if total.dropped_pap_count > 0:
+        print(
+            f"\n  [제외] PAP (v2 drop): "
+            f"recs={_fmt_si(total.dropped_pap_count)}, "
+            f"{total.dropped_pap_seconds / 3600:,.1f} h "
+            f"- 집계에 미포함"
+        )
+
     print("\n" + "=" * 76)
 
 
@@ -376,6 +390,8 @@ def main() -> None:
         total.n_recordings += s.n_recordings
         total.signal_seconds += s.signal_seconds
         total.wall_clock_seconds += s.wall_clock_seconds
+        total.dropped_pap_seconds += s.dropped_pap_seconds
+        total.dropped_pap_count += s.dropped_pap_count
         for k, v in s.per_signal_seconds.items():
             total.per_signal_seconds[k] += v
         for k, v in s.per_signal_count.items():
