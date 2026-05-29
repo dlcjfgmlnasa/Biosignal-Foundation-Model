@@ -18,7 +18,7 @@ def create_dataloader(
     drop_last: bool = False,
     pin_memory: bool = False,           # pinned RAM 누적 방지 (NCCL stuck 시 leak 회피)
     persistent_workers: bool = False,   # epoch마다 worker 재생성 → leak 누적 reset (Pod OOM 방지)
-    prefetch_factor: int | None = 2,    # 큰 batch fetch queue 방지
+    prefetch_factor: int | None = 4,    # 2→4: leak 해결 후 throughput 회복 (queue ↑)
     collate_mode: str = "any_variate",
     patch_size: int | None = None,
     stride: int | None = None,

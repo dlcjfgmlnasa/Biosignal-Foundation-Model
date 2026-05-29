@@ -51,10 +51,10 @@ min_patches: 5
 
 # ── Shard backend ──
 shard_index_path: /home/coder/workspace/k-mimic-/bio_fm/data/train/k_mimic_shard/shard_index.json
-shard_cache_size: 1
+shard_cache_size: 2     # 1→2: leak 해결됐으니 cache hit ratio ↑ (IO 병목 ↓)
 
 # ── 학습 ──
-batch_size: 64       # 128→64: per-step memory ½, step 수 2배 (wall clock 동일)
+batch_size: 128      # leak 해결됐으니 원래 batch 복원 (step 수 ½ — throughput +30-50%)
 lr: 8.0e-4
 n_epochs: 50          # 80→50: ablation budget 단축 (12 variant × wall clock)
 warmup_epochs: 8

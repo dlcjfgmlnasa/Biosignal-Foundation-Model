@@ -44,10 +44,10 @@ min_patches: 5
 
 # ── Shard backend ──
 shard_index_path: /home/coder/workspace/k-mimic-/bio_fm/data/train/k_mimic_shard/shard_index.json
-shard_cache_size: 1
+shard_cache_size: 2     # 1→2: leak 해결됐으니 cache hit ratio ↑ (IO 병목 ↓)
 
 # ── 학습 ──
-batch_size: 32       # 64→32: Phase 1 처방과 동일 비율 절반
+batch_size: 64       # leak 해결됐으니 원래 batch 복원 (Phase 1 처방과 동일 비율)
 lr: 2.0e-4
 n_epochs: 50
 warmup_epochs: 3

@@ -356,7 +356,7 @@ def main():
         collate_mode=config.collate_mode,
         patch_size=config.model_config.patch_size,
         pin_memory=False,         # pinned RAM 누적 방지 (NCCL stuck 시 leak 회피)
-        prefetch_factor=2,        # 8→2: DataLoader queue 메모리 ~4배 감소 (Pod OOM 방지)
+        prefetch_factor=4,        # 2→4: leak 해결됐으니 queue ↑ (GPU starvation ↓)
         persistent_workers=False, # epoch마다 worker 재생성 → leak 누적 reset
         sampler=sampler,
         use_length_aware_batching=config.use_length_aware_batching,
@@ -392,7 +392,7 @@ def main():
             collate_mode=config.collate_mode,
             patch_size=config.model_config.patch_size,
             pin_memory=False,         # pinned RAM 누적 방지
-            prefetch_factor=2,        # 8→2: queue 메모리 축소
+            prefetch_factor=4,        # 2→4: queue ↑ (leak 해결 후 throughput 회복)
             persistent_workers=False, # epoch 사이 leak reset
             sampler=val_sampler,
             use_length_aware_batching=config.use_length_aware_batching,
