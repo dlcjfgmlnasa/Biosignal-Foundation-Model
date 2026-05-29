@@ -386,11 +386,16 @@ class BiosignalDataset(Dataset[BiosignalSample]):
         return self._load_recording_impl(fallback_idx)
 
     def __getstate__(self) -> dict:
-        """Pickle 직렬화: lru_cache wrapper는 pickle 불가이므로 제외."""
+        """Pickle 직렬화: lru_cache wrapper는 pickle 불가이므로 제외.
+
+        _load_shard 는 method (instance 의 bound method) 이므로 굳이 pop 안 해도
+        되지만 명시적으로 제외 (worker 에서 깨끗하게 시작).
+        """
         state = self.__dict__.copy()
         state.pop("_load_recording", None)
-        state.pop("_load_shard", None)
-        # _shard_cache_size 누락 방지 (older state 호환)
+        # manual cache 상태도 worker 에서 깨끗하게 시작 — leak source 회피
+        state["_shard_cache_key"] = None
+        state["_shard_cache_value"] = None
         return state
 
     def __setstate__(self, state: dict) -> None:
@@ -399,9 +404,9 @@ class BiosignalDataset(Dataset[BiosignalSample]):
         self._load_recording = lru_cache(maxsize=self._cache_size)(
             self._load_recording_impl
         )
-        # shard cache (없으면 기본 4)
-        shard_cache_size = getattr(self, "_shard_cache_size_attr", 4)
-        self._load_shard = lru_cache(maxsize=shard_cache_size)(self._load_shard_impl)
+        # shard cache 는 manual (instance 의 method 이므로 자동 bind 됨,
+        # 별도 재생성 불필요). _shard_cache_key/value 는 __getstate__ 에서
+        # None 으로 reset 됨.
 
     def __len__(self) -> int:
         return self._rec_offsets[-1]
