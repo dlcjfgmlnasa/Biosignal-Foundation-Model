@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 import gc
+from datetime import timedelta
 import torch
 import torch.distributed as dist
 import yaml
@@ -1205,10 +1206,19 @@ def resolve_device(device_str: str) -> torch.device:
 
 
 def setup_ddp(rank: int, world_size: int) -> None:
-    """DDP 프로세스 그룹을 초기화한다."""
+    """DDP 프로세스 그룹을 초기화한다.
+
+    NCCL collective timeout 을 30 분으로 명시 (default 10 분).
+    한 rank 의 일시적 slowdown (RAM 압박, IO stall) 시에도 견디기 위함.
+    """
     os.environ.setdefault("MASTER_ADDR", "localhost")
     os.environ.setdefault("MASTER_PORT", "29500")
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    dist.init_process_group(
+        "nccl",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(minutes=30),   # default 10분 → 30분 (rank straggler 견딤)
+    )
     torch.cuda.set_device(rank)
 
 
