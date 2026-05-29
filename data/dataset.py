@@ -217,7 +217,13 @@ class BiosignalDataset(Dataset[BiosignalSample]):
         # LRU 캐시를 인스턴스별로 생성 (lru_cache는 함수 레벨이므로 래핑)
         self._load_recording = lru_cache(maxsize=cache_size)(self._load_recording_impl)
         self._shard_cache_size_attr = shard_cache_size
-        self._load_shard = lru_cache(maxsize=shard_cache_size)(self._load_shard_impl)
+
+        # Shard cache — 명시적 1-slot manual cache (lru_cache 의 메모리 reference
+        # leak 회피). 새 shard 로드 전 del + gc.collect() 강제로 이전 shard
+        # 메모리 즉시 해제. 같은 shard 연속 hit 시엔 cache hit 으로 동작.
+        # shard_cache_size 인자는 호환성 위해 받지만 1-slot 으로 고정 동작.
+        self._shard_cache_key: int | None = None
+        self._shard_cache_value: dict | None = None
 
         # 레코딩별 window/stride (샘플 단위로 변환)
         self._window_lengths_per_rec: list[int | None] = []
@@ -258,8 +264,26 @@ class BiosignalDataset(Dataset[BiosignalSample]):
             self._n_windows_per_rec.append(n_win)
             self._rec_offsets.append(self._rec_offsets[-1] + entry.n_channels * n_win)
 
+    def _load_shard(self, shard_id: int) -> dict:
+        """1-slot manual cache (lru_cache 의 reference leak 회피).
+
+        같은 shard 연속 hit 시 cached value 반환. 새 shard 로드 전
+        ``del`` + ``gc.collect()`` 로 이전 shard 메모리 즉시 해제.
+        """
+        if shard_id != self._shard_cache_key:
+            # 이전 shard 명시적 해제
+            if self._shard_cache_value is not None:
+                del self._shard_cache_value
+                self._shard_cache_value = None
+                import gc
+                gc.collect()
+            # 새 shard 로드
+            self._shard_cache_value = self._load_shard_impl(shard_id)
+            self._shard_cache_key = shard_id
+        return self._shard_cache_value
+
     def _load_shard_impl(self, shard_id: int) -> dict:
-        """Shard 파일 로드 (LRU 캐시 대상). 한 번 로드로 수백 recording 처리."""
+        """Shard 파일 로드. 한 번 로드로 수백 recording 처리."""
         shard_path = self._shard_dir / f"shard_{shard_id:05d}.pt"
         return torch.load(shard_path, weights_only=True, mmap=self._use_mmap)
 
