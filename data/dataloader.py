@@ -67,6 +67,7 @@ def create_dataloader(
             pin_memory=pin_memory,
             persistent_workers=(persistent_workers and num_workers > 0),
             prefetch_factor=(prefetch_factor if num_workers > 0 else None),
+            multiprocessing_context=("forkserver" if num_workers > 0 else None),
         )
     else:
         # CI 모드: 개별 샘플 랜덤 샘플링 (DDP 시 sampler 사용)
@@ -104,4 +105,5 @@ def create_dataloader(
             pin_memory=pin_memory,
             persistent_workers=(persistent_workers and num_workers > 0),
             prefetch_factor=(prefetch_factor if num_workers > 0 else None),
+            multiprocessing_context=("forkserver" if num_workers > 0 else None),
         )
