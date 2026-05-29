@@ -391,9 +391,9 @@ def main():
             num_workers=config.num_workers,
             collate_mode=config.collate_mode,
             patch_size=config.model_config.patch_size,
-            pin_memory=True,
-            prefetch_factor=8,
-            persistent_workers=True,
+            pin_memory=False,         # pinned RAM 누적 방지
+            prefetch_factor=2,        # 8→2: queue 메모리 축소
+            persistent_workers=False, # epoch 사이 leak reset
             sampler=val_sampler,
             use_length_aware_batching=config.use_length_aware_batching,
             length_overpack=config.length_overpack,
