@@ -337,6 +337,10 @@ class BiosignalDataset(Dataset[BiosignalSample]):
                 values = rec["values"]
                 if not torch.is_tensor(values):
                     values = torch.from_numpy(values).float()
+                # fp16 shard 호환: 학습 안정성 위해 fp32 로 cast
+                # (build_shards 가 fp16 저장 — 디스크 1/2 + OS cache hit ↑)
+                if values.dtype == torch.float16:
+                    values = values.float()
                 # (channels, time) 보장 — 1D면 unsqueeze
                 if values.ndim == 1:
                     values = values.unsqueeze(0)

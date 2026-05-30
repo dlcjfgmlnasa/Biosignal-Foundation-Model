@@ -23,8 +23,17 @@ import torch
 
 
 def _load_one_tensor(path: str) -> torch.Tensor:
-    """Worker: 한 recording 파일을 로드. 별도 프로세스에서 실행됨."""
-    return torch.load(path, weights_only=True)
+    """Worker: 한 recording 파일을 로드 후 fp16 으로 변환.
+
+    fp32 → fp16 변환으로 디스크/메모리 사용량 1/2.
+    AMP autocast 사용 중이라 학습 정확도 영향 거의 없음
+    (어차피 forward 시 fp16으로 계산됨).
+    Dataset 의 __getitem__ 에서 학습 시 fp32 로 cast.
+    """
+    t = torch.load(path, weights_only=True)
+    if t.dtype == torch.float32:
+        t = t.to(torch.float16)
+    return t
 
 
 def _load_manifest_paths_from_jsonl(jsonl_path: Path) -> list[dict]:
