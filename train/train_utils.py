@@ -753,10 +753,14 @@ def train_one_epoch(
                         f"Stopping epoch early."
                     )
                 break
-            optimizer.zero_grad(set_to_none=True)
             n_batches += 1
             if scaler is not None:
+                # unscale_() 호출됐으면 반드시 step() 호출해야 다음 iter 에서
+                # unscale_() 재호출 가능 (PyTorch GradScaler API 규칙).
+                # step() 은 inf gradient 자동 감지해서 optimizer.step() skip 함.
+                scaler.step(optimizer)
                 scaler.update()
+            optimizer.zero_grad(set_to_none=True)
             continue
 
         nan_count = 0  # 정상 batch면 카운터 리셋
