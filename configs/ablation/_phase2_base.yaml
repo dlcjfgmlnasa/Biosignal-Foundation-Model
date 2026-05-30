@@ -34,7 +34,7 @@ data_dir:
   - /home/coder/workspace/k-mimic-/bio_fm/data/train/k_mimic/
 signal_types: [0, 1, 2, 3, 4, 5, 7, 8, 9]
 max_subjects: null
-subject_ids_file: configs/ablation/subset_25pct_subjects.txt
+subject_ids_file: configs/ablation/subset_5pct_subjects.txt   # SMOKE TEST (본 학습 시 25%로 원복)
 window_seconds: 600.0
 max_length: 128000   # Phase 1 OOM 처방 일치 — per-row memory ½
 cache_size: 16
@@ -47,9 +47,9 @@ shard_index_path: /home/coder/workspace/k-mimic-/bio_fm/data/train/k_mimic_shard
 shard_cache_size: 2     # 1→2: leak 해결됐으니 cache hit ratio ↑ (IO 병목 ↓)
 
 # ── 학습 ──
-batch_size: 64       # leak 해결됐으니 원래 batch 복원 (Phase 1 처방과 동일 비율)
+batch_size: 32       # 64→32: 발산 방지 검증된 setup 복원
 lr: 2.0e-4
-n_epochs: 25          # 50→25 (B' 옵션 Phase 1 동일)
+n_epochs: 5           # SMOKE TEST (본 학습 시 25로 원복)
 warmup_epochs: 3
 min_lr_ratio: 0.1
 mask_ratio: 0.4
@@ -94,7 +94,7 @@ use_amp: true
 # ── Validation & Early Stopping ──
 val_ratio: 0.05
 val_max_batches: 500
-patience: 6           # 10→6 (B' 옵션 Phase 1 동일)
+patience: 3           # SMOKE TEST (본 학습 시 6으로 원복)
 
 # ── 시스템 ──
 device: auto
