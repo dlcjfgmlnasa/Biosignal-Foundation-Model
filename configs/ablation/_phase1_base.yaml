@@ -41,7 +41,7 @@ data_dir:
   - /home/coder/workspace/k-mimic-/bio_fm/data/train/k_mimic/
 signal_types: [0, 1, 2, 3, 4, 5, 7, 8, 9]
 max_subjects: null
-subject_ids_file: configs/ablation/subset_5pct_subjects.txt   # ★ SMOKE TEST: 5% (본 학습 시 25%로 원복)
+subject_ids_file: configs/ablation/subset_25pct_subjects.txt  # ★ 25% subset (본 학습)
 window_seconds: 600.0
 max_length: 128000   # batch 1050 시점 +38GB RAM 폭증으로 Pod OOM — per-row memory ½ 처방
 cache_size: 16
@@ -50,14 +50,14 @@ crop_ratio_max: 1.0
 min_patches: 5
 
 # ── Shard backend ──
-shard_index_path: /home/coder/workspace/k-mimic-/bio_fm/data/train/k_mimic_shard/shard_index.json
+shard_index_path: /home/coder/workspace/k-mimic-/bio_fm/data/train/k_mimic_shard_500mb/shard_index.json   # fp16 + 500MB shard
 shard_cache_size: 2     # 1→2: leak 해결됐으니 cache hit ratio ↑ (IO 병목 ↓)
 
 # ── 학습 ──
 batch_size: 64       # 128→64: batch 128 + LR 8e-4 발산 (epoch 4)로 검증된 안정 setup 복원
 lr: 8.0e-4
-n_epochs: 5           # SMOKE TEST: 5 epoch (본 학습 시 25로 원복)
-warmup_epochs: 2      # SMOKE TEST: 2 epoch warmup (본 학습 시 5로 원복)
+n_epochs: 25          # 본 학습 (smoke test 5 epoch 검증 OK — val 1.81 → 1.19 정상 수렴)
+warmup_epochs: 5      # 본 학습 (n_epochs 25 에 적합)
 min_lr_ratio: 0.1
 mask_ratio: 0.4
 gradient_clip: 1.0
@@ -98,7 +98,7 @@ use_amp: true
 # ── Validation & Early Stopping ──
 val_ratio: 0.05
 val_max_batches: 500
-patience: 3           # SMOKE TEST: 3 (본 학습 시 6으로 원복)
+patience: 6           # 본 학습
 
 # ── 시스템 ──
 device: auto
