@@ -70,28 +70,27 @@ def _group_into_shards(
     entries: list[dict],
     target_shard_bytes: int,
 ) -> list[list[dict]]:
-    """같은 subject의 recording들을 같은 shard에 모으면서, 누적 크기가
-    target에 도달하면 새 shard 시작. 같은 subject가 너무 크면 분할 허용.
+    """누적 크기가 target에 도달하면 새 shard 시작.
+
+    Subject boundary 무시 (같은 subject 안에서도 split 허용) — train/val split
+    은 manifest level에서 subject 단위로 이루어지므로 (train_utils.py:517 의
+    ``_split_by_subject``) shard structure 와는 독립. subject leak 위험 없음.
+
+    이전 동작: subject boundary 존중 → 큰 subject 가 한 shard 통째 차지 →
+    shard 크기 폭증 (target=512MB 인데 실제 3.6GB shard 발생).
     """
     shards: list[list[dict]] = []
     current: list[dict] = []
     current_size = 0
-    last_subject = None
 
     for rec in entries:
         rec_size = _estimate_size_bytes(rec)
-        # subject가 바뀌었고 현재 shard가 target에 도달했으면 새 shard 시작
-        if (
-            last_subject is not None
-            and rec["subject_id"] != last_subject
-            and current_size >= target_shard_bytes
-        ):
+        if current_size >= target_shard_bytes:
             shards.append(current)
             current = []
             current_size = 0
         current.append(rec)
         current_size += rec_size
-        last_subject = rec["subject_id"]
 
     if current:
         shards.append(current)
