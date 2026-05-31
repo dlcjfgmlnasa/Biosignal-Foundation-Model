@@ -47,8 +47,8 @@ shard_index_path: /home/coder/workspace/k-mimic-/bio_fm/data/train/k_mimic_shard
 shard_cache_size: 2     # 1→2: leak 해결됐으니 cache hit ratio ↑ (IO 병목 ↓)
 
 # ── 학습 ──
-batch_size: 32       # 64→32: 발산 방지 검증된 setup 복원
-lr: 2.0e-4
+batch_size: 64       # 옵션 B: batch 2× ↑ (Phase 1 동일 비율)
+lr: 4.0e-4           # 옵션 B: linear scaling (batch 2× → LR 2×)
 n_epochs: 25          # 본 학습 (Phase 1 동일)
 warmup_epochs: 3
 min_lr_ratio: 0.1
