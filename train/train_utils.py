@@ -595,7 +595,7 @@ def train_one_epoch(
 
     enable_next = config.beta > 0
     use_amp = scaler is not None
-    amp_dtype = torch.float16 if device.type == "cuda" else torch.bfloat16
+    amp_dtype = torch.bfloat16  # fp16 → bf16: overflow 회피 (L40S native 지원, fp32 range)
     use_dist = dist.is_available() and dist.is_initialized()
 
     def _sync_criterion_grads() -> None:
@@ -934,7 +934,7 @@ def validate(
 
     enable_next = config.beta > 0
     use_amp = config.use_amp and device.type == "cuda"
-    amp_dtype = torch.float16 if device.type == "cuda" else torch.bfloat16
+    amp_dtype = torch.bfloat16  # fp16 → bf16: overflow 회피 (L40S native 지원, fp32 range)
 
     # validation 진행률 표시 (rank 0만, cold val shard 로드라 분 단위 걸림)
     val_limit = (
