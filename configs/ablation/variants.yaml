@@ -10,15 +10,18 @@
 
 variants:
   # ── #0 Baseline (CARMEN full) ────────────────────────────────
+  # exp_name 은 _phase1_base.yaml / _phase2_base.yaml 의 기본값과 동일하게
+  # 유지 (ablation_phase1_base / ablation_phase2_base) — 이미 진행 중인
+  # base 학습 ckpt 를 옵션 C reuse chain 에서 그대로 활용하기 위함.
   - name: "00_full"
     description: "CARMEN full (α=0.5 sampler, all losses on, LSCNorm on, Phase 1+2, var_attn_bias on)"
     ablation_group: "baseline"
     phase1:
       overrides:
-        exp_name: ablation_00_full_p1
+        exp_name: ablation_phase1_base
     phase2:
       overrides:
-        exp_name: ablation_00_full_p2
+        exp_name: ablation_phase2_base
 
   # ── #1 Loss component ────────────────────────────────────────
   - name: "01a_no_mpm"
