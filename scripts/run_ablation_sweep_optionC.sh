@@ -37,17 +37,52 @@ set -uo pipefail
 # set -e 는 일부러 끔 — 한 variant 실패해도 다음 진행
 
 # ─── 환경 변수 (override 가능) ──────────────────────────────────
-REPO_ROOT="${REPO_ROOT:-$HOME/workspace/k-mimic-/bio_fm}"
+# REPO_ROOT 는 스크립트 자신의 위치 기준 자동 결정 → 어디서 호출해도 동작.
+# env 로 강제 override 가능.
+SCRIPT_DIR="$( cd "$(dirname "${BASH_SOURCE[0]}")" && pwd )"
+REPO_ROOT="${REPO_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+
+# OUTPUT_ROOT 는 yaml 의 output_dir 와 일치해야 함 (configs/ablation/_phase{1,2}_base.yaml).
+# 디스크 마운트 경로가 repo 와 별개일 수 있으므로 분리.
+OUTPUT_ROOT="${OUTPUT_ROOT:-$HOME/workspace/k-mimic-/bio_fm/outputs/ablation}"
+
 NPROC="${NPROC:-4}"
 START_STAGE="${START_STAGE:-0}"
 STOP_STAGE="${STOP_STAGE:-5}"
 LOG_DIR="${LOG_DIR:-$REPO_ROOT/logs/ablation_sweep}"
 # 실제 ckpt 파일은 checkpoint_{phase}_epoch{NNN}_best.pt 형식이므로 glob 사용
-BASE_P1_CKPT_DIR="$REPO_ROOT/outputs/ablation/ablation_phase1_base/checkpoints"
-BASE_P2_CKPT_DIR="$REPO_ROOT/outputs/ablation/ablation_phase2_base/checkpoints"
+BASE_P1_CKPT_DIR="$OUTPUT_ROOT/ablation_phase1_base/checkpoints"
+BASE_P2_CKPT_DIR="$OUTPUT_ROOT/ablation_phase2_base/checkpoints"
 
 mkdir -p "$LOG_DIR"
-cd "$REPO_ROOT"
+
+# run_ablation.py 자식 process 에 OUTPUT_ROOT 전파
+export ABLATION_OUTPUT_ROOT="$OUTPUT_ROOT"
+
+# REPO_ROOT 존재 검증 + cd 실패 시 abort
+if [ ! -d "$REPO_ROOT" ]; then
+    echo "❌ REPO_ROOT 디렉토리 없음: $REPO_ROOT"
+    echo "   현재 PWD: $(pwd)"
+    echo "   SCRIPT_DIR: $SCRIPT_DIR"
+    echo "   REPO_ROOT env 로 직접 지정하세요:"
+    echo "     REPO_ROOT=/path/to/repo bash scripts/run_ablation_sweep_optionC.sh"
+    exit 1
+fi
+cd "$REPO_ROOT" || {
+    echo "❌ cd $REPO_ROOT failed"
+    exit 1
+}
+# train 모듈 import 가능한지 사전 검증 (torchrun 즉시 사망 방지)
+if [ ! -f "$REPO_ROOT/train/1_channel_independency.py" ]; then
+    echo "❌ $REPO_ROOT/train/1_channel_independency.py 없음 — REPO_ROOT 가 잘못됨"
+    echo "   현재 디렉토리 (cwd): $(pwd)"
+    echo "   ls: $(ls "$REPO_ROOT" 2>/dev/null | head -10 | tr '\n' ' ')"
+    exit 1
+fi
+if [ ! -f "$REPO_ROOT/configs/ablation/_phase1_base.yaml" ]; then
+    echo "❌ $REPO_ROOT/configs/ablation/_phase1_base.yaml 없음 — REPO_ROOT 또는 config 누락"
+    exit 1
+fi
 
 # ─── 유틸 ─────────────────────────────────────────────────────
 ts() { date "+%Y-%m-%d %H:%M:%S"; }
@@ -112,11 +147,23 @@ in_range() {
 
 # ─── 환경 점검 ────────────────────────────────────────────────
 section "Pre-check"
-say "REPO_ROOT  = $REPO_ROOT"
-say "NPROC      = $NPROC"
-say "START_STAGE= $START_STAGE"
-say "STOP_STAGE = $STOP_STAGE"
-say "LOG_DIR    = $LOG_DIR"
+say "REPO_ROOT   = $REPO_ROOT"
+say "OUTPUT_ROOT = $OUTPUT_ROOT"
+say "PWD (cwd)   = $(pwd)"
+say "NPROC       = $NPROC"
+say "START_STAGE = $START_STAGE"
+say "STOP_STAGE  = $STOP_STAGE"
+say "LOG_DIR     = $LOG_DIR"
+
+# OUTPUT_ROOT 가 yaml output_dir 과 일치하는지 검증
+yaml_output=$(grep -E "^output_dir:" "$REPO_ROOT/configs/ablation/_phase1_base.yaml" \
+    | awk '{print $2}')
+if [ -n "$yaml_output" ] && [ "$yaml_output" != "$OUTPUT_ROOT" ]; then
+    say "⚠️  OUTPUT_ROOT 와 yaml output_dir 불일치:"
+    say "    sweep    : $OUTPUT_ROOT"
+    say "    yaml     : $yaml_output"
+    say "    → OUTPUT_ROOT=$yaml_output 으로 재실행하거나 yaml 을 맞추세요."
+fi
 
 nvidia-smi --query-gpu=index,name,memory.free --format=csv,noheader 2>/dev/null \
     | head -n "$NPROC" \
@@ -252,7 +299,7 @@ for exp in \
     ablation_07b_30m_p1 ablation_07b_30m_p2 \
     ablation_07c_100m_p1 ablation_07c_100m_p2 \
 ; do
-    ckpt_dir="$REPO_ROOT/outputs/ablation/$exp/checkpoints"
+    ckpt_dir="$OUTPUT_ROOT/$exp/checkpoints"
     latest=$(ls -t "$ckpt_dir"/*_best.pt 2>/dev/null | head -1)
     if [ -n "$latest" ] && [ -f "$latest" ]; then
         echo "  ✅ $exp — $(basename "$latest")"

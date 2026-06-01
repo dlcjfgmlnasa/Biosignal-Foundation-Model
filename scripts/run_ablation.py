@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import os
 import subprocess
 import sys
 import tempfile
@@ -45,7 +46,13 @@ ABL_DIR = REPO_ROOT / "configs" / "ablation"
 PHASE1_BASE = ABL_DIR / "_phase1_base.yaml"
 PHASE2_BASE = ABL_DIR / "_phase2_base.yaml"
 VARIANTS_FILE = ABL_DIR / "variants.yaml"
-OUTPUT_ROOT = Path("/home/coder/workspace/k-mimic-/bio_fm/outputs/ablation")
+# OUTPUT_ROOT 는 env override 가능 — yaml 의 output_dir 와 일치해야 함.
+OUTPUT_ROOT = Path(
+    os.environ.get(
+        "ABLATION_OUTPUT_ROOT",
+        "/home/coder/workspace/k-mimic-/bio_fm/outputs/ablation",
+    )
+)
 
 
 def deep_merge(base: dict, override: dict) -> dict:
