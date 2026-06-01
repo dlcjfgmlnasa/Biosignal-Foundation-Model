@@ -33,8 +33,9 @@ REPO_ROOT="${REPO_ROOT:-$HOME/workspace/k-mimic-/bio_fm}"
 NPROC="${NPROC:-4}"
 START_STAGE="${START_STAGE:-0}"
 LOG_DIR="${LOG_DIR:-$REPO_ROOT/logs/ablation_sweep}"
-BASE_P1_CKPT="$REPO_ROOT/outputs/ablation/ablation_phase1_base/checkpoints/best.pt"
-BASE_P2_CKPT="$REPO_ROOT/outputs/ablation/ablation_phase2_base/checkpoints/best.pt"
+# 실제 ckpt 파일은 checkpoint_{phase}_epoch{NNN}_best.pt 형식이므로 glob 사용
+BASE_P1_CKPT_DIR="$REPO_ROOT/outputs/ablation/ablation_phase1_base/checkpoints"
+BASE_P2_CKPT_DIR="$REPO_ROOT/outputs/ablation/ablation_phase2_base/checkpoints"
 
 mkdir -p "$LOG_DIR"
 cd "$REPO_ROOT"
@@ -50,14 +51,25 @@ section() {
     echo "════════════════════════════════════════════════════════════════"
 }
 require_ckpt() {
-    local ckpt="$1"
+    # glob 패턴으로 *_best.pt 최신 파일 검증
+    local ckpt_dir="$1"
     local desc="$2"
-    if [ ! -f "$ckpt" ]; then
-        say "❌ $desc ckpt 없음: $ckpt"
+    if [ ! -d "$ckpt_dir" ]; then
+        say "❌ $desc ckpt 디렉토리 없음: $ckpt_dir"
         say "   해당 단계를 먼저 완주한 후 실행하세요."
         exit 1
     fi
-    say "✅ $desc ckpt 존재 — $(du -h "$ckpt" | cut -f1)"
+    # ls -t 로 최신 *_best.pt 찾기
+    local latest
+    latest=$(ls -t "$ckpt_dir"/*_best.pt 2>/dev/null | head -1)
+    if [ -z "$latest" ] || [ ! -f "$latest" ]; then
+        say "❌ $desc *_best.pt 파일 없음 in: $ckpt_dir"
+        say "   디렉토리 내용:"
+        ls -la "$ckpt_dir" 2>/dev/null | sed 's/^/     /' | head -20
+        say "   해당 단계를 먼저 완주한 후 실행하세요."
+        exit 1
+    fi
+    say "✅ $desc ckpt: $(basename "$latest") ($(du -h "$latest" | cut -f1))"
 }
 run_stage() {
     local stage_num="$1"
@@ -85,7 +97,7 @@ say "LOG_DIR    = $LOG_DIR"
 say "START_STAGE= $START_STAGE"
 
 if [ "$START_STAGE" -le 0 ]; then
-    require_ckpt "$BASE_P1_CKPT" "Base P1"
+    require_ckpt "$BASE_P1_CKPT_DIR" "Base P1"
 fi
 
 nvidia-smi --query-gpu=index,name,memory.free --format=csv,noheader 2>/dev/null \
@@ -102,14 +114,16 @@ fi
 
 # ─── Stage 0 — Base P2 ────────────────────────────────────────
 if [ "$START_STAGE" -le 0 ]; then
-    if [ -f "$BASE_P2_CKPT" ]; then
-        say "✅ Stage 0 skip — Base P2 ckpt 이미 존재"
+    # Base P2 ckpt 존재 여부 — glob 으로 확인
+    base_p2_existing=$(ls -t "$BASE_P2_CKPT_DIR"/*_best.pt 2>/dev/null | head -1)
+    if [ -n "$base_p2_existing" ] && [ -f "$base_p2_existing" ]; then
+        say "✅ Stage 0 skip — Base P2 ckpt 이미 존재: $(basename "$base_p2_existing")"
     else
         run_stage 0 "base_p2" \
             torchrun --nproc_per_node="$NPROC" \
                 -m train.2_any_variate \
                 --config configs/ablation/_phase2_base.yaml
-        require_ckpt "$BASE_P2_CKPT" "Base P2"
+        require_ckpt "$BASE_P2_CKPT_DIR" "Base P2"
     fi
 fi
 
@@ -195,9 +209,10 @@ for exp in \
     ablation_07b_30m_p1 ablation_07b_30m_p2 \
     ablation_07c_100m_p1 ablation_07c_100m_p2 \
 ; do
-    ckpt="$REPO_ROOT/outputs/ablation/$exp/checkpoints/best.pt"
-    if [ -f "$ckpt" ]; then
-        echo "  ✅ $exp"
+    ckpt_dir="$REPO_ROOT/outputs/ablation/$exp/checkpoints"
+    latest=$(ls -t "$ckpt_dir"/*_best.pt 2>/dev/null | head -1)
+    if [ -n "$latest" ] && [ -f "$latest" ]; then
+        echo "  ✅ $exp — $(basename "$latest")"
     else
         echo "  ❌ $exp (missing)"
     fi

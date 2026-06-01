@@ -92,8 +92,22 @@ def resolve_variants(
 
 
 def ckpt_path_for_exp(exp_name: str) -> Path:
-    """exp_name 으로부터 best.pt 경로 추정."""
-    return OUTPUT_ROOT / exp_name / "checkpoints" / "best.pt"
+    """exp_name 으로부터 가장 최신 *_best.pt 경로 반환.
+
+    train_utils.save_training_checkpoint 은
+        checkpoint_{phase_name}_epoch{NNN}_best.pt
+    형식으로 저장하므로 단일 best.pt 가 아닌 glob 매칭이 필요.
+
+    파일이 아직 없으면 (dry-run / 학습 미완료) placeholder 경로 반환 —
+    caller (run_variant) 가 reuse 시점에 .exists() 로 검증한다.
+    """
+    ckpt_dir = OUTPUT_ROOT / exp_name / "checkpoints"
+    if ckpt_dir.is_dir():
+        candidates = sorted(ckpt_dir.glob("*_best.pt"))
+        if candidates:
+            return candidates[-1]
+    # 아직 없음 — caller 에서 .exists() False 로 처리됨
+    return ckpt_dir / "best.pt"  # placeholder
 
 
 def build_torchrun_cmd(
