@@ -1,25 +1,22 @@
 # -*- coding: utf-8 -*-
-"""ICH cohort signal combo diagnostic.
+"""ICH cohort signal combo diagnostic — fast variant.
 
-`mimic3-waveform-ich/` 의 각 master record header(.hea + _layout.hea) 만 읽어서
-어떤 channel 조합을 갖고 있는지 집계한다. 실제 signal load 없이 빠르게 수행.
+MIMIC-III multi-segment record 의 `_layout` segment 1개만 읽어 channel 집합을
+파악한다. 신호 load 없음 + ThreadPool 병렬 → 네트워크 마운트에서도 빠름.
 
 사용법:
     python -m scripts.count_ich_signal_combos \
-        --waveform-dir /home/coder/workspace/updown/raw/mimic3-waveform-ich
-
-출력:
-  - record-level cohort size: 5ch / 4ch / 3ch / 2ch / ICP-only
-  - patient-level cohort size (dedup by p-ID prefix)
-  - drop-rate trade-off table
+        --waveform-dir /home/coder/workspace/updown/raw/mimic3-waveform-ich \
+        --workers 16
 """
 from __future__ import annotations
 
 import argparse
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-# MIMIC-III 채널명 → signal_type (ICH prepare_data.py 와 동일)
+# MIMIC-III 채널명 → signal_type (prepare_data.py 와 동일)
 CHANNEL_MAP: dict[str, str] = {
     "II": "ecg", "I": "ecg", "III": "ecg", "V": "ecg", "V5": "ecg",
     "MCL1": "ecg", "MCL": "ecg",
@@ -30,82 +27,93 @@ CHANNEL_MAP: dict[str, str] = {
 }
 
 
-def _scan_record_channels(master_hea: Path) -> set[str]:
-    """master .hea 의 segment 목록 → 각 segment .hea 읽어 channel union."""
-    channels: set[str] = set()
+def _channels_from_hea(hea_path: Path) -> set[str]:
+    """단일 .hea 파일에서 signal channel 이름 집합 추출."""
+    out: set[str] = set()
     try:
-        with open(master_hea, encoding="latin-1") as f:
+        with open(hea_path, encoding="latin-1") as f:
             lines = f.readlines()
     except Exception:
-        return channels
-
-    record_dir = master_hea.parent
-    # line 1+: segment names (or sig channels for non-multi-segment)
+        return out
+    # line 0 은 record header line. line 1+ 가 signal entry.
     for line in lines[1:]:
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        first = line.split()[0]
-        # multi-segment record entry: "<seg_name> <samples>"
-        # ↑ first 가 seg 이름이면 그 seg .hea 도 읽어야 함
-        seg_hea = record_dir / f"{first}.hea"
-        if seg_hea.exists() and seg_hea != master_hea:
-            try:
-                with open(seg_hea, encoding="latin-1") as g:
-                    seg_lines = g.readlines()
-            except Exception:
-                continue
-            for sl in seg_lines[1:]:
-                sl = sl.strip()
-                if not sl or sl.startswith("#"):
+        tokens = line.split()
+        if len(tokens) >= 9:
+            ch_name = tokens[-1]
+            stype = CHANNEL_MAP.get(ch_name)
+            if stype:
+                out.add(stype)
+    return out
+
+
+def _scan_record(master_hea: Path) -> tuple[Path, set[str]]:
+    """master .hea → channel 집합. layout segment 1개만 읽음.
+
+    Multi-segment record format:
+        line 0: header (record_name/N_seg ...)
+        line 1+: segment entries — 그 중 '_layout' 으로 끝나는 segment 가
+        전체 channel 정의를 가짐.
+
+    fallback: layout 못 찾으면 master 자체에서 추출.
+    """
+    record_dir = master_hea.parent
+    layout_path: Path | None = None
+    try:
+        with open(master_hea, encoding="latin-1") as f:
+            for line in f.readlines()[1:]:
+                line = line.strip()
+                if not line or line.startswith("#"):
                     continue
-                tokens = sl.split()
-                # signal entry: 마지막 토큰이 채널명일 가능성
-                # WFDB header 의 signal line: "<file> <format> <gain> <res> <zero> <init> <chksum> <bsize> <desc>"
-                if len(tokens) >= 9:
-                    ch_name = tokens[-1]
-                    stype = CHANNEL_MAP.get(ch_name)
-                    if stype:
-                        channels.add(stype)
-        else:
-            # 단일-segment record: 이 line 자체가 signal entry
-            tokens = line.split()
-            if len(tokens) >= 9:
-                ch_name = tokens[-1]
-                stype = CHANNEL_MAP.get(ch_name)
-                if stype:
-                    channels.add(stype)
-    return channels
+                first = line.split()[0]
+                if first.endswith("_layout"):
+                    candidate = record_dir / f"{first}.hea"
+                    if candidate.exists():
+                        layout_path = candidate
+                        break
+    except Exception:
+        pass
+
+    if layout_path is not None:
+        return master_hea, _channels_from_hea(layout_path)
+    # Fallback: master 자체가 single-segment record
+    return master_hea, _channels_from_hea(master_hea)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="ICH cohort signal combo counter")
+    parser = argparse.ArgumentParser(description="ICH cohort signal combo counter (fast)")
     parser.add_argument("--waveform-dir", type=str, required=True)
+    parser.add_argument("--workers", type=int, default=16)
     args = parser.parse_args()
 
     root = Path(args.waveform_dir)
     if not root.is_dir():
         raise SystemExit(f"ERROR: not a directory: {root}")
 
-    # master .hea 만 (segment .hea 는 제외: layout / numeric / 숫자 segment)
+    # master .hea: pXXXXXX-YYYY-... 형식. 끝이 'n' (numerics) 이나 '_layout' 제외.
     master_files = sorted(
         p for p in root.rglob("p[0-9]*-*.hea")
         if not p.stem.endswith("n")
         and "_layout" not in p.stem
     )
-    print(f"Found {len(master_files)} master .hea files")
+    print(f"Found {len(master_files)} master .hea files; workers={args.workers}")
 
     record_combos: list[frozenset[str]] = []
     patient_combos: dict[str, set[str]] = defaultdict(set)
 
-    for i, hea in enumerate(master_files, 1):
-        chans = _scan_record_channels(hea)
-        record_combos.append(frozenset(chans))
-        # patient_id = pXXXXXX (master stem 의 prefix)
-        pid = hea.stem.split("-", 1)[0]
-        patient_combos[pid] |= chans
-        if i % 50 == 0:
-            print(f"  scanned {i}/{len(master_files)}")
+    with ThreadPoolExecutor(max_workers=args.workers) as ex:
+        futures = {ex.submit(_scan_record, m): m for m in master_files}
+        done = 0
+        for fut in as_completed(futures):
+            master, chans = fut.result()
+            record_combos.append(frozenset(chans))
+            pid = master.stem.split("-", 1)[0]
+            patient_combos[pid] |= chans
+            done += 1
+            if done % 50 == 0:
+                print(f"  scanned {done}/{len(master_files)}")
 
     print(f"\nUnique patients: {len(patient_combos)}")
 
@@ -121,11 +129,10 @@ def main() -> None:
         ("ABP+ECG+PPG+CO2+ICP (5ch)",         ["abp", "ecg", "ppg", "co2", "icp"]),
     ]
 
+    n_rec = len(record_combos)
     print("\n" + "=" * 78)
     print(f"{'Required signals':<35} {'records':>10} {'patients':>10} {'rec_rate':>10}")
     print("-" * 78)
-    n_rec = len(record_combos)
-    n_pt = len(patient_combos)
     for label, req in requirements:
         rec_hit = sum(1 for c in record_combos if has_all(set(c), req))
         pt_hit = sum(1 for chans in patient_combos.values() if has_all(chans, req))
