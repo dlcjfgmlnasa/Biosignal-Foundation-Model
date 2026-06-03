@@ -280,7 +280,8 @@ def main():
         print(f"{'=' * 60}")
 
     # ── Checkpoint (Phase 1 transition or Phase 2 resume) ──
-    ckpt_path = args.resume
+    # CLI --resume 우선, 없으면 yaml config 의 resume (ablation runner 주입) fallback
+    ckpt_path = args.resume or config.resume
     if ckpt_path is None:
         found = find_phase1_checkpoint()
         if found is None:

@@ -131,6 +131,11 @@ class TrainConfig:
     # 실험 관리
     exp_name: str = ""  # 실험 이름 (비어있으면 output_dir 그대로 사용)
 
+    # Phase 1 → 2 transition / Phase 2 resume checkpoint 경로.
+    # CLI --resume 미지정 시 fallback. ablation runner(run_ablation.py)가
+    # reuse Phase 1 ckpt 를 temp yaml 의 이 키로 주입한다.
+    resume: str | None = None
+
     # 시각화
     viz_every: int = 5  # N 에폭마다 시각화 저장 (0=비활성)
 
