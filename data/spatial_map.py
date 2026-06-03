@@ -176,25 +176,36 @@ MECHANISM_GROUP_NAMES: dict[int, str] = {
 #   ECG↔CVP/PAP/ICP: 전기→유체 도메인 단절 (mV→mmHg), morphology 복원 불가
 #   PPG↔CO2: cardiac(~1Hz) vs respiratory(~0.2Hz) 시간 스케일 다름
 
+# ── γ (CMPM, directed cross-modal MSE 복원) 대상 쌍 — 강결합만 ──
+# 손실 배정 (팀 생리학 교차검증 + 결합강도 tier, 2026-06-03):
+#   Tier1(강·형태) / Tier2(강·타이밍) 쌍만 γ(directed MSE)에 사용한다.
+#   Tier3(약결합)은 γ 제외 → δ(contrastive)로만 정렬. δ 는 ungated(전체 쌍)이라
+#   Tier3 는 자동으로 CMCL 만 받는다. (약결합에 복원을 걸면 "리듬만 베끼는"
+#   shortcut 으로 loss 를 낮추므로 contrastive 가 더 안전.)
+# NOTE: signal_type 번호는 현재 체계 유지(ICP=7, CO2=4, AWP=5, RespImp=8,
+#   RespFlow=9). 번호 재배치는 ModalityEmbedding 인덱스·shard·remap 을 깨고
+#   base P1 재학습을 유발하므로 하지 않는다(쌍은 의미로만 정의).
 CROSS_PRED_ALLOWED_PAIRS: set[tuple[int, int]] = {
-    # Arterial-Cardiac (심박 주기 → 압력파 직접 인과)
+    # Tier 2 — 강·타이밍 (전기-기계 시간 결합)
     (0, 1),  # ECG ↔ ABP — cardiac cycle, pulse transit time
     (0, 2),  # ECG ↔ PPG — cardiac cycle, peripheral pulse
+    (0, 3),  # ECG ↔ CVP — a/c/v파가 P/QRS/T에 lock (CVP 고아 해결, 타이밍 앵커)
+    # Tier 1 — 강·형태 (waveform 직결)
     (1, 2),  # ABP ↔ PPG — arterial pulse wave (거의 동형)
-    # Respiratory cycle (호흡 주기)
-    (4, 8),  # CO2 ↔ RESP_Impedance — capnography ↔ 흉부 임피던스, 같은 호흡 cycle
-    (5, 9),  # AWP ↔ RESP_Flow — airway pressure ↔ ventilator flow, P–Q 인과
+    (5, 9),  # AWP ↔ RESP_Flow — airway pressure ↔ flow, P–Q 직접 인과
+    (8, 9),  # RESP_Impedance ↔ RESP_Flow — volume ≈ ∫flow (압력→유량→용적 사슬 완성)
 }
-# ── γ(directed cross-pred)에서 제외된 쌍 (팀 생리학 교차검증, 2026-06-03) ──
-#   (1,7) ABP↔ICP : ICP 파형 중 P1(percussion, 동맥 박동 전달)만 ABP 인과이고,
-#       P2(뇌 compliance)·B-wave·plateau(Lundberg) 같은 느린 두개내 동역학은
-#       ABP에 정보가 없다. γ(MSE)에 두면 복원 불가 성분을 conditional-mean으로
-#       over-smoothing 하며 ABP encoder 에 ICP-mean bias 를 역주입한다.
-#       → cross-modal 관계는 δ(contrastive, 전체 쌍 허용)로만 학습.
-#   (1,6) ABP↔PAP, (3,6) CVP↔PAP : PAP(6)가 pretrain 데이터에서 제외되어 dead.
-#       PAP 데이터 복원 시 (1,6)/(3,6) 재등록 + (1,7) 재검토.
-# → 결과적으로 ICP(7)/CVP(3)/PAP(6)는 γ 짝이 없고, MPM + same-variate
-#   next-pred + δ(contrastive)로 표현을 학습한다(팀 검증: 표현 학습 충분).
+# ── γ 에서 제외된 쌍 (δ contrastive 로만 cross-modal 정렬) ──
+#   Tier 3 (약결합 — 타이밍/맥동만, 형태 인과 약함):
+#   (1,7) ABP↔ICP        : P1(박동)만 ABP 인과. P2(compliance)·B-wave·plateau 는
+#       ABP 에 정보 없음 → directed MSE 시 ABP encoder 에 ICP-mean bias 역주입.
+#   (4,8) CO2↔RESP_Imped : 같은 호흡주기지만 capnography plateau 는 임피던스(용적)에
+#       선행자 없음 → contrastive 정렬로 충분.
+#   Dead (PAP 데이터 제외): (1,6) ABP↔PAP, (3,6) CVP↔PAP.
+#       PAP 복원 시 (1,6)/(3,6) 재등록 + (1,7) 재검토.
+# 보류: (8,9) 는 호흡팀이 patch-wise γ 안정성에 보류 의견(90° 위상지연·임피던스
+#   baseline drift) → 효과를 ablation 으로 모니터링할 것.
+# 결과: ICP(7)/PAP(6)는 γ 짝 없음(δ 전용), CVP(3)는 (0,3)으로 γ 참여.
 
 
 # 채널명 → signal_type (v2: spatial 폐지, 단일 int 반환)
