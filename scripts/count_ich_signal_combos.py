@@ -94,23 +94,35 @@ def main() -> None:
     if not root.is_dir():
         raise SystemExit(f"ERROR: not a directory: {root}")
 
-    # master .hea: pXX/pXXXXXX/pXXXXXX-YYYY-MM-DD-HH-MM.hea (2-level)
-    # rglob 는 네트워크 마운트에서 수만 개 .hea 를 다 훑어 느림 — 구조 명시 glob.
-    print(f"Enumerating master .hea under {root} ...", flush=True)
-    top_dirs = sorted(d for d in root.iterdir() if d.is_dir())
+    # 구조 무관 enumeration — os.walk 로 stream + 매 분기마다 print.
+    # 네트워크 마운트의 iterdir/stat 가 느리거나 행 걸리면 어디서 멈췄는지 보임.
+    import os
+    import re
+    master_re = re.compile(r"^p\d+-\d+-\d+-\d+-\d+-\d+$")  # pXXXXXX-YYYY-MM-DD-HH-MM (no 'n', no _layout)
+
+    print(f"Enumerating .hea under {root} ...", flush=True)
     master_files: list[Path] = []
-    for top in tqdm(top_dirs, desc="walk pXX", unit="dir", dynamic_ncols=True):
-        for patient_dir in top.iterdir():
-            if not patient_dir.is_dir():
+    n_walked_files = 0
+    n_walked_dirs = 0
+    pbar = tqdm(desc="walk", unit="file", dynamic_ncols=True)
+    for dirpath, dirnames, filenames in os.walk(root):
+        n_walked_dirs += 1
+        for fn in filenames:
+            n_walked_files += 1
+            if not fn.endswith(".hea"):
                 continue
-            for hea in patient_dir.glob("p[0-9]*-*.hea"):
-                if hea.stem.endswith("n"):
-                    continue
-                if "_layout" in hea.stem:
-                    continue
-                master_files.append(hea)
+            stem = fn[:-4]
+            if not master_re.match(stem):
+                continue
+            master_files.append(Path(dirpath) / fn)
+        pbar.update(len(filenames))
+        pbar.set_postfix(dirs=n_walked_dirs, masters=len(master_files))
+    pbar.close()
     master_files.sort()
-    print(f"Found {len(master_files)} master .hea files; workers={args.workers}")
+    print(
+        f"Walked {n_walked_dirs} dirs / {n_walked_files} files; "
+        f"found {len(master_files)} master .hea; workers={args.workers}"
+    )
 
     record_combos: list[frozenset[str]] = []
     patient_combos: dict[str, set[str]] = defaultdict(set)
