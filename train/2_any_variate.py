@@ -315,12 +315,15 @@ def main():
         # 또한 구버전 ckpt에 없는 필드는 ModelConfig.from_dict에서 기본값으로
         # 채워지므로(예: 신규 추가된 next_head_d_inner=None), yaml에 명시된
         # 값과 다르면 yaml 값이 무시된다는 경고가 표시됨 — 의도된 동작.
+        # NOTE: num_spatial_ids는 v2에서 폐지됨 (model/_config.py 참고) — 제외.
+        # use_lscnorm/d_cond는 cond_proj·modulation weight shape에 영향 → shape-lock.
         SHAPE_LOCKED_FIELDS = {
             "d_model", "num_layers", "patch_size", "stride",
             "num_heads", "num_groups",
             "use_glu", "use_moe", "num_experts",
             "use_rope", "use_var_attn_bias", "use_spatial_embed",
-            "num_signal_types", "num_spatial_ids", "next_head_d_inner",
+            "num_signal_types", "next_head_d_inner",
+            "use_lscnorm", "d_cond",
         }
         # 런타임 또는 안전한 재초기화 가능 필드 — yaml 값이 우선.
         # (next_block_size, contrastive_proj_dim은 head shape에 영향 있지만
