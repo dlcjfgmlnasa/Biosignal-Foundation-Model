@@ -177,35 +177,35 @@ MECHANISM_GROUP_NAMES: dict[int, str] = {
 #   PPG↔CO2: cardiac(~1Hz) vs respiratory(~0.2Hz) 시간 스케일 다름
 
 # ── γ (CMPM, directed cross-modal MSE 복원) 대상 쌍 — 강결합만 ──
-# 손실 배정 (팀 생리학 교차검증 + 결합강도 tier, 2026-06-03):
-#   Tier1(강·형태) / Tier2(강·타이밍) 쌍만 γ(directed MSE)에 사용한다.
-#   Tier3(약결합)은 γ 제외 → δ(contrastive)로만 정렬. δ 는 ungated(전체 쌍)이라
-#   Tier3 는 자동으로 CMCL 만 받는다. (약결합에 복원을 걸면 "리듬만 베끼는"
-#   shortcut 으로 loss 를 낮추므로 contrastive 가 더 안전.)
+# 손실 배정 (팀 4 생리학 교차검증 + 문헌, 2026-06-03 확정):
+#   "파형이 실제로 전달되는 강결합"만 γ(directed MSE)에 사용한다. 절대압·용적·
+#   compliance 가 끼어 형태가 전기신호에 안 실리는 약결합은 δ(contrastive)로만
+#   정렬한다(δ 는 ungated 전체 쌍이라 약결합은 자동으로 CMCL 만 받음).
+#   약결합에 복원을 걸면 "리듬만 베끼는" shortcut 으로 loss 를 낮추므로 contrastive 가 안전.
+#   문헌: cross-modal waveform 변환은 PPG↔ECG(CardioGAN 등)에 집중, ECG↔CVP 등은
+#   공백 → 약결합은 합성(CMPM)이 아니라 정렬(CMCL)로 다루는 것이 근거와 일치.
 # NOTE: signal_type 번호는 현재 체계 유지(ICP=7, CO2=4, AWP=5, RespImp=8,
 #   RespFlow=9). 번호 재배치는 ModalityEmbedding 인덱스·shard·remap 을 깨고
 #   base P1 재학습을 유발하므로 하지 않는다(쌍은 의미로만 정의).
 CROSS_PRED_ALLOWED_PAIRS: set[tuple[int, int]] = {
-    # Tier 2 — 강·타이밍 (전기-기계 시간 결합)
-    (0, 1),  # ECG ↔ ABP — cardiac cycle, pulse transit time
-    (0, 2),  # ECG ↔ PPG — cardiac cycle, peripheral pulse
-    (0, 3),  # ECG ↔ CVP — a/c/v파가 P/QRS/T에 lock (CVP 고아 해결, 타이밍 앵커)
+    # Tier 2 — 강·타이밍 (전기-기계 수축 트리거, ECG 허브)
+    (0, 1),  # ECG ↔ ABP — R-peak→수축 트리거, 형태도 cardiac 지배
+    (0, 2),  # ECG ↔ PPG — cardiac cycle, 말초 맥파
     # Tier 1 — 강·형태 (waveform 직결)
     (1, 2),  # ABP ↔ PPG — arterial pulse wave (거의 동형)
-    (5, 9),  # AWP ↔ RESP_Flow — airway pressure ↔ flow, P–Q 직접 인과
-    (8, 9),  # RESP_Impedance ↔ RESP_Flow — volume ≈ ∫flow (압력→유량→용적 사슬 완성)
+    (5, 9),  # AWP ↔ RESP_Flow — airway pressure ↔ flow, P–Q 운동방정식 직접 인과
 }
-# ── γ 에서 제외된 쌍 (δ contrastive 로만 cross-modal 정렬) ──
-#   Tier 3 (약결합 — 타이밍/맥동만, 형태 인과 약함):
-#   (1,7) ABP↔ICP        : P1(박동)만 ABP 인과. P2(compliance)·B-wave·plateau 는
-#       ABP 에 정보 없음 → directed MSE 시 ABP encoder 에 ICP-mean bias 역주입.
-#   (4,8) CO2↔RESP_Imped : 같은 호흡주기지만 capnography plateau 는 임피던스(용적)에
-#       선행자 없음 → contrastive 정렬로 충분.
+# ── γ 에서 제외된 쌍 (δ contrastive 로만 cross-modal 정렬) — 약결합 ──
+#   (0,3) ECG↔CVP      : a/c/v파가 P/QRS/T에 타이밍 lock 되나, 절대압·진폭은
+#       용적상태·우심기능·삼첨판·흉강내압이 결정 → ECG 에 없음 (타이밍 강·형태 약).
+#   (1,7) ABP↔ICP      : P1(박동)만 ABP 인과. P2(compliance)·B-wave·plateau 불가.
+#   (4,8) CO2↔RESP_Imp : capnography 는 V/Q·관류·대사 산물, 임피던스(용적)에 선행자 없음.
+#   (8,9) RESP_Imp↔Flow: volume ≈ ∫flow 적분관계 → 90° 위상지연, patch-wise MSE 부담.
 #   Dead (PAP 데이터 제외): (1,6) ABP↔PAP, (3,6) CVP↔PAP.
-#       PAP 복원 시 (1,6)/(3,6) 재등록 + (1,7) 재검토.
-# 보류: (8,9) 는 호흡팀이 patch-wise γ 안정성에 보류 의견(90° 위상지연·임피던스
-#   baseline drift) → 효과를 ablation 으로 모니터링할 것.
-# 결과: ICP(7)/PAP(6)는 γ 짝 없음(δ 전용), CVP(3)는 (0,3)으로 γ 참여.
+#       PAP 복원 시 (1,6)/(3,6)/(0,6 ECG↔PAP) 재등록 + (1,7) 재검토.
+# ablation 후보: (0,3)·(8,9) 의 γ on/off — 약결합 directed 효과 사후 검증.
+# 결과: γ 참여 = ECG/ABP/PPG/AWP/RESP_Flow(5종), δ전용 = CVP/CO2/ICP/RESP_Imp(4종).
+#   모든 신호는 MPM + same-variate next + δ 수신.
 
 
 # 채널명 → signal_type (v2: spatial 폐지, 단일 int 반환)
