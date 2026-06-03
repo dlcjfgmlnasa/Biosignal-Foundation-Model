@@ -94,12 +94,22 @@ def main() -> None:
     if not root.is_dir():
         raise SystemExit(f"ERROR: not a directory: {root}")
 
-    # master .hea: pXXXXXX-YYYY-... 형식. 끝이 'n' (numerics) 이나 '_layout' 제외.
-    master_files = sorted(
-        p for p in root.rglob("p[0-9]*-*.hea")
-        if not p.stem.endswith("n")
-        and "_layout" not in p.stem
-    )
+    # master .hea: pXX/pXXXXXX/pXXXXXX-YYYY-MM-DD-HH-MM.hea (2-level)
+    # rglob 는 네트워크 마운트에서 수만 개 .hea 를 다 훑어 느림 — 구조 명시 glob.
+    print(f"Enumerating master .hea under {root} ...", flush=True)
+    top_dirs = sorted(d for d in root.iterdir() if d.is_dir())
+    master_files: list[Path] = []
+    for top in tqdm(top_dirs, desc="walk pXX", unit="dir", dynamic_ncols=True):
+        for patient_dir in top.iterdir():
+            if not patient_dir.is_dir():
+                continue
+            for hea in patient_dir.glob("p[0-9]*-*.hea"):
+                if hea.stem.endswith("n"):
+                    continue
+                if "_layout" in hea.stem:
+                    continue
+                master_files.append(hea)
+    master_files.sort()
     print(f"Found {len(master_files)} master .hea files; workers={args.workers}")
 
     record_combos: list[frozenset[str]] = []
