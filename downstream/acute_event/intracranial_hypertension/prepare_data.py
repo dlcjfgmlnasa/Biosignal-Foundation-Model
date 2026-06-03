@@ -28,7 +28,14 @@ import numpy as np
 import torch
 
 from data.parser.mimic3_waveform import _apply_pipeline
+from downstream._gap_mask import (
+    DEFAULT_VALID_RATIO_THRESHOLD,
+    GapStats,
+    apply_gap_mask_multichannel,
+    compute_valid_ratio,
+)
 from downstream._kfold_utils import stratified_kfold_patient_splits, summarize_splits
+from downstream._save_utils import consume_gap_masks
 
 
 TARGET_SR: float = 100.0
@@ -58,6 +65,7 @@ class ICHSample:
     """두개내 고혈압 예측 샘플."""
 
     input_signals: dict[str, np.ndarray]
+    input_gap_masks: dict[str, np.ndarray]  # bool, True=원본이 NaN (gap)
     label: int  # 0=normal, 1=intracranial hypertension
     label_value: float  # future max ICP (mmHg)
     case_id: str
@@ -209,8 +217,16 @@ def extract_forecast_samples(
     horizon_sec: float = 300.0,
     icp_threshold: float = ICP_THRESHOLD,
     sustained_sec: float = SUSTAINED_SEC,
+    valid_ratio_threshold: float = DEFAULT_VALID_RATIO_THRESHOLD,
+    gap_stats: GapStats | None = None,
+    sample_dtype: str = "float16",  # OOM 회피
 ) -> list[ICHSample]:
-    """시간 정렬된 다채널 데이터에서 (input, future_label) 쌍을 추출한다."""
+    """시간 정렬된 다채널 데이터에서 (input, future_label) 쌍을 추출한다.
+
+    Gap policy (project_downstream_gap_window_policy):
+      Step 1 — input window 의 multi-channel valid_ratio < threshold → window drop
+      Step 2 — 통과 window 의 NaN 위치는 0 으로 채우고 gap_mask boolean 저장.
+    """
     win_samples = int(window_sec * TARGET_SR)
     stride_samples = int(stride_sec * TARGET_SR)
     horizon_samples = int(horizon_sec * TARGET_SR)
@@ -242,7 +258,14 @@ def extract_forecast_samples(
             if not input_dict:
                 continue
 
-            # Future ICP
+            # Step 1: gap-policy window drop (multi-channel valid_ratio)
+            valid_ratio = compute_valid_ratio(list(input_dict.values()))
+            if valid_ratio < valid_ratio_threshold:
+                if gap_stats is not None:
+                    gap_stats.add_drop()
+                continue
+
+            # Future ICP (label) — 기존 10s sub-window NaN-free 정책 유지
             future_start = start + win_samples
             future_end = future_start + horizon_samples
             future_icp = icp[future_start:future_end]
@@ -254,6 +277,8 @@ def extract_forecast_samples(
                     future_icps.append(float(np.mean(w)))
 
             if not future_icps:
+                if gap_stats is not None:
+                    gap_stats.add_drop()
                 continue
 
             label = (
@@ -262,9 +287,19 @@ def extract_forecast_samples(
                 else 0
             )
 
+            # Step 2: gap mask + 즉시 dtype 캐스팅 (OOM 회피)
+            filled_dict, gap_mask_dict = apply_gap_mask_multichannel(
+                input_dict, output_dtype=sample_dtype,
+            )
+            if gap_stats is not None:
+                n_total_s = sum(arr.size for arr in filled_dict.values())
+                n_gap_s = sum(int(m.sum()) for m in gap_mask_dict.values())
+                gap_stats.add_window(n_total_s, n_gap_s)
+
             samples.append(
                 ICHSample(
-                    input_signals=input_dict,
+                    input_signals=filled_dict,
+                    input_gap_masks=gap_mask_dict,
                     label=label,
                     label_value=max(future_icps),
                     case_id=case["case_id"],
@@ -290,7 +325,8 @@ def _consume_to_tensors_ich(
     torch.stack 의 2× peak 회피 — 출력 텐서를 미리 할당 + numpy ref pop.
     """
     if not samples:
-        return {"signals": {}, "labels": torch.tensor([], dtype=torch.long),
+        return {"signals": {}, "gap_masks": {},
+                "labels": torch.tensor([], dtype=torch.long),
                 "label_values": torch.tensor([], dtype=torch.float32),
                 "case_ids": [], "subject_ids": []}
 
@@ -321,8 +357,11 @@ def _consume_to_tensors_ich(
             i += 1
         sig_tensors[stype] = out
 
+    gap_tensors = consume_gap_masks(samples, input_signals, attr="input_gap_masks")
+
     return {
         "signals": sig_tensors,
+        "gap_masks": gap_tensors,
         "labels": labels,
         "label_values": label_values,
         "case_ids": case_ids,
@@ -365,6 +404,7 @@ def save_split_dataset(
             "n_folds": n_folds,
             "chunk_idx": chunk_idx,
             "signal_dtype": str(signal_dtype).replace("torch.", ""),
+            "valid_ratio_threshold": DEFAULT_VALID_RATIO_THRESHOLD,
         },
     }
 
@@ -494,6 +534,8 @@ def prepare_ich_sweep(
 
     saved_paths: list[Path] = []
     run_idx = 0
+    # signal_dtype (torch) → str for apply_gap_mask_multichannel
+    sample_dtype_str = str(signal_dtype).replace("torch.", "")
     for window_sec, horizon_min in combos:
         horizon_sec = horizon_min * 60.0
         for fold_idx, (train_pids, val_pids, test_pids) in enumerate(splits):
@@ -516,12 +558,15 @@ def prepare_ich_sweep(
             ):
                 if not split_cases:
                     continue
+                gap_stats = GapStats()
                 chunk_idx = 0
                 total = 0
                 for batch_start in range(0, len(split_cases), CASES_PER_CHUNK):
                     case_batch = split_cases[batch_start:batch_start + CASES_PER_CHUNK]
                     samples = extract_forecast_samples(
                         case_batch, input_signals, window_sec, stride_sec, horizon_sec,
+                        gap_stats=gap_stats,
+                        sample_dtype=sample_dtype_str,
                     )
                     if not samples:
                         continue
@@ -542,9 +587,11 @@ def prepare_ich_sweep(
                     chunk_idx += 1
                     del packed; gc.collect()
                 print(f"    {split_name.capitalize()}: {chunk_idx} chunk(s), {total} samples")
+                print(gap_stats.summary())
 
     print(f"\n{'=' * 60}")
-    print(f"  Done! {len(saved_paths)}/{len(combos)} datasets saved to {out_dir}")
+    print(f"  Done! {len(saved_paths)} files saved across {len(combos)} combo × {len(splits)} fold")
+    print(f"  Output: {out_dir}")
     print(f"{'=' * 60}")
     return saved_paths
 
