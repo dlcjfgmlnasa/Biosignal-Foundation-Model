@@ -16,6 +16,8 @@ from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+from tqdm import tqdm
+
 # MIMIC-III 채널명 → signal_type (prepare_data.py 와 동일)
 CHANNEL_MAP: dict[str, str] = {
     "II": "ecg", "I": "ecg", "III": "ecg", "V": "ecg", "V5": "ecg",
@@ -105,15 +107,20 @@ def main() -> None:
 
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
         futures = {ex.submit(_scan_record, m): m for m in master_files}
-        done = 0
-        for fut in as_completed(futures):
+        pbar = tqdm(
+            as_completed(futures),
+            total=len(futures),
+            desc="scan",
+            unit="rec",
+            dynamic_ncols=True,
+        )
+        for fut in pbar:
             master, chans = fut.result()
             record_combos.append(frozenset(chans))
             pid = master.stem.split("-", 1)[0]
             patient_combos[pid] |= chans
-            done += 1
-            if done % 50 == 0:
-                print(f"  scanned {done}/{len(master_files)}")
+            pbar.set_postfix(patients=len(patient_combos))
+        pbar.close()
 
     print(f"\nUnique patients: {len(patient_combos)}")
 
