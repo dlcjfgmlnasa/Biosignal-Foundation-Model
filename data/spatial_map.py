@@ -181,16 +181,20 @@ CROSS_PRED_ALLOWED_PAIRS: set[tuple[int, int]] = {
     (0, 1),  # ECG ↔ ABP — cardiac cycle, pulse transit time
     (0, 2),  # ECG ↔ PPG — cardiac cycle, peripheral pulse
     (1, 2),  # ABP ↔ PPG — arterial pulse wave (거의 동형)
-    # Systemic-Pulmonary (체순환 ↔ 폐순환)
-    (1, 6),  # ABP ↔ PAP — 유사 동맥 morphology, 다른 amplitude scale (슬롯 유지)
-    # Right Heart (우심계 혈역학)
-    (3, 6),  # CVP ↔ PAP — 우심 전후부하, 같은 pressure 도메인 (슬롯 유지)
-    # Cerebral Perfusion (뇌관류)
-    (1, 7),  # ABP ↔ ICP — CPP = MAP - ICP, 뇌자동조절
     # Respiratory cycle (호흡 주기)
     (4, 8),  # CO2 ↔ RESP_Impedance — capnography ↔ 흉부 임피던스, 같은 호흡 cycle
     (5, 9),  # AWP ↔ RESP_Flow — airway pressure ↔ ventilator flow, P–Q 인과
 }
+# ── γ(directed cross-pred)에서 제외된 쌍 (팀 생리학 교차검증, 2026-06-03) ──
+#   (1,7) ABP↔ICP : ICP 파형 중 P1(percussion, 동맥 박동 전달)만 ABP 인과이고,
+#       P2(뇌 compliance)·B-wave·plateau(Lundberg) 같은 느린 두개내 동역학은
+#       ABP에 정보가 없다. γ(MSE)에 두면 복원 불가 성분을 conditional-mean으로
+#       over-smoothing 하며 ABP encoder 에 ICP-mean bias 를 역주입한다.
+#       → cross-modal 관계는 δ(contrastive, 전체 쌍 허용)로만 학습.
+#   (1,6) ABP↔PAP, (3,6) CVP↔PAP : PAP(6)가 pretrain 데이터에서 제외되어 dead.
+#       PAP 데이터 복원 시 (1,6)/(3,6) 재등록 + (1,7) 재검토.
+# → 결과적으로 ICP(7)/CVP(3)/PAP(6)는 γ 짝이 없고, MPM + same-variate
+#   next-pred + δ(contrastive)로 표현을 학습한다(팀 검증: 표현 학습 충분).
 
 
 # 채널명 → signal_type (v2: spatial 폐지, 단일 int 반환)
