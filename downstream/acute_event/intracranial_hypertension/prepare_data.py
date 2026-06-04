@@ -132,14 +132,24 @@ def parse_waveform_record(
 
 def load_patient_signals(
     waveform_dir: Path,
+    required_signals: list[str] | None = None,
 ) -> list[dict]:
     """Waveform 디렉토리에서 ICP 포함 레코드를 로드한다.
+
+    required_signals 지정 시 그 channel set 이 **모두** 존재하는 record 만 유지
+    (VitalDB task / arrhythmia 패턴과 정합 — sample 마다 동일 채널 보장).
+    ICP 는 라벨 산출에 항상 필요하므로 자동으로 required 에 포함.
 
     Returns
     -------
     list of {"case_id": str, "patient_id": str, "signals": {type: ndarray}}
     """
     import re
+
+    if required_signals is not None:
+        required_set = set(required_signals) | {"icp"}
+    else:
+        required_set = {"icp"}
 
     # 마스터 헤더만 선별: 파일명이 p<6자리>-... 형태
     # (segment: <num>_NNNN.hea, layout: <num>_layout.hea 는 제외)
@@ -148,9 +158,11 @@ def load_patient_signals(
         h for h in waveform_dir.rglob("*.hea") if master_re.match(h.stem)
     )
     print(f"  Found {len(all_hea)} master .hea files")
+    print(f"  Required signals: {sorted(required_set)}")
 
     cases: list[dict] = []
     n_no_icp = 0
+    n_missing_required = 0
 
     for i, hea_path in enumerate(all_hea):
         rec_name = hea_path.stem
@@ -170,6 +182,10 @@ def load_patient_signals(
             n_no_icp += 1
             continue
 
+        if not required_set.issubset(set(signals.keys())):
+            n_missing_required += 1
+            continue
+
         cases.append({
             "case_id": f"{patient_id}_{rec_name}",
             "patient_id": patient_id,
@@ -182,7 +198,12 @@ def load_patient_signals(
             print(f"    [{i + 1}/{len(all_hea)}] {patient_id}/{rec_name} "
                   f"signals={sig_types} dur={dur_sec:.0f}s")
 
-    print(f"  ICP records: {len(cases)}, skipped (no ICP): {n_no_icp}")
+    print(
+        f"  ICP records: {len(cases)}, "
+        f"skipped (no ICP): {n_no_icp}, "
+        f"skipped (missing required {sorted(required_set - {'icp'})}): "
+        f"{n_missing_required}"
+    )
     return cases
 
 
@@ -482,6 +503,7 @@ def prepare_ich_sweep(
     split_mode: str = "kfold",
     signal_dtype: torch.dtype = torch.float16,
     seed: int = 42,
+    required_signals: list[str] | None = None,
 ) -> list[Path]:
     """(window, horizon) 조합 × stratified K-fold CV 데이터셋 생성.
 
@@ -500,9 +522,13 @@ def prepare_ich_sweep(
     print(f"  ICP threshold: {ICP_THRESHOLD} mmHg, sustained: {SUSTAINED_SEC}s")
     print(f"{'=' * 60}")
 
-    # 1. 데이터 로딩
+    # 1. 데이터 로딩 — required_signals 강제 시 sample 마다 동일 채널 보장
     print("\n[1/3] Loading ICP waveform records...")
-    cases = load_patient_signals(Path(waveform_dir))
+    # default: input_signals 전체를 강제 (모든 sample 이 동일 채널)
+    effective_required = (
+        required_signals if required_signals is not None else input_signals
+    )
+    cases = load_patient_signals(Path(waveform_dir), required_signals=effective_required)
     if not cases:
         print("ERROR: No ICP records found.", file=sys.stderr)
         sys.exit(1)
@@ -645,6 +671,13 @@ def main() -> None:
         help="Storage dtype for waveform tensors. fp16 halves disk/RAM peak; "
              "run.py auto-casts back to fp32 at load time.",
     )
+    parser.add_argument(
+        "--required-signals", nargs="+", default=None,
+        choices=["icp", "ecg", "abp", "ppg", "co2"],
+        help="모든 record 가 반드시 가져야 하는 channel set (intersection cohort). "
+             "지정하지 않으면 --input-signals 가 그대로 강제됨. "
+             "ICP 는 라벨 산출용으로 항상 자동 포함.",
+    )
     args = parser.parse_args()
 
     dtype_map = {"float16": torch.float16, "float32": torch.float32}
@@ -660,6 +693,7 @@ def main() -> None:
         out_dir=args.out_dir,
         split_mode=args.split_mode,
         signal_dtype=dtype_map[args.signal_dtype],
+        required_signals=args.required_signals,
     )
 
 
