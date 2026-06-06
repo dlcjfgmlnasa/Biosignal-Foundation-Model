@@ -36,7 +36,7 @@ signal_types: [0, 1, 2, 3, 4, 5, 7, 8, 9]
 max_subjects: null
 subject_ids_file: configs/ablation/subset_25pct_subjects.txt  # 본 학습 (25% subset)
 window_seconds: 600.0
-max_length: 64000    # Phase 2 GPU OOM/hang 대응 (2026-06-06): 03a sweep GPU1 45GB 직전 — 128000 → 64000 로 ½, PackCollate per-rank 편차 완화
+max_length: 128000   # Phase 1 OOM 처방 일치 — per-row memory ½
 cache_size: 16
 crop_ratio_min: 0.01
 crop_ratio_max: 1.0
