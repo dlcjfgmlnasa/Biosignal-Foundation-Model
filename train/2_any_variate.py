@@ -472,6 +472,7 @@ def main():
         shuffle=True,
         num_workers=config.num_workers,
         pin_memory=False,         # pinned RAM 누적 방지 (NCCL stuck 시 leak 회피)
+        persistent_workers=True,  # epoch 경계 worker re-fork 회피 → shard cache 보존, dataloader cold-start stall 제거 (NCCL ALLREDUCE timeout 재발 방지). worker leak 처방 c8e7325/cd53873 적용 후 안전.
         collate_mode=config.collate_mode,
         patch_size=config.model_config.patch_size,
         min_patches=config.min_patches,
@@ -496,6 +497,7 @@ def main():
             batch_size=config.batch_size,
             shuffle=False,
             num_workers=config.num_workers,
+            persistent_workers=True,  # val 경계도 worker 보존 (train↔val 전환에서 stall 회피)
             collate_mode=config.collate_mode,
             patch_size=config.model_config.patch_size,
             min_patches=config.min_patches,
