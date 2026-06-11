@@ -173,6 +173,12 @@ def run_phase1(
         result = subprocess.run(cmd, cwd=REPO_ROOT)
         if result.returncode != 0:
             raise RuntimeError(f"Phase 1 failed (variant={variant['name']}, rc={result.returncode})")
+        # 학습 전 해석된 ckpt 는 placeholder(best.pt)일 수 있음 — 학습 후 재해석
+        ckpt = ckpt_path_for_exp(exp_name)
+        if not ckpt.exists():
+            raise RuntimeError(
+                f"Phase 1 종료했지만 *_best.pt 미발견: {ckpt.parent} (variant={variant['name']})"
+            )
     return ckpt
 
 
@@ -200,6 +206,14 @@ def run_phase2(
     if skip_existing and ckpt.exists():
         print(f"  [skip] Phase 2 ckpt exists: {ckpt}")
         return ckpt
+
+    # torchrun 실행 전 resume ckpt 존재 검증 — 없으면 rank 간 NCCL 대기로
+    # 수 시간 hang 할 수 있으므로 즉시 실패시킨다.
+    resume_path = Path(cfg.get("resume", phase1_ckpt))
+    if not dry_run and not resume_path.exists():
+        raise FileNotFoundError(
+            f"Phase 2 resume ckpt 없음: {resume_path} (variant={variant['name']})"
+        )
 
     tmp_yaml = write_temp_yaml(cfg, f"{variant['name']}_p2")
     cmd = build_torchrun_cmd("train.2_any_variate", tmp_yaml, nproc)
@@ -293,19 +307,31 @@ def main() -> None:
     for v in selected:
         print(f"  - {v['name']} ({v.get('ablation_group', '?')}): {v.get('description', '')}")
 
+    failed: list[str] = []
     for v in selected:
         print()
         print(f"━━━ variant: {v['name']} ━━━")
-        run_variant(
-            v, all_variants,
-            nproc=args.nproc,
-            dry_run=args.dry_run,
-            skip_existing=args.skip_existing,
-            phase1_only=args.phase1_only,
-            phase2_only=args.phase2_only,
-        )
+        try:
+            run_variant(
+                v, all_variants,
+                nproc=args.nproc,
+                dry_run=args.dry_run,
+                skip_existing=args.skip_existing,
+                phase1_only=args.phase1_only,
+                phase2_only=args.phase2_only,
+            )
+        except Exception as e:
+            # 한 variant 실패가 나머지 variant 실행을 막지 않도록 격리
+            print(f"  ⚠️  variant {v['name']} failed: {e}", file=sys.stderr)
+            failed.append(v["name"])
 
     print()
+    if failed:
+        print(
+            f"[run_ablation] DONE — {len(selected) - len(failed)}/{len(selected)} "
+            f"succeeded, failed: {', '.join(failed)}"
+        )
+        sys.exit(1)
     print(f"[run_ablation] DONE — {len(selected)} variants processed.")
 
 
