@@ -34,6 +34,10 @@ from downstream._save_utils import (
     add_signal_dtype_arg,
     stack_attr_destructive,
 )
+from downstream._kfold_utils import (
+    stratified_kfold_patient_splits,
+    summarize_splits,
+)
 
 TARGET_SR: float = 100.0
 
@@ -121,6 +125,51 @@ def _load_mimic3_signal(
                 })
 
     print(f"  Loaded {len(results)} cases with {signal_type.upper()} from MIMIC-III")
+    return results
+
+
+# ---- VitalDB 로더 ----
+
+
+def _load_vitaldb_signal(
+    n_cases: int,
+    signal_type: str,
+    offset_from_end: int = 200,
+) -> list[dict]:
+    """VitalDB에서 단일 signal type 의 연속 waveform 을 로드한다.
+
+    cross_modal._load_vitaldb_cases 와 동일하게 ``load_pilot_cases`` 를 사용하되,
+    forecast 는 단일 채널의 연속 waveform 에서 (context, target) 쌍을 뽑으므로
+    해당 signal_type 트랙만 가져와 ``{"case_id", "signal"}`` 형태로 반환한다
+    (``_load_mimic3_signal`` 출력 규약과 동일).
+
+    Returns
+    -------
+    list of {"case_id": str, "signal": np.ndarray}
+    """
+    from downstream.data_utils import load_pilot_cases
+
+    print(f"  Loading {n_cases} VitalDB cases (signal={signal_type})...")
+    raw_cases = load_pilot_cases(
+        n_cases=n_cases,
+        offset_from_end=offset_from_end,
+        signal_types=[signal_type],
+    )
+
+    min_samples = int(60 * TARGET_SR)
+    results: list[dict] = []
+    for rc in raw_cases:
+        if signal_type not in rc.tracks:
+            continue
+        sig = np.asarray(rc.tracks[signal_type], dtype=np.float64).ravel()
+        if len(sig) < min_samples:
+            continue
+        results.append({
+            "case_id": f"vitaldb_{rc.case_id}",
+            "signal": sig,
+        })
+
+    print(f"  Loaded {len(results)} cases with {signal_type.upper()} from VitalDB")
     return results
 
 
@@ -215,59 +264,96 @@ def save_multi_input_dataset(
     source: str,
     out_dir: str,
     signal_dtype: torch.dtype = torch.float16,
-) -> Path:
+    chunk_windows: int = 2000,
+    val_samples: list[MultiInputForecastSample] | None = None,
+    fold_idx: int | None = None,
+    n_folds: int = 1,
+) -> list[Path]:
+    """Multi-input (context=멀티채널, target=단일채널) 쌍을 split별 chunk 저장.
+
+    파일명:
+      - 단일: ``forecasting_multi_{source}_{ctx_tag}_to_{target}_ctx{C}s_tgt{T}s_{split}_chunk{C}.pt``
+      - K-fold: ``..._tgt{T}s_fold{F}_{split}_chunk{C}.pt``
+
+    context 는 2D (n_context, ctx_T) 이므로 chunk 텐서는 (n, n_context, ctx_T).
+    ``fold_idx`` 지정 시 파일명에 ``_fold{F}``, ``val_samples`` 있으면 3 split 저장.
+    """
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
-    n_train = len(train_samples)
-    n_test = len(test_samples)
-
-    def _to_tensors(samples) -> dict:
-        if not samples:
-            return {}
-        case_ids = [s.case_id for s in samples]
-        # context 는 다차원 — stack_attr_destructive 가 1D 가정. context 는 따로 처리.
-        ctx = torch.empty(
-            (len(samples),) + samples[0].context.shape, dtype=signal_dtype
-        )
-        for i, s in enumerate(samples):
-            ctx[i].copy_(torch.from_numpy(s.context))
-            s.context = None
-        tgt = stack_attr_destructive(samples, "target", signal_dtype)
-        return {"context": ctx, "target": tgt, "case_ids": case_ids}
-
-    train_dict = _to_tensors(train_samples); train_samples.clear()
-    test_dict = _to_tensors(test_samples); test_samples.clear()
-    gc.collect()
-
-    save_dict = {
-        "train": train_dict,
-        "test": test_dict,
-        "metadata": {
-            "task": "multi_input_forecasting",
-            "source": source,
-            "context_signal_types": list(context_signals),
-            "target_signal_type": target_signal,
-            "context_sec": context_sec,
-            "target_sec": target_sec,
-            "sampling_rate": TARGET_SR,
-            "n_train": n_train,
-            "n_test": n_test,
-            "signal_dtype": str(signal_dtype).replace("torch.", ""),
-        },
-    }
-
     ctx_tag = "+".join(context_signals)
-    filename = (
+    base = (
         f"forecasting_multi_{source}_{ctx_tag}_to_{target_signal}"
-        f"_ctx{int(context_sec)}s_tgt{int(target_sec)}s.pt"
+        f"_ctx{int(context_sec)}s_tgt{int(target_sec)}s"
     )
-    save_path = out_path / filename
-    torch.save(save_dict, save_path)
+    fold_suffix = f"_fold{fold_idx}" if fold_idx is not None else ""
 
-    file_size_mb = save_path.stat().st_size / (1024 * 1024)
-    print(f"  Saved: {save_path} ({file_size_mb:.2f} MB)")
-    return save_path
+    split_items: list[tuple[str, list[MultiInputForecastSample]]] = [
+        ("train", train_samples)
+    ]
+    if val_samples is not None:
+        split_items.append(("val", val_samples))
+    split_items.append(("test", test_samples))
+
+    saved: list[Path] = []
+    for split_name, samples in split_items:
+        if not samples:
+            continue
+        chunk_idx = 0
+        total = 0
+        for bstart in range(0, len(samples), chunk_windows):
+            batch = samples[bstart:bstart + chunk_windows]
+            n = len(batch)
+            case_ids = [s.case_id for s in batch]
+            # context 는 다차원 — stack_attr_destructive(1D 가정) 대신 직접 build.
+            ctx = torch.empty(
+                (n,) + batch[0].context.shape, dtype=signal_dtype
+            )  # (n, n_context, ctx_T)
+            for i, s in enumerate(batch):
+                ctx[i].copy_(torch.from_numpy(s.context))
+                s.context = None
+            tgt = stack_attr_destructive(batch, "target", signal_dtype)  # (n, tgt_T)
+
+            chunk = {
+                "split": split_name,
+                "context": ctx,
+                "target": tgt,
+                "case_ids": case_ids,
+                "metadata": {
+                    "task": "multi_input_forecasting",
+                    "source": source,
+                    "context_signal_types": list(context_signals),
+                    "target_signal_type": target_signal,
+                    "context_sec": context_sec,
+                    "target_sec": target_sec,
+                    "sampling_rate": TARGET_SR,
+                    "fold_idx": fold_idx,
+                    "n_folds": n_folds,
+                    "split": split_name,
+                    "chunk_idx": chunk_idx,
+                    "n_windows": n,
+                    "signal_dtype": str(signal_dtype).replace("torch.", ""),
+                },
+            }
+            out_file = (
+                out_path / f"{base}{fold_suffix}_{split_name}_chunk{chunk_idx}.pt"
+            )
+            torch.save(chunk, out_file)
+            file_size_mb = out_file.stat().st_size / (1024 * 1024)
+            print(f"  Saved: {out_file.name} ({n} samples, {file_size_mb:.2f} MB)")
+            saved.append(out_file)
+            total += n
+            chunk_idx += 1
+            del batch, ctx, tgt, chunk
+            gc.collect()
+        print(f"  {split_name}: {chunk_idx} chunk(s), {total} samples")
+
+    train_samples.clear()
+    test_samples.clear()
+    if val_samples is not None:
+        val_samples.clear()
+    gc.collect()
+    return saved
 
 
 def extract_forecast_samples(
@@ -320,48 +406,87 @@ def save_dataset(
     source: str,
     out_dir: str,
     signal_dtype: torch.dtype = torch.float16,
-) -> Path:
+    chunk_windows: int = 2000,
+    val_samples: list[ForecastSample] | None = None,
+    fold_idx: int | None = None,
+    n_folds: int = 1,
+) -> list[Path]:
+    """(context, target) 쌍을 split별 chunk .pt로 저장 (sepsis chunk 패턴).
+
+    파일명:
+      - 단일(fold 미사용): ``forecasting_{source}_{signal}_ctx{C}s_tgt{T}s_{split}_chunk{C}.pt``
+      - K-fold:           ``forecasting_{source}_{signal}_ctx{C}s_tgt{T}s_fold{F}_{split}_chunk{C}.pt``
+
+    각 chunk 는 최대 ``chunk_windows`` 개 샘플을 담고, chunk 단위로 텐서를
+    destructive build → save → ``del + gc.collect()`` 한다. ``fold_idx`` 지정 시
+    파일명에 ``_fold{F}`` 가 붙고, ``val_samples`` 가 있으면 3 split 을 저장한다.
+    """
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
-    n_train = len(train_samples)
-    n_test = len(test_samples)
+    base = (
+        f"forecasting_{source}_{signal_type}"
+        f"_ctx{int(context_sec)}s_tgt{int(target_sec)}s"
+    )
+    fold_suffix = f"_fold{fold_idx}" if fold_idx is not None else ""
 
-    def _to_tensors(samples) -> dict:
+    split_items: list[tuple[str, list[ForecastSample]]] = [("train", train_samples)]
+    if val_samples is not None:
+        split_items.append(("val", val_samples))
+    split_items.append(("test", test_samples))
+
+    saved: list[Path] = []
+    for split_name, samples in split_items:
         if not samples:
-            return {}
-        case_ids = [s.case_id for s in samples]
-        ctx = stack_attr_destructive(samples, "context", signal_dtype)
-        tgt = stack_attr_destructive(samples, "target", signal_dtype)
-        return {"context": ctx, "target": tgt, "case_ids": case_ids}
+            continue
+        chunk_idx = 0
+        total = 0
+        for bstart in range(0, len(samples), chunk_windows):
+            batch = samples[bstart:bstart + chunk_windows]
+            n = len(batch)
+            case_ids = [s.case_id for s in batch]
+            ctx = stack_attr_destructive(batch, "context", signal_dtype)  # (n, ctx_T)
+            tgt = stack_attr_destructive(batch, "target", signal_dtype)   # (n, tgt_T)
 
-    train_dict = _to_tensors(train_samples); train_samples.clear()
-    test_dict = _to_tensors(test_samples); test_samples.clear()
+            chunk = {
+                "split": split_name,
+                "context": ctx,
+                "target": tgt,
+                "case_ids": case_ids,
+                "metadata": {
+                    "task": "vital_sign_forecasting",
+                    "source": source,
+                    "signal_type": signal_type,
+                    "context_sec": context_sec,
+                    "target_sec": target_sec,
+                    "sampling_rate": TARGET_SR,
+                    "fold_idx": fold_idx,
+                    "n_folds": n_folds,
+                    "split": split_name,
+                    "chunk_idx": chunk_idx,
+                    "n_windows": n,
+                    "signal_dtype": str(signal_dtype).replace("torch.", ""),
+                },
+            }
+            out_file = (
+                out_path / f"{base}{fold_suffix}_{split_name}_chunk{chunk_idx}.pt"
+            )
+            torch.save(chunk, out_file)
+            file_size_mb = out_file.stat().st_size / (1024 * 1024)
+            print(f"  Saved: {out_file.name} ({n} samples, {file_size_mb:.2f} MB)")
+            saved.append(out_file)
+            total += n
+            chunk_idx += 1
+            del batch, ctx, tgt, chunk
+            gc.collect()
+        print(f"  {split_name}: {chunk_idx} chunk(s), {total} samples")
+
+    train_samples.clear()
+    test_samples.clear()
+    if val_samples is not None:
+        val_samples.clear()
     gc.collect()
-
-    save_dict = {
-        "train": train_dict,
-        "test": test_dict,
-        "metadata": {
-            "task": "vital_sign_forecasting",
-            "source": source,
-            "signal_type": signal_type,
-            "context_sec": context_sec,
-            "target_sec": target_sec,
-            "sampling_rate": TARGET_SR,
-            "n_train": n_train,
-            "n_test": n_test,
-            "signal_dtype": str(signal_dtype).replace("torch.", ""),
-        },
-    }
-
-    filename = f"forecasting_{source}_{signal_type}_ctx{int(context_sec)}s_tgt{int(target_sec)}s.pt"
-    save_path = out_path / filename
-    torch.save(save_dict, save_path)
-
-    file_size_mb = save_path.stat().st_size / (1024 * 1024)
-    print(f"  Saved: {save_path} ({file_size_mb:.2f} MB)")
-    return save_path
+    return saved
 
 
 # ---- 통계 ----
@@ -441,6 +566,9 @@ def prepare_forecasting(
     out_dir: str = "outputs/downstream/forecasting",
     visualize: bool = False,
     signal_dtype: torch.dtype = torch.float16,
+    chunk_windows: int = 2000,
+    n_folds: int = 1,
+    seed: int = 42,
 ) -> list[Path]:
     # "all"이면 모든 signal type에 대해 반복
     if signal_type == "all":
@@ -460,6 +588,8 @@ def prepare_forecasting(
         print(f"\n[1/4] Loading {stype.upper()} data...")
         if source == "mimic3":
             cases = _load_mimic3_signal(n_cases, stype)
+        elif source == "vitaldb":
+            cases = _load_vitaldb_signal(n_cases, stype)
         else:
             print(f"ERROR: Unknown source '{source}'", file=sys.stderr)
             continue
@@ -468,9 +598,47 @@ def prepare_forecasting(
             print(f"  SKIP: No valid {stype.upper()} data")
             continue
 
-        # 2. Train/Test 분할
+        # ── K-fold CV (n_folds>=2): case(=patient)-level group K-fold ──
+        if n_folds >= 2:
+            # generation = no label → 더미 uniform label 로 plain group K-fold.
+            # forecast case 는 case_id 가 곧 환자/레코드 단위 → 그룹 키로 사용.
+            print(f"\n[2-4/4] Patient(case)-level {n_folds}-fold CV...")
+            case_ids = sorted({str(c["case_id"]) for c in cases})
+            patient_to_labels = {pid: [0] for pid in case_ids}
+            splits = stratified_kfold_patient_splits(
+                case_ids, patient_to_labels, n_folds=n_folds, seed=seed,
+            )
+            print(summarize_splits(splits))
+
+            for fold_idx, (train_p, val_p, test_p) in enumerate(splits):
+                print(f"\n  Fold {fold_idx}: extract samples + save...")
+                fold_samples: dict[str, list[ForecastSample]] = {}
+                for split_name, pset in (
+                    ("train", train_p), ("val", val_p), ("test", test_p),
+                ):
+                    split_cases = [c for c in cases if str(c["case_id"]) in pset]
+                    fold_samples[split_name] = extract_forecast_samples(
+                        split_cases, stype, context_sec, target_sec, stride_sec,
+                    )
+                if not any(fold_samples.values()):
+                    print(f"    WARN: fold {fold_idx} no samples — skip.")
+                    continue
+                paths = save_dataset(
+                    fold_samples["train"], fold_samples["test"],
+                    stype, context_sec, target_sec, source, out_dir,
+                    signal_dtype=signal_dtype,
+                    chunk_windows=chunk_windows,
+                    val_samples=fold_samples["val"],
+                    fold_idx=fold_idx,
+                    n_folds=n_folds,
+                )
+                saved_paths.extend(paths)
+            continue
+
+        # ── 단일 train/test (n_folds==1, back-compat) ───────────────
+        # 2. Train/Test 분할 (case-level)
         print(f"\n[2/4] Splitting (ratio={train_ratio})...")
-        rng = np.random.default_rng(42)
+        rng = np.random.default_rng(seed)
         indices = list(range(len(cases)))
         rng.shuffle(indices)
         n_train = max(1, int(len(cases) * train_ratio))
@@ -493,18 +661,20 @@ def prepare_forecasting(
             print(f"  SKIP: No samples for {stype.upper()}")
             continue
 
-        # 4. 저장
-        print(f"\n[4/4] Saving...")
-        path = save_dataset(
-            train_samples, test_samples,
-            stype, context_sec, target_sec, source, out_dir,
-            signal_dtype=signal_dtype,
-        )
-        saved_paths.append(path)
-
+        # (옵션) 시각화 — save 가 샘플을 destructive 하게 비우므로 먼저 수행.
         if visualize:
             all_samples = train_samples + test_samples
             _visualize(all_samples, stype, context_sec, target_sec, Path(out_dir))
+
+        # 4. 저장 (split별 chunk)
+        print(f"\n[4/4] Saving...")
+        paths = save_dataset(
+            train_samples, test_samples,
+            stype, context_sec, target_sec, source, out_dir,
+            signal_dtype=signal_dtype,
+            chunk_windows=chunk_windows,
+        )
+        saved_paths.extend(paths)
 
     if saved_paths:
         print(f"\n{'='*60}")
@@ -527,7 +697,10 @@ def prepare_multi_input_forecasting(
     out_dir: str = "outputs/downstream/forecasting",
     source: str = "mimic3",
     signal_dtype: torch.dtype = torch.float16,
-) -> Path | None:
+    chunk_windows: int = 2000,
+    n_folds: int = 1,
+    seed: int = 42,
+) -> list[Path]:
     """ABP+ICP → ICP 같은 multi-input forecasting 데이터셋 구축."""
     print(f"\n{'='*60}")
     print(f"  Multi-Input Forecasting: {'+'.join(context_signals)} → {target_signal}")
@@ -538,11 +711,49 @@ def prepare_multi_input_forecasting(
     cases = _load_mimic3_multi_input(waveform_dir, context_signals, target_signal)
     if not cases:
         print("  SKIP: No cases with all required signals")
-        return None
+        return []
 
-    # Train/Test split (patient-level이 아니라 case-level — 환자 ID 기반으로
-    # 분리하려면 case_id prefix로 그룹핑 필요; 우선 단순 shuffle)
-    rng = np.random.default_rng(42)
+    # ── K-fold CV (n_folds>=2): case(=patient)-level group K-fold ──
+    if n_folds >= 2:
+        print(f"\n  Patient(case)-level {n_folds}-fold CV...")
+        case_ids = sorted({str(c["case_id"]) for c in cases})
+        patient_to_labels = {pid: [0] for pid in case_ids}
+        splits = stratified_kfold_patient_splits(
+            case_ids, patient_to_labels, n_folds=n_folds, seed=seed,
+        )
+        print(summarize_splits(splits))
+
+        saved_paths: list[Path] = []
+        for fold_idx, (train_p, val_p, test_p) in enumerate(splits):
+            print(f"\n  Fold {fold_idx}: extract samples + save...")
+            fold_samples: dict[str, list[MultiInputForecastSample]] = {}
+            for split_name, pset in (
+                ("train", train_p), ("val", val_p), ("test", test_p),
+            ):
+                split_cases = [c for c in cases if str(c["case_id"]) in pset]
+                fold_samples[split_name] = extract_multi_input_samples(
+                    split_cases, context_signals, target_signal,
+                    context_sec, target_sec, stride_sec,
+                )
+            if not any(fold_samples.values()):
+                print(f"    WARN: fold {fold_idx} no samples — skip.")
+                continue
+            paths = save_multi_input_dataset(
+                fold_samples["train"], fold_samples["test"],
+                context_signals, target_signal,
+                context_sec, target_sec, source, out_dir,
+                signal_dtype=signal_dtype,
+                chunk_windows=chunk_windows,
+                val_samples=fold_samples["val"],
+                fold_idx=fold_idx,
+                n_folds=n_folds,
+            )
+            saved_paths.extend(paths)
+        return saved_paths
+
+    # ── 단일 train/test (n_folds==1, back-compat) ───────────────
+    # Train/Test split (case-level group)
+    rng = np.random.default_rng(seed)
     indices = list(range(len(cases)))
     rng.shuffle(indices)
     n_train = max(1, int(len(cases) * train_ratio))
@@ -562,13 +773,14 @@ def prepare_multi_input_forecasting(
 
     if not train_samples and not test_samples:
         print("  SKIP: No valid samples extracted")
-        return None
+        return []
 
     return save_multi_input_dataset(
         train_samples, test_samples,
         context_signals, target_signal,
         context_sec, target_sec, source, out_dir,
         signal_dtype=signal_dtype,
+        chunk_windows=chunk_windows,
     )
 
 
@@ -577,7 +789,9 @@ def main() -> None:
         description="Vital Sign Forecasting - Data Preparation",
     )
     parser.add_argument("--source", type=str, default="mimic3",
-                        choices=["mimic3"])
+                        choices=["mimic3", "vitaldb"],
+                        help="Data source. vitaldb 는 single-input 만 지원 "
+                             "(load_pilot_cases 경유 연속 waveform).")
     parser.add_argument("--signal-type", type=str, default="ecg",
                         choices=ALL_SIGNAL_TYPES + ["all"],
                         help="Signal type to forecast ('all' for all types, "
@@ -591,6 +805,20 @@ def main() -> None:
     parser.add_argument("--train-ratio", type=float, default=0.7)
     parser.add_argument("--out-dir", type=str, default="outputs/downstream/forecasting")
     parser.add_argument("--visualize", action="store_true")
+    parser.add_argument(
+        "--chunk-windows", type=int, default=2000,
+        help="Samples per split chunk file (sepsis-style chunked save, "
+             "lowers peak RAM/disk). Default 2000.",
+    )
+    parser.add_argument(
+        "--n-folds", type=int, default=5,
+        help="Patient(case)-level K-fold CV. >=2 면 fold별 train/val/test chunk "
+             "저장 (파일명에 _fold{F}). 1 이면 단일 train/test (back-compat). "
+             "Default 5.",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42, help="Patient split RNG seed.",
+    )
 
     # Multi-input forecasting 플래그
     parser.add_argument(
@@ -630,6 +858,9 @@ def main() -> None:
             out_dir=args.out_dir,
             source=args.source,
             signal_dtype=sig_dtype,
+            chunk_windows=args.chunk_windows,
+            n_folds=args.n_folds,
+            seed=args.seed,
         )
     else:
         prepare_forecasting(
@@ -643,6 +874,9 @@ def main() -> None:
             out_dir=args.out_dir,
             visualize=args.visualize,
             signal_dtype=sig_dtype,
+            chunk_windows=args.chunk_windows,
+            n_folds=args.n_folds,
+            seed=args.seed,
         )
 
 

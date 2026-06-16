@@ -11,6 +11,8 @@ contiguous 출력 두 벌을 잡아 600s × N-channel windows 에서 ~70 GB 피�
 from __future__ import annotations
 
 import gc
+import re
+from pathlib import Path
 from typing import Any, Callable, Iterable
 
 import numpy as np
@@ -150,6 +152,162 @@ def stack_attr_destructive(
         a = getattr(s, attr)
         out[i].copy_(torch.from_numpy(a))
         setattr(s, attr, None)
+    return out
+
+
+# ── chunked save/load (sepsis-style split chunking) ──────────────────────
+
+
+def _concat_values(vals: list[Any]) -> Any:
+    """동일 구조 값 리스트를 key별 재귀 concat.
+
+    - torch.Tensor  -> dim 0 으로 torch.cat (빈 텐서 제외)
+    - dict           -> 키별 재귀 concat (e.g. signals={stype: (N,T)})
+    - list           -> extend
+    - 그 외 scalar   -> 첫 값 그대로
+    """
+    first = vals[0]
+    if isinstance(first, torch.Tensor):
+        non_empty = [v for v in vals if v.numel() > 0]
+        if not non_empty:
+            return first
+        if len(non_empty) == 1:
+            return non_empty[0]
+        return torch.cat(non_empty, dim=0)
+    if isinstance(first, dict):
+        out_d: dict[Any, Any] = {}
+        all_keys: list[Any] = []
+        for v in vals:
+            for kk in v.keys():
+                if kk not in all_keys:
+                    all_keys.append(kk)
+        for kk in all_keys:
+            out_d[kk] = _concat_values([v[kk] for v in vals if kk in v])
+        return out_d
+    if isinstance(first, list):
+        out_l: list[Any] = []
+        for v in vals:
+            out_l.extend(v)
+        return out_l
+    return first
+
+
+def _concat_payloads(payloads: list[dict]) -> dict:
+    """split chunk payload(dict) 리스트를 단일 dict 로 병합 (key별 concat)."""
+    if not payloads:
+        return {}
+    merged: dict[str, Any] = {}
+    keys: list[str] = []
+    for pl in payloads:
+        for k in pl.keys():
+            if k not in keys:
+                keys.append(k)
+    for k in keys:
+        merged[k] = _concat_values([pl[k] for pl in payloads if k in pl])
+    return merged
+
+
+def _split_count(split_dict: dict) -> int:
+    """split payload 에서 샘플 수(N) 추정 (첫 텐서/리스트의 길이)."""
+    for v in split_dict.values():
+        if isinstance(v, torch.Tensor):
+            return int(v.shape[0]) if v.dim() > 0 else 0
+        if isinstance(v, dict):
+            for vv in v.values():
+                if isinstance(vv, torch.Tensor):
+                    return int(vv.shape[0]) if vv.dim() > 0 else 0
+        if isinstance(v, list):
+            return len(v)
+    return 0
+
+
+def load_prepared_chunked(
+    data_path: str | Path,
+    fold: int | None = None,
+) -> dict:
+    """단일 .pt 또는 split-chunked .pt 묶음을 통일된 dict 로 로드.
+
+    Back-compat: ``fold is None`` 이고 ``data_path`` 가 실제 파일이면 그대로
+    ``torch.load`` 한다.
+
+    Chunked: ``data_path`` (보통 ``<base>.pt`` 또는 확장자 없는 base) 의 stem 을
+    prefix 로 하는 chunk 파일들을 split 별로 모아 텐서/리스트를 concat 한다.
+    반환 shape 은 기존 단일 파일과 동일하다::
+
+        {"train": {...}, ["val": {...},] "test": {...}, "metadata": {...}}
+
+    Parameters
+    ----------
+    fold : int | None
+        None  → 비-fold glob ``<stem>_<split>_chunk*.pt`` (+ 단일파일 back-compat).
+        int K → fold glob ``<stem>_fold{K}_<split>_chunk*.pt`` 만 로드 (K-fold CV).
+
+    cross_modal(`signals` nested dict + `case_ids`) 와
+    forecast(`context`/`target` flat 텐서 + `case_ids`) 양쪽을 처리한다.
+    """
+    p = Path(data_path)
+
+    # 1) 단일 파일 우선 (back-compat). fold 미지정 시에만.
+    if fold is None:
+        if p.is_file():
+            return torch.load(p, weights_only=False)
+        if p.suffix != ".pt":
+            single = p.with_suffix(".pt")
+            if single.is_file():
+                return torch.load(single, weights_only=False)
+
+    # 2) chunk 집계: prefix 를 기준으로 <prefix>_<split>_chunk<idx>.pt glob
+    stem = p.name[:-3] if p.name.endswith(".pt") else p.name
+    parent = p.parent if str(p.parent) else Path(".")
+    prefix = stem if fold is None else f"{stem}_fold{int(fold)}"
+
+    chunk_files = sorted(parent.glob(f"{prefix}_*_chunk*.pt"))
+
+    # split 별로 (chunk_idx, file) 수집
+    pat = re.compile(r"(.+)_chunk(\d+)$")
+    fold_split = re.compile(r"^fold\d+_")  # fold 파일 split 토큰
+    splits: dict[str, list[tuple[int, Path]]] = {}
+    for f in chunk_files:
+        name = f.name[:-3]  # strip .pt
+        rest = name[len(prefix) + 1:]  # "{split}_chunk{idx}"
+        m = pat.match(rest)
+        if not m:
+            continue
+        split_name = m.group(1)
+        # fold 미지정인데 fold 파일이 glob 에 섞였으면 제외 (n_folds>=2 산출물).
+        if fold is None and fold_split.match(split_name):
+            continue
+        cidx = int(m.group(2))
+        splits.setdefault(split_name, []).append((cidx, f))
+
+    if not splits:
+        looked = parent / (prefix + "_*_chunk*.pt")
+        raise FileNotFoundError(
+            f"No single file or chunk files found for: {data_path} "
+            f"(fold={fold}, looked for {looked})"
+        )
+
+    out: dict[str, Any] = {}
+    metadata: dict[str, Any] | None = None
+    for split_name, items in splits.items():
+        items.sort(key=lambda x: x[0])
+        payloads: list[dict] = []
+        for _, f in items:
+            ck = torch.load(f, weights_only=False)
+            if metadata is None and isinstance(ck.get("metadata"), dict):
+                metadata = dict(ck["metadata"])
+            payloads.append(
+                {k: v for k, v in ck.items() if k not in ("split", "metadata")}
+            )
+        out[split_name] = _concat_payloads(payloads)
+
+    # metadata 정리: chunk 고유 키 제거 + 집계 카운트 보강 (fold_idx/n_folds 는 보존)
+    metadata = metadata or {}
+    for k in ("chunk_idx", "n_windows", "split"):
+        metadata.pop(k, None)
+    for split_name in out:
+        metadata[f"n_{split_name}"] = _split_count(out[split_name])
+    out["metadata"] = metadata
     return out
 
 

@@ -43,6 +43,10 @@ from downstream._save_utils import (
     add_signal_dtype_arg,
     stack_arrays_destructive,
 )
+from downstream._kfold_utils import (
+    stratified_kfold_patient_splits,
+    summarize_splits,
+)
 
 
 TARGET_SR: float = 100.0
@@ -464,53 +468,93 @@ def save_dataset(
     source: str,
     out_dir: str,
     signal_dtype: torch.dtype = torch.float16,
-) -> Path:
-    """윈도우 리스트를 .pt로 저장한다."""
+    chunk_windows: int = 2000,
+    val_windows: list[dict] | None = None,
+    fold_idx: int | None = None,
+    n_folds: int = 1,
+) -> list[Path]:
+    """윈도우 리스트를 split별 chunk .pt로 저장한다 (sepsis chunk 패턴과 동일).
+
+    파일명:
+      - 단일(fold 미사용): ``cross_modal_{source}_{types}_w{win}s_{split}_chunk{C}.pt``
+      - K-fold:           ``cross_modal_{source}_{types}_w{win}s_fold{F}_{split}_chunk{C}.pt``
+
+    각 chunk 는 최대 ``chunk_windows`` 개 윈도우를 담으며, chunk 단위로 텐서를
+    destructive build → save → ``del + gc.collect()`` 하여 피크 메모리를 낮춘다.
+    run.py 의 ``load_prepared_chunked()`` 가 split별로 다시 concat 한다.
+
+    ``fold_idx`` 가 주어지면 파일명에 ``_fold{F}`` 가 붙고, ``val_windows`` 가
+    있으면 train/val/test 3 split 을 저장한다 (classification fine-tuning 비교용).
+    """
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
-    n_train = len(train_windows)
-    n_test = len(test_windows)
-
-    def _to_tensors(windows: list[dict]) -> dict:
-        if not windows:
-            return {"signals": {}, "case_ids": []}
-
-        case_ids = [w["case_id"] for w in windows]
-        sig_tensors = {}
-        for st in signal_types:
-            arrs = [w["signals"].pop(st) for w in windows]
-            sig_tensors[st] = stack_arrays_destructive(arrs, signal_dtype)
-        return {"signals": sig_tensors, "case_ids": case_ids}
-
-    train_dict = _to_tensors(train_windows); train_windows.clear()
-    test_dict = _to_tensors(test_windows); test_windows.clear()
-    gc.collect()
-
-    save_dict = {
-        "train": train_dict,
-        "test": test_dict,
-        "metadata": {
-            "task": "any_to_any_cross_modal",
-            "source": source,
-            "signal_types": signal_types,
-            "window_sec": window_sec,
-            "sampling_rate": TARGET_SR,
-            "n_train": n_train,
-            "n_test": n_test,
-            "signal_dtype": str(signal_dtype).replace("torch.", ""),
-        },
-    }
-
     types_str = "_".join(signal_types)
     win_str = int(window_sec)
-    filename = f"cross_modal_{source}_{types_str}_w{win_str}s.pt"
-    save_path = out_path / filename
-    torch.save(save_dict, save_path)
+    base = f"cross_modal_{source}_{types_str}_w{win_str}s"
+    fold_suffix = f"_fold{fold_idx}" if fold_idx is not None else ""
 
-    file_size_mb = save_path.stat().st_size / (1024 * 1024)
-    print(f"  Saved: {save_path} ({file_size_mb:.2f} MB)")
-    return save_path
+    split_items: list[tuple[str, list[dict]]] = [("train", train_windows)]
+    if val_windows is not None:
+        split_items.append(("val", val_windows))
+    split_items.append(("test", test_windows))
+
+    saved: list[Path] = []
+    for split_name, windows in split_items:
+        if not windows:
+            continue
+        chunk_idx = 0
+        total = 0
+        for bstart in range(0, len(windows), chunk_windows):
+            batch = windows[bstart:bstart + chunk_windows]
+            n_w = len(batch)
+            case_ids = [w["case_id"] for w in batch]
+            sig_tensors: dict[str, torch.Tensor] = {}
+            for st in signal_types:
+                # 각 윈도우 dict 에서 stype pop → numpy 즉시 해제하며 (n_w, T) build
+                arrs = [w["signals"].pop(st) for w in batch]
+                sig_tensors[st] = stack_arrays_destructive(arrs, signal_dtype)
+
+            chunk = {
+                "split": split_name,
+                "signals": sig_tensors,          # {stype: (n_w, win_samples)}
+                "case_ids": case_ids,            # list[str], len == n_w
+                "metadata": {
+                    "task": "any_to_any_cross_modal",
+                    "source": source,
+                    "signal_types": signal_types,
+                    "window_sec": window_sec,
+                    "sampling_rate": TARGET_SR,
+                    "fold_idx": fold_idx,
+                    "n_folds": n_folds,
+                    "split": split_name,
+                    "chunk_idx": chunk_idx,
+                    "n_windows": n_w,
+                    "signal_dtype": str(signal_dtype).replace("torch.", ""),
+                },
+            }
+            out_file = (
+                out_path / f"{base}{fold_suffix}_{split_name}_chunk{chunk_idx}.pt"
+            )
+            torch.save(chunk, out_file)
+            file_size_mb = out_file.stat().st_size / (1024 * 1024)
+            print(
+                f"  Saved: {out_file.name} "
+                f"({n_w} windows, {file_size_mb:.2f} MB)"
+            )
+            saved.append(out_file)
+            total += n_w
+            chunk_idx += 1
+            del batch, sig_tensors, chunk
+            gc.collect()
+        print(f"  {split_name}: {chunk_idx} chunk(s), {total} windows")
+
+    train_windows.clear()
+    test_windows.clear()
+    if val_windows is not None:
+        val_windows.clear()
+    gc.collect()
+    return saved
 
 
 # ---- 통계 출력 ----
@@ -552,7 +596,10 @@ def prepare_any_to_any(
     manifest_path: str | None = None,
     data_dir: str | None = None,
     signal_dtype: torch.dtype = torch.float16,
-) -> Path:
+    chunk_windows: int = 2000,
+    n_folds: int = 1,
+    seed: int = 42,
+) -> list[Path]:
     """Any-to-Any cross-modal 평가 데이터를 준비한다.
 
     Parameters
@@ -562,10 +609,13 @@ def prepare_any_to_any(
     n_cases : 로드할 케이스 수.
     window_sec : 윈도우 길이 (초).
     stride_sec : 슬라이드 보폭 (초).
-    train_ratio : patient 단위 train/test 분할 비율.
+    train_ratio : patient 단위 train/test 분할 비율 (n_folds==1 일 때만).
     out_dir : 저장 디렉토리.
     manifest_path : MIMIC-III manifest 경로.
     data_dir : local source 시 .pt 디렉토리 경로.
+    n_folds : >=2 면 patient-level K-fold CV (fold별 train/val/test chunk 저장).
+        1 이면 기존 단일 train/test (fold suffix 없음, back-compat).
+    seed : patient split RNG seed.
     """
     if signal_types is None:
         signal_types = ["ecg", "abp", "ppg", "cvp"]
@@ -614,9 +664,58 @@ def prepare_any_to_any(
         print("ERROR: No valid cases loaded.", file=sys.stderr)
         sys.exit(1)
 
+    # ── K-fold CV (n_folds>=2): patient-level group K-fold ──────────────
+    if n_folds >= 2:
+        # generation 은 class label 이 없으므로 더미 uniform label →
+        # stratified_kfold_patient_splits 가 plain group K-fold (60/20/20,
+        # 모든 환자 정확히 1번 test) 로 동작. (sepsis prepare_data 호출 패턴 동일.)
+        print(f"\n[2/4] Patient-level {n_folds}-fold CV split...")
+        patient_ids = sorted({str(c["patient_id"]) for c in cases})
+        patient_to_labels = {pid: [0] for pid in patient_ids}
+        splits = stratified_kfold_patient_splits(
+            patient_ids, patient_to_labels, n_folds=n_folds, seed=seed,
+        )
+        print(summarize_splits(splits))
+
+        all_saved: list[Path] = []
+        for fold_idx, (train_p, val_p, test_p) in enumerate(splits):
+            print(f"\n[3-4/4] Fold {fold_idx}: extract windows + save...")
+            fold_windows: dict[str, list[dict]] = {}
+            for split_name, pset in (
+                ("train", train_p), ("val", val_p), ("test", test_p),
+            ):
+                split_cases = [c for c in cases if str(c["patient_id"]) in pset]
+                # 환자 단위로 case 분리 후 윈도우 추출 → fold 간 누수 없음.
+                fold_windows[split_name] = extract_aligned_windows(
+                    split_cases, signal_types, window_sec, stride_sec
+                )
+            if not any(fold_windows.values()):
+                print(f"  WARN: fold {fold_idx} produced no windows — skip.")
+                continue
+            saved = save_dataset(
+                fold_windows["train"],
+                fold_windows["test"],
+                signal_types,
+                window_sec,
+                source,
+                out_dir,
+                signal_dtype=signal_dtype,
+                chunk_windows=chunk_windows,
+                val_windows=fold_windows["val"],
+                fold_idx=fold_idx,
+                n_folds=n_folds,
+            )
+            all_saved.extend(saved)
+
+        print(f"\n{'=' * 60}")
+        print(f"  Done! {n_folds}-fold CV, {len(all_saved)} chunk file(s) in {out_dir}")
+        print(f"{'=' * 60}")
+        return all_saved
+
+    # ── 단일 train/test (n_folds==1, back-compat) ───────────────────────
     # 2. Patient 단위 train/test 분할
     print(f"\n[2/4] Splitting by patient (ratio={train_ratio})...")
-    rng = np.random.default_rng(42)
+    rng = np.random.default_rng(seed)
     patient_ids = list({c["patient_id"] for c in cases})
     rng.shuffle(patient_ids)
     n_train_patients = max(1, int(len(patient_ids) * train_ratio))
@@ -647,9 +746,10 @@ def prepare_any_to_any(
         print("ERROR: No windows extracted.", file=sys.stderr)
         sys.exit(1)
 
-    # 4. 저장
+    # 4. 저장 (split별 chunk)
     print("\n[4/4] Saving...")
-    save_path = save_dataset(
+    n_train, n_test = len(train_windows), len(test_windows)
+    saved_paths = save_dataset(
         train_windows,
         test_windows,
         signal_types,
@@ -657,13 +757,14 @@ def prepare_any_to_any(
         source,
         out_dir,
         signal_dtype=signal_dtype,
+        chunk_windows=chunk_windows,
     )
 
     print(f"\n{'=' * 60}")
-    print(f"  Done! {save_path}")
-    print(f"  Train: {len(train_windows)} windows, Test: {len(test_windows)} windows")
+    print(f"  Done! {len(saved_paths)} chunk file(s) in {out_dir}")
+    print(f"  Train: {n_train} windows, Test: {n_test} windows")
     print(f"{'=' * 60}")
-    return save_path
+    return saved_paths
 
 
 def main() -> None:
@@ -720,6 +821,24 @@ def main() -> None:
     parser.add_argument(
         "--manifest", type=str, default=None, help="MIMIC-III manifest JSON path"
     )
+    parser.add_argument(
+        "--chunk-windows",
+        type=int,
+        default=2000,
+        help="Windows per split chunk file (sepsis-style chunked save, "
+             "lowers peak RAM/disk). Default 2000.",
+    )
+    parser.add_argument(
+        "--n-folds",
+        type=int,
+        default=5,
+        help="Patient-level K-fold CV. >=2 면 fold별 train/val/test chunk 저장 "
+             "(파일명에 _fold{F}). 1 이면 단일 train/test (train_ratio, back-compat). "
+             "Default 5.",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42, help="Patient split RNG seed.",
+    )
     dtype_map = add_signal_dtype_arg(parser)
     args = parser.parse_args()
 
@@ -734,6 +853,9 @@ def main() -> None:
         manifest_path=args.manifest,
         data_dir=args.data_dir,
         signal_dtype=dtype_map(args.signal_dtype),
+        chunk_windows=args.chunk_windows,
+        n_folds=args.n_folds,
+        seed=args.seed,
     )
 
 

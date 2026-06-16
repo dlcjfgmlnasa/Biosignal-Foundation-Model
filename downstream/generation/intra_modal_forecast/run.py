@@ -40,9 +40,27 @@ from data.dataset import BiosignalSample
 # v2: parser-local v1 dict 대신 data.spatial_map 의 SSOT 사용
 # (resp_impedance=8 / resp_flow=9 포함, .get(...,0) ECG 폴백 위험 제거).
 from data.spatial_map import SIGNAL_KEY_TO_TYPE as SIGNAL_TYPES
+from downstream._save_utils import load_prepared_chunked
 
 PATCH_SIZE = 100
 TARGET_SR = 100.0
+
+
+def _data_path_available(data_path: str, fold: int | None = None) -> bool:
+    """data_path 가 단일 .pt 파일이거나 split-chunk 묶음으로 존재하는지 확인.
+
+    fold 지정 시 ``<stem>_fold{F}_*_chunk*.pt`` 존재 여부로 판단.
+    """
+    p = Path(data_path)
+    if fold is None:
+        if p.is_file():
+            return True
+        if p.suffix != ".pt" and p.with_suffix(".pt").is_file():
+            return True
+    stem = p.name[:-3] if p.name.endswith(".pt") else p.name
+    parent = p.parent if str(p.parent) else Path(".")
+    prefix = stem if fold is None else f"{stem}_fold{int(fold)}"
+    return any(parent.glob(f"{prefix}_*_chunk*.pt"))
 
 
 # ---- Dummy model ----
@@ -378,9 +396,12 @@ def main() -> None:
     is_multi_input = False
     context_signal_types: list[str] | None = None
     patient_ids: list[str] | None = None
-    if args.data_path and Path(args.data_path).exists():
-        print(f"Loading prepared data: {args.data_path}")
-        data = torch.load(args.data_path, weights_only=False)
+    # n_folds>1 이면 해당 fold 의 chunk 만 로드 (K-fold CV). 1 이면 비-fold/단일.
+    load_fold = int(args.fold) if int(args.n_folds) > 1 else None
+    if args.data_path and _data_path_available(args.data_path, fold=load_fold):
+        print(f"Loading prepared data: {args.data_path} (fold={load_fold})")
+        # 단일 .pt (back-compat) 또는 split-chunked .pt 묶음을 동일 shape 으로 로드.
+        data = load_prepared_chunked(args.data_path, fold=load_fold)
         meta = data["metadata"]
         is_multi_input = meta.get("task") == "multi_input_forecasting"
         if is_multi_input:

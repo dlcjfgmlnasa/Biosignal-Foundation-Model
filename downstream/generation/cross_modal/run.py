@@ -49,6 +49,7 @@ from torch import nn
 from data.collate import PackCollate, PackedBatch
 from data.dataset import BiosignalSample
 from data.spatial_map import SIGNAL_KEY_TO_TYPE
+from downstream._save_utils import load_prepared_chunked
 
 # signal_type_key -> signal_type_id : data.spatial_map 의 SSOT(v2) 사용.
 # (10 signal_type, spatial_id 폐지, resp_impedance=8 / resp_flow=9.)
@@ -347,20 +348,42 @@ class WaveformRegressionHead(nn.Module):
 # ── LoRA data utilities ─────────────────────────────────────
 
 
-def _load_prepared_data(data_path: str) -> dict:
+def _data_path_available(data_path: str, fold: int | None = None) -> bool:
+    """data_path 가 단일 .pt 파일이거나 split-chunk 묶음으로 존재하는지 확인.
+
+    fold 지정 시 ``<stem>_fold{F}_*_chunk*.pt`` 존재 여부로 판단.
+    """
+    p = Path(data_path)
+    if fold is None:
+        if p.is_file():
+            return True
+        if p.suffix != ".pt" and p.with_suffix(".pt").is_file():
+            return True
+    stem = p.name[:-3] if p.name.endswith(".pt") else p.name
+    parent = p.parent if str(p.parent) else Path(".")
+    prefix = stem if fold is None else f"{stem}_fold{int(fold)}"
+    return any(parent.glob(f"{prefix}_*_chunk*.pt"))
+
+
+def _load_prepared_data(data_path: str, fold: int | None = None) -> dict:
     """Load a prepared .pt file for LoRA training.
 
     Expected structure::
 
         {
             "train": {"signals": {"ecg": (N, T), "abp": (N, T), ...}, "case_ids": [...]},
+            ["val": {...},]
             "test":  {"signals": {...}, "case_ids": [...]},
             "metadata": {"signal_types": [...], "window_sec": 30, ...}
         }
+
+    ``fold`` 지정 시 ``<stem>_fold{F}_<split>_chunk*.pt`` 만 로드 (K-fold CV).
+    None 이면 비-fold glob + 단일파일 back-compat.
     """
-    data = torch.load(data_path, weights_only=False)
+    # 단일 .pt (back-compat) 또는 split-chunked .pt 묶음을 동일 shape 으로 로드.
+    data = load_prepared_chunked(data_path, fold=fold)
     meta = data.get("metadata", {})
-    print(f"  Loaded: {data_path}")
+    print(f"  Loaded: {data_path} (fold={fold})")
     print(f"  Source: {meta.get('source', '?')}, Signals: {meta.get('signal_types', '?')}")
     print(f"  Train: {meta.get('n_train', '?')}, Test: {meta.get('n_test', '?')}")
     return data
@@ -623,16 +646,22 @@ def evaluate_lora_regression(
     head: WaveformRegressionHead,
     test_batches: list[tuple[PackedBatch, torch.Tensor]],
     device: torch.device,
-) -> dict[str, float]:
+    collect_raw: bool = False,
+) -> dict:
     """Evaluate LoRA regression on test set.
 
-    Returns dict with mse, mae, pearson_r, n_patches.
+    Returns dict with mse, mae, pearson_r, n_patches. ``collect_raw`` 시
+    per-window 평탄화 waveform ``raw_y_true``/``raw_y_score`` (N_win, L) 도 포함
+    (preds_fold{F}.npz dump 용, forecast/classification 포맷과 동일 키).
     """
     model.model.eval()
     head.to(device).eval()
 
     all_pred: list[torch.Tensor] = []
     all_target: list[torch.Tensor] = []
+    # per-window raw waveform (collect_raw) — 배치별 (B, L) numpy 누적.
+    raw_pred_win: list[np.ndarray] = []
+    raw_tgt_win: list[np.ndarray] = []
 
     for batch, target_patches in test_batches:
         batch = model.batch_to_device(batch)
@@ -647,8 +676,14 @@ def evaluate_lora_regression(
         predicted = head(pooled)
 
         n_out = min(predicted.shape[1], target_patches.shape[1])
-        all_pred.append(predicted[:, :n_out].cpu().reshape(-1))
-        all_target.append(target_patches[:, :n_out].cpu().reshape(-1))
+        pred_o = predicted[:, :n_out].cpu()      # (B, n_out, patch_size)
+        tgt_o = target_patches[:, :n_out].cpu()  # (B, n_out, patch_size)
+        all_pred.append(pred_o.reshape(-1))
+        all_target.append(tgt_o.reshape(-1))
+        if collect_raw:
+            # window 당 평탄화 waveform: (B, n_out*patch_size)
+            raw_pred_win.append(pred_o.reshape(pred_o.shape[0], -1).numpy())
+            raw_tgt_win.append(tgt_o.reshape(tgt_o.shape[0], -1).numpy())
 
     pred = torch.cat(all_pred)
     target = torch.cat(all_target)
@@ -658,12 +693,22 @@ def evaluate_lora_regression(
     r = _pearson_r(pred, target)
     n_patches = pred.shape[0]
 
-    return {
+    metrics: dict = {
         "mse": mse,
         "mae": mae,
         "pearson_r": r,
         "n_patches": n_patches,
     }
+
+    if collect_raw and raw_pred_win:
+        # 배치 간 L 이 다를 수 있으니 공통 최소 길이로 truncate 후 stack.
+        min_L = min(a.shape[1] for a in raw_pred_win)
+        y_score = np.concatenate([a[:, :min_L] for a in raw_pred_win], axis=0)
+        y_true = np.concatenate([a[:, :min_L] for a in raw_tgt_win], axis=0)
+        metrics["raw_y_score"] = y_score.astype(np.float32)  # (N_win, L)
+        metrics["raw_y_true"] = y_true.astype(np.float32)    # (N_win, L)
+
+    return metrics
 
 
 # ── Dummy test ───────────────────────────────────────────────
@@ -834,6 +879,7 @@ def run_random_subset_eval(
     mask_ratios: list[float] | None = None,
     n_iterations: int = 3,
     device_str: str = "cpu",
+    fold: int | None = None,
 ) -> dict:
     """Random-subset → full recovery zero-shot 평가.
 
@@ -869,8 +915,8 @@ def run_random_subset_eval(
 
     # 데이터 소스 준비: data_path 우선, 없으면 pilot cases
     windows: list[dict[str, np.ndarray]] = []
-    if data_path and Path(data_path).exists():
-        data = _load_prepared_data(data_path)
+    if data_path and _data_path_available(data_path, fold=fold):
+        data = _load_prepared_data(data_path, fold=fold)
         test_data = data["test"]
         available_sigs = list(test_data["signals"].keys())
         n_samples = test_data["signals"][available_sigs[0]].shape[0]
@@ -971,6 +1017,7 @@ def run_checkpoint_eval(
     data_path: str | None = None,
     scenarios: list[Scenario] | None = None,
     device_str: str = "cpu",
+    fold: int | None = None,
 ) -> list[AnyToAnyResult]:
     """Evaluate scenarios with a pretrained checkpoint (zero-shot)."""
     from downstream.model_wrapper import DownstreamModelWrapper
@@ -991,9 +1038,9 @@ def run_checkpoint_eval(
 
     results: list[AnyToAnyResult] = []
 
-    if data_path and Path(data_path).exists():
+    if data_path and _data_path_available(data_path, fold=fold):
         # Evaluate from prepared .pt file
-        data = _load_prepared_data(data_path)
+        data = _load_prepared_data(data_path, fold=fold)
         test_data = data["test"]
 
         for sc in scenarios:
@@ -1113,6 +1160,9 @@ def run_lora_regression(
     batch_size: int = 16,
     device_str: str = "cpu",
     out_dir: str = ".",
+    fold: int | None = None,
+    n_folds: int = 1,
+    dump_preds: bool = True,
 ) -> dict:
     """Run LoRA regression training and evaluation for a single scenario.
 
@@ -1166,8 +1216,8 @@ def run_lora_regression(
     wrapper.inject_lora(rank=lora_rank, alpha=lora_alpha)
     patch_size = wrapper.patch_size
 
-    # Load data
-    data = _load_prepared_data(data_path)
+    # Load data (fold-aware)
+    data = _load_prepared_data(data_path, fold=fold)
 
     # Build batches
     print("\nBuilding train batches...")
@@ -1199,9 +1249,14 @@ def run_lora_regression(
         wrapper, head, train_batches, epochs, lr, device
     )
 
-    # Evaluate
+    # Evaluate (raw 수집은 preds dump 시에만)
     print(f"\nEvaluating on test set...")
-    metrics = evaluate_lora_regression(wrapper, head, test_batches, device)
+    metrics = evaluate_lora_regression(
+        wrapper, head, test_batches, device, collect_raw=dump_preds,
+    )
+    # raw 배열은 JSON 직렬화 불가 → 분리.
+    raw_y_score = metrics.pop("raw_y_score", None)
+    raw_y_true = metrics.pop("raw_y_true", None)
 
     # Print results
     print(f"\n{'=' * 50}")
@@ -1239,6 +1294,37 @@ def run_lora_regression(
     with open(results_file, "w") as f:
         json.dump(results, f, indent=2)
     print(f"\nResults saved: {results_file}")
+
+    # ── Raw prediction dump (ablation aggregator 호환) ──────────────
+    # forecast/classification 과 동일한 <out_dir>/preds_fold{idx}.npz 포맷.
+    # generation: y_true / y_score 는 float waveform (N_win, L).
+    if dump_preds and raw_y_true is not None and raw_y_score is not None:
+        n_win = raw_y_true.shape[0]
+        # patient_id: test split case_ids (윈도우 순서 보존) 를 정렬해서 매핑.
+        case_ids = data.get("test", {}).get("case_ids", [])
+        if len(case_ids) >= n_win:
+            patient_id = np.array([str(c) for c in case_ids[:n_win]], dtype=str)
+        else:
+            patient_id = np.array([str(i) for i in range(n_win)], dtype=str)
+        preds_path = out_path / f"preds_fold{int(fold) if fold is not None else 0}.npz"
+        payload = {
+            "y_true": raw_y_true.astype(np.float32),
+            "y_score": raw_y_score.astype(np.float32),
+            "patient_id": patient_id,
+            "fold_idx": np.int64(int(fold) if fold is not None else 0),
+            "n_folds": np.int64(int(n_folds)),
+            "task": f"cross_modal_{scenario_slug}",
+            "classes": np.array([], dtype=str),
+            "extra__scenario": np.full((n_win,), scenario.name, dtype=object).astype(str),
+            "extra__target": np.full((n_win,), scenario.target, dtype=object).astype(str),
+            "extra__group_type": np.full(
+                (n_win,), scenario.group_type, dtype=object,
+            ).astype(str),
+        }
+        np.savez_compressed(preds_path, **payload)
+        print(f"Predictions saved: {preds_path} "
+              f"(y_true={raw_y_true.shape}, y_score={raw_y_score.shape}, "
+              f"patients={len(patient_id)})")
 
     return results
 
@@ -1354,7 +1440,23 @@ def main() -> None:
     parser.add_argument(
         "--dummy", action="store_true", help="Dummy test with random model"
     )
+    parser.add_argument(
+        "--fold", type=int, default=0,
+        help="K-fold CV fold index. n_folds>1 일 때 해당 fold chunk 를 로드.",
+    )
+    parser.add_argument(
+        "--n-folds", type=int, default=1,
+        help="총 fold 수. 1 이면 비-fold/단일 data_path (back-compat), "
+             ">=2 면 _fold{F} chunk 를 fold 별로 로드.",
+    )
+    parser.add_argument(
+        "--no-dump-preds", action="store_true",
+        help="preds_fold{idx}.npz raw waveform dump 생략 (lora 모드 기본은 dump).",
+    )
     args = parser.parse_args()
+
+    # n_folds>1 이면 해당 fold chunk 만 로드, 1 이면 비-fold/단일 (None).
+    load_fold = int(args.fold) if int(args.n_folds) > 1 else None
 
     if args.dummy:
         run_dummy_test()
@@ -1377,6 +1479,7 @@ def main() -> None:
                 mask_ratios=args.mask_ratio,
                 n_iterations=args.n_iterations,
                 device_str=args.device,
+                fold=load_fold,
             )
             return
 
@@ -1394,6 +1497,7 @@ def main() -> None:
             data_path=args.data_path,
             scenarios=scenarios,
             device_str=args.device,
+            fold=load_fold,
         )
 
     elif args.mode == "lora":
@@ -1418,6 +1522,9 @@ def main() -> None:
             batch_size=args.batch_size,
             device_str=args.device,
             out_dir=args.out_dir,
+            fold=load_fold,
+            n_folds=args.n_folds,
+            dump_preds=not args.no_dump_preds,
         )
 
 
