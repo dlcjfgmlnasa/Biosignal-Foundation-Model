@@ -220,6 +220,7 @@ def _load_vitaldb_cases(
     signal_types: list[str],
     min_duration_sec: float = 600.0,
     offset_from_end: int = 200,
+    vital_dir: str | None = None,
 ) -> list[dict]:
     """VitalDB에서 시간 정렬된 다채널 데이터를 로드한다.
 
@@ -234,6 +235,7 @@ def _load_vitaldb_cases(
         n_cases=n_cases,
         offset_from_end=offset_from_end,
         signal_types=signal_types,
+        vital_dir=vital_dir,
     )
 
     cases = []
@@ -595,6 +597,7 @@ def prepare_any_to_any(
     out_dir: str = "outputs/downstream/any_to_any",
     manifest_path: str | None = None,
     data_dir: str | None = None,
+    vital_dir: str | None = None,
     signal_dtype: torch.dtype = torch.float16,
     chunk_windows: int = 2000,
     n_folds: int = 1,
@@ -645,6 +648,7 @@ def prepare_any_to_any(
             n_cases,
             signal_types,
             min_duration_sec,
+            vital_dir=vital_dir,
         )
     elif source == "local":
         if not data_dir:
@@ -785,6 +789,12 @@ def main() -> None:
         help="Local .pt directory path (required for source=local)",
     )
     parser.add_argument(
+        "--vital-dir",
+        type=str,
+        default=None,
+        help="로컬 VitalDB Open .vital 파일 디렉토리 (source=vitaldb 시 API 대신 사용)",
+    )
+    parser.add_argument(
         "--signal-types",
         nargs="+",
         default=["ecg", "abp", "ppg", "cvp", "co2", "resp_impedance", "icp", "pap"],
@@ -852,6 +862,7 @@ def main() -> None:
         out_dir=args.out_dir,
         manifest_path=args.manifest,
         data_dir=args.data_dir,
+        vital_dir=args.vital_dir,
         signal_dtype=dtype_map(args.signal_dtype),
         chunk_windows=args.chunk_windows,
         n_folds=args.n_folds,

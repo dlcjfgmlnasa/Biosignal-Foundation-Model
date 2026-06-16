@@ -15,6 +15,7 @@ VitalDB 뒤쪽 케이스를 pilot test 전용으로 사용한다.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 
@@ -101,6 +102,7 @@ def load_pilot_cases(
     n_cases: int = 50,
     offset_from_end: int = 0,
     signal_types: list[str] | None = None,
+    vital_dir: str | None = None,
 ) -> list[CaseData]:
     """VitalDB 뒤쪽 케이스 N개를 로드하여 파이프라인 필터링 후 반환한다.
 
@@ -123,7 +125,13 @@ def load_pilot_cases(
     if signal_types is None:
         signal_types = ["ecg", "abp", "ppg", "cvp"]
 
-    # ECG가 있는 케이스를 기준으로 전체 목록 구성
+    # 로컬 VitalDB Open .vital 파일 우선 (API 미사용 — 사내망 차단 환경)
+    if vital_dir is not None:
+        return _load_local_vital_cases(
+            vital_dir, n_cases, offset_from_end, signal_types
+        )
+
+    # ECG가 있는 케이스를 기준으로 전체 목록 구성 (VitalDB API)
     all_cases = sorted(vitaldb.find_cases(["SNUADC/ECG_II"]))
     total = len(all_cases)
 
@@ -183,6 +191,75 @@ def _load_single_case(
             case.tracks[stype_key] = processed
 
     return case
+
+
+def _load_local_vital_cases(
+    vital_dir: str,
+    n_cases: int,
+    offset_from_end: int,
+    signal_types: list[str],
+) -> list[CaseData]:
+    """로컬 VitalDB Open ``.vital`` 파일에서 케이스를 로드한다 (API 미사용).
+
+    ``vitaldb.VitalFile(path).to_numpy([track], interval)`` 로 트랙을 읽어,
+    API 경로(``_load_single_case``)와 동일한 파이프라인/출력 규약을 따른다.
+    """
+    import vitaldb
+
+    files = sorted(Path(vital_dir).glob("*.vital"))
+    total = len(files)
+    if total == 0:
+        print(f"ERROR: no .vital files in {vital_dir}")
+        return []
+
+    start_idx = max(0, total - offset_from_end - n_cases)
+    end_idx = max(0, total - offset_from_end)
+    selected = files[start_idx:end_idx]
+    print(f"Local .vital files: {len(selected)}/{total} (dir={vital_dir})")
+
+    results: list[CaseData] = []
+    for vp in selected:
+        case = CaseData(case_id=vp.stem)
+        try:
+            vf = vitaldb.VitalFile(str(vp))
+            avail = set(vf.get_track_names())
+        except Exception as e:  # noqa: BLE001 — 손상 파일 스킵
+            print(f"  skip {vp.name}: {e}")
+            continue
+
+        for stype_key in signal_types:
+            if stype_key not in PREFERRED_TRACKS:
+                continue
+            native_sr = NATIVE_SR.get(stype_key, 500.0)
+            cfg = SIGNAL_CONFIGS.get(stype_key)
+            if cfg is None:
+                continue
+
+            data = None
+            for track_name in PREFERRED_TRACKS[stype_key]:
+                if track_name not in avail:
+                    continue
+                try:
+                    raw = vf.to_numpy([track_name], 1.0 / native_sr)  # (n, 1)
+                    if raw is not None and len(raw) > 0:
+                        col = raw[:, 0].flatten()
+                        if (~np.isnan(col)).sum() > int(60 * native_sr):
+                            data = col
+                            break
+                except Exception:  # noqa: BLE001
+                    continue
+
+            if data is None:
+                continue
+            processed = _apply_full_pipeline(data, stype_key, cfg, native_sr)
+            if processed is not None and len(processed) >= int(10 * TARGET_SR):
+                case.tracks[stype_key] = processed
+
+        if case.tracks:
+            results.append(case)
+
+    print(f"Loaded {len(results)}/{len(selected)} cases with data")
+    return results
 
 
 def _apply_full_pipeline(

@@ -135,6 +135,7 @@ def _load_vitaldb_signal(
     n_cases: int,
     signal_type: str,
     offset_from_end: int = 200,
+    vital_dir: str | None = None,
 ) -> list[dict]:
     """VitalDB에서 단일 signal type 의 연속 waveform 을 로드한다.
 
@@ -154,6 +155,7 @@ def _load_vitaldb_signal(
         n_cases=n_cases,
         offset_from_end=offset_from_end,
         signal_types=[signal_type],
+        vital_dir=vital_dir,
     )
 
     min_samples = int(60 * TARGET_SR)
@@ -569,6 +571,7 @@ def prepare_forecasting(
     chunk_windows: int = 2000,
     n_folds: int = 1,
     seed: int = 42,
+    vital_dir: str | None = None,
 ) -> list[Path]:
     # "all"이면 모든 signal type에 대해 반복
     if signal_type == "all":
@@ -589,7 +592,7 @@ def prepare_forecasting(
         if source == "mimic3":
             cases = _load_mimic3_signal(n_cases, stype)
         elif source == "vitaldb":
-            cases = _load_vitaldb_signal(n_cases, stype)
+            cases = _load_vitaldb_signal(n_cases, stype, vital_dir=vital_dir)
         else:
             print(f"ERROR: Unknown source '{source}'", file=sys.stderr)
             continue
@@ -788,6 +791,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Vital Sign Forecasting - Data Preparation",
     )
+    parser.add_argument("--vital-dir", type=str, default=None,
+                        help="로컬 VitalDB Open .vital 디렉토리 (source=vitaldb 시 API 대신 사용)")
     parser.add_argument("--source", type=str, default="mimic3",
                         choices=["mimic3", "vitaldb"],
                         help="Data source. vitaldb 는 single-input 만 지원 "
@@ -873,6 +878,7 @@ def main() -> None:
             train_ratio=args.train_ratio,
             out_dir=args.out_dir,
             visualize=args.visualize,
+            vital_dir=args.vital_dir,
             signal_dtype=sig_dtype,
             chunk_windows=args.chunk_windows,
             n_folds=args.n_folds,
