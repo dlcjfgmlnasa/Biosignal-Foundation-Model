@@ -295,7 +295,8 @@ def _apply_full_pipeline(
         return None
 
     # 가장 긴 세그먼트 선택
-    segment = max(segments, key=len)
+    # segments: list of (start_sample, segment_array) — 배열만 꺼낸다.
+    _, segment = max(segments, key=lambda s: len(s[1]))
 
     # Step 4: Median -> Notch -> Filter
     if cfg.median_kernel > 0:
