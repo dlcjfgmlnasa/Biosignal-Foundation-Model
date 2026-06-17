@@ -13,6 +13,7 @@ Patient-level aggregation task (Mortality / Sepsis)는 별도 경로
 """
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
@@ -74,29 +75,191 @@ def _multi_window_to_samples(
     return samples
 
 
+def _needed_length(samples: list[BiosignalSample], patch_size: int) -> int:
+    """이 윈도우의 모든 신호를 패치 정렬해 이어 붙였을 때 필요한 길이.
+
+    PackCollate 는 각 variate 의 seg_len 을 ``patch_size`` 배수로 FLOOR 한 뒤
+    이어 붙이므로(앞 trim 은 start_sample=win_start=0 이라 0), 윈도우 전체를
+    담는 데 필요한 폭은 floor 합과 같다. 최소 1 패치는 보장한다.
+    """
+    total = 0
+    for s in samples:
+        n = int(s.values.shape[0])
+        total += (n // patch_size) * patch_size
+    return max(total, patch_size)
+
+
+def _zero_row(
+    max_length: int,
+    patch_size: int,
+    signal_type: int,
+    rate: float,
+) -> PackedBatch:
+    """신호가 너무 짧아 1 패치도 못 만드는 (사실상 발생하지 않는) 윈도우용 폴백.
+
+    라벨 정렬을 유지하기 위해 1 개의 zero variate(1 패치) 로 구성된 단일 행을
+    만든다. extract_features 의 mean-pool 은 patch_mask 가 거의 비어 0 feature 를
+    돌려주므로 학습에 해를 주지 않는 degenerate sample 이 된다.
+    """
+    values = torch.zeros(1, max_length)
+    sample_id = torch.zeros(1, max_length, dtype=torch.long)
+    variate_id = torch.zeros(1, max_length, dtype=torch.long)
+    sample_id[0, :patch_size] = 1
+    variate_id[0, :patch_size] = 1
+    return PackedBatch(
+        values=values,
+        sample_id=sample_id,
+        variate_id=variate_id,
+        lengths=torch.tensor([patch_size], dtype=torch.long),
+        sampling_rates=torch.tensor([rate], dtype=torch.float32),
+        signal_types=torch.tensor([signal_type], dtype=torch.long),
+        spatial_ids=torch.tensor([0], dtype=torch.long),
+        padded_lengths=torch.tensor([patch_size], dtype=torch.long),
+        start_samples=torch.tensor([0], dtype=torch.long),
+    )
+
+
+def _collate_one_window(
+    collate: PackCollate,
+    samples: list[BiosignalSample],
+    patch_size: int,
+    max_length: int,
+) -> PackedBatch:
+    """한 윈도우의 신호들을 정확히 1 행(B=1)으로 collate 한다.
+
+    한 윈도우의 모든 신호는 같은 ``session_id`` → 같은 그룹 → 하나의 PackUnit →
+    하나의 FFD bin 으로 묶이므로 n_rows==1 이 보장된다(any_variate/ci 동일).
+    multi-tier truncate 가 모든 variate 를 버리는 극단(모든 신호 < 10s)에서만
+    0 행이 나오므로, 그 경우 zero-row 폴백으로 1 행을 보장한다.
+    """
+    pb = collate(samples)
+    if pb.values.shape[0] == 1:
+        return pb
+    if pb.values.shape[0] == 0:
+        st = samples[0].signal_type if samples else 0
+        rate = samples[0].sampling_rate if samples else DEFAULT_SR
+        return _zero_row(collate.max_length, patch_size, st, rate)
+    # 단일 윈도우는 구조상 >1 행이 될 수 없으나, 방어적으로 첫 행만 사용.
+    return PackedBatch(
+        values=pb.values[:1],
+        sample_id=pb.sample_id[:1],
+        variate_id=pb.variate_id[:1],
+        lengths=pb.lengths,
+        sampling_rates=pb.sampling_rates,
+        signal_types=pb.signal_types,
+        spatial_ids=pb.spatial_ids,
+        padded_lengths=pb.padded_lengths,
+        start_samples=pb.start_samples,
+    )
+
+
+def _stack_rows(rows: list[PackedBatch]) -> PackedBatch:
+    """행마다 B=1 인 PackedBatch 들을 (n_windows, max_length) 로 쌓는다.
+
+    각 행은 같은 ``max_length`` 폭을 갖는다(collate 가 항상 그 폭으로 할당).
+    per-variate 평탄 배열은 행 순서대로 concat → PackCollate 가 멀티-행을 직접
+    만들 때와 **동일한 row-major 구조**가 되어 모델 forward 가 그대로 처리한다.
+    행 i == window i == label i 로 정렬이 보장된다.
+    """
+    has_padded = rows[0].padded_lengths is not None
+    has_starts = rows[0].start_samples is not None
+    return PackedBatch(
+        values=torch.cat([r.values for r in rows], dim=0),
+        sample_id=torch.cat([r.sample_id for r in rows], dim=0),
+        variate_id=torch.cat([r.variate_id for r in rows], dim=0),
+        lengths=torch.cat([r.lengths for r in rows], dim=0),
+        sampling_rates=torch.cat([r.sampling_rates for r in rows], dim=0),
+        signal_types=torch.cat([r.signal_types for r in rows], dim=0),
+        spatial_ids=torch.cat([r.spatial_ids for r in rows], dim=0),
+        padded_lengths=(
+            torch.cat([r.padded_lengths for r in rows], dim=0)
+            if has_padded else None
+        ),
+        start_samples=(
+            torch.cat([r.start_samples for r in rows], dim=0)
+            if has_starts else None
+        ),
+    )
+
+
+def make_window_batches(
+    windows: list,
+    batch_size: int,
+    patch_size: int,
+    to_samples: Callable[[object, int], list[BiosignalSample]],
+    get_label: Callable[[object], float],
+    label_dtype: torch.dtype = torch.float32,
+) -> list[tuple[PackedBatch, torch.Tensor]]:
+    """윈도우 분류용 (batch, labels) 리스트 — **윈도우당 1 행** 보장.
+
+    버그 수정(2026-06-17): 기존 구현은 batch_size 개 윈도우의 모든 신호를 한 번에
+    PackCollate(FFD bin-packing) 로 묶어, 여러 윈도우가 1 개 pack 행으로 합쳐졌다.
+    그러면 ``extract_features`` 가 행 단위 mean-pool 을 해 B(행 수) ≠ n_windows 가
+    되어 logits 와 labels 크기가 어긋났다(예: input [1,1] vs target [8,1]).
+
+    수정: 각 윈도우를 **개별 collate** 해 정확히 1 행을 얻고, 그 행들을 batch 차원
+    으로 쌓는다. 결과 PackedBatch 는 FFD 가 윈도우당 1 bin 을 배치했을 때와 구조가
+    동일하므로 사전학습 모델 forward 의미는 불변이고, 행 i == window i == label i 로
+    per-window 풀링·정렬이 자동 보장된다(linear_probe / lora 양 경로 공통).
+
+    Parameters
+    ----------
+    windows:
+        윈도우 객체 리스트(MultiSignalWindow 또는 dict 등 task 별 표현).
+    to_samples:
+        ``(window, idx) -> list[BiosignalSample]`` 변환 콜백(task 별 신호 매핑 보존).
+    get_label:
+        ``window -> float`` 라벨 추출 콜백.
+    """
+    multi = any(len(to_samples(w, i)) > 1 for i, w in enumerate(windows)) \
+        if windows else False
+    collate_mode = "any_variate" if multi else "ci"
+
+    batches: list[tuple[PackedBatch, torch.Tensor]] = []
+    for i in range(0, len(windows), batch_size):
+        chunk = windows[i : i + batch_size]
+        chunk_samples = [to_samples(w, i + j) for j, w in enumerate(chunk)]
+
+        # chunk 내 모든 윈도우를 담을 수 있는 공통 폭(가장 큰 윈도우 기준).
+        # 같은 max_length 로 윈도우별 collate → 모든 행 폭 동일 → 그대로 stack.
+        max_length = max(
+            (_needed_length(s, patch_size) for s in chunk_samples),
+            default=patch_size,
+        )
+        collate = PackCollate(
+            max_length=max_length,
+            collate_mode=collate_mode,
+            patch_size=patch_size,
+        )
+
+        rows = [
+            _collate_one_window(collate, s, patch_size, max_length)
+            for s in chunk_samples
+        ]
+        batch = _stack_rows(rows)
+        labels = torch.tensor([get_label(w) for w in chunk], dtype=label_dtype)
+        batches.append((batch, labels))
+    return batches
+
+
 def make_batches(
     windows: list[MultiSignalWindow],
     batch_size: int,
     patch_size: int,
     max_length: int,
 ) -> list[tuple[PackedBatch, torch.Tensor]]:
-    """(batch, labels) 리스트 생성. 다중 신호는 any_variate collate."""
-    multi = any(len(w.signals) > 1 for w in windows)
-    collate_mode = "any_variate" if multi else "ci"
-    collate = PackCollate(
-        max_length=max_length, collate_mode=collate_mode, patch_size=patch_size
-    )
+    """(batch, labels) 리스트 생성 — 윈도우당 1 행.
 
-    batches = []
-    for i in range(0, len(windows), batch_size):
-        chunk = windows[i : i + batch_size]
-        all_samples = []
-        for j, mw in enumerate(chunk):
-            all_samples.extend(_multi_window_to_samples(mw, idx=i + j))
-        labels = torch.tensor([mw.label for mw in chunk], dtype=torch.float32)
-        batch = collate(all_samples)
-        batches.append((batch, labels))
-    return batches
+    ``max_length`` 는 하위 호환을 위해 시그니처에 남기지만 실제 폭은 윈도우별로
+    자동 계산한다(아래 ``make_window_batches`` 참조).
+    """
+    return make_window_batches(
+        windows,
+        batch_size,
+        patch_size,
+        to_samples=_multi_window_to_samples,
+        get_label=lambda w: w.label,
+    )
 
 
 class DummyFeatureExtractor:

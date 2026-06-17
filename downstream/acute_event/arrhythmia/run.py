@@ -32,7 +32,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from data.collate import PackCollate, PackedBatch
+from data.collate import PackedBatch
 from data.dataset import BiosignalSample
 from data.spatial_map import get_global_spatial_id
 from data.parser.vitaldb import SIGNAL_TYPES
@@ -43,6 +43,7 @@ from downstream.metrics import (
     compute_sensitivity_specificity,
 )
 from downstream.model_wrapper import LinearProbe
+from downstream.window_task import make_window_batches
 from downstream._eval_utils import dump_fold_predictions
 
 # ── 설정 ──────────────────────────────────────────────────────
@@ -94,22 +95,17 @@ def _make_batches(
     patch_size: int,
     max_length: int,
 ) -> list[tuple[PackedBatch, torch.Tensor]]:
-    multi = any(len(w.signals) > 1 for w in windows)
-    collate_mode = "any_variate" if multi else "ci"
-    collate = PackCollate(
-        max_length=max_length, collate_mode=collate_mode, patch_size=patch_size
+    # 버그 수정(2026-06-17): 윈도우당 1 행 보장(공유 헬퍼 위임). 예전엔 batch 의
+    # 여러 윈도우가 1 pack 행으로 합쳐져 extract_features 가 B≠n_windows 를 냈다.
+    # arrhythmia 는 multi-class → labels 는 long 유지(label_dtype).
+    return make_window_batches(
+        windows,
+        batch_size,
+        patch_size,
+        to_samples=_multi_window_to_samples,
+        get_label=lambda w: w.label,
+        label_dtype=torch.long,
     )
-
-    batches = []
-    for i in range(0, len(windows), batch_size):
-        chunk = windows[i : i + batch_size]
-        all_samples = []
-        for j, mw in enumerate(chunk):
-            all_samples.extend(_multi_window_to_samples(mw, idx=i + j))
-        labels = torch.tensor([mw.label for mw in chunk], dtype=torch.long)
-        batch = collate(all_samples)
-        batches.append((batch, labels))
-    return batches
 
 
 # ── 더미 feature 추출기 ──────────────────────────────────────

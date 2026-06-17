@@ -29,7 +29,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from data.collate import PackCollate, PackedBatch
+from data.collate import PackedBatch
 from data.dataset import BiosignalSample
 from data.spatial_map import SIGNAL_KEY_TO_TYPE, get_global_spatial_id
 
@@ -41,6 +41,7 @@ from downstream.metrics import (
 )
 from downstream.viz import plot_roc_curve
 from downstream.model_wrapper import LinearProbe
+from downstream.window_task import make_window_batches
 from downstream._eval_utils import dump_fold_predictions
 from downstream._save_utils import load_prepared_split_chunked
 
@@ -87,22 +88,15 @@ def _make_batches(
     patch_size: int,
     max_length: int,
 ) -> list[tuple[PackedBatch, torch.Tensor]]:
-    multi = any(len(w["signals"]) > 1 for w in windows)
-    collate_mode = "any_variate" if multi else "ci"
-    collate = PackCollate(
-        max_length=max_length, collate_mode=collate_mode, patch_size=patch_size
+    # 버그 수정(2026-06-17): 윈도우당 1 행 보장(공유 헬퍼 위임). 예전엔 batch 의
+    # 여러 윈도우가 1 pack 행으로 합쳐져 extract_features 가 B≠n_windows 를 냈다.
+    return make_window_batches(
+        windows,
+        batch_size,
+        patch_size,
+        to_samples=lambda w, idx: _make_samples(w["signals"], idx),
+        get_label=lambda w: w["label"],
     )
-
-    batches = []
-    for i in range(0, len(windows), batch_size):
-        chunk = windows[i: i + batch_size]
-        all_samples = []
-        for j, w in enumerate(chunk):
-            all_samples.extend(_make_samples(w["signals"], idx=i + j))
-        labels = torch.tensor([w["label"] for w in chunk], dtype=torch.float32)
-        batch = collate(all_samples)
-        batches.append((batch, labels))
-    return batches
 
 
 # ── Mean pooling ─────────────────────────────────────────────
