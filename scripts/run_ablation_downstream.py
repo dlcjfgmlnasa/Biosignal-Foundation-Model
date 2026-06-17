@@ -74,6 +74,7 @@ from __future__ import annotations
 import argparse
 import copy
 import os
+import re
 import subprocess
 import sys
 import time
@@ -95,6 +96,20 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 def load_yaml(path: Path) -> dict:
     with open(path, encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
+
+
+_ENV_PAT = re.compile(r"\$\{env:([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def expand_env(value: Any) -> Any:
+    """문자열 내 ``${env:VAR}`` 를 os.environ[VAR] 로 치환. 미설정 시 원본 유지.
+
+    downstream_tasks.yaml 의 data_path 는 ``${env:DOWNSTREAM_DATA_ROOT}/...``
+    형태이며, runner 가 실행 환경의 env 로 치환한다. 비문자열은 그대로 통과.
+    """
+    if not isinstance(value, str):
+        return value
+    return _ENV_PAT.sub(lambda m: os.environ.get(m.group(1), m.group(0)), value)
 
 
 def normalize_variants(doc: dict) -> list[dict]:
@@ -145,6 +160,21 @@ def _find_variant(all_variants: list[dict], name: str) -> dict:
     raise KeyError(f"variant not found: {name}")
 
 
+def _resolve_best_ckpt(ckpt_dir: Path) -> Path:
+    """``checkpoints/`` 에서 최신 ``*_best.pt`` 를 반환. 없으면 ``best.pt`` placeholder.
+
+    사전학습(train_utils.save_training_checkpoint)은
+    ``checkpoint_{phase}_epoch{NNN}_best.pt`` 형식으로 저장하므로 단일 ``best.pt``
+    가 아닌 glob 매칭이 필요하다 (run_ablation.py:ckpt_path_for_exp 와 동일 규약).
+    파일이 없으면 placeholder 를 반환해 preflight 가 .exists()=False 로 잡도록 한다.
+    """
+    if ckpt_dir.is_dir():
+        cands = sorted(ckpt_dir.glob("*_best.pt"))
+        if cands:
+            return cands[-1]
+    return ckpt_dir / "best.pt"  # placeholder (preflight 에서 missing 처리)
+
+
 def resolve_ckpt_path(
     variant: dict,
     all_variants: list[dict],
@@ -162,7 +192,7 @@ def resolve_ckpt_path(
 
     if not run_phase2:
         exp = _resolve_phase1_exp_name(variant, all_variants)
-        return ckpt_root / exp / "checkpoints" / "best.pt"
+        return _resolve_best_ckpt(ckpt_root / exp / "checkpoints")
 
     p2 = variant.get("phase2", {}) or {}
     reuse = p2.get("reuse")
@@ -171,7 +201,7 @@ def resolve_ckpt_path(
         return resolve_ckpt_path(referent, all_variants, ckpt_root)
 
     exp = _exp_name_of(variant, "phase2", f"ablation_{name}_p2")
-    return ckpt_root / exp / "checkpoints" / "best.pt"
+    return _resolve_best_ckpt(ckpt_root / exp / "checkpoints")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -195,10 +225,46 @@ class Cell:
     epochs: int | None = None
     lr: float | None = None
     batch_size: int | None = None
+    patch_size: int | None = None
     omit_flags: set[str] = field(default_factory=set)
 
     def key(self) -> str:
         return f"{self.variant}/{self.task}/{self.mode}/fold{self.fold}"
+
+
+def _resolve_per_mode(value: Any, mode: str) -> Any:
+    """value 가 ``{mode: scalar}`` dict 면 mode 키로 풀고, 아니면 그대로 반환.
+
+    downstream_tasks.yaml 의 ``epochs``/``lr`` 는
+    ``{linear_probe: .., lora: ..}`` per-mode dict 일 수 있다. runner 는 cell 의
+    mode 에 해당하는 스칼라만 argv 로 넘겨야 한다 (C1 fix). dict 인데 mode 키가
+    없으면 None (해당 flag skip).
+    """
+    if isinstance(value, dict):
+        return value.get(mode)
+    return value
+
+
+# downstream_tasks.yaml 의 ``no_<x>_arg`` 힌트 → omit 할 CLI flag 집합 (W2 fix).
+# runner 가 자동 주입하는 flag 중 일부 task(특히 forecasting eval-only)가
+# 지원하지 않는 것을 차단한다. extra_args 는 omit 대상이 아니다.
+_NO_ARG_HINT_TO_FLAGS: dict[str, tuple[str, ...]] = {
+    "no_mode_arg": ("mode",),
+    "no_fold_arg": ("fold", "n-folds"),
+    "no_lora_arg": ("lora-rank", "lora-alpha"),
+    "no_epochs_arg": ("epochs", "lr"),
+    "no_batch_arg": ("batch-size",),
+    "no_patch_arg": ("patch-size",),
+}
+
+
+def _omit_flags_for_task(t: dict) -> set[str]:
+    """task 의 명시 ``omit_flags`` + ``no_<x>_arg`` 힌트를 합쳐 omit 집합 구성."""
+    omit = set(t.get("omit_flags", []) or [])
+    for hint, flags in _NO_ARG_HINT_TO_FLAGS.items():
+        if t.get(hint):
+            omit.update(flags)
+    return omit
 
 
 def _filter_tasks(
@@ -268,6 +334,14 @@ def build_cells(
             n_folds = int(t.get("n_folds", default_n_folds))
             folds = list(range(n_folds)) if fold_filter is None else list(fold_filter)
 
+            omit = _omit_flags_for_task(t)
+            # eval_only task(예: forecasting)는 fold/mode loop 없이 1회만 실행.
+            # mode/fold flag 는 omit 되며, out_dir 충돌·중복 실행을 피하기 위해
+            # 단일 (mode[0], fold[0]) cell 로 축약한다.
+            if t.get("eval_only"):
+                modes = modes[:1]
+                folds = folds[:1]
+
             for mode in modes:
                 for fold in folds:
                     out_dir = (
@@ -283,13 +357,18 @@ def build_cells(
                             fold=fold,
                             n_folds=n_folds,
                             ckpt=ckpt,
-                            data_path=t.get("data_path"),
+                            data_path=expand_env(t.get("data_path")),
                             out_dir=out_dir,
                             extra_args=t.get("extra_args", {}) or {},
-                            epochs=t.get("epochs", defaults.get("epochs")),
-                            lr=t.get("lr", defaults.get("lr")),
+                            # epochs/lr 는 per-mode dict 일 수 있어 mode 로 resolve (C1).
+                            epochs=_resolve_per_mode(
+                                t.get("epochs", defaults.get("epochs")), mode),
+                            lr=_resolve_per_mode(
+                                t.get("lr", defaults.get("lr")), mode),
                             batch_size=t.get("batch_size", defaults.get("batch_size")),
-                            omit_flags=set(t.get("omit_flags", []) or []),
+                            # patch_size 를 명시 전달해 encoder ckpt patch 와 정렬 (W1).
+                            patch_size=t.get("patch_size", defaults.get("patch_size")),
+                            omit_flags=omit,
                         )
                     )
     return cells
@@ -349,6 +428,8 @@ def build_cell_cmd(cell: Cell) -> list[str]:
         _add("lr", cell.lr)
     if cell.batch_size is not None:
         _add("batch-size", cell.batch_size)
+    if cell.patch_size is not None:
+        _add("patch-size", cell.patch_size)
     for k, v in cell.extra_args.items():
         _append_kv(cmd, k, v)   # extra_args bypass omit (의도된 명시 인자)
     return cmd
@@ -357,6 +438,22 @@ def build_cell_cmd(cell: Cell) -> list[str]:
 # ──────────────────────────────────────────────────────────────────────────────
 # Pre-flight checks
 # ──────────────────────────────────────────────────────────────────────────────
+
+
+def _data_present(data_path: str) -> bool:
+    """data_path 가 그대로 존재하거나, prefix 로서 매칭되는 파일이 있으면 True.
+
+    hypotension/mortality/ich 의 data_path 는 ``_fold{k}_{split}[_chunk{c}].pt``
+    suffix 가 붙기 전 prefix 이므로 정확한 .exists() 가 아닌 glob 매칭이 필요하다.
+    forecasting 은 완전한 .pt 경로라 .exists() 로 처리된다.
+    """
+    p = Path(data_path)
+    if p.exists():
+        return True
+    parent = p.parent
+    if not parent.is_dir():
+        return False
+    return any(parent.glob(p.name + "*"))
 
 
 def preflight(cells: list[Cell], strict: bool) -> list[str]:
@@ -370,7 +467,7 @@ def preflight(cells: list[Cell], strict: bool) -> list[str]:
         if not seen_ckpt[c.ckpt]:
             issues.append(f"[ckpt-missing] variant={c.variant} → {c.ckpt}")
         if c.data_path is not None and c.data_path not in seen_data:
-            seen_data[c.data_path] = Path(c.data_path).exists()
+            seen_data[c.data_path] = _data_present(c.data_path)
         if c.data_path is not None and not seen_data[c.data_path]:
             issues.append(f"[data-missing]  task={c.task}   → {c.data_path}")
     # dedup
@@ -444,8 +541,12 @@ def _parse_args() -> argparse.Namespace:
                    default=REPO_ROOT / "configs" / "ablation" / "variants.yaml")
     p.add_argument("--tasks-yaml", type=Path,
                    default=REPO_ROOT / "configs" / "ablation" / "downstream_tasks.yaml")
+    # 사전학습(run_ablation.py)의 OUTPUT_ROOT 와 동일 위치를 가리켜야 ckpt 를 찾는다.
+    # ABLATION_OUTPUT_ROOT env 가 있으면 우선 사용 (pretraining 과 동일 규약),
+    # 없으면 repo 내 outputs/ablation 으로 fallback.
     p.add_argument("--ckpt-root", type=Path,
-                   default=REPO_ROOT / "outputs" / "ablation")
+                   default=Path(os.environ.get(
+                       "ABLATION_OUTPUT_ROOT", str(REPO_ROOT / "outputs" / "ablation"))))
     p.add_argument("--result-root", type=Path,
                    default=REPO_ROOT / "result" / "ablation")
 
