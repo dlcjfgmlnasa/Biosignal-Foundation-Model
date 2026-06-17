@@ -42,6 +42,7 @@ from downstream.metrics import (
 from downstream.viz import plot_roc_curve
 from downstream.model_wrapper import LinearProbe
 from downstream._eval_utils import dump_fold_predictions
+from downstream._save_utils import load_prepared_split_chunked
 
 
 DEFAULT_PATCH_SIZE = 100
@@ -245,12 +246,15 @@ def _compute_metrics(y_true, y_score):
 
 
 def _load_data(args):
-    if not args.data_path or not Path(args.data_path).exists():
+    if not args.data_path:
         print("ERROR: --data-path required", file=sys.stderr)
         sys.exit(1)
 
-    print(f"\nLoading data: {args.data_path}")
-    data = torch.load(args.data_path, weights_only=False)
+    # data_path 는 단일 통합 .pt (back-compat) 또는 per-(fold,split)[_chunk]
+    # prefix 묶음 (ablation runner). n_folds>1 이면 해당 fold 의 chunk 만 로드.
+    load_fold = int(args.fold) if int(args.n_folds) > 1 else None
+    print(f"\nLoading data: {args.data_path} (fold={load_fold})")
+    data = load_prepared_split_chunked(args.data_path, fold=load_fold)
     meta = data.get("metadata", {})
     print(f"  Task: {meta.get('task', '?')}")
     print(f"  Signals: {meta.get('input_signals', '?')}")

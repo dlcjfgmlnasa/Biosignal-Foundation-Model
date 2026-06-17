@@ -311,6 +311,85 @@ def load_prepared_chunked(
     return out
 
 
+def load_prepared_split_chunked(
+    data_path: str | Path,
+    fold: int | None = None,
+    splits: Iterable[str] = ("train", "val", "test"),
+) -> dict:
+    """분류 prepare_data 의 per-(fold,split)[_chunk] 산출물을 통일 dict 로 로드.
+
+    분류 task(hypotension/mortality/ich)의 ``save_split_dataset`` 은 split 마다
+    ``{"split": str, "data": <split_payload>, "metadata": {...}}`` 형태로 따로
+    저장한다 (forecast 의 flat 텐서와 달리 실제 payload 가 ``"data"`` 로 한 겹
+    wrap 된다). 이 함수는 ``"data"`` 를 벗기고 같은 (fold, split) 의 모든 chunk 를
+    concat 하여, 기존 run.py 가 기대하는::
+
+        {"train": <payload>, ["val": <payload>,] "test": <payload>, "metadata": {...}}
+
+    형태로 돌려준다.
+
+    payload 는 task 에 따라 dict (hypotension/ich: ``signals``/``labels``/... 키) 또는
+    list (mortality: patient dict 리스트) 일 수 있으며, 양쪽 모두 :func:`_concat_values`
+    로 dim0/extend concat 된다.
+
+    Back-compat
+    -----------
+    ``data_path`` 가 실제 .pt 파일이면 (prefix 가 아니라 통합 산출물이면) 그대로
+    ``torch.load`` 하여 반환한다 — 기존 단일파일 경로 무수정.
+
+    Parameters
+    ----------
+    fold : int | None
+        None  → 비-fold glob ``<base>_<split>*.pt`` (+ 단일파일 back-compat).
+        int K → fold glob ``<base>_fold{K}_<split>*.pt`` 만 로드 (K-fold CV).
+    splits : Iterable[str]
+        탐색할 split 이름들. 존재하지 않는 split (예: val 없는 legacy) 은 건너뛴다.
+    """
+    p = Path(data_path)
+
+    # 1) 실제 파일이면 단일 통합 산출물 — 그대로 로드 (back-compat).
+    if p.is_file():
+        return torch.load(p, weights_only=False)
+    if fold is None and p.suffix != ".pt":
+        single = p.with_suffix(".pt")
+        if single.is_file():
+            return torch.load(single, weights_only=False)
+
+    # 2) prefix 모드: <base>[_fold{K}]_<split>*.pt 를 split 별로 glob → concat.
+    base = p.name[:-3] if p.name.endswith(".pt") else p.name
+    parent = p.parent if str(p.parent) else Path(".")
+    prefix = base if fold is None else f"{base}_fold{int(fold)}"
+
+    out: dict[str, Any] = {}
+    metadata: dict[str, Any] | None = None
+    for split_name in splits:
+        files = sorted(parent.glob(f"{prefix}_{split_name}*.pt"))
+        if not files:
+            continue
+        payloads: list[Any] = []
+        for f in files:
+            ck = torch.load(f, weights_only=False)
+            if metadata is None and isinstance(ck.get("metadata"), dict):
+                metadata = dict(ck["metadata"])
+            # split payload 는 "data" 로 wrap 됨. 누락 시 chunk 전체에서 추출.
+            payloads.append(ck["data"] if "data" in ck else ck)
+        out[split_name] = _concat_values(payloads)
+
+    if not out:
+        looked = parent / (prefix + "_<split>*.pt")
+        raise FileNotFoundError(
+            f"No single file or split-chunk files found for: {data_path} "
+            f"(fold={fold}, looked for {looked})"
+        )
+
+    # metadata 정리: chunk 고유 키 제거 (fold_idx/n_folds 는 보존).
+    metadata = metadata or {}
+    for k in ("chunk_idx", "n_windows", "n_samples", "n_patients", "n_dead", "split"):
+        metadata.pop(k, None)
+    out["metadata"] = metadata
+    return out
+
+
 def add_signal_dtype_arg(
     parser, default: str = "float16"
 ) -> Callable[[str], torch.dtype]:

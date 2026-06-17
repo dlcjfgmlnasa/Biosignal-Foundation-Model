@@ -46,6 +46,7 @@ from downstream.metrics import (
 from downstream.viz import plot_roc_curve
 from downstream.model_wrapper import LinearProbe
 from downstream._eval_utils import dump_fold_predictions
+from downstream._save_utils import load_prepared_split_chunked
 
 
 # ── 설정 ──────────────────────────────────────────────────────
@@ -327,9 +328,12 @@ def _load_data(
     20%(patient/case 단위 X — sample 단위)를 dynamic split 하고 ``warnings.warn``
     으로 알린다.
     """
-    if args.data_path and Path(args.data_path).exists():
-        print(f"\nLoading prepared data: {args.data_path}")
-        data = torch.load(args.data_path, weights_only=False)
+    if args.data_path:
+        # data_path 는 단일 통합 .pt (back-compat) 또는 per-(fold,split)[_chunk]
+        # prefix 묶음 (ablation runner). n_folds>1 이면 해당 fold 의 chunk 만 로드.
+        load_fold = int(args.fold) if int(args.n_folds) > 1 else None
+        print(f"\nLoading prepared data: {args.data_path} (fold={load_fold})")
+        data = load_prepared_split_chunked(args.data_path, fold=load_fold)
         meta = data.get("metadata", {})
         print(f"  Task: {meta.get('task', '?')}, Source: {meta.get('source', '?')}")
         print(f"  Input signals: {meta.get('input_signals', '?')}")

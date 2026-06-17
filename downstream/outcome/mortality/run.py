@@ -42,6 +42,7 @@ from downstream.metrics import (
 from downstream.viz import plot_roc_curve
 from downstream.model_wrapper import LinearProbe
 from downstream._eval_utils import dump_fold_predictions
+from downstream._save_utils import load_prepared_split_chunked
 from downstream.aggregator import (
     SIGNAL_TYPE_INT,
     TransformerAggregator,
@@ -203,10 +204,18 @@ def _compute_metrics(y_true, y_score):
 # ── 데이터 로딩 ──────────────────────────────────────────────
 
 
-def _load_data(data_path: str) -> tuple[list[dict], list[dict], dict]:
-    """환자 단위로 그룹핑된 .pt 파일을 로드한다."""
-    print(f"\nLoading data: {data_path}")
-    data = torch.load(data_path, weights_only=False)
+def _load_data(
+    data_path: str, fold: int = 0, n_folds: int = 1,
+) -> tuple[list[dict], list[dict], dict]:
+    """환자 단위로 그룹핑된 .pt 를 로드한다.
+
+    단일 통합 .pt (back-compat) 또는 per-(fold,split)[_chunk] prefix 묶음
+    (ablation runner) 양쪽을 처리한다. n_folds>1 이면 해당 fold 의 chunk 만 로드.
+    chunk 들의 ``data`` (patient dict 리스트) 는 split 별로 extend concat 된다.
+    """
+    load_fold = int(fold) if int(n_folds) > 1 else None
+    print(f"\nLoading data: {data_path} (fold={load_fold})")
+    data = load_prepared_split_chunked(data_path, fold=load_fold)
     meta = data.get("metadata", {})
     print(f"  Task: {meta.get('task', '?')}")
     print(f"  Signals: {meta.get('input_signals', '?')}")
@@ -265,7 +274,9 @@ def main() -> None:
         model.inject_lora(rank=args.lora_rank, alpha=args.lora_alpha)
 
     # ── 데이터 로드 ──
-    train_patients, test_patients, meta = _load_data(args.data_path)
+    train_patients, test_patients, meta = _load_data(
+        args.data_path, args.fold, args.n_folds,
+    )
 
     n_dead_train = sum(1 for p in train_patients if p["mortality"] == 1)
     n_dead_test = sum(1 for p in test_patients if p["mortality"] == 1)
