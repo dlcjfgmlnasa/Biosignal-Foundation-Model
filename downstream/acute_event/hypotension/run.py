@@ -31,6 +31,12 @@ import numpy as np
 import torch
 from torch import nn
 
+try:
+    from tqdm import tqdm
+except ImportError:  # tqdm 미설치 시 no-op 폴백
+    def tqdm(it, **_kwargs):  # type: ignore[no-redef]
+        return it
+
 from data.collate import PackedBatch
 from data.dataset import BiosignalSample
 from data.spatial_map import get_global_spatial_id
@@ -139,6 +145,27 @@ def _mean_pool(
 ) -> torch.Tensor:  # (B, d_model)
     mask_f = patch_mask.unsqueeze(-1).float()  # (B, N, 1)
     return (encoded * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp(min=1.0)
+
+
+@torch.no_grad()
+def _eval_probe_cached(
+    probe: LinearProbe,
+    cached: list[tuple[torch.Tensor, torch.Tensor]],  # [(features(B,d), labels(B,))]
+    device: torch.device,
+) -> dict:
+    """미리 추출된 frozen-encoder feature 로 probe 평가 (linear_probe 전용).
+
+    ``evaluate_linear_probe`` 와 동일 산출(y_true/y_score 포함 metrics)이되,
+    encoder forward 없이 캐시된 feature 만 사용한다.
+    """
+    probe.to(device).eval()
+    all_labels, all_scores = [], []
+    for features, labels in cached:
+        logits = probe(features)
+        probs = torch.sigmoid(logits).squeeze(-1).cpu().numpy()
+        all_labels.append(labels.detach().cpu().numpy())
+        all_scores.append(probs)
+    return _compute_metrics(np.concatenate(all_labels), np.concatenate(all_scores))
 
 
 # ── Linear Probe (encoder frozen) ───────────────────────────
@@ -644,6 +671,29 @@ def main() -> None:
     best_probe_state: dict | None = None
     best_model_state: dict | None = None  # LoRA mode 에서만 저장
 
+    # ── Frozen-encoder feature 캐싱 (linear_probe 전용 최적화) ──
+    # encoder 가 frozen 이라 feature 가 epoch 간 불변 → 1-pass 추출 후 재사용해
+    # epoch 마다 반복되던 encoder forward(≈epochs 배)·per-window collate 를 제거.
+    # lora 는 encoder(LoRA)가 갱신되므로 캐싱 불가 — 기존 경로 유지.
+    cached_train: list[tuple[torch.Tensor, torch.Tensor]] | None = None
+    cached_val: list[tuple[torch.Tensor, torch.Tensor]] | None = None
+    cached_test: list[tuple[torch.Tensor, torch.Tensor]] | None = None
+    if not is_lora:
+        @torch.no_grad()
+        def _cache_feats(batches):
+            out = []
+            for batch, labels in tqdm(
+                batches, desc="cache features", unit="batch", mininterval=0.5,
+            ):
+                feats = model.extract_features(batch, pool="mean").to(device)
+                out.append((feats, labels.to(device)))
+            return out
+
+        print("  Caching frozen-encoder features (1-pass)...")
+        cached_train = _cache_feats(train_batches)
+        cached_val = _cache_feats(val_batches)
+        cached_test = _cache_feats(test_batches)
+
     for epoch in range(args.epochs):
         # ── train one epoch ──
         probe.train()
@@ -651,17 +701,19 @@ def main() -> None:
             model.model.train()
         epoch_loss, n_steps = 0.0, 0
 
-        for batch, labels in train_batches:
+        for step_idx, (batch, labels) in enumerate(train_batches):
             if is_lora:
                 batch = model.batch_to_device(batch)
                 out = model.model(batch, task="masked")
                 features = _mean_pool(out["encoded"], out["patch_mask"])
+                target = labels.to(device).unsqueeze(-1)
             else:
-                with torch.no_grad():
-                    features = model.extract_features(batch, pool="mean").to(device)
+                # frozen-encoder feature 캐시 재사용 (encoder forward 생략)
+                features, cached_labels = cached_train[step_idx]
+                target = cached_labels.unsqueeze(-1)
 
             logits = probe(features)
-            loss = criterion(logits, labels.to(device).unsqueeze(-1))
+            loss = criterion(logits, target)
             optimizer.zero_grad()
             loss.backward()
             if is_lora:
@@ -676,7 +728,10 @@ def main() -> None:
         train_losses.append(avg_loss)
 
         # ── val evaluation ──
-        val_metrics = evaluate_fn(model, probe, val_batches, device)
+        if is_lora:
+            val_metrics = evaluate_fn(model, probe, val_batches, device)
+        else:
+            val_metrics = _eval_probe_cached(probe, cached_val, device)
         val_auroc = float(val_metrics["auroc"])
         val_aurocs.append(val_auroc)
 
@@ -705,7 +760,10 @@ def main() -> None:
             model.model.load_state_dict(best_model_state)
 
     print("\nEvaluating on test set with best-val ckpt...")
-    metrics = evaluate_fn(model, probe, test_batches, device)
+    if is_lora:
+        metrics = evaluate_fn(model, probe, test_batches, device)
+    else:
+        metrics = _eval_probe_cached(probe, cached_test, device)
 
     # ── 결과 출력 ──
     y_true = metrics.pop("y_true")
