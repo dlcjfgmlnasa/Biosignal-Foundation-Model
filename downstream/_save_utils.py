@@ -18,6 +18,12 @@ from typing import Any, Callable, Iterable
 import numpy as np
 import torch
 
+try:
+    from tqdm import tqdm
+except ImportError:  # tqdm 미설치 시 no-op 폴백
+    def tqdm(it, **_kwargs):  # type: ignore[no-redef]
+        return it
+
 
 def stack_arrays_destructive(
     arrs: list[np.ndarray],
@@ -367,7 +373,13 @@ def load_prepared_split_chunked(
         if not files:
             continue
         payloads: list[Any] = []
-        for f in files:
+        # 네트워크 마운트에서 chunk 순차 torch.load 는 분 단위 — 진행률 표시.
+        for f in tqdm(
+            files,
+            desc=f"load {split_name} (fold={fold})",
+            unit="chunk",
+            mininterval=0.5,
+        ):
             ck = torch.load(f, weights_only=False)
             if metadata is None and isinstance(ck.get("metadata"), dict):
                 metadata = dict(ck["metadata"])
