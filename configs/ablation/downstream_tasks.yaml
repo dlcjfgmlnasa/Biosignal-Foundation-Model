@@ -85,9 +85,9 @@ tasks:
   - name: hypotension
     category: acute_event
     module: downstream.acute_event.hypotension.run
-    data_path: "${env:DOWNSTREAM_DATA_ROOT}/hypotension/hypotension_abp_w600s_h5min"
-    # ↑ runner 가 fold suffix + split 을 붙여 prepared .pt 를 찾는다.
-    #   예: ..._fold0_train.pt / ..._fold0_val.pt / ..._fold0_test.pt
+    data_path: "${env:DOWNSTREAM_DATA_ROOT}/hypotension/hypotension_ecg_ppg_abp_w300s_h15min"
+    # ↑ paper canonical (Table: ABP/ECG/PPG, window 5min=300s, horizon 15min).
+    #   run.py 로더가 prefix 에 _fold{k}_{split}*.pt 를 붙여 chunk 를 glob·concat 한다.
     modes: [linear_probe, lora]
     applies_to_groups: [baseline, loss_component, lscnorm, cross_modal,
                         phase_stage, sampling, attn_bias]
@@ -95,10 +95,10 @@ tasks:
       linear_probe: 20         # run.py 기본값
       lora: 20
     extra_args:
-      window-sec: 600.0        # 10 min
+      window-sec: 300.0        # 5 min (paper canonical)
       stride-sec: 60.0
       train-ratio: 0.7
-      input-signals: [abp]     # paper canonical
+      input-signals: [ecg, ppg, abp]   # paper canonical (ABP/ECG/PPG)
       bootstrap-iters: 1000
 
   # ── 2. Mortality Prediction (Outcome) ────────────────────────────
