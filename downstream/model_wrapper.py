@@ -316,8 +316,15 @@ class DownstreamModelWrapper(nn.Module):
         return loss
 
     def batch_to_device(self, batch: PackedBatch) -> PackedBatch:
-        """PackedBatch 텐서를 self.device로 이동한다."""
-        batch.values = batch.values.to(self.device)
+        """PackedBatch 텐서를 self.device로 이동한다.
+
+        ``values`` 는 모델 파라미터 dtype 으로 캐스팅한다. downstream loader 가
+        메모리 절약을 위해 fp16 window 를 유지한 경우(run.py), forward 직전 이
+        지점에서만 모델 dtype 으로 올려 dtype mismatch 를 막는다. 이미 fp32 인
+        batch (PackCollate 기본 출력) 에는 no-op 이라 pretrain/기존 경로 불변.
+        """
+        param_dtype = next(self.model.parameters()).dtype
+        batch.values = batch.values.to(device=self.device, dtype=param_dtype)
         batch.sample_id = batch.sample_id.to(self.device)
         batch.variate_id = batch.variate_id.to(self.device)
         return batch

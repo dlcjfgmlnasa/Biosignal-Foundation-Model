@@ -402,6 +402,69 @@ def load_prepared_split_chunked(
     return out
 
 
+def iter_prepared_split_chunks(
+    data_path: str | Path,
+    fold: int | None,
+    split: str,
+) -> Iterable[dict]:
+    """한 split 의 chunk payload 를 **한 번에 하나씩** yield (스트리밍 로드).
+
+    :func:`load_prepared_split_chunked` 는 split 의 모든 chunk 를 concat 하여
+    split 전체(수십 GB)를 한꺼번에 RAM 에 올린다. 이 제너레이터는 chunk 파일을
+    하나 ``torch.load`` 할 때마다 그 payload(dict) 만 yield 하고, 호출측이 소비 후
+    다음 chunk 로 넘어가게 하여 peak 를 **chunk 1개 분량**으로 제한한다
+    (downstream OOM 회피용 — 학습 결과 불변, 윈도우 순서 보존).
+
+    Back-compat
+    -----------
+    ``data_path`` 가 실제 .pt 파일(단일 통합 산출물)이면 통째로 로드해 해당 split
+    을 1회 yield 한다. split 이 없으면 아무것도 yield 하지 않는다.
+
+    Parameters
+    ----------
+    fold : int | None
+        None  → 비-fold glob ``<base>_<split>*.pt``.
+        int K → fold glob ``<base>_fold{K}_<split>*.pt`` (K-fold CV).
+    split : str
+        "train" / "val" / "test" 중 하나.
+
+    Yields
+    ------
+    payload : dict
+        split chunk 의 실제 payload (``"data"`` wrap 을 벗긴 dict).
+    """
+    p = Path(data_path)
+
+    # 1) 단일 통합 파일 — 그대로 로드 후 해당 split 1회 yield (back-compat).
+    if p.is_file():
+        data = torch.load(p, weights_only=False)
+        if split in data:
+            yield data[split]
+        return
+    if fold is None and p.suffix != ".pt":
+        single = p.with_suffix(".pt")
+        if single.is_file():
+            data = torch.load(single, weights_only=False)
+            if split in data:
+                yield data[split]
+            return
+
+    # 2) prefix 모드: <base>[_fold{K}]_<split>*.pt chunk 를 정렬해 하나씩 yield.
+    base = p.name[:-3] if p.name.endswith(".pt") else p.name
+    parent = p.parent if str(p.parent) else Path(".")
+    prefix = base if fold is None else f"{base}_fold{int(fold)}"
+
+    files = sorted(parent.glob(f"{prefix}_{split}*.pt"))
+    for f in tqdm(
+        files,
+        desc=f"stream {split} (fold={fold})",
+        unit="chunk",
+        mininterval=0.5,
+    ):
+        ck = torch.load(f, weights_only=False)
+        yield ck["data"] if "data" in ck else ck
+
+
 def add_signal_dtype_arg(
     parser, default: str = "float16"
 ) -> Callable[[str], torch.dtype]:
