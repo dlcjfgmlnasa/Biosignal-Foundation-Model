@@ -226,6 +226,7 @@ class Cell:
     lr: float | None = None
     batch_size: int | None = None
     patch_size: int | None = None
+    device: str | None = None
     omit_flags: set[str] = field(default_factory=set)
 
     def key(self) -> str:
@@ -255,6 +256,7 @@ _NO_ARG_HINT_TO_FLAGS: dict[str, tuple[str, ...]] = {
     "no_epochs_arg": ("epochs", "lr"),
     "no_batch_arg": ("batch-size",),
     "no_patch_arg": ("patch-size",),
+    "no_device_arg": ("device",),
 }
 
 
@@ -368,6 +370,9 @@ def build_cells(
                             batch_size=t.get("batch_size", defaults.get("batch_size")),
                             # patch_size 를 명시 전달해 encoder ckpt patch 와 정렬 (W1).
                             patch_size=t.get("patch_size", defaults.get("patch_size")),
+                            # device 미전달 시 run.py 기본 cpu → encoder 가 CPU 에서 도는
+                            # 치명적 저속. defaults.device(=cuda) 를 명시 주입.
+                            device=t.get("device", defaults.get("device")),
                             omit_flags=omit,
                         )
                     )
@@ -430,6 +435,8 @@ def build_cell_cmd(cell: Cell) -> list[str]:
         _add("batch-size", cell.batch_size)
     if cell.patch_size is not None:
         _add("patch-size", cell.patch_size)
+    if cell.device is not None:
+        _add("device", cell.device)
     for k, v in cell.extra_args.items():
         _append_kv(cmd, k, v)   # extra_args bypass omit (의도된 명시 인자)
     return cmd

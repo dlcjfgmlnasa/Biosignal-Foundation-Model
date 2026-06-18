@@ -133,6 +133,7 @@ tasks:
     no_epochs_arg: true        # runner hint: --epochs/--lr 전달 금지
     no_batch_arg: true         # runner hint: --batch-size 전달 금지
     no_patch_arg: true         # runner hint: --patch-size 전달 금지
+    no_device_arg: true        # runner hint: --device 전달 금지 (forecast run.py 미지원)
     extra_args:
       signal-type: ecg         # paper canonical (main); appendix 는 abp/ppg/co2
       target-sec: [10]         # 단일 horizon
