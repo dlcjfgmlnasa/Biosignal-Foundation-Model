@@ -52,7 +52,11 @@ from downstream.metrics import (
 )
 from downstream.viz import plot_roc_curve
 from downstream.model_wrapper import LinearProbe
-from downstream.window_task import make_window_batches
+from downstream.window_task import (
+    infer_collate_mode,
+    iter_window_batches,
+    make_window_batches,
+)
 from downstream._eval_utils import dump_fold_predictions
 from downstream._save_utils import (
     iter_prepared_split_chunks,
@@ -471,6 +475,120 @@ def _stream_split_features(
     }
 
 
+# ── lora on-the-fly 배칭 (host-RAM OOM 회피) ─────────────────
+#
+# linear_probe 는 frozen-encoder feature 를 1회 추출·캐싱하면 epoch 간 불변이라
+# 위 스트리밍 caching 으로 충분하다. 그러나 lora 는 encoder(LoRA adapter)가 매
+# epoch 갱신되므로 feature 캐싱이 불가능 — 매 epoch 실제 window 로 forward 해야
+# 한다. 예전 lora 경로는 fold 전체 batch 를 fp32 padded 로 **미리** 빌드해
+# (~150 GB) OOM 을 냈다. 아래 헬퍼는 fp16 window 만 보유하고 batch 를 epoch 마다
+# on-the-fly 로 빌드(iter_window_batches)해 peak 를 batch 1개로 누른다.
+
+
+def _load_split_windows_streaming(
+    args, split: str, load_fold: int | None,
+) -> list[MultiSignalWindow]:
+    """data_path 의 한 split 을 chunk 스트리밍으로 **fp16 window 리스트**로 적재.
+
+    lora 전용: batch 는 만들지 않는다(OOM 회피). chunk 를 하나씩 ``torch.load`` →
+    ``_payload_to_windows`` 로 window 만 누적한다. window 의 signals numpy 는 chunk
+    fp16 텐서의 row view 라 추가 복사가 없다(업캐스트는 batch 빌드 시 1회). 단일
+    통합 .pt(back-compat)도 ``iter_prepared_split_chunks`` 가 1회 yield 하므로 동작.
+    """
+    windows: list[MultiSignalWindow] = []
+    input_keys: list[str] | None = None
+    for payload in iter_prepared_split_chunks(args.data_path, load_fold, split):
+        if input_keys is None:
+            input_keys = list(payload["signals"].keys())
+            if not input_keys:
+                print("ERROR: No signals in prepared data.", file=sys.stderr)
+                sys.exit(1)
+        windows.extend(_payload_to_windows(payload, input_keys))
+        del payload
+    return windows
+
+
+@torch.no_grad()
+def _evaluate_lora_windows(
+    model,
+    probe: LinearProbe,
+    windows: list[MultiSignalWindow],
+    args,
+    device: torch.device,
+    collate_mode: str,
+) -> dict:
+    """lora val/test 평가 — windows 를 on-the-fly batch 로 빌드(미리 안 만듦).
+
+    ``iter_window_batches`` 가 batch 를 하나씩 yield → forward → 즉시 폐기.
+    feature 캐싱 불가(LoRA encoder 가 epoch 마다 갱신)하므로 매 호출 forward 한다.
+    행/라벨 순서는 iter_window_batches 가 보존하므로 y_true/y_score 정렬 유지.
+    """
+    model.model.eval()
+    probe.to(device).eval()
+    all_labels, all_scores = [], []
+    for batch, labels in iter_window_batches(
+        windows, args.batch_size, args.patch_size,
+        to_samples=_multi_window_to_samples, get_label=lambda w: w.label,
+        collate_mode=collate_mode,
+    ):
+        batch = model.batch_to_device(batch)
+        out = model.model(batch, task="masked")
+        features = _mean_pool(out["encoded"], out["patch_mask"])
+        logits = probe(features)
+        probs = torch.sigmoid(logits).squeeze(-1).cpu().numpy()
+        all_labels.append(labels.numpy())
+        all_scores.append(probs)
+    return _compute_metrics(np.concatenate(all_labels), np.concatenate(all_scores))
+
+
+@torch.no_grad()
+def _evaluate_lora_test_streaming(
+    args,
+    load_fold: int | None,
+    model,
+    probe: LinearProbe,
+    device: torch.device,
+    collate_mode: str,
+) -> tuple[np.ndarray, np.ndarray, list[str]] | tuple[None, None, None]:
+    """lora test 평가 — test chunk 를 **스트리밍**하며 on-the-fly batch eval.
+
+    test split 전체를 RAM 에 올리지 않는다(peak ≈ chunk 1개 + batch). chunk →
+    windows(fp16 view) → iter_window_batches → forward → 누적 → chunk 폐기.
+    y_true/y_score/case_ids 를 chunk·window 순서대로 누적해 정렬을 보존한다
+    (``dump_fold_predictions`` 의 patient 단위 집계·정렬용).
+    """
+    model.model.eval()
+    probe.to(device).eval()
+    all_labels, all_scores, case_ids = [], [], []
+    input_keys: list[str] | None = None
+    found = False
+    for payload in iter_prepared_split_chunks(args.data_path, load_fold, "test"):
+        found = True
+        if input_keys is None:
+            input_keys = list(payload["signals"].keys())
+        windows = _payload_to_windows(payload, input_keys)
+        del payload
+        for w in windows:
+            case_ids.append(str(w.case_id))
+        for batch, labels in iter_window_batches(
+            windows, args.batch_size, args.patch_size,
+            to_samples=_multi_window_to_samples, get_label=lambda w: w.label,
+            collate_mode=collate_mode,
+        ):
+            batch = model.batch_to_device(batch)
+            out = model.model(batch, task="masked")
+            features = _mean_pool(out["encoded"], out["patch_mask"])
+            logits = probe(features)
+            probs = torch.sigmoid(logits).squeeze(-1).cpu().numpy()
+            all_labels.append(labels.numpy())
+            all_scores.append(probs)
+        del windows
+        gc.collect()
+    if not found:
+        return None, None, None
+    return np.concatenate(all_labels), np.concatenate(all_scores), case_ids
+
+
 def _load_data(
     args,
 ) -> tuple[
@@ -721,7 +839,12 @@ def main() -> None:
     cached_train: list[tuple[torch.Tensor, torch.Tensor]] | None = None
     cached_val: list[tuple[torch.Tensor, torch.Tensor]] | None = None
     cached_test: list[tuple[torch.Tensor, torch.Tensor]] | None = None
-    train_batches = val_batches = test_batches = None
+    # lora on-the-fly: fp16 window 만 보유, batch 는 epoch 마다 빌드(미리 안 만듦).
+    lora_train_windows: list[MultiSignalWindow] | None = None
+    lora_val_windows: list[MultiSignalWindow] | None = None
+    lora_test_windows: list[MultiSignalWindow] | None = None
+    lora_collate_mode: str | None = None
+    lora_stream_test = False  # data_path lora → test 는 끝에 chunk 스트리밍
     patient_ids: list[str]
 
     def _stat_line(name: str, n_pos: int, n_total: int) -> None:
@@ -774,7 +897,88 @@ def main() -> None:
             sys.exit(1)
         del train_stream, val_stream, test_stream
         gc.collect()
+    elif is_lora:
+        # ── lora: fp16 window 만 보유, batch 는 epoch 마다 on-the-fly ──
+        # encoder(LoRA)가 epoch 마다 갱신 → feature 캐싱 불가, 매 epoch 실제
+        # window forward 필요. fold 전체 batch 를 fp32 padded 로 미리 빌드하던
+        # 옛 경로(~150 GB)를 제거하고, fp16 window 만 들고 batch 는 epoch 마다
+        # iter_window_batches 로 그 자리에서 빌드해 peak 를 batch 1개로 누른다.
+        if args.data_path:
+            # chunk 스트리밍으로 train/val window 만 적재(batch 미빌드). test 는
+            # 끝에 chunk 스트리밍으로 평가 → 학습 중 RAM 에 안 들고 있는다.
+            print(
+                f"\nLoading prepared windows (fp16) for lora on-the-fly "
+                f"batching (fold={load_fold})"
+            )
+            lora_train_windows = _load_split_windows_streaming(
+                args, "train", load_fold
+            )
+            lora_val_windows = _load_split_windows_streaming(
+                args, "val", load_fold
+            )
+            if not lora_train_windows:
+                print(
+                    "ERROR: train chunks missing in prepared data.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            if not lora_val_windows:
+                # legacy(no-val) — train 에서 20% 동적 split (mirror _load_data).
+                warnings.warn(
+                    "data['val'] not found; falling back to a 20% dynamic split "
+                    "of train. Re-run prepare_data.py for a deterministic val "
+                    "split.",
+                    stacklevel=2,
+                )
+                rng = np.random.default_rng(args.val_split_seed)
+                idx = np.arange(len(lora_train_windows))
+                rng.shuffle(idx)
+                n_val = max(1, int(len(lora_train_windows) * 0.2))
+                val_idx = set(idx[:n_val].tolist())
+                new_train = [
+                    w for i, w in enumerate(lora_train_windows) if i not in val_idx
+                ]
+                lora_val_windows = [
+                    w for i, w in enumerate(lora_train_windows) if i in val_idx
+                ]
+                lora_train_windows = new_train
+            lora_stream_test = True  # test 는 끝에 스트리밍 평가
+            patient_ids = []  # 스트리밍 test eval 에서 window 순서대로 채움
+            n_pos_tr = sum(1 for w in lora_train_windows if w.label == 1)
+            n_pos_va = sum(1 for w in lora_val_windows if w.label == 1)
+            _stat_line("Train", n_pos_tr, len(lora_train_windows))
+            _stat_line("Val  ", n_pos_va, len(lora_val_windows))
+            print("  Test : (streamed at eval time)")
+        else:
+            # data_dir / 단일파일 비-prefix smoke 경로 — _load_data 로 3-way 적재.
+            # 작은 경로라 test window 도 보유(스트리밍 불필요).
+            lora_train_windows, lora_val_windows, lora_test_windows = _load_data(
+                args
+            )
+            n_pos_tr = sum(1 for w in lora_train_windows if w.label == 1)
+            n_pos_va = sum(1 for w in lora_val_windows if w.label == 1)
+            n_pos_te = sum(1 for w in lora_test_windows if w.label == 1)
+            _stat_line("Train", n_pos_tr, len(lora_train_windows))
+            _stat_line("Val  ", n_pos_va, len(lora_val_windows))
+            _stat_line("Test ", n_pos_te, len(lora_test_windows))
+            if not lora_train_windows or not lora_test_windows:
+                print("Insufficient data.", file=sys.stderr)
+                sys.exit(1)
+            if not lora_val_windows:
+                print(
+                    "ERROR: val split is empty even after fallback — cannot do "
+                    "best-ckpt selection.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            # test case-order grouping id — 정렬 보존(스트리밍과 동일 순서).
+            patient_ids = [str(w.case_id) for w in lora_test_windows]
+        # collate_mode 는 학습 시작 전 1회 계산해 재스캔 비용 제거(결과 동일).
+        lora_collate_mode = infer_collate_mode(
+            lora_train_windows, _multi_window_to_samples
+        )
     else:
+        # ── linear_probe (non-stream: data_dir / 단일파일 / legacy-no-val) ──
         train_labeled, val_labeled, test_labeled = _load_data(args)
 
         def _pos_stats(name: str, ws: list[MultiSignalWindow]) -> None:
@@ -799,41 +1003,26 @@ def main() -> None:
         # test case-order grouping id — window free 전에 미리 추출 (정렬 보존).
         patient_ids = [str(w.case_id) for w in test_labeled]
 
-        if is_lora:
-            # lora: encoder(LoRA) 가 epoch 마다 갱신 → feature 캐싱 불가.
-            # batch 를 빌드해 재사용하되, 빌드 후 원본 windows 는 free.
-            train_batches = _make_batches(
-                train_labeled, args.batch_size, args.patch_size, 0
-            )
-            val_batches = _make_batches(
-                val_labeled, args.batch_size, args.patch_size, 0
-            )
-            test_batches = _make_batches(
-                test_labeled, args.batch_size, args.patch_size, 0
-            )
-            del train_labeled, val_labeled, test_labeled
-            gc.collect()
-        else:
-            # linear_probe: split 별 per-batch 스트리밍 caching + 즉시 free.
-            print("  Caching frozen-encoder features (streaming per-batch)...")
-            cached_train = _cache_features_from_windows(
-                train_labeled, model, device,
-                args.batch_size, args.patch_size, progress=True,
-            )
-            del train_labeled
-            gc.collect()
-            cached_val = _cache_features_from_windows(
-                val_labeled, model, device,
-                args.batch_size, args.patch_size, progress=True,
-            )
-            del val_labeled
-            gc.collect()
-            cached_test = _cache_features_from_windows(
-                test_labeled, model, device,
-                args.batch_size, args.patch_size, progress=True,
-            )
-            del test_labeled
-            gc.collect()
+        # linear_probe: split 별 per-batch 스트리밍 caching + 즉시 free.
+        print("  Caching frozen-encoder features (streaming per-batch)...")
+        cached_train = _cache_features_from_windows(
+            train_labeled, model, device,
+            args.batch_size, args.patch_size, progress=True,
+        )
+        del train_labeled
+        gc.collect()
+        cached_val = _cache_features_from_windows(
+            val_labeled, model, device,
+            args.batch_size, args.patch_size, progress=True,
+        )
+        del val_labeled
+        gc.collect()
+        cached_test = _cache_features_from_windows(
+            test_labeled, model, device,
+            args.batch_size, args.patch_size, progress=True,
+        )
+        del test_labeled
+        gc.collect()
 
     # ── 학습 + Best-ckpt selection on val (Patch A) ──
     probe = LinearProbe(d_model, n_classes=1)
@@ -845,7 +1034,6 @@ def main() -> None:
             f"\nTraining LoRA + Probe (rank={args.lora_rank}, "
             f"LoRA={n_lora:,} + Probe={n_probe:,} params)..."
         )
-        evaluate_fn = evaluate_lora
         probe = probe.to(device)
         probe.train()
         model.model.train()
@@ -859,7 +1047,6 @@ def main() -> None:
         )
     else:
         print(f"\nTraining LinearProbe (frozen encoder, d_model={d_model})...")
-        evaluate_fn = evaluate_linear_probe
         probe = probe.to(device)
         probe.train()
         optimizer = torch.optim.Adam(probe.parameters(), lr=args.lr)
@@ -874,7 +1061,8 @@ def main() -> None:
 
     # 캐싱은 위 데이터 로드 단계에서 이미 완료(linear_probe). cached_* 는
     # frozen-encoder feature 라 epoch 간 불변 → encoder forward 반복 제거.
-    # lora 는 train_batches 를 그대로 재사용(encoder/LoRA 가 epoch 마다 갱신).
+    # lora 는 epoch 마다 lora_train_windows 에서 batch 를 on-the-fly 로 빌드
+    # (encoder/LoRA 가 epoch 마다 갱신 → feature 캐싱 불가).
 
     for epoch in range(args.epochs):
         # ── train one epoch ──
@@ -883,9 +1071,18 @@ def main() -> None:
             model.model.train()
         epoch_loss, n_steps = 0.0, 0
 
-        # lora: (PackedBatch, labels) / linear: (features(B,d), labels) — 둘 다
-        # 2-tuple 이라 동일 루프로 처리. linear 의 features/labels 는 이미 device 상.
-        train_iter = train_batches if is_lora else cached_train
+        # lora: window 를 batch_size 씩 잘라 그 자리에서 1 batch 빌드(on-the-fly)
+        #       → forward/backward → batch 즉시 폐기 (peak = batch 1개).
+        # linear: (features(B,d), labels) 캐시 — 이미 device 상, encoder forward X.
+        if is_lora:
+            train_iter = iter_window_batches(
+                lora_train_windows, args.batch_size, args.patch_size,
+                to_samples=_multi_window_to_samples,
+                get_label=lambda w: w.label,
+                collate_mode=lora_collate_mode,
+            )
+        else:
+            train_iter = cached_train
         for first, labels in train_iter:
             if is_lora:
                 batch = model.batch_to_device(first)
@@ -906,13 +1103,20 @@ def main() -> None:
             optimizer.step()
             epoch_loss += loss.item()
             n_steps += 1
+            if is_lora:
+                # on-the-fly batch + activation 즉시 폐기 (host/GPU peak 억제).
+                del batch, out, features, first
+        del train_iter
 
         avg_loss = epoch_loss / max(n_steps, 1)
         train_losses.append(avg_loss)
 
         # ── val evaluation ──
         if is_lora:
-            val_metrics = evaluate_fn(model, probe, val_batches, device)
+            # val window 를 on-the-fly batch 로 평가(미리 batch 안 만듦).
+            val_metrics = _evaluate_lora_windows(
+                model, probe, lora_val_windows, args, device, lora_collate_mode,
+            )
         else:
             val_metrics = _eval_probe_cached(probe, cached_val, device)
         val_auroc = float(val_metrics["auroc"])
@@ -934,6 +1138,13 @@ def main() -> None:
                 f"(best={best_val_auroc:.4f}@ep{best_epoch + 1})"
             )
 
+    # lora: 학습 종료 → train/val window 해제(더 이상 불필요) 후 test 평가.
+    # test 는 fresh 스트리밍/보유 window 로 빌드하므로 peak 가 batch 1개로 유지.
+    if is_lora:
+        lora_train_windows = None
+        lora_val_windows = None
+        gc.collect()
+
     # ── Restore best ckpt and run test ONCE (Patch A) ──
     if best_probe_state is None:
         print("WARNING: no best ckpt captured; using last epoch.", file=sys.stderr)
@@ -944,16 +1155,35 @@ def main() -> None:
 
     print("\nEvaluating on test set with best-val ckpt...")
     if is_lora:
-        metrics = evaluate_fn(model, probe, test_batches, device)
+        if lora_stream_test:
+            # data_path: test chunk 를 스트리밍하며 on-the-fly batch eval.
+            yt, ys, patient_ids = _evaluate_lora_test_streaming(
+                args, load_fold, model, probe, device, lora_collate_mode,
+            )
+            if yt is None:
+                print(
+                    "ERROR: test chunks missing in prepared data.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            metrics = _compute_metrics(yt, ys)
+        else:
+            # data_dir/단일파일: 보유한 test window 로 on-the-fly batch eval.
+            metrics = _evaluate_lora_windows(
+                model, probe, lora_test_windows, args, device, lora_collate_mode,
+            )
+            lora_test_windows = None
+            gc.collect()
     else:
         metrics = _eval_probe_cached(probe, cached_test, device)
 
     # ── 결과 출력 ──
     y_true = metrics.pop("y_true")
     y_score = metrics.pop("y_score")
-    # patient(=case)-level grouping id 는 데이터 로드 단계에서 test windows 순서
-    # 그대로 미리 추출(`patient_ids`). y_true/y_score(=cached_test/test_batches 순서)
-    # 와 동일 정렬이라 _eval_utils.bootstrap_ci 의 환자 단위 resampling 에 그대로 사용.
+    # patient(=case)-level grouping id(`patient_ids`)는 test window 순서 그대로다:
+    # linear=cached_test 순서, lora=on-the-fly batch(window) 순서로 누적된
+    # y_true/y_score 와 동일 정렬 → _eval_utils.bootstrap_ci 의 환자 단위
+    # resampling·dump_fold_predictions 에 그대로 사용 가능.
 
     # Patch D: bootstrap 95% CI on test AUROC/AUPRC/F1 (1000 iter).
     thr = metrics["optimal_threshold"]

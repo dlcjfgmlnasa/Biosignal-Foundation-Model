@@ -13,7 +13,7 @@ Patient-level aggregation task (Mortality / Sepsis)는 별도 경로
 """
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
 import numpy as np
@@ -299,6 +299,70 @@ def _build_batch_fast(
     return batch, torch.tensor(labels, dtype=label_dtype)
 
 
+def infer_collate_mode(
+    windows: list,
+    to_samples: Callable[[object, int], list[BiosignalSample]],
+) -> str:
+    """윈도우 리스트의 multi-signal 여부로 collate_mode("ci"/"any_variate") 산정.
+
+    ``make_window_batches`` 가 내부에서 쓰는 것과 **완전히 동일한 규칙**(any over
+    windows)이다. lora on-the-fly 배칭(iter_window_batches)에서 매 epoch·chunk
+    마다 재스캔하지 않도록 학습 시작 전에 1회 계산해 넘기는 용도. 같은 규칙이라
+    pre-built batch 와 collate_mode 가 동일해 결과(배치 내용)가 보존된다.
+    """
+    multi = any(len(to_samples(w, i)) > 1 for i, w in enumerate(windows)) \
+        if windows else False
+    return "any_variate" if multi else "ci"
+
+
+def _build_one_chunk(
+    chunk: list,
+    start_idx: int,
+    batch_size: int,
+    patch_size: int,
+    to_samples: Callable[[object, int], list[BiosignalSample]],
+    get_label: Callable[[object], float],
+    collate_mode: str,
+    label_dtype: torch.dtype,
+) -> tuple[PackedBatch, torch.Tensor]:
+    """윈도우 chunk(<= batch_size 개) 1 개를 (batch, labels) 1 개로 구성.
+
+    ``make_window_batches`` 와 ``iter_window_batches`` 가 공유하는 코어. fast-path
+    (균일 윈도우 → 배치당 1회 할당)와 fallback(비균일 → per-window collate→stack)
+    분기가 동일하므로, 두 진입점이 만드는 batch 는 **바이트 단위로 동일**하다.
+    """
+    chunk_samples = [to_samples(w, start_idx + j) for j, w in enumerate(chunk)]
+    chunk_labels = [get_label(w) for w in chunk]
+
+    # ── Fast path: 균일 윈도우는 배치당 1회 할당으로 직접 구성 ──
+    fast = _build_batch_fast(
+        chunk_samples, chunk_labels, patch_size, collate_mode, label_dtype
+    )
+    if fast is not None:
+        return fast
+
+    # ── Fallback: 비균일 chunk 는 윈도우별 collate 후 stack(기존 경로) ──
+    # chunk 내 모든 윈도우를 담을 수 있는 공통 폭(가장 큰 윈도우 기준).
+    # 같은 max_length 로 윈도우별 collate → 모든 행 폭 동일 → 그대로 stack.
+    max_length = max(
+        (_needed_length(s, patch_size) for s in chunk_samples),
+        default=patch_size,
+    )
+    collate = PackCollate(
+        max_length=max_length,
+        collate_mode=collate_mode,
+        patch_size=patch_size,
+    )
+
+    rows = [
+        _collate_one_window(collate, s, patch_size, max_length)
+        for s in chunk_samples
+    ]
+    batch = _stack_rows(rows)
+    labels = torch.tensor(chunk_labels, dtype=label_dtype)
+    return (batch, labels)
+
+
 def make_window_batches(
     windows: list,
     batch_size: int,
@@ -332,45 +396,52 @@ def make_window_batches(
     get_label:
         ``window -> float`` 라벨 추출 콜백.
     """
-    multi = any(len(to_samples(w, i)) > 1 for i, w in enumerate(windows)) \
-        if windows else False
-    collate_mode = "any_variate" if multi else "ci"
+    collate_mode = infer_collate_mode(windows, to_samples)
 
     batches: list[tuple[PackedBatch, torch.Tensor]] = []
     for i in range(0, len(windows), batch_size):
         chunk = windows[i : i + batch_size]
-        chunk_samples = [to_samples(w, i + j) for j, w in enumerate(chunk)]
-        chunk_labels = [get_label(w) for w in chunk]
-
-        # ── Fast path: 균일 윈도우는 배치당 1회 할당으로 직접 구성 ──
-        fast = _build_batch_fast(
-            chunk_samples, chunk_labels, patch_size, collate_mode, label_dtype
+        batches.append(
+            _build_one_chunk(
+                chunk, i, batch_size, patch_size,
+                to_samples, get_label, collate_mode, label_dtype,
+            )
         )
-        if fast is not None:
-            batches.append(fast)
-            continue
-
-        # ── Fallback: 비균일 chunk 는 윈도우별 collate 후 stack(기존 경로) ──
-        # chunk 내 모든 윈도우를 담을 수 있는 공통 폭(가장 큰 윈도우 기준).
-        # 같은 max_length 로 윈도우별 collate → 모든 행 폭 동일 → 그대로 stack.
-        max_length = max(
-            (_needed_length(s, patch_size) for s in chunk_samples),
-            default=patch_size,
-        )
-        collate = PackCollate(
-            max_length=max_length,
-            collate_mode=collate_mode,
-            patch_size=patch_size,
-        )
-
-        rows = [
-            _collate_one_window(collate, s, patch_size, max_length)
-            for s in chunk_samples
-        ]
-        batch = _stack_rows(rows)
-        labels = torch.tensor(chunk_labels, dtype=label_dtype)
-        batches.append((batch, labels))
     return batches
+
+
+def iter_window_batches(
+    windows: list,
+    batch_size: int,
+    patch_size: int,
+    to_samples: Callable[[object, int], list[BiosignalSample]],
+    get_label: Callable[[object], float],
+    label_dtype: torch.dtype = torch.float32,
+    collate_mode: str | None = None,
+) -> Iterator[tuple[PackedBatch, torch.Tensor]]:
+    """``make_window_batches`` 의 **스트리밍 버전** — batch 를 하나씩 yield.
+
+    ``make_window_batches`` 는 모든 batch 를 리스트로 모아 반환하므로 peak 메모리
+    가 "전체 batch 합"(downstream lora 에서 fp32 padded × 수만 윈도우 → 100 GB+)
+    이 된다. 이 제너레이터는 **동일한 chunk 분할·collate_mode·_build_one_chunk**
+    경로로 batch 를 하나씩 yield 하여, 호출측이 forward 후 즉시 폐기하면 peak 가
+    **batch 1개**로 제한된다 (lora host-RAM OOM 회피용).
+
+    결과 동일성: ``list(iter_window_batches(...)) == make_window_batches(...)``.
+    둘 다 ``range(0, len(windows), batch_size)`` 로 같은 순서·같은 chunk 를 만들고
+    같은 ``_build_one_chunk`` 로 빌드하므로 (batch, labels) 시퀀스가 바이트 단위로
+    동일하다. ``collate_mode`` 를 명시하면 windows 재스캔을 생략(매 epoch O(N)
+    to_samples 호출 방지)하되, ``infer_collate_mode`` 와 같은 값이어야 동일성이
+    유지된다(기본 None 이면 내부에서 동일 규칙으로 계산).
+    """
+    if collate_mode is None:
+        collate_mode = infer_collate_mode(windows, to_samples)
+    for i in range(0, len(windows), batch_size):
+        chunk = windows[i : i + batch_size]
+        yield _build_one_chunk(
+            chunk, i, batch_size, patch_size,
+            to_samples, get_label, collate_mode, label_dtype,
+        )
 
 
 def make_batches(
