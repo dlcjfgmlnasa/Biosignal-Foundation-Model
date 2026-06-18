@@ -367,7 +367,10 @@ def build_cells(
                                 t.get("epochs", defaults.get("epochs")), mode),
                             lr=_resolve_per_mode(
                                 t.get("lr", defaults.get("lr")), mode),
-                            batch_size=t.get("batch_size", defaults.get("batch_size")),
+                            # batch_size 도 epochs/lr 처럼 per-mode dict 가능
+                            # (linear_probe: 64, lora: 128 등). mode 로 resolve.
+                            batch_size=_resolve_per_mode(
+                                t.get("batch_size", defaults.get("batch_size")), mode),
                             # patch_size 를 명시 전달해 encoder ckpt patch 와 정렬 (W1).
                             patch_size=t.get("patch_size", defaults.get("patch_size")),
                             # device 미전달 시 run.py 기본 cpu → encoder 가 CPU 에서 도는

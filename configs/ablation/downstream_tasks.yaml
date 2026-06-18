@@ -94,7 +94,9 @@ tasks:
     epochs:
       linear_probe: 20         # run.py 기본값
       lora: 20
-    batch_size: 64             # linear_probe feature 추출 GPU 활용↑ (frozen 추론)
+    batch_size:                # per-mode: linear 64 유지(기존 cell 정합),
+      linear_probe: 64         #   lora 128 (bf16 autocast 가속 → 더 큰 batch)
+      lora: 128
     extra_args:
       window-sec: 300.0        # 5 min (paper canonical)
       stride-sec: 60.0

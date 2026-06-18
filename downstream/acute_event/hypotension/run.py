@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import gc
 import json
@@ -158,6 +159,23 @@ def _mean_pool(
 ) -> torch.Tensor:  # (B, d_model)
     mask_f = patch_mask.unsqueeze(-1).float()  # (B, N, 1)
     return (encoded * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp(min=1.0)
+
+
+# ── bf16 autocast helper (lora 전용) ─────────────────────────
+#
+# lora train/eval 의 encoder forward + _mean_pool + probe + BCE 를 bf16 autocast
+# 로 감싸 가속(사전학습 AMP 와 정합). bf16 은 loss scaling 불필요(GradScaler X).
+# linear_probe(use_autocast=False)는 nullcontext → frozen feature 경로가 fp32
+# 그대로 유지되어 결과 불변(기존 cell 재실행 회피). cpu 등 cuda 가 아니면
+# enabled=False 로 autocast 를 안전 무력화한다.
+
+
+def _maybe_bf16_autocast(device: torch.device, use_autocast: bool):
+    if not use_autocast:
+        return contextlib.nullcontext()
+    return torch.amp.autocast(
+        device.type, dtype=torch.bfloat16, enabled=(device.type == "cuda")
+    )
 
 
 @torch.no_grad()
@@ -532,10 +550,13 @@ def _evaluate_lora_windows(
         collate_mode=collate_mode,
     ):
         batch = model.batch_to_device(batch)
-        out = model.model(batch, task="masked")
-        features = _mean_pool(out["encoded"], out["patch_mask"])
-        logits = probe(features)
-        probs = torch.sigmoid(logits).squeeze(-1).cpu().numpy()
+        # 추론도 lora train 과 동일 bf16 autocast(backward 없음).
+        with _maybe_bf16_autocast(device, True):
+            out = model.model(batch, task="masked")
+            features = _mean_pool(out["encoded"], out["patch_mask"])
+            logits = probe(features)
+        # bf16 autocast 출력 logits → numpy 가 bfloat16 미지원이라 .float() 필수.
+        probs = torch.sigmoid(logits).float().squeeze(-1).cpu().numpy()
         all_labels.append(labels.numpy())
         all_scores.append(probs)
     return _compute_metrics(np.concatenate(all_labels), np.concatenate(all_scores))
@@ -576,10 +597,13 @@ def _evaluate_lora_test_streaming(
             collate_mode=collate_mode,
         ):
             batch = model.batch_to_device(batch)
-            out = model.model(batch, task="masked")
-            features = _mean_pool(out["encoded"], out["patch_mask"])
-            logits = probe(features)
-            probs = torch.sigmoid(logits).squeeze(-1).cpu().numpy()
+            # 추론도 lora train 과 동일 bf16 autocast(backward 없음).
+            with _maybe_bf16_autocast(device, True):
+                out = model.model(batch, task="masked")
+                features = _mean_pool(out["encoded"], out["patch_mask"])
+                logits = probe(features)
+            # bf16 autocast 출력 logits → numpy 가 bfloat16 미지원이라 .float() 필수.
+            probs = torch.sigmoid(logits).float().squeeze(-1).cpu().numpy()
             all_labels.append(labels.numpy())
             all_scores.append(probs)
         del windows
@@ -1084,16 +1108,20 @@ def main() -> None:
         else:
             train_iter = cached_train
         for first, labels in train_iter:
-            if is_lora:
-                batch = model.batch_to_device(first)
-                out = model.model(batch, task="masked")
-                features = _mean_pool(out["encoded"], out["patch_mask"])
-            else:
-                features = first  # (B, d_model) cached feature
             target = labels.to(device).unsqueeze(-1)
-
-            logits = probe(features)
-            loss = criterion(logits, target)
+            # lora: forward+loss(encoder/_mean_pool/probe/BCE) 를 bf16 autocast 로
+            #       감싸 가속. backward/optimizer.step 은 autocast **밖**(bf16 은
+            #       GradScaler 불필요). linear: nullcontext → fp32 cached feature
+            #       경로 불변(재실행 회피).
+            with _maybe_bf16_autocast(device, is_lora):
+                if is_lora:
+                    batch = model.batch_to_device(first)
+                    out = model.model(batch, task="masked")
+                    features = _mean_pool(out["encoded"], out["patch_mask"])
+                else:
+                    features = first  # (B, d_model) cached feature
+                logits = probe(features)
+                loss = criterion(logits, target)
             optimizer.zero_grad()
             loss.backward()
             if is_lora:
