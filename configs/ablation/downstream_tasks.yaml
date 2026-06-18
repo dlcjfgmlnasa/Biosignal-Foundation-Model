@@ -94,6 +94,7 @@ tasks:
     epochs:
       linear_probe: 20         # run.py 기본값
       lora: 20
+    batch_size: 64             # linear_probe feature 추출 GPU 활용↑ (frozen 추론)
     extra_args:
       window-sec: 300.0        # 5 min (paper canonical)
       stride-sec: 60.0

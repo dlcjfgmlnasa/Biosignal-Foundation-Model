@@ -182,6 +182,123 @@ def _stack_rows(rows: list[PackedBatch]) -> PackedBatch:
     )
 
 
+# PackCollate.__init__ 의 ``min_patches`` 기본값. fast-path 게이트가 any_variate
+# multi-tier truncate 의 "10s(=5 patch) 미만 variate drop" 조건을 정확히 재현하려면
+# collate 와 같은 값을 써야 한다. PackCollate 기본값이 바뀌면 여기도 맞춰야 한다.
+_PACK_MIN_PATCHES = 5
+
+
+def _build_batch_fast(
+    chunk_samples: list[list[BiosignalSample]],
+    labels: list[float],
+    patch_size: int,
+    collate_mode: str,
+    label_dtype: torch.dtype,
+) -> tuple[PackedBatch, torch.Tensor] | None:
+    """균일(uniform) 윈도우 chunk 를 **단 한 번의 텐서 할당**으로 batch 화한다.
+
+    윈도우당 PackCollate 를 호출하던 기존 경로(B 회 호출 + B 개 (1,max_length)
+    텐서 할당 + concat)는 CPU collate 가 GPU 를 굶기는 병목이었다. downstream
+    윈도우는 (a) ``start_sample==win_start==0`` 이라 patch 정렬 trim 이 없고,
+    (b) 한 윈도우의 모든 신호가 같은 길이 T 이며, (c) 같은 session 이라 1 행으로
+    묶이는 **균일 구조**이므로 FFD/per-window collate 없이 필드를 직접 stack 할 수
+    있다. 결과 PackedBatch 는 윈도우별 collate→stack(기존) 출력과 **수치적으로 동일**
+    하다(행 i == window i == label i, 변이체 순서·메타데이터·spatial 동일).
+
+    게이트를 통과하지 못하는 윈도우(불균일 길이, 너무 짧음, trim 필요)가 하나라도
+    있으면 ``None`` 을 돌려 호출자가 기존 per-window collate 경로로 폴백하게 한다.
+    → 정확성은 항상 보존되고, 균일한 일반 케이스에서만 가속된다.
+
+    Returns
+    -------
+    ``(PackedBatch, labels)`` 또는 게이트 실패 시 ``None``.
+    """
+    ps = patch_size
+    if ps is None:
+        return None
+
+    # 1) 게이트 검사 + 윈도우별 (정렬된 sample, variate 길이 L_w) 산정
+    per_window: list[tuple[list[BiosignalSample], int]] = []
+    max_total = ps
+    for samples in chunk_samples:
+        if not samples:
+            return None  # zero-row 폴백이 필요한 극단 — 기존 경로로
+        # collate 와 동일 정렬: (signal_type, channel_idx)
+        srt = sorted(samples, key=lambda s: (s.signal_type, s.channel_idx))
+        # trim 없음(절대 시작이 patch 경계) 보장
+        if any((s.start_sample + s.win_start) != 0 for s in srt):
+            return None
+        t0 = int(srt[0].values.shape[0])
+        # 한 윈도우 내 모든 신호가 동일 길이여야 multi-tier 가 no-op 으로 동작
+        if any(int(s.values.shape[0]) != t0 for s in srt):
+            return None
+        if t0 < ps:
+            return None  # 1 패치 미만 → collate 는 drop/zero-row, 폴백
+        n_w = len(srt)
+        if (
+            collate_mode == "any_variate"
+            and n_w >= 2
+            and t0 < _PACK_MIN_PATCHES * ps
+        ):
+            # multi-tier 가 일부/전부 variate 를 drop → 구조 복잡, 폴백
+            return None
+        l_w = (t0 // ps) * ps  # patch 배수로 FLOOR (collate 와 동일)
+        per_window.append((srt, l_w))
+        total_w = n_w * l_w
+        if total_w > max_total:
+            max_total = total_w
+
+    max_length = max_total  # 이미 ps 배수 & >= ps (collate.max_length 와 일치)
+    b = len(chunk_samples)
+
+    # 2) 최종 크기로 한 번만 할당 후 직접 채움.
+    #    모든 행이 꽉 차면(패딩 0) zero-init 이 전부 덮어쓰여 낭비 → empty 사용.
+    #    한 행이라도 짧으면 패딩 영역이 0 이어야 하므로 zeros 로 안전하게 할당.
+    all_full = all(len(srt) * l_w == max_length for srt, l_w in per_window)
+    alloc = torch.empty if all_full else torch.zeros
+    values = alloc(b, max_length)
+    sample_id = alloc(b, max_length, dtype=torch.long)
+    variate_id = alloc(b, max_length, dtype=torch.long)
+
+    all_lengths: list[int] = []
+    all_padded: list[int] = []
+    all_rates: list[float] = []
+    all_types: list[int] = []
+    all_spatial: list[int] = []
+    all_starts: list[int] = []
+
+    for row, (srt, l_w) in enumerate(per_window):
+        total_w = len(srt) * l_w
+        sample_id[row, :total_w] = 1  # 한 윈도우 = 1 PackUnit → local_id=1
+        offset = 0
+        for var_id, s in enumerate(srt, start=1):
+            end = offset + l_w
+            # float32 대상 텐서에 대입 → collate 와 동일하게 자동 캐스팅(fp16→fp32)
+            values[row, offset:end] = s.values[:l_w]
+            variate_id[row, offset:end] = var_id
+            all_lengths.append(l_w)
+            all_padded.append(l_w)
+            all_rates.append(s.sampling_rate)
+            all_types.append(s.signal_type)
+            # collate 와 완전 동일: 이미 전역화된 s.spatial_id 를 그대로 재투입
+            all_spatial.append(get_global_spatial_id(s.signal_type, s.spatial_id))
+            all_starts.append(s.start_sample + s.win_start)  # ==0
+            offset = end
+
+    batch = PackedBatch(
+        values=values,
+        sample_id=sample_id,
+        variate_id=variate_id,
+        lengths=torch.tensor(all_lengths, dtype=torch.long),
+        sampling_rates=torch.tensor(all_rates, dtype=torch.float32),
+        signal_types=torch.tensor(all_types, dtype=torch.long),
+        spatial_ids=torch.tensor(all_spatial, dtype=torch.long),
+        padded_lengths=torch.tensor(all_padded, dtype=torch.long),
+        start_samples=torch.tensor(all_starts, dtype=torch.long),
+    )
+    return batch, torch.tensor(labels, dtype=label_dtype)
+
+
 def make_window_batches(
     windows: list,
     batch_size: int,
@@ -197,10 +314,14 @@ def make_window_batches(
     그러면 ``extract_features`` 가 행 단위 mean-pool 을 해 B(행 수) ≠ n_windows 가
     되어 logits 와 labels 크기가 어긋났다(예: input [1,1] vs target [8,1]).
 
-    수정: 각 윈도우를 **개별 collate** 해 정확히 1 행을 얻고, 그 행들을 batch 차원
-    으로 쌓는다. 결과 PackedBatch 는 FFD 가 윈도우당 1 bin 을 배치했을 때와 구조가
-    동일하므로 사전학습 모델 forward 의미는 불변이고, 행 i == window i == label i 로
-    per-window 풀링·정렬이 자동 보장된다(linear_probe / lora 양 경로 공통).
+    성능 개선(2026-06-18): 윈도우마다 PackCollate 를 1 회씩 호출하면(B 회/배치)
+    매 윈도우마다 (1,max_length) 텐서 3개를 새로 할당하고 마지막에 concat 까지 해,
+    frozen-encoder forward(GPU)가 CPU collate 를 기다리며 굶었다(GPU util ~0%).
+    이제 균일 윈도우 chunk 는 ``_build_batch_fast`` 가 **배치당 텐서 1회 할당**으로
+    직접 구성한다(B 회 → 1 회). 출력 PackedBatch 는 기존 per-window collate→stack
+    과 **수치적으로 동일**(행 i == window i == label i, 변이체 순서·메타데이터 동일)
+    하므로 deterministic frozen encoder 의 feature 도 동일하다. 게이트를 통과하지
+    못하는 비균일 chunk 는 기존 per-window collate 경로로 자동 폴백한다.
 
     Parameters
     ----------
@@ -219,7 +340,17 @@ def make_window_batches(
     for i in range(0, len(windows), batch_size):
         chunk = windows[i : i + batch_size]
         chunk_samples = [to_samples(w, i + j) for j, w in enumerate(chunk)]
+        chunk_labels = [get_label(w) for w in chunk]
 
+        # ── Fast path: 균일 윈도우는 배치당 1회 할당으로 직접 구성 ──
+        fast = _build_batch_fast(
+            chunk_samples, chunk_labels, patch_size, collate_mode, label_dtype
+        )
+        if fast is not None:
+            batches.append(fast)
+            continue
+
+        # ── Fallback: 비균일 chunk 는 윈도우별 collate 후 stack(기존 경로) ──
         # chunk 내 모든 윈도우를 담을 수 있는 공통 폭(가장 큰 윈도우 기준).
         # 같은 max_length 로 윈도우별 collate → 모든 행 폭 동일 → 그대로 stack.
         max_length = max(
@@ -237,7 +368,7 @@ def make_window_batches(
             for s in chunk_samples
         ]
         batch = _stack_rows(rows)
-        labels = torch.tensor([get_label(w) for w in chunk], dtype=label_dtype)
+        labels = torch.tensor(chunk_labels, dtype=label_dtype)
         batches.append((batch, labels))
     return batches
 
