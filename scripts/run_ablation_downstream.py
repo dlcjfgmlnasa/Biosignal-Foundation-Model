@@ -516,6 +516,9 @@ def _run_cell(
     # 자식 print() 즉시 flush → run.log 에 진행 상황이 실시간으로 보이게
     # (파일 redirect 시 기본 block-buffering 이라 epoch 로그가 한참 안 보임).
     env["PYTHONUNBUFFERED"] = "1"
+    # lora 의 on-the-fly batch 매 iter 할당으로 CUDA allocator 단편화 → s/batch 가
+    # 점진 증가. expandable_segments 로 단편화 완화 (사용자 설정 있으면 존중).
+    env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
     log_path = cell.out_dir / "run.log"
     if dry_run:
