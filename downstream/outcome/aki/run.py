@@ -225,6 +225,7 @@ def evaluate_model(
     device: torch.device,
     patch_size: int,
     max_windows: int,
+    fixed_threshold: float | None = None,
 ) -> dict:
     aggregator.to(device).eval()
     probe.to(device).eval()
@@ -258,25 +259,33 @@ def evaluate_model(
     y_score = np.stack(all_scores)  # (N,1) binary or (N,4) stage
 
     if label_mode == "binary":
-        return _compute_metrics_binary(y_true, y_score[:, 0])
+        return _compute_metrics_binary(y_true, y_score[:, 0], fixed_threshold)
     return _compute_metrics_stage(y_true, y_score)
 
 
 # ── 메트릭 ───────────────────────────────────────────────────
 
 
-def _compute_metrics_binary(y_true: np.ndarray, y_score: np.ndarray) -> dict:
+def _compute_metrics_binary(
+    y_true: np.ndarray,
+    y_score: np.ndarray,
+    fixed_threshold: float | None = None,
+) -> dict:
     auroc = compute_auroc(y_true, y_score)
     auprc = compute_auprc(y_true, y_score)
 
-    best_thresh, best_j = 0.5, -1.0
-    for thresh in np.linspace(0.01, 0.99, 99):
-        y_pred = (y_score >= thresh).astype(int)
-        ss = compute_sensitivity_specificity(y_true, y_pred)
-        j = ss["sensitivity"] + ss["specificity"] - 1.0
-        if j > best_j:
-            best_j = j
-            best_thresh = thresh
+    if fixed_threshold is not None:
+        # threshold 는 val 에서 선택된 값을 그대로 사용 (test 셀프튜닝 방지).
+        best_thresh = float(fixed_threshold)
+    else:
+        best_thresh, best_j = 0.5, -1.0
+        for thresh in np.linspace(0.01, 0.99, 99):
+            y_pred = (y_score >= thresh).astype(int)
+            ss = compute_sensitivity_specificity(y_true, y_pred)
+            j = ss["sensitivity"] + ss["specificity"] - 1.0
+            if j > best_j:
+                best_j = j
+                best_thresh = thresh
 
     y_pred_opt = (y_score >= best_thresh).astype(int)
     ss_opt = compute_sensitivity_specificity(y_true, y_pred_opt)
@@ -512,10 +521,22 @@ def main() -> None:
     if use_lora and "lora" in best_state:
         model.model.load_state_dict(best_state["lora"])
 
+    # binary: operating threshold 를 test 가 아닌 val 에서 선택 (test 셀프튜닝 방지).
+    # AUROC/AUPRC 는 threshold-free 라 무관하지만 sens/spec/F1 의 낙관 편향을 제거.
+    val_threshold: float | None = None
+    if label_mode == "binary":
+        val_metrics = evaluate_model(
+            model, aggregator, probe, val_patients, label_mode,
+            device=device, patch_size=patch_size, max_windows=args.max_windows,
+        )
+        val_threshold = float(val_metrics["optimal_threshold"])
+        print(f"  Operating threshold (from val): {val_threshold:.3f}")
+
     print("Evaluating on test set with best-val ckpt...")
     metrics = evaluate_model(
         model, aggregator, probe, test_patients, label_mode,
         device=device, patch_size=patch_size, max_windows=args.max_windows,
+        fixed_threshold=val_threshold,
     )
 
     y_true = metrics.pop("y_true")

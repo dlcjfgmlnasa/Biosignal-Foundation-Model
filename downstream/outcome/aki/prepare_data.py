@@ -181,16 +181,24 @@ def compute_kdigo_stage(
     ratio = peak_cr / preop_cr
     inc = peak_cr - preop_cr
 
-    # Stage 3: ≥3.0× baseline OR ≥4.0 mg/dL
+    # KDIGO: 먼저 AKI(급성 손상) 정의를 충족해야 한다.
+    #   acute rise ≥0.3 mg/dL OR ≥1.5× baseline.
+    # 이 조건 없이 peak_cr≥4.0 만으로 Stage 3 을 매기면, baseline 이 높은
+    # 안정적 CKD 환자(예: preop_cr=4.2, ratio≈1.0)가 AKI 로 over-call 된다.
+    # KDIGO 의 "increase to ≥4.0 mg/dL" 도 AKI 충족을 전제로 한 Stage 3 기준이다.
+    is_aki = ratio >= 1.5 or inc >= abs_increase_threshold
+    if not is_aki:
+        return 0
+
+    # AKI 확정 후 중증도 분류:
+    # Stage 3: ≥3.0× baseline OR peak ≥4.0 mg/dL
     if ratio >= 3.0 or peak_cr >= 4.0:
         return 3
     # Stage 2: 2.0-2.9× baseline
     if ratio >= 2.0:
         return 2
     # Stage 1: 1.5-1.9× baseline OR ≥0.3 mg/dL absolute increase
-    if ratio >= 1.5 or inc >= abs_increase_threshold:
-        return 1
-    return 0
+    return 1
 
 
 def build_aki_labels(

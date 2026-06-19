@@ -27,6 +27,8 @@ from data.collate import PackCollate
 from data.dataset import BiosignalSample
 from data.spatial_map import SIGNAL_KEY_TO_TYPE, get_global_spatial_id
 
+from downstream._gap_mask import sample_to_patch_mask
+
 
 DEFAULT_SR = 100.0
 
@@ -177,6 +179,43 @@ def _make_samples_for_window(
     return samples
 
 
+def _gap_patch_mask_for_window(
+    batch,
+    gap_masks: dict,  # {sig_type: (K, win_samples) bool}
+    idx: int,
+    sig_types: list[str],
+    patch_size: int,
+) -> torch.Tensor | None:
+    """packed batch(단일 윈도우)의 gap 을 patch-level (1, N) bool 로 변환.
+
+    `batch.variate_id` 로 각 variate 의 실제 packed 위치를 읽어 sample-level gap 을
+    동일 좌표에 채운 뒤 `sample_to_patch_mask` 로 다운샘플한다. per-window encode 는
+    start_sample=win_start=0 이라 trim=0 이고 stride=patch_size(non-overlap)이므로
+    sample_to_patch_mask 의 patch 그리드가 모델 패치와 정확히 정렬된다.
+    gap 이 없으면 None (extra_content_mask 미적용 → 기존 동작과 동일).
+    """
+    var_ids = batch.variate_id  # (1, T) long, 0=padding, 1..n=variate (packed 순서)
+    t = var_ids.shape[1]
+    sample_gap = torch.zeros(1, t, dtype=torch.bool)
+    # packed 순서 = PackCollate 의 group_samples.sort(key=(signal_type, channel_idx)).
+    sorted_sts = sorted(sig_types, key=lambda st: SIGNAL_TYPE_INT.get(st, 0))
+    for v in [int(x) for x in torch.unique(var_ids) if int(x) > 0]:
+        if v - 1 >= len(sorted_sts):
+            continue
+        st = sorted_sts[v - 1]
+        if st not in gap_masks:
+            continue
+        pos = var_ids[0] == v  # 해당 variate 가 차지한 연속 구간
+        seg_len = int(pos.sum())
+        if seg_len == 0:
+            continue
+        gm = torch.as_tensor(gap_masks[st][idx], dtype=torch.bool)[:seg_len]
+        sample_gap[0, pos] = gm
+    if not bool(sample_gap.any()):
+        return None
+    return sample_to_patch_mask(sample_gap, patch_size)  # (1, N)
+
+
 def encode_patient_windows(
     model,
     patient: dict,
@@ -230,6 +269,12 @@ def encode_patient_windows(
         max_length=pack_max_length, collate_mode=collate_mode, patch_size=patch_size
     )
 
+    # gap_masks 가 저장돼 있으면 0-fill 된 gap 구간을 patch-level [MASK] 로 교체
+    # (사전학습 mask_token mechanism 재사용). 없거나 gap 0 이면 기존 동작.
+    gap_masks = patient.get("gap_masks")
+    has_gap = isinstance(gap_masks, dict) and len(gap_masks) > 0
+    device = getattr(model, "device", None)
+
     grad_ctx = torch.enable_grad() if use_lora else torch.no_grad()
     chunk_reprs = []
     with grad_ctx:
@@ -238,12 +283,22 @@ def encode_patient_windows(
             samples = _make_samples_for_window(win_signals, idx, session_prefix)
             batch = collate(samples)
 
+            gap_patch = None
+            if has_gap:
+                gap_patch = _gap_patch_mask_for_window(
+                    batch, gap_masks, int(idx), sig_types, patch_size
+                )
+                if gap_patch is not None and device is not None:
+                    gap_patch = gap_patch.to(device)
+
             if use_lora:
                 batch = model.batch_to_device(batch)
-                out = model.model(batch, task="masked")
+                out = model.model(batch, task="masked", extra_content_mask=gap_patch)
                 feat = mean_pool(out["encoded"], out["patch_mask"])
             else:
-                feat = model.extract_features(batch, pool="mean")
+                feat = model.extract_features(
+                    batch, pool="mean", gap_mask_patch=gap_patch
+                )
 
             chunk_reprs.append(feat)  # (1, d_model)
 
