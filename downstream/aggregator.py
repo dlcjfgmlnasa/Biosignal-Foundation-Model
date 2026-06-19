@@ -220,8 +220,14 @@ def encode_patient_windows(
     collate_mode = "any_variate" if multi else "ci"
     win_samples = patient["signals"][sig_types[0]].shape[1]
 
+    # 한 윈도우의 모든 variate가 같은 row 에 packing 되어야 multi-modal repr 이 된다.
+    # max_length 를 단일 variate 길이로 잡으면 첫 variate(최저 signal_type)가 row 를
+    # 가득 채워 offset==max_length 에서 break → 나머지 채널이 통째로 누락된다.
+    # variate 수만큼 확보해 모든 채널이 한 row 에 들어가게 한다 (ci 모드는 ×1 = 동일).
+    pack_max_length = win_samples * len(sig_types)
+
     collate = PackCollate(
-        max_length=win_samples, collate_mode=collate_mode, patch_size=patch_size
+        max_length=pack_max_length, collate_mode=collate_mode, patch_size=patch_size
     )
 
     grad_ctx = torch.enable_grad() if use_lora else torch.no_grad()
