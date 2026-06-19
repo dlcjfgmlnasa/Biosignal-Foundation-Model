@@ -43,6 +43,7 @@ from downstream.metrics import (
 from downstream.viz import plot_roc_curve
 from downstream.model_wrapper import LinearProbe
 from downstream._eval_utils import dump_fold_predictions
+from downstream._save_utils import load_prepared_split_chunked
 from downstream.aggregator import (
     TransformerAggregator,
     collate_patients,
@@ -338,11 +339,16 @@ def _compute_metrics_stage(y_true: np.ndarray, y_score: np.ndarray) -> dict:
 
 
 def _load_data(
-    data_path: str, val_split_seed: int = 42
+    data_path: str, fold: int = 0, n_folds: int = 1, val_split_seed: int = 42
 ) -> tuple[list[dict], list[dict], list[dict], dict]:
-    """Train/val/test 3-way 로드. legacy 2-way 산출물은 train에서 dynamic split."""
-    print(f"\nLoading data: {data_path}")
-    data = torch.load(data_path, weights_only=False)
+    """Train/val/test 3-way 로드. legacy 2-way 산출물은 train에서 dynamic split.
+
+    단일 통합 .pt (back-compat) 또는 per-(fold,split)[_chunk] prefix 묶음
+    (5-fold CV) 양쪽을 처리한다. n_folds>1 이면 해당 fold 의 chunk 만 로드.
+    """
+    load_fold = int(fold) if int(n_folds) > 1 else None
+    print(f"\nLoading data: {data_path} (fold={load_fold})")
+    data = load_prepared_split_chunked(data_path, fold=load_fold)
     meta = data.get("metadata", {})
     print(f"  Task:        {meta.get('task', '?')}")
     print(f"  Label mode:  {meta.get('label_mode', '?')}")
@@ -440,7 +446,8 @@ def main() -> None:
 
     # ── 데이터 로드 (train/val/test 3-way) ──
     train_patients, val_patients, test_patients, meta = _load_data(
-        args.data_path, val_split_seed=args.val_split_seed
+        args.data_path, fold=args.fold, n_folds=args.n_folds,
+        val_split_seed=args.val_split_seed,
     )
     label_mode = meta.get("label_mode", "binary")
     if label_mode not in {"binary", "stage"}:
