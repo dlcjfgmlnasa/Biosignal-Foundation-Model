@@ -93,7 +93,8 @@ tasks:
                         phase_stage, sampling, attn_bias]
     epochs:
       linear_probe: 20         # run.py 기본값
-      lora: 10                 # LoRA 빠른 수렴 + lora cell 비용 큼 → 20→10 (2x 가속)
+      lora: 20                 # lora 는 baseline(00_full)만 돌림 → epoch 20 감당 가능
+                               #   (component 비교는 linear_probe, lora 는 ceiling용)
     batch_size:                # per-mode: linear 64 유지(기존 cell 정합),
       linear_probe: 64         #   lora 128 (bf16 autocast 가속 → 더 큰 batch)
       lora: 128
