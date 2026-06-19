@@ -513,6 +513,9 @@ def _run_cell(
     env = os.environ.copy()
     if gpu_id is not None:
         env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    # 자식 print() 즉시 flush → run.log 에 진행 상황이 실시간으로 보이게
+    # (파일 redirect 시 기본 block-buffering 이라 epoch 로그가 한참 안 보임).
+    env["PYTHONUNBUFFERED"] = "1"
 
     log_path = cell.out_dir / "run.log"
     if dry_run:

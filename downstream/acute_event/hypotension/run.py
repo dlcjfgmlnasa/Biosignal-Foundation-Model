@@ -1105,6 +1105,15 @@ def main() -> None:
                 get_label=lambda w: w.label,
                 collate_mode=lora_collate_mode,
             )
+            # epoch 내 batch 진행 라이브 표시 (tqdm→stderr 즉시 flush).
+            n_train_batches = (
+                len(lora_train_windows) + args.batch_size - 1
+            ) // args.batch_size
+            train_iter = tqdm(
+                train_iter, total=n_train_batches,
+                desc=f"lora train ep{epoch + 1}/{args.epochs}",
+                unit="batch", mininterval=2.0,
+            )
         else:
             train_iter = cached_train
         for first, labels in train_iter:
