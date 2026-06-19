@@ -283,7 +283,7 @@ def train_lora(
         epoch_loss, n = 0.0, 0
         for batch, labels in train_batches:
             batch = model.batch_to_device(batch)
-            out = model.model(batch, task="masked")
+            out = model.model._encode(batch, task="masked")
             features = _mean_pool(out["encoded"], out["patch_mask"])
 
             logits = probe(features)
@@ -320,7 +320,7 @@ def evaluate_lora(
 
     for batch, labels in test_batches:
         batch = model.batch_to_device(batch)
-        out = model.model(batch, task="masked")
+        out = model.model._encode(batch, task="masked")
         features = _mean_pool(out["encoded"], out["patch_mask"])
 
         logits = probe(features)
@@ -552,7 +552,7 @@ def _evaluate_lora_windows(
         batch = model.batch_to_device(batch)
         # 추론도 lora train 과 동일 bf16 autocast(backward 없음).
         with _maybe_bf16_autocast(device, True):
-            out = model.model(batch, task="masked")
+            out = model.model._encode(batch, task="masked")
             features = _mean_pool(out["encoded"], out["patch_mask"])
             logits = probe(features)
         # bf16 autocast 출력 logits → numpy 가 bfloat16 미지원이라 .float() 필수.
@@ -599,7 +599,7 @@ def _evaluate_lora_test_streaming(
             batch = model.batch_to_device(batch)
             # 추론도 lora train 과 동일 bf16 autocast(backward 없음).
             with _maybe_bf16_autocast(device, True):
-                out = model.model(batch, task="masked")
+                out = model.model._encode(batch, task="masked")
                 features = _mean_pool(out["encoded"], out["patch_mask"])
                 logits = probe(features)
             # bf16 autocast 출력 logits → numpy 가 bfloat16 미지원이라 .float() 필수.
@@ -1125,7 +1125,7 @@ def main() -> None:
             with _maybe_bf16_autocast(device, is_lora):
                 if is_lora:
                     batch = model.batch_to_device(first)
-                    out = model.model(batch, task="masked")
+                    out = model.model._encode(batch, task="masked")
                     features = _mean_pool(out["encoded"], out["patch_mask"])
                 else:
                     features = first  # (B, d_model) cached feature
