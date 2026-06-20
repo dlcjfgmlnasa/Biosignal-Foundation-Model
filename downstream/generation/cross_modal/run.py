@@ -1031,6 +1031,156 @@ def run_random_subset_eval(
     return all_results
 
 
+@torch.no_grad()
+def run_cross_modal_generate_eval(
+    checkpoint_path: str,
+    data_path: str,
+    scenario: Scenario,
+    model_version: str = "v1",
+    device_str: str = "cpu",
+    out_dir: str = ".",
+    fold: int | None = None,
+    n_folds: int = 1,
+    dump_preds: bool = True,
+) -> dict:
+    """Fixed source->target zero-shot 생성 평가 (generate_cross_modal).
+
+    scenario.inputs(예: PPG)만 visible 로 batch 를 구성하고, target(ABP) variate 에
+    [MASK] 가상 토큰을 주입(generate_cross_modal)해 PPG 로부터 ABP 파형을 생성한다.
+    target variate 가 입력에 부재하므로 **진짜 cross-modal PPG->ABP** 평가이며, 모델
+    본연의 cross_pred head 를 그대로 쓰는 zero-shot(학습 없음)이다. metric 은
+    per-window Pearson r / MSE / MAE, preds dump 는 ablation aggregator 호환.
+    """
+    from downstream.model_wrapper import DownstreamModelWrapper
+
+    inputs_str = " + ".join(s.upper() for s in scenario.inputs)
+    print("=" * 70)
+    print("Task 8: Cross-Modal Generation (zero-shot, generate_cross_modal)")
+    print(f"  Scenario:   {inputs_str} -> {scenario.target.upper()}")
+    print(f"  Checkpoint: {checkpoint_path}")
+    print(f"  Data:       {data_path} (fold={fold})")
+    print("=" * 70)
+
+    device = torch.device(device_str)
+    wrapper = DownstreamModelWrapper(checkpoint_path, model_version, device)
+    model = wrapper.model
+    patch_size = wrapper.patch_size
+
+    data = _load_prepared_data(data_path, fold=fold)
+    test_data = data["test"]
+    sigs = test_data["signals"]
+    needed = set(scenario.inputs + [scenario.target])
+    if not needed.issubset(set(sigs.keys())):
+        print(f"ERROR: missing signals {needed - set(sigs.keys())}", file=sys.stderr)
+        sys.exit(1)
+
+    n_samples = sigs[scenario.inputs[0]].shape[0]
+    target_type_id = SIGNAL_TYPE_IDS[scenario.target]
+    print(f"  Test windows: {n_samples}")
+
+    per_r: list[float] = []
+    per_mse: list[float] = []
+    per_mae: list[float] = []
+    raw_pred_win: list[np.ndarray] = []
+    raw_tgt_win: list[np.ndarray] = []
+
+    for i in range(n_samples):
+        # source(visible) 신호만으로 batch 구성 — target(ABP) 는 입력에 부재.
+        visible_signals = {s: sigs[s][i].float().numpy() for s in scenario.inputs}
+        gt = sigs[scenario.target][i].float().numpy()
+        try:
+            batch = build_multivariate_batch(visible_signals, patch_size=patch_size)
+            batch.values = batch.values.to(device)
+            batch.sample_id = batch.sample_id.to(device)
+            batch.variate_id = batch.variate_id.to(device)
+            out = model.generate_cross_modal(
+                batch, target_signal_type=target_type_id, denormalize=True,
+            )
+        except Exception:
+            continue
+
+        pred = out["waveform"]
+        if pred.numel() == 0:
+            continue
+        pred_flat = pred[0].reshape(-1).cpu().numpy()
+        min_len = min(len(pred_flat), len(gt))
+        if min_len < patch_size:
+            continue
+        pf = pred_flat[:min_len]
+        gf = gt[:min_len]
+
+        per_mae.append(float(np.mean(np.abs(pf - gf))))
+        per_mse.append(float(np.mean((pf - gf) ** 2)))
+        # per-window Pearson (파형 형태 fidelity, DC offset/scale 무관).
+        if np.std(pf) > 1e-8 and np.std(gf) > 1e-8:
+            per_r.append(float(np.corrcoef(pf, gf)[0, 1]))
+        else:
+            per_r.append(0.0)
+        if dump_preds:
+            raw_pred_win.append(pf.astype(np.float32))
+            raw_tgt_win.append(gf.astype(np.float32))
+
+    metrics = {
+        "mse": round(float(np.mean(per_mse)), 6) if per_mse else 0.0,
+        "mae": round(float(np.mean(per_mae)), 6) if per_mae else 0.0,
+        "pearson_r_win": round(float(np.mean(per_r)), 4) if per_r else 0.0,
+        "n_windows": len(per_r),
+    }
+
+    print(f"\n{'=' * 50}")
+    print(f"  Scenario:      {scenario.name}")
+    print(f"  MSE:           {metrics['mse']:.6f}  (denormalized)")
+    print(f"  MAE:           {metrics['mae']:.6f}")
+    print(f"  Pearson r_win: {metrics['pearson_r_win']:.4f}  (per-window)")
+    print(f"  N windows:     {metrics['n_windows']}")
+    print(f"{'=' * 50}")
+
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+    scenario_slug = scenario.name.replace("->", "_to_").replace("+", "_")
+    results = {
+        "scenario": scenario.name,
+        "inputs": scenario.inputs,
+        "target": scenario.target,
+        "metrics": metrics,
+        "config": {
+            "mode": "generate",
+            "data_path": data_path,
+            "fold": fold,
+            "n_folds": n_folds,
+        },
+    }
+    results_file = out_path / f"task8_generate_{scenario_slug}.json"
+    with open(results_file, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"\nResults saved: {results_file}")
+
+    if dump_preds and raw_pred_win:
+        min_L = min(a.shape[0] for a in raw_pred_win)
+        y_score = np.stack([a[:min_L] for a in raw_pred_win], axis=0)  # (N_win, L)
+        y_true = np.stack([a[:min_L] for a in raw_tgt_win], axis=0)
+        n_win = y_score.shape[0]
+        case_ids = test_data.get("case_ids", [])
+        if len(case_ids) >= n_win:
+            patient_id = np.array([str(c) for c in case_ids[:n_win]], dtype=str)
+        else:
+            patient_id = np.array([str(i) for i in range(n_win)], dtype=str)
+        preds_path = out_path / f"preds_fold{int(fold) if fold is not None else 0}.npz"
+        np.savez_compressed(
+            preds_path,
+            y_true=y_true.astype(np.float32),
+            y_score=y_score.astype(np.float32),
+            patient_id=patient_id,
+            fold_idx=np.int64(int(fold) if fold is not None else 0),
+            n_folds=np.int64(int(n_folds)),
+            task=f"cross_modal_gen_{scenario_slug}",
+            classes=np.array([], dtype=str),
+        )
+        print(f"Predictions saved: {preds_path} (y_true={y_true.shape})")
+
+    return results
+
+
 def run_checkpoint_eval(
     checkpoint_path: str,
     model_version: str = "v1",
@@ -1633,8 +1783,9 @@ def main() -> None:
         "--mode",
         type=str,
         default="zero_shot",
-        choices=["zero_shot", "linear_probe", "lora"],
-        help="zero_shot: pretrained cross_pred head, "
+        choices=["zero_shot", "generate", "linear_probe", "lora"],
+        help="zero_shot: pretrained cross_pred head (fixed-scenario recon), "
+             "generate: 진짜 PPG->ABP (generate_cross_modal, target 부재), "
              "linear_probe: frozen encoder + regression head, "
              "lora: LoRA + regression head",
     )
@@ -1736,6 +1887,27 @@ def main() -> None:
             scenarios=scenarios,
             device_str=args.device,
             fold=load_fold,
+        )
+
+    elif args.mode == "generate":
+        if not args.data_path:
+            print("Error: --data-path required for generate mode", file=sys.stderr)
+            sys.exit(1)
+        if not args.scenario:
+            print("Error: --scenario required for generate mode (e.g. 'PPG->ABP')",
+                  file=sys.stderr)
+            sys.exit(1)
+        scenario = parse_scenario(args.scenario)
+        run_cross_modal_generate_eval(
+            checkpoint_path=args.checkpoint,
+            data_path=args.data_path,
+            scenario=scenario,
+            model_version=args.model_version,
+            device_str=args.device,
+            out_dir=args.out_dir,
+            fold=load_fold,
+            n_folds=args.n_folds,
+            dump_preds=not args.no_dump_preds,
         )
 
     elif args.mode == "linear_probe":

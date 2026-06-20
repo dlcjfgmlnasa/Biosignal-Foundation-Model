@@ -170,26 +170,19 @@ tasks:
     category: generation
     module: downstream.generation.cross_modal.run
     data_path: "${env:DOWNSTREAM_DATA_ROOT}/cross_modal_recon/cross_modal_vitaldb_ecg_abp_ppg_w30s"
-    modes: [linear_probe, lora]
+    # generate: 모델 본연 cross_pred head(generate_cross_modal, [MASK] 주입)로
+    #   PPG 로부터 ABP 생성 — 진짜 PPG->ABP, zero-shot(학습 없음). target 부재.
+    modes: [generate]
     applies_to_groups: [baseline, loss_component, lscnorm, cross_modal,
                         phase_stage, attn_bias]
     n_folds: 5                 # fold-chunked 5-fold OOF (classification 과 일관)
     no_patch_arg: true         # cross_modal run.py 에 --patch-size 없음
-    batch_size:                # w30s(=15 token/신호) 짧아 GPU 저활용 → 128 로 상향.
-      linear_probe: 128        #   linear_probe: frozen+no_grad → 메모리 여유 큼
-      lora: 128                #   lora: 30s 윈도우라 128 도 시도(OOM 시 64/32 로)
-    epochs:
-      linear_probe: 30
-      lora: 30
-    lr:
-      linear_probe: 1.0e-3
-      lora: 1.0e-4
+    no_lora_arg: true          # generate 는 학습 없음 → lora 인자 불필요
+    no_epochs_arg: true        # generate 는 학습 없음 → epochs/lr 불필요
+    no_batch_arg: true         # generate 는 per-window 추론 → batch-size 불필요
     extra_args:
       model-version: v2
       scenario: "PPG->ABP"
-      n-cases: 50
-      window-sec: 30.0
-      stride-sec: 15.0
 
   # ── 5. ICH Sparse Variant (Sampling group only) ──────────────────
   - name: ich_sparse
