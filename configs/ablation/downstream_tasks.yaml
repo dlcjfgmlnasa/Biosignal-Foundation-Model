@@ -121,7 +121,23 @@ tasks:
       agg-layers: 2
       agg-heads: 4
 
-  # ── 3. Waveform Forecasting (Generation) ─────────────────────────
+  # ── 3. Postoperative AKI (Outcome) ───────────────────────────────
+  - name: aki
+    category: outcome
+    module: downstream.outcome.aki.run
+    data_path: "${env:DOWNSTREAM_DATA_ROOT}/aki/aki_binary_abp_cvp_w600s"
+    # 실제 파일: aki_binary_abp_cvp_w600s_fold{F}_{split}_chunk{C}.pt — runner expand.
+    # CVP modality 커버리지 창구 (ABP+CVP, paper #9). KDIGO Stage≥1 binary.
+    modes: [linear_probe, lora]
+    applies_to_groups: [baseline, loss_component, lscnorm, cross_modal,
+                        phase_stage, sampling, attn_bias]
+    batch_size: 16            # 환자 수 per batch (window 수 아님)
+    extra_args:
+      max-windows: 24         # session 당 최대 window 수
+      agg-layers: 2
+      agg-heads: 4
+
+  # ── 4. Waveform Forecasting (Generation) ─────────────────────────
   - name: waveform_forecasting
     category: generation
     module: downstream.generation.intra_modal_forecast.run
@@ -142,7 +158,7 @@ tasks:
       signal-type: ecg         # paper canonical (main); appendix 는 abp/ppg/co2
       target-sec: [10]         # 단일 horizon
 
-  # ── 4. ICH Sparse Variant (Sampling group only) ──────────────────
+  # ── 5. ICH Sparse Variant (Sampling group only) ──────────────────
   - name: ich_sparse
     category: acute_event
     module: downstream.acute_event.intracranial_hypertension.run
