@@ -163,16 +163,17 @@ tasks:
   # ── 6. Cross-Modal Reconstruction PPG->ABP (Generation) ──────────
   # Paper Table 4 의 generation 컬럼(PPG -> ABP, ρ↑/MSE↓). cross_pred head 기반
   # cross-modal reconstruction. forecasting(#4, intra-modal)과 별개 task.
-  # run.py 가 --patch-size 미지원 → no_patch_arg. fold loop 없이 단일 test-set
-  # eval + patient-cluster bootstrap CI 이므로 n_folds=1 (fold0 단일 호출, 두 mode).
+  # run.py 가 --patch-size 미지원 → no_patch_arg. 데이터는 fold-chunked
+  # (cross_modal_vitaldb_ecg_abp_ppg_w30s_fold{F}_{split}_chunk{C}.pt) 이라
+  # prefix(.pt 없음) + n_folds=5 로 5-fold OOF (_load_prepared_data 가 glob).
   - name: cross_modal_ppg_abp
     category: generation
     module: downstream.generation.cross_modal.run
-    data_path: "${env:DOWNSTREAM_DATA_ROOT}/cross_modal/cross_modal_local_ecg_abp_ppg_w30s.pt"
+    data_path: "${env:DOWNSTREAM_DATA_ROOT}/cross_modal_recon/cross_modal_vitaldb_ecg_abp_ppg_w30s"
     modes: [linear_probe, lora]
     applies_to_groups: [baseline, loss_component, lscnorm, cross_modal,
                         phase_stage, attn_bias]
-    n_folds: 1                 # 단일 test-set (fold0), bootstrap CI 로 불확실성 추정
+    n_folds: 5                 # fold-chunked 5-fold OOF (classification 과 일관)
     no_patch_arg: true         # cross_modal run.py 에 --patch-size 없음
     batch_size: 16
     epochs:
