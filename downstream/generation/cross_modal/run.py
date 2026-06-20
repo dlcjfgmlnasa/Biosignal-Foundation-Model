@@ -345,6 +345,54 @@ class WaveformRegressionHead(nn.Module):
         return self.head(encoded)
 
 
+class WaveformConvDecoder(nn.Module):
+    """토큰 feature 시퀀스 → target 파형 패치 (Conv decoder).
+
+    단일 Linear(WaveformRegressionHead) 대비 (1) 비선형 + (2) 토큰 간 temporal
+    context(1D conv, kernel 로 인접 패치 참조)를 갖춰 파형 형태 복원력이 높다.
+    PPG-only feature 로부터 ABP 파형을 복원하는 진짜 cross-modal 생성용.
+    ablation 판별력 보존을 위해 capacity 는 moderate (default ~0.7M params).
+
+    Parameters
+    ----------
+    d_model : 인코더 hidden dim.
+    patch_size : 패치당 샘플 수 (출력 길이).
+    hidden : conv 채널 (None 이면 d_model).
+    kernel : 1D conv kernel (토큰 시간축).
+    n_conv : conv 층 수.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        patch_size: int,
+        hidden: int | None = None,
+        kernel: int = 5,
+        n_conv: int = 2,
+    ) -> None:
+        super().__init__()
+        hidden = hidden or d_model
+        self.norm = nn.LayerNorm(d_model)
+        layers: list[nn.Module] = []
+        ch = d_model
+        for _ in range(n_conv):
+            layers.append(nn.Conv1d(ch, hidden, kernel, padding=kernel // 2))
+            layers.append(nn.GELU())
+            ch = hidden
+        self.convs = nn.Sequential(*layers)
+        self.proj = nn.Linear(hidden, patch_size)
+
+    def forward(
+        self,
+        encoded: torch.Tensor,  # (B, N, d_model)
+    ) -> torch.Tensor:  # (B, N, patch_size)
+        x = self.norm(encoded)
+        x = x.transpose(1, 2)   # (B, d_model, N)
+        x = self.convs(x)       # (B, hidden, N)
+        x = x.transpose(1, 2)   # (B, N, hidden)
+        return self.proj(x)     # (B, N, patch_size)
+
+
 # ── LoRA data utilities ─────────────────────────────────────
 
 
@@ -1032,6 +1080,66 @@ def run_random_subset_eval(
 
 
 @torch.no_grad()
+def _cross_pred_window(
+    model,
+    signals: dict[str, np.ndarray],  # source + target 모두 포함
+    source_keys: list[str],
+    target_key: str,
+    patch_size: int,
+    device: torch.device,
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Multi-variate cross-modal 예측 (train/visualize_phase2._extract_cross_modal_pairs 방식).
+
+    signals 에 source + target 을 **모두** 넣어 forward 하고, source 패치 위치에서
+    target signal_type 의 ``cross_pred_per_type`` 를 뽑아 **target 의 loc/scale** 로
+    denorm 한다(시각화와 동일 — range 까지 일치). source-only generate_cross_modal 은
+    target 부재로 OOD 이라 동작하지 않으므로 이 경로를 사용한다.
+
+    returns (pred_flat, gt_flat) — n_common 패치 평탄화, 또는 (None, None).
+    """
+    target_type = SIGNAL_TYPE_IDS[target_key]
+    src_types = torch.tensor(
+        sorted({SIGNAL_TYPE_IDS[k] for k in source_keys}), device=device,
+    )
+
+    batch = build_multivariate_batch(signals, patch_size=patch_size)
+    batch.values = batch.values.to(device)
+    batch.sample_id = batch.sample_id.to(device)
+    batch.variate_id = batch.variate_id.to(device)
+
+    out = model(batch, task="masked", mask_ratio=0.0)
+    cpp = out.get("cross_pred_per_type")   # (1, N, T, P)
+    pst = out.get("patch_signal_types")    # (1, N)
+    pmask = out["patch_mask"]              # (1, N)
+    loc, scale = out["loc"], out["scale"]
+    if pst is None or cpp is None:
+        return None, None
+
+    n = cpp.shape[1]
+    stride = model.patch_embed.stride
+    patch_starts = (torch.arange(n, device=loc.device) * stride).clamp(max=loc.shape[1] - 1)
+    patch_loc = loc[0, patch_starts, 0]     # (N,)
+    patch_scale = scale[0, patch_starts, 0]
+    original = batch.values[0, : n * patch_size].reshape(n, patch_size)  # raw target/source
+
+    valid = pmask[0]
+    src_mask = valid & torch.isin(pst[0], src_types)
+    tgt_mask = valid & (pst[0] == target_type)
+    idx_a = src_mask.nonzero(as_tuple=True)[0]  # source 패치 위치
+    idx_b = tgt_mask.nonzero(as_tuple=True)[0]  # target 패치 위치
+    if len(idx_a) == 0 or len(idx_b) == 0:
+        return None, None
+    n_common = min(len(idx_a), len(idx_b))
+    ia, ib = idx_a[:n_common], idx_b[:n_common]
+
+    # source 위치에서 target 예측 → target 의 loc/scale 로 denorm (시각화 동일).
+    cp = cpp[0, ia, target_type]  # (n_common, P) normalized
+    cpred = cp * patch_scale[ib].unsqueeze(-1) + patch_loc[ib].unsqueeze(-1)
+    gt = original[ib]  # (n_common, P) raw target
+    return cpred.reshape(-1).cpu().numpy(), gt.reshape(-1).cpu().numpy()
+
+
+@torch.no_grad()
 def run_cross_modal_generate_eval(
     checkpoint_path: str,
     data_path: str,
@@ -1085,33 +1193,21 @@ def run_cross_modal_generate_eval(
     raw_tgt_win: list[np.ndarray] = []
 
     for i in range(n_samples):
-        # source(visible) 신호만으로 batch 구성 — target(ABP) 는 입력에 부재.
-        visible_signals = {s: sigs[s][i].float().numpy() for s in scenario.inputs}
-        gt = sigs[scenario.target][i].float().numpy()
+        # source + target 을 모두 batch 에 넣어 multi-variate cross_pred (시각화 방식).
+        signals = {s: sigs[s][i].float().numpy() for s in scenario.inputs}
+        signals[scenario.target] = sigs[scenario.target][i].float().numpy()
         try:
-            batch = build_multivariate_batch(visible_signals, patch_size=patch_size)
-            batch.values = batch.values.to(device)
-            batch.sample_id = batch.sample_id.to(device)
-            batch.variate_id = batch.variate_id.to(device)
-            out = model.generate_cross_modal(
-                batch, target_signal_type=target_type_id, denormalize=True,
+            pf, gf = _cross_pred_window(
+                model, signals, scenario.inputs, scenario.target, patch_size, device,
             )
         except Exception:
             continue
-
-        pred = out["waveform"]
-        if pred.numel() == 0:
+        if pf is None or gf is None or len(pf) < patch_size:
             continue
-        pred_flat = pred[0].reshape(-1).cpu().numpy()
-        min_len = min(len(pred_flat), len(gt))
-        if min_len < patch_size:
-            continue
-        pf = pred_flat[:min_len]
-        gf = gt[:min_len]
 
         per_mae.append(float(np.mean(np.abs(pf - gf))))
         per_mse.append(float(np.mean((pf - gf) ** 2)))
-        # per-window Pearson (파형 형태 fidelity, DC offset/scale 무관).
+        # per-window Pearson (파형 형태 fidelity).
         if np.std(pf) > 1e-8 and np.std(gf) > 1e-8:
             per_r.append(float(np.corrcoef(pf, gf)[0, 1]))
         else:
@@ -1627,7 +1723,7 @@ def run_lora_regression(
         sys.exit(1)
 
     # Create regression head
-    head = WaveformRegressionHead(wrapper.d_model, patch_size)
+    head = WaveformConvDecoder(wrapper.d_model, patch_size)
 
     n_lora = sum(p.numel() for p in wrapper.lora_parameters())
     n_head = sum(p.numel() for p in head.parameters())
@@ -1851,7 +1947,7 @@ def run_linear_probe_regression(
         print("ERROR: No train batches.", file=sys.stderr)
         sys.exit(1)
 
-    head = WaveformRegressionHead(wrapper.d_model, patch_size)
+    head = WaveformConvDecoder(wrapper.d_model, patch_size)
     n_head = sum(p.numel() for p in head.parameters())
     print(f"\nTrainable params: Head={n_head:,} (encoder frozen)")
 
