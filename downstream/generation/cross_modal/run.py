@@ -664,6 +664,8 @@ def evaluate_lora_regression(
     # per-window raw waveform (collect_raw) — 배치별 (B, L) numpy 누적.
     raw_pred_win: list[np.ndarray] = []
     raw_tgt_win: list[np.ndarray] = []
+    # per-window (segment) Pearson r 누적 — 파형 형태 fidelity 지표.
+    per_win_r: list[float] = []
 
     for batch, target_patches in test_batches:
         batch = model.batch_to_device(batch)
@@ -682,10 +684,20 @@ def evaluate_lora_regression(
         tgt_o = target_patches[:, :n_out].cpu()  # (B, n_out, patch_size)
         all_pred.append(pred_o.reshape(-1))
         all_target.append(tgt_o.reshape(-1))
+
+        # ── per-window 상관 ────────────────────────────────────────
+        # global flatten 은 window 간 절대 BP 편차(encoder instance-norm 으로
+        # 복원 불가)가 분산을 지배해 r 을 과소평가한다. 파형 형태 fidelity 는
+        # window 별 상관(=DC offset/scale 무관)을 평균한 값이 올바른 지표.
+        pw = pred_o.reshape(pred_o.shape[0], -1)  # (B, L)
+        tw = tgt_o.reshape(tgt_o.shape[0], -1)
+        for i in range(pw.shape[0]):
+            per_win_r.append(_pearson_r(pw[i], tw[i]))
+
         if collect_raw:
             # window 당 평탄화 waveform: (B, n_out*patch_size)
-            raw_pred_win.append(pred_o.reshape(pred_o.shape[0], -1).numpy())
-            raw_tgt_win.append(tgt_o.reshape(tgt_o.shape[0], -1).numpy())
+            raw_pred_win.append(pw.numpy())
+            raw_tgt_win.append(tw.numpy())
 
     pred = torch.cat(all_pred)
     target = torch.cat(all_target)
@@ -693,12 +705,14 @@ def evaluate_lora_regression(
     mse = F.mse_loss(pred, target).item()
     mae = F.l1_loss(pred, target).item()
     r = _pearson_r(pred, target)
+    r_win = float(np.mean(per_win_r)) if per_win_r else 0.0
     n_patches = pred.shape[0]
 
     metrics: dict = {
         "mse": mse,
         "mae": mae,
-        "pearson_r": r,
+        "pearson_r": r,            # global flatten (절대 BP 포함, 과소평가)
+        "pearson_r_win": r_win,    # per-window 평균 (파형 형태 fidelity, 권장)
         "n_patches": n_patches,
     }
 
@@ -1263,10 +1277,11 @@ def run_lora_regression(
     # Print results
     print(f"\n{'=' * 50}")
     print(f"  Scenario:  {scenario.name}")
-    print(f"  MSE:       {metrics['mse']:.6f}")
-    print(f"  MAE:       {metrics['mae']:.6f}")
-    print(f"  Pearson r: {metrics['pearson_r']:.4f}")
-    print(f"  N patches: {metrics['n_patches']}")
+    print(f"  MSE:           {metrics['mse']:.6f}")
+    print(f"  MAE:           {metrics['mae']:.6f}")
+    print(f"  Pearson r:     {metrics['pearson_r']:.4f}  (global flatten)")
+    print(f"  Pearson r_win: {metrics['pearson_r_win']:.4f}  (per-window, 권장)")
+    print(f"  N patches:     {metrics['n_patches']}")
     print(f"{'=' * 50}")
 
     # Save results
@@ -1480,10 +1495,11 @@ def run_linear_probe_regression(
 
     print(f"\n{'=' * 50}")
     print(f"  Scenario:  {scenario.name}")
-    print(f"  MSE:       {metrics['mse']:.6f}")
-    print(f"  MAE:       {metrics['mae']:.6f}")
-    print(f"  Pearson r: {metrics['pearson_r']:.4f}")
-    print(f"  N patches: {metrics['n_patches']}")
+    print(f"  MSE:           {metrics['mse']:.6f}")
+    print(f"  MAE:           {metrics['mae']:.6f}")
+    print(f"  Pearson r:     {metrics['pearson_r']:.4f}  (global flatten)")
+    print(f"  Pearson r_win: {metrics['pearson_r_win']:.4f}  (per-window, 권장)")
+    print(f"  N patches:     {metrics['n_patches']}")
     print(f"{'=' * 50}")
 
     out_path = Path(out_dir)
