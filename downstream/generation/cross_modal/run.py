@@ -494,10 +494,17 @@ def _build_lora_batches(
         batch = collate(all_samples)
 
         # Target patches: (B, n_patches_per_variate, patch_size)
-        # 저장 데이터가 fp16(Half) 일 수 있음 → regression head/loss(Float) 와
-        # dtype 충돌("Found dtype Half but expected Float") 방지 위해 float 캐스팅.
-        target_sig = signals_dict[scenario.target][start:end]  # (B, T)
-        target_patches = _patchify(target_sig, patch_size).float()  # (B, n_patches, patch_size)
+        # 모델은 normalized space(loc/scale)에서 동작한다(zero_shot recon MSE~0.57).
+        # raw mmHg ABP 를 그대로 target 으로 쓰면, instance-norm 된 feature 로 환자별
+        # 절대 BP(offset/scale)를 맞추려다 평균만 예측 → r 붕괴(관측된 버그).
+        # PPG 로 절대 BP 는 복원 불가하므로 per-window z-score 로 정규화해 "파형 형태"
+        # 만 예측하도록 한다(올바른 task 정의 + 모델 normalized space 와 정합).
+        # fp16 데이터 → float 캐스팅도 겸함(dtype 충돌 방지).
+        target_sig = signals_dict[scenario.target][start:end].float()  # (B, T)
+        t_mu = target_sig.mean(dim=1, keepdim=True)
+        t_sd = target_sig.std(dim=1, keepdim=True).clamp_min(1e-6)
+        target_sig = (target_sig - t_mu) / t_sd
+        target_patches = _patchify(target_sig, patch_size)  # (B, n_patches, patch_size)
 
         batches.append((batch, target_patches))
 
