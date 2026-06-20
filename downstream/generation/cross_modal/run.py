@@ -1356,30 +1356,37 @@ def train_linear_probe_regression(
 
     optimizer = torch.optim.AdamW(head.parameters(), lr=lr, weight_decay=0.01)
 
+    # ── frozen encoder feature 를 1회만 추출해 CPU 캐싱 ──────────────
+    # encoder 가 고정이라 pooled feature 는 epoch 마다 동일 → 매 epoch 재계산하면
+    # encoder forward 가 (n_batches × epochs) 회로 불필요하게 30× 중복된다.
+    # 한 번만 추출(detach→cpu)해 두고 head 만 cached feature 로 학습하면
+    # encoder forward 가 n_batches 회로 줄어 대폭 가속된다.
+    print("  Caching frozen encoder features (1 pass)...")
+    cached: list[tuple[torch.Tensor, torch.Tensor]] = []
+    with torch.no_grad():
+        for batch, target_patches in train_batches:
+            batch = model.batch_to_device(batch)
+            out = model.model(batch, task="masked", mask_ratio=0.0)
+            pooled = _pool_by_time(
+                out["encoded"], out["time_id"], out["patch_mask"]
+            )  # (B, N_time, d_model)
+            n_out = min(pooled.shape[1], target_patches.shape[1])
+            cached.append((
+                pooled[:, :n_out].detach().cpu(),
+                target_patches[:, :n_out].float().cpu(),
+            ))
+
     losses: list[float] = []
 
     for epoch in range(epochs):
         epoch_loss = 0.0
         n_batches = 0
 
-        for batch, target_patches in train_batches:
-            batch = model.batch_to_device(batch)
-            target_patches = target_patches.to(device)  # (B, N_target, patch_size)
+        for pooled_c, target_c in cached:
+            pooled = pooled_c.to(device)
+            target = target_c.to(device)  # (B, N_out, patch_size)
 
-            # encoder 는 frozen → no_grad 로 feature 추출 (메모리 절감, grad 차단)
-            with torch.no_grad():
-                out = model.model(batch, task="masked", mask_ratio=0.0)
-                encoded = out["encoded"]      # (B, N_total, d_model)
-                time_id = out["time_id"]      # (B, N_total)
-                patch_mask = out["patch_mask"]  # (B, N_total) bool
-                pooled = _pool_by_time(encoded, time_id, patch_mask)
-
-            predicted = head(pooled)  # (B, N_time, patch_size)
-
-            n_out = min(predicted.shape[1], target_patches.shape[1])
-            predicted = predicted[:, :n_out]
-            target = target_patches[:, :n_out]
-
+            predicted = head(pooled)  # (B, N_out, patch_size)
             loss = F.mse_loss(predicted, target)
 
             optimizer.zero_grad()
