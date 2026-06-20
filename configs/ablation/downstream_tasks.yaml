@@ -175,7 +175,9 @@ tasks:
                         phase_stage, attn_bias]
     n_folds: 5                 # fold-chunked 5-fold OOF (classification 과 일관)
     no_patch_arg: true         # cross_modal run.py 에 --patch-size 없음
-    batch_size: 16
+    batch_size:                # w30s(=15 token/신호) 짧아 16 은 GPU 저활용.
+      linear_probe: 64         #   linear_probe: frozen+no_grad → 메모리 여유 큼
+      lora: 64                 #   lora: 30s 윈도우라 64 도 안전(OOM 시 32 로)
     epochs:
       linear_probe: 30
       lora: 30
