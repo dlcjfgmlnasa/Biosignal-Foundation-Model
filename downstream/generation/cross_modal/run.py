@@ -494,8 +494,10 @@ def _build_lora_batches(
         batch = collate(all_samples)
 
         # Target patches: (B, n_patches_per_variate, patch_size)
+        # 저장 데이터가 fp16(Half) 일 수 있음 → regression head/loss(Float) 와
+        # dtype 충돌("Found dtype Half but expected Float") 방지 위해 float 캐스팅.
         target_sig = signals_dict[scenario.target][start:end]  # (B, T)
-        target_patches = _patchify(target_sig, patch_size)  # (B, n_patches, patch_size)
+        target_patches = _patchify(target_sig, patch_size).float()  # (B, n_patches, patch_size)
 
         batches.append((batch, target_patches))
 
