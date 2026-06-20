@@ -121,21 +121,23 @@ tasks:
       agg-layers: 2
       agg-heads: 4
 
-  # ── 3. Postoperative AKI (Outcome) ───────────────────────────────
-  - name: aki
-    category: outcome
-    module: downstream.outcome.aki.run
-    data_path: "${env:DOWNSTREAM_DATA_ROOT}/aki/aki_binary_abp_cvp_w600s"
-    # 실제 파일: aki_binary_abp_cvp_w600s_fold{F}_{split}_chunk{C}.pt — runner expand.
-    # CVP modality 커버리지 창구 (ABP+CVP, paper #9). KDIGO Stage≥1 binary.
-    modes: [linear_probe, lora]
-    applies_to_groups: [baseline, loss_component, lscnorm, cross_modal,
-                        phase_stage, sampling, attn_bias]
-    batch_size: 16            # 환자 수 per batch (window 수 아님)
-    extra_args:
-      max-windows: 24         # session 당 최대 window 수
-      agg-layers: 2
-      agg-heads: 4
+  # ── 3. Postoperative AKI (Outcome) ── DROPPED (2026-06-20) ──────
+  # AKI 는 ablation outcome task 에서 제외. 사유: frozen linear-probe 가
+  # near-chance(val_auroc≈0.5) — 작은 코호트(train 414명/AKI 60) + 신호 단독
+  # (preop Cr/eGFR 없이) 으로 KDIGO 예측은 문헌상으로도 약함. ablation 의
+  # outcome 대표 task 는 mortality 로 교체. 되살리려면 주석 해제.
+  # - name: aki
+  #   category: outcome
+  #   module: downstream.outcome.aki.run
+  #   data_path: "${env:DOWNSTREAM_DATA_ROOT}/aki/aki_binary_abp_cvp_w600s"
+  #   modes: [linear_probe, lora]
+  #   applies_to_groups: [baseline, loss_component, lscnorm, cross_modal,
+  #                       phase_stage, sampling, attn_bias]
+  #   batch_size: 16
+  #   extra_args:
+  #     max-windows: 24
+  #     agg-layers: 2
+  #     agg-heads: 4
 
   # ── 4. Waveform Forecasting (Generation) ─────────────────────────
   - name: waveform_forecasting
@@ -157,6 +159,34 @@ tasks:
     extra_args:
       signal-type: ecg         # paper canonical (main); appendix 는 abp/ppg/co2
       target-sec: [10]         # 단일 horizon
+
+  # ── 6. Cross-Modal Reconstruction PPG->ABP (Generation) ──────────
+  # Paper Table 4 의 generation 컬럼(PPG -> ABP, ρ↑/MSE↓). cross_pred head 기반
+  # cross-modal reconstruction. forecasting(#4, intra-modal)과 별개 task.
+  # run.py 가 --patch-size 미지원 → no_patch_arg. fold loop 없이 단일 test-set
+  # eval + patient-cluster bootstrap CI 이므로 n_folds=1 (fold0 단일 호출, 두 mode).
+  - name: cross_modal_ppg_abp
+    category: generation
+    module: downstream.generation.cross_modal.run
+    data_path: "${env:DOWNSTREAM_DATA_ROOT}/cross_modal/cross_modal_local_ecg_abp_ppg_w30s.pt"
+    modes: [linear_probe, lora]
+    applies_to_groups: [baseline, loss_component, lscnorm, cross_modal,
+                        phase_stage, attn_bias]
+    n_folds: 1                 # 단일 test-set (fold0), bootstrap CI 로 불확실성 추정
+    no_patch_arg: true         # cross_modal run.py 에 --patch-size 없음
+    batch_size: 16
+    epochs:
+      linear_probe: 30
+      lora: 30
+    lr:
+      linear_probe: 1.0e-3
+      lora: 1.0e-4
+    extra_args:
+      model-version: v2
+      scenario: "PPG->ABP"
+      n-cases: 50
+      window-sec: 30.0
+      stride-sec: 15.0
 
   # ── 5. ICH Sparse Variant (Sampling group only) ──────────────────
   - name: ich_sparse

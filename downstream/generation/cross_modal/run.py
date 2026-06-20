@@ -117,29 +117,29 @@ def get_default_scenarios() -> list[Scenario]:
     """Task #12 Cross-Modal Reconstruction default scenarios.
 
     Paper-confirmed pair definition (docs/paper_task_modality.md).
-    v2 (RESP 분리) — respiratory pair 를 spatial_map CROSS_PRED_ALLOWED_PAIRS
-    (4,8)=CO2↔RESP_Impedance, (5,9)=AWP↔RESP_Flow 와 동기화:
-      - ECG → ABP (baseline cardiac cycle)
-      - ECG → PPG (cardiac → peripheral)
-      - ABP → PPG (arterial pulse wave)
-      - CO2 → RESP_Impedance (호흡 effort coupling, capnography ↔ 흉부 임피던스)
-      - AWP → RESP_Flow (ventilator P–Q 인과, airway pressure ↔ flow waveform)
-      - ABP → ICP (virtual ICP probe — non-invasive ICP estimation)
-      - ABP → PAP (virtual Swan-Ganz — non-invasive PA pressure)
-      - CVP → PAP (right heart hemodynamics)
+    Reporting set (2026-06-17 갱신): 강결합 (γ, CROSS_PRED_ALLOWED_PAIRS) 기반,
+    "약한(비침습) 신호 → 강한(침습) 신호" 복원 방향:
+      - ECG → ABP (비침습 → 침습 동맥압)          (0,1)
+      - PPG → ABP (비침습 말초 맥파 → 침습 동맥압) (1,2)
+      - ECG+PPG → ABP (비침습 2채널 → 침습 ABP)   (0,1)+(1,2)  ← multi-input
+      - AWP → RESP_Flow (ventilator P–Q 인과)     (5,9)
+
+    제외:
+      - ECG → PPG: cardiac→peripheral 이나, 임상 활용도 높은 PPG → ABP
+        (비침습 BP 추정)로 대체.
+      - ABP → PPG: 강 → 약 방향이라 임상 의의 낮음 → ECG+PPG → ABP 로 대체.
+      - ABP → ICP: ICP 가 VitalDB 에 없음(평가 소스 부재) → 제외.
+      - CO2 → RESP_Impedance: 약결합 + downstream RESP 데이터 소스 부재.
+      - ABP → PAP / CVP → PAP: PAP 는 사전학습에서 제외(slot 6 데이터 없음) →
+        타깃이 pretrain 에 미등장하여 복원 대상 부적합.
     """
     scenarios = [
-        # Cardiovascular intra-group baselines
+        # 강결합 cardiovascular (γ) — 약 → 강 방향
         Scenario("ECG->ABP", ["ecg"], "abp", "intra", 1),
-        Scenario("ECG->PPG", ["ecg"], "ppg", "intra", 1),
-        Scenario("ABP->PPG", ["abp"], "ppg", "intra", 1),
-        # Respiratory coupling (spatial_map (4,8)/(5,9) 와 동기화)
-        Scenario("CO2->RESP_IMPEDANCE", ["co2"], "resp_impedance", "intra", 1),
+        Scenario("PPG->ABP", ["ppg"], "abp", "intra", 1),
+        Scenario("ECG+PPG->ABP", ["ecg", "ppg"], "abp", "intra", 2),  # multi-input
+        # 강결합 respiratory (γ, spatial_map (5,9))
         Scenario("AWP->RESP_FLOW", ["awp"], "resp_flow", "intra", 1),
-        # Rare-modality virtual probes (primary novelty)
-        Scenario("ABP->ICP", ["abp"], "icp", "inter", 1),
-        Scenario("ABP->PAP", ["abp"], "pap", "intra", 1),
-        Scenario("CVP->PAP", ["cvp"], "pap", "intra", 1),
     ]
     return scenarios
 
@@ -1329,6 +1329,210 @@ def run_lora_regression(
     return results
 
 
+# ── Linear-probe regression entry point ─────────────────────
+
+
+def train_linear_probe_regression(
+    model,  # DownstreamModelWrapper (encoder frozen, no LoRA)
+    head: WaveformRegressionHead,
+    train_batches: list[tuple[PackedBatch, torch.Tensor]],
+    epochs: int,
+    lr: float,
+    device: torch.device,
+    gradient_clip: float = 1.0,
+) -> list[float]:
+    """Train only WaveformRegressionHead on top of a frozen encoder.
+
+    LoRA 를 주입하지 않고 encoder 를 eval()+no_grad 로 고정한 채 head 만 학습한다
+    (frozen linear probe). forward/pooling 로직은 train_lora_regression 과 동일.
+    """
+    model.model.eval()
+    for p in model.model.parameters():
+        p.requires_grad_(False)
+    head = head.to(device)
+    head.train()
+
+    optimizer = torch.optim.AdamW(head.parameters(), lr=lr, weight_decay=0.01)
+
+    losses: list[float] = []
+
+    for epoch in range(epochs):
+        epoch_loss = 0.0
+        n_batches = 0
+
+        for batch, target_patches in train_batches:
+            batch = model.batch_to_device(batch)
+            target_patches = target_patches.to(device)  # (B, N_target, patch_size)
+
+            # encoder 는 frozen → no_grad 로 feature 추출 (메모리 절감, grad 차단)
+            with torch.no_grad():
+                out = model.model(batch, task="masked", mask_ratio=0.0)
+                encoded = out["encoded"]      # (B, N_total, d_model)
+                time_id = out["time_id"]      # (B, N_total)
+                patch_mask = out["patch_mask"]  # (B, N_total) bool
+                pooled = _pool_by_time(encoded, time_id, patch_mask)
+
+            predicted = head(pooled)  # (B, N_time, patch_size)
+
+            n_out = min(predicted.shape[1], target_patches.shape[1])
+            predicted = predicted[:, :n_out]
+            target = target_patches[:, :n_out]
+
+            loss = F.mse_loss(predicted, target)
+
+            optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(head.parameters(), gradient_clip)
+            optimizer.step()
+
+            epoch_loss += loss.item()
+            n_batches += 1
+
+        avg = epoch_loss / max(n_batches, 1)
+        losses.append(avg)
+        if (epoch + 1) % 5 == 0 or epoch == 0:
+            print(f"  Epoch {epoch + 1}/{epochs}  loss={avg:.6f}")
+
+    return losses
+
+
+def run_linear_probe_regression(
+    checkpoint_path: str,
+    data_path: str,
+    scenario: Scenario,
+    model_version: str = "v1",
+    epochs: int = 30,
+    lr: float = 1e-3,
+    batch_size: int = 16,
+    device_str: str = "cpu",
+    out_dir: str = ".",
+    fold: int | None = None,
+    n_folds: int = 1,
+    dump_preds: bool = True,
+) -> dict:
+    """Frozen linear-probe regression for a single cross-modal scenario.
+
+    run_lora_regression 과 동일하나 LoRA 주입 없이 frozen encoder + regression
+    head 만 학습한다. 저장/preds dump 포맷은 lora 와 동일 (ablation aggregator 호환).
+    """
+    from downstream.model_wrapper import DownstreamModelWrapper
+
+    inputs_str = " + ".join(s.upper() for s in scenario.inputs)
+    target_str = scenario.target.upper()
+
+    print("=" * 70)
+    print(f"Task 8: Any-to-Any — Linear Probe (frozen encoder)")
+    print(f"  Scenario:   {inputs_str} -> {target_str}")
+    print(f"  Checkpoint: {checkpoint_path}")
+    print(f"  Data:       {data_path}")
+    print(f"  Training:   epochs={epochs}, lr={lr}, batch_size={batch_size}")
+    print("=" * 70)
+
+    device = torch.device(device_str)
+
+    # Load model (NO LoRA injection → encoder frozen)
+    wrapper = DownstreamModelWrapper(checkpoint_path, model_version, device)
+    patch_size = wrapper.patch_size
+
+    # Load data (fold-aware)
+    data = _load_prepared_data(data_path, fold=fold)
+
+    print("\nBuilding train batches...")
+    train_batches = _build_lora_batches(
+        data["train"], scenario, patch_size, batch_size
+    )
+    print(f"  Train: {len(train_batches)} batches")
+
+    print("Building test batches...")
+    test_batches = _build_lora_batches(
+        data["test"], scenario, patch_size, batch_size
+    )
+    print(f"  Test: {len(test_batches)} batches")
+
+    if not train_batches:
+        print("ERROR: No train batches.", file=sys.stderr)
+        sys.exit(1)
+
+    head = WaveformRegressionHead(wrapper.d_model, patch_size)
+    n_head = sum(p.numel() for p in head.parameters())
+    print(f"\nTrainable params: Head={n_head:,} (encoder frozen)")
+
+    print(f"\nTraining...")
+    train_losses = train_linear_probe_regression(
+        wrapper, head, train_batches, epochs, lr, device
+    )
+
+    print(f"\nEvaluating on test set...")
+    metrics = evaluate_lora_regression(
+        wrapper, head, test_batches, device, collect_raw=dump_preds,
+    )
+    raw_y_score = metrics.pop("raw_y_score", None)
+    raw_y_true = metrics.pop("raw_y_true", None)
+
+    print(f"\n{'=' * 50}")
+    print(f"  Scenario:  {scenario.name}")
+    print(f"  MSE:       {metrics['mse']:.6f}")
+    print(f"  MAE:       {metrics['mae']:.6f}")
+    print(f"  Pearson r: {metrics['pearson_r']:.4f}")
+    print(f"  N patches: {metrics['n_patches']}")
+    print(f"{'=' * 50}")
+
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    scenario_slug = scenario.name.replace("->", "_to_").replace("+", "_")
+    results = {
+        "scenario": scenario.name,
+        "inputs": scenario.inputs,
+        "target": scenario.target,
+        "group_type": scenario.group_type,
+        "metrics": metrics,
+        "train_losses": train_losses,
+        "config": {
+            "mode": "linear_probe",
+            "epochs": epochs,
+            "lr": lr,
+            "batch_size": batch_size,
+            "data_path": data_path,
+        },
+    }
+
+    results_file = out_path / f"task8_linear_probe_{scenario_slug}.json"
+    with open(results_file, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"\nResults saved: {results_file}")
+
+    # ── Raw prediction dump (ablation aggregator 호환) ──────────────
+    if dump_preds and raw_y_true is not None and raw_y_score is not None:
+        n_win = raw_y_true.shape[0]
+        case_ids = data.get("test", {}).get("case_ids", [])
+        if len(case_ids) >= n_win:
+            patient_id = np.array([str(c) for c in case_ids[:n_win]], dtype=str)
+        else:
+            patient_id = np.array([str(i) for i in range(n_win)], dtype=str)
+        preds_path = out_path / f"preds_fold{int(fold) if fold is not None else 0}.npz"
+        payload = {
+            "y_true": raw_y_true.astype(np.float32),
+            "y_score": raw_y_score.astype(np.float32),
+            "patient_id": patient_id,
+            "fold_idx": np.int64(int(fold) if fold is not None else 0),
+            "n_folds": np.int64(int(n_folds)),
+            "task": f"cross_modal_{scenario_slug}",
+            "classes": np.array([], dtype=str),
+            "extra__scenario": np.full((n_win,), scenario.name, dtype=object).astype(str),
+            "extra__target": np.full((n_win,), scenario.target, dtype=object).astype(str),
+            "extra__group_type": np.full(
+                (n_win,), scenario.group_type, dtype=object,
+            ).astype(str),
+        }
+        np.savez_compressed(preds_path, **payload)
+        print(f"Predictions saved: {preds_path} "
+              f"(y_true={raw_y_true.shape}, y_score={raw_y_score.shape}, "
+              f"patients={len(patient_id)})")
+
+    return results
+
+
 # ── Output ───────────────────────────────────────────────────
 
 
@@ -1397,8 +1601,10 @@ def main() -> None:
         "--mode",
         type=str,
         default="zero_shot",
-        choices=["zero_shot", "lora"],
-        help="zero_shot: pretrained cross_pred head, lora: LoRA + regression head",
+        choices=["zero_shot", "linear_probe", "lora"],
+        help="zero_shot: pretrained cross_pred head, "
+             "linear_probe: frozen encoder + regression head, "
+             "lora: LoRA + regression head",
     )
     parser.add_argument(
         "--data-path",
@@ -1498,6 +1704,31 @@ def main() -> None:
             scenarios=scenarios,
             device_str=args.device,
             fold=load_fold,
+        )
+
+    elif args.mode == "linear_probe":
+        if not args.data_path:
+            print("Error: --data-path required for linear_probe mode", file=sys.stderr)
+            sys.exit(1)
+        if not args.scenario:
+            print("Error: --scenario required for linear_probe mode (e.g. 'PPG->ABP')",
+                  file=sys.stderr)
+            sys.exit(1)
+
+        scenario = parse_scenario(args.scenario)
+        run_linear_probe_regression(
+            checkpoint_path=args.checkpoint,
+            data_path=args.data_path,
+            scenario=scenario,
+            model_version=args.model_version,
+            epochs=args.epochs,
+            lr=args.lr,
+            batch_size=args.batch_size,
+            device_str=args.device,
+            out_dir=args.out_dir,
+            fold=load_fold,
+            n_folds=args.n_folds,
+            dump_preds=not args.no_dump_preds,
         )
 
     elif args.mode == "lora":
