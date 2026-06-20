@@ -563,8 +563,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--ckpt-root", type=Path,
                    default=Path(os.environ.get(
                        "ABLATION_OUTPUT_ROOT", str(REPO_ROOT / "outputs" / "ablation"))))
+    # 결과 저장 루트. ABLATION_RESULT_ROOT env 가 있으면 우선 사용
+    # (ckpt-root 의 ABLATION_OUTPUT_ROOT 와 동일 패턴 — repo 밖 k-mimic 쪽 저장),
+    # 없으면 repo 내 result/ablation 으로 fallback.
     p.add_argument("--result-root", type=Path,
-                   default=REPO_ROOT / "result" / "ablation")
+                   default=Path(os.environ.get(
+                       "ABLATION_RESULT_ROOT", str(REPO_ROOT / "result" / "ablation"))))
 
     p.add_argument("--variants", nargs="+", default=None,
                    help="실행할 variant name 화이트리스트 (생략 시 전체)")
