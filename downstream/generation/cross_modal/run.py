@@ -1181,6 +1181,223 @@ def run_cross_modal_generate_eval(
     return results
 
 
+def train_generate_lora(
+    wrapper,  # DownstreamModelWrapper (LoRA injected)
+    train_batches: list[tuple[PackedBatch, torch.Tensor]],
+    target_type_id: int,
+    epochs: int,
+    lr: float,
+    device: torch.device,
+    gradient_clip: float = 1.0,
+) -> list[float]:
+    """모델 본연 cross_pred pathway 를 LoRA 로 fine-tune (source->target 생성).
+
+    각 batch = source(예: PPG) 만 포함한 PackedBatch + 정규화된 target(ABP) patches.
+    forward(task="masked", mask_ratio=0) 의 cross_pred_per_type[:, :, target, :] 를
+    target patches 에 MSE 로 맞추며 **LoRA adapter 만** 학습(base/head=frozen).
+    """
+    model = wrapper.model
+    model.train()
+    lora_params = wrapper.lora_parameters()
+    optimizer = torch.optim.AdamW(lora_params, lr=lr, weight_decay=0.01)
+
+    losses: list[float] = []
+    for epoch in range(epochs):
+        epoch_loss = 0.0
+        n_batches = 0
+        for batch, target_patches in train_batches:
+            batch = wrapper.batch_to_device(batch)
+            target = target_patches.to(device)  # (B, N_t, P) normalized
+
+            out = model(batch, task="masked", mask_ratio=0.0)
+            cpp = out["cross_pred_per_type"]  # (B, N, T, P)
+            pred = cpp[:, :, target_type_id, :]  # (B, N, P)
+
+            n_out = min(pred.shape[1], target.shape[1])
+            loss = F.mse_loss(pred[:, :n_out], target[:, :n_out])
+
+            optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(lora_params, gradient_clip)
+            optimizer.step()
+
+            epoch_loss += loss.item()
+            n_batches += 1
+
+        avg = epoch_loss / max(n_batches, 1)
+        losses.append(avg)
+        if (epoch + 1) % 5 == 0 or epoch == 0:
+            print(f"  Epoch {epoch + 1}/{epochs}  loss={avg:.6f}")
+    return losses
+
+
+def run_cross_modal_generate_lora(
+    checkpoint_path: str,
+    data_path: str,
+    scenario: Scenario,
+    model_version: str = "v1",
+    epochs: int = 30,
+    lr: float = 1e-4,
+    lora_rank: int = 8,
+    lora_alpha: float = 16.0,
+    batch_size: int = 16,
+    device_str: str = "cpu",
+    out_dir: str = ".",
+    fold: int | None = None,
+    n_folds: int = 1,
+    dump_preds: bool = True,
+) -> dict:
+    """generate + LoRA companion — native cross_pred 를 LoRA fine-tune 후 평가.
+
+    zero-shot generate 와 동일한 generate_cross_modal 메커니즘이되 LoRA 로 downstream
+    에 적응시킨 상한(companion). 학습은 source-only forward 의 cross_pred_per_type,
+    평가는 generate_cross_modal per-window r/MSE (generate 와 동일 지표·저장 포맷).
+    """
+    from downstream.model_wrapper import DownstreamModelWrapper
+
+    inputs_str = " + ".join(s.upper() for s in scenario.inputs)
+    print("=" * 70)
+    print("Task 8: Cross-Modal Generation + LoRA (fine-tune cross_pred)")
+    print(f"  Scenario:   {inputs_str} -> {scenario.target.upper()}")
+    print(f"  Checkpoint: {checkpoint_path}")
+    print(f"  LoRA:       rank={lora_rank}, alpha={lora_alpha}, epochs={epochs}, lr={lr}")
+    print("=" * 70)
+
+    device = torch.device(device_str)
+    wrapper = DownstreamModelWrapper(checkpoint_path, model_version, device)
+    wrapper.inject_lora(rank=lora_rank, alpha=lora_alpha)
+    model = wrapper.model
+    patch_size = wrapper.patch_size
+    target_type_id = SIGNAL_TYPE_IDS[scenario.target]
+
+    data = _load_prepared_data(data_path, fold=fold)
+
+    print("\nBuilding train batches...")
+    train_batches = _build_lora_batches(data["train"], scenario, patch_size, batch_size)
+    print(f"  Train: {len(train_batches)} batches")
+    if not train_batches:
+        print("ERROR: No train batches.", file=sys.stderr)
+        sys.exit(1)
+
+    n_lora = sum(p.numel() for p in wrapper.lora_parameters())
+    print(f"  Trainable LoRA params: {n_lora:,}")
+
+    print("\nTraining (LoRA fine-tune of cross_pred)...")
+    train_losses = train_generate_lora(
+        wrapper, train_batches, target_type_id, epochs, lr, device,
+    )
+
+    # ── Eval: generate_cross_modal per-window (LoRA-adapted model) ──
+    print("\nEvaluating (generate_cross_modal, per-window)...")
+    model.eval()
+    test_data = data["test"]
+    sigs = test_data["signals"]
+    n_samples = sigs[scenario.inputs[0]].shape[0]
+
+    per_r: list[float] = []
+    per_mse: list[float] = []
+    per_mae: list[float] = []
+    raw_pred_win: list[np.ndarray] = []
+    raw_tgt_win: list[np.ndarray] = []
+    with torch.no_grad():
+        for i in range(n_samples):
+            visible_signals = {s: sigs[s][i].float().numpy() for s in scenario.inputs}
+            gt = sigs[scenario.target][i].float().numpy()
+            try:
+                batch = build_multivariate_batch(visible_signals, patch_size=patch_size)
+                batch.values = batch.values.to(device)
+                batch.sample_id = batch.sample_id.to(device)
+                batch.variate_id = batch.variate_id.to(device)
+                out = model.generate_cross_modal(
+                    batch, target_signal_type=target_type_id, denormalize=True,
+                )
+            except Exception:
+                continue
+            pred = out["waveform"]
+            if pred.numel() == 0:
+                continue
+            pf = pred[0].reshape(-1).cpu().numpy()
+            ml = min(len(pf), len(gt))
+            if ml < patch_size:
+                continue
+            pf = pf[:ml]
+            gf = gt[:ml]
+            per_mae.append(float(np.mean(np.abs(pf - gf))))
+            per_mse.append(float(np.mean((pf - gf) ** 2)))
+            per_r.append(
+                float(np.corrcoef(pf, gf)[0, 1])
+                if np.std(pf) > 1e-8 and np.std(gf) > 1e-8 else 0.0
+            )
+            if dump_preds:
+                raw_pred_win.append(pf.astype(np.float32))
+                raw_tgt_win.append(gf.astype(np.float32))
+
+    metrics = {
+        "mse": round(float(np.mean(per_mse)), 6) if per_mse else 0.0,
+        "mae": round(float(np.mean(per_mae)), 6) if per_mae else 0.0,
+        "pearson_r_win": round(float(np.mean(per_r)), 4) if per_r else 0.0,
+        "n_windows": len(per_r),
+    }
+    print(f"\n{'=' * 50}")
+    print(f"  Scenario:      {scenario.name}  (generate + LoRA)")
+    print(f"  MSE:           {metrics['mse']:.6f}  (denormalized)")
+    print(f"  MAE:           {metrics['mae']:.6f}")
+    print(f"  Pearson r_win: {metrics['pearson_r_win']:.4f}  (per-window)")
+    print(f"  N windows:     {metrics['n_windows']}")
+    print(f"{'=' * 50}")
+
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+    scenario_slug = scenario.name.replace("->", "_to_").replace("+", "_")
+    results = {
+        "scenario": scenario.name,
+        "inputs": scenario.inputs,
+        "target": scenario.target,
+        "metrics": metrics,
+        "train_losses": train_losses,
+        "config": {
+            "mode": "generate_lora",
+            "lora_rank": lora_rank,
+            "lora_alpha": lora_alpha,
+            "epochs": epochs,
+            "lr": lr,
+            "batch_size": batch_size,
+            "data_path": data_path,
+            "fold": fold,
+            "n_folds": n_folds,
+        },
+    }
+    results_file = out_path / f"task8_generate_lora_{scenario_slug}.json"
+    with open(results_file, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"\nResults saved: {results_file}")
+
+    if dump_preds and raw_pred_win:
+        min_L = min(a.shape[0] for a in raw_pred_win)
+        y_score = np.stack([a[:min_L] for a in raw_pred_win], axis=0)
+        y_true = np.stack([a[:min_L] for a in raw_tgt_win], axis=0)
+        n_win = y_score.shape[0]
+        case_ids = test_data.get("case_ids", [])
+        if len(case_ids) >= n_win:
+            patient_id = np.array([str(c) for c in case_ids[:n_win]], dtype=str)
+        else:
+            patient_id = np.array([str(i) for i in range(n_win)], dtype=str)
+        preds_path = out_path / f"preds_fold{int(fold) if fold is not None else 0}.npz"
+        np.savez_compressed(
+            preds_path,
+            y_true=y_true.astype(np.float32),
+            y_score=y_score.astype(np.float32),
+            patient_id=patient_id,
+            fold_idx=np.int64(int(fold) if fold is not None else 0),
+            n_folds=np.int64(int(n_folds)),
+            task=f"cross_modal_gen_lora_{scenario_slug}",
+            classes=np.array([], dtype=str),
+        )
+        print(f"Predictions saved: {preds_path} (y_true={y_true.shape})")
+
+    return results
+
+
 def run_checkpoint_eval(
     checkpoint_path: str,
     model_version: str = "v1",
@@ -1783,9 +2000,10 @@ def main() -> None:
         "--mode",
         type=str,
         default="zero_shot",
-        choices=["zero_shot", "generate", "linear_probe", "lora"],
+        choices=["zero_shot", "generate", "generate_lora", "linear_probe", "lora"],
         help="zero_shot: pretrained cross_pred head (fixed-scenario recon), "
-             "generate: 진짜 PPG->ABP (generate_cross_modal, target 부재), "
+             "generate: 진짜 PPG->ABP (generate_cross_modal, target 부재, 학습X), "
+             "generate_lora: generate + LoRA fine-tune of cross_pred (companion), "
              "linear_probe: frozen encoder + regression head, "
              "lora: LoRA + regression head",
     )
@@ -1903,6 +2121,32 @@ def main() -> None:
             data_path=args.data_path,
             scenario=scenario,
             model_version=args.model_version,
+            device_str=args.device,
+            out_dir=args.out_dir,
+            fold=load_fold,
+            n_folds=args.n_folds,
+            dump_preds=not args.no_dump_preds,
+        )
+
+    elif args.mode == "generate_lora":
+        if not args.data_path:
+            print("Error: --data-path required for generate_lora mode", file=sys.stderr)
+            sys.exit(1)
+        if not args.scenario:
+            print("Error: --scenario required for generate_lora mode (e.g. 'PPG->ABP')",
+                  file=sys.stderr)
+            sys.exit(1)
+        scenario = parse_scenario(args.scenario)
+        run_cross_modal_generate_lora(
+            checkpoint_path=args.checkpoint,
+            data_path=args.data_path,
+            scenario=scenario,
+            model_version=args.model_version,
+            epochs=args.epochs,
+            lr=args.lr,
+            lora_rank=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            batch_size=args.batch_size,
             device_str=args.device,
             out_dir=args.out_dir,
             fold=load_fold,

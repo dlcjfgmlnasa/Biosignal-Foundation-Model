@@ -184,6 +184,25 @@ tasks:
       model-version: v2
       scenario: "PPG->ABP"
 
+  # ── 6b. Cross-Modal PPG->ABP + LoRA companion (Generation) ───────
+  # generate(zero-shot)와 동일 메커니즘(generate_cross_modal)이되 native cross_pred
+  # 를 LoRA 로 fine-tune 한 상한(companion). 표에 "frozen vs fine-tune" 대조용.
+  - name: cross_modal_ppg_abp_ft
+    category: generation
+    module: downstream.generation.cross_modal.run
+    data_path: "${env:DOWNSTREAM_DATA_ROOT}/cross_modal_recon/cross_modal_vitaldb_ecg_abp_ppg_w30s"
+    modes: [generate_lora]
+    applies_to_groups: [baseline, loss_component, lscnorm, cross_modal,
+                        phase_stage, attn_bias]
+    n_folds: 5                 # fold-chunked 5-fold OOF
+    no_patch_arg: true         # cross_modal run.py 에 --patch-size 없음
+    batch_size: 64             # w30s 짧은 윈도우 학습
+    epochs: 30
+    lr: 1.0e-4
+    extra_args:
+      model-version: v2
+      scenario: "PPG->ABP"
+
   # ── 5. ICH Sparse Variant (Sampling group only) ──────────────────
   - name: ich_sparse
     category: acute_event
