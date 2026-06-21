@@ -143,19 +143,19 @@ tasks:
   - name: waveform_forecasting
     category: generation
     module: downstream.generation.intra_modal_forecast.run
-    data_path: "${env:DOWNSTREAM_DATA_ROOT}/forecasting/forecasting_vitaldb_ecg_ctx30s_tgt10s.pt"
-    # eval-only: fold/mode 인자 없음. runner 가 단일 호출.
-    modes: [linear_probe]      # placeholder — run.py 가 mode 인자 미사용
+    # 데이터는 fold-chunked (forecasting_vitaldb_ecg_ctx30s_tgt10s_fold{F}_{split}
+    # _chunk{C}.pt) → prefix(.pt 없음) + n_folds=5. run.py 가 fold 별 test chunk 로드.
+    data_path: "${env:DOWNSTREAM_DATA_ROOT}/forecasting/forecasting_vitaldb_ecg_ctx30s_tgt10s"
+    modes: [linear_probe]      # placeholder — run.py 가 mode 인자 미사용(no_mode_arg)
     applies_to_groups: [baseline, loss_component, lscnorm, cross_modal,
                         phase_stage, sampling, attn_bias]
-    eval_only: true            # runner hint: fold/mode loop skip
-    no_mode_arg: true          # runner hint: --mode 전달 금지
-    no_fold_arg: true          # runner hint: --fold/--n-folds 전달 금지
-    no_lora_arg: true          # runner hint: --lora-* 전달 금지
-    no_epochs_arg: true        # runner hint: --epochs/--lr 전달 금지
-    no_batch_arg: true         # runner hint: --batch-size 전달 금지
-    no_patch_arg: true         # runner hint: --patch-size 전달 금지
-    no_device_arg: true        # runner hint: --device 전달 금지 (forecast run.py 미지원)
+    n_folds: 5                 # fold-chunked 5-fold OOF (zero-shot eval, fold별 test)
+    no_mode_arg: true          # forecasting run.py 는 --mode 없음
+    no_lora_arg: true          # 학습 없음 → lora 인자 금지
+    no_epochs_arg: true        # 학습 없음 → epochs/lr 금지
+    no_batch_arg: true         # --batch-size 금지
+    no_patch_arg: true         # --patch-size 금지
+    no_device_arg: true        # forecast run.py 는 --device 미지원
     extra_args:
       signal-type: ecg         # paper canonical (main); appendix 는 abp/ppg/co2
       target-sec: [10]         # 단일 horizon
