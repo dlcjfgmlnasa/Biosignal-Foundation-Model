@@ -325,12 +325,21 @@ def _compute_multiclass_metrics(
 
 
 def _load_data(args) -> tuple[list[MultiSignalWindow], list[MultiSignalWindow]]:
-    if not args.data_path or not Path(args.data_path).exists():
-        print("ERROR: --data-path required.", file=sys.stderr)
+    # data_path 가 그대로 존재하면 단일 파일(back-compat). 없으면 fold-prefix 로
+    # 해석해 ``{data_path}_fold{fold}.pt`` 를 로드한다 (ablation runner 는 prefix +
+    # --fold 를 넘기고, arrhythmia 데이터는 fold 당 완성 파일이라 fold 별로 선택).
+    path = Path(args.data_path) if args.data_path else None
+    if path is not None and not path.exists():
+        cand = Path(f"{args.data_path}_fold{int(args.fold)}.pt")
+        if cand.exists():
+            path = cand
+    if path is None or not path.exists():
+        print("ERROR: --data-path required (단일 .pt 또는 '{prefix}_fold{F}.pt').",
+              file=sys.stderr)
         sys.exit(1)
 
-    print(f"\nLoading prepared data: {args.data_path}")
-    data = torch.load(args.data_path, weights_only=False)
+    print(f"\nLoading prepared data: {path}")
+    data = torch.load(path, weights_only=False)
     meta = data.get("metadata", {})
     print(f"  Task: {meta.get('task', '?')}")
     print(f"  Input signals: {meta.get('input_signals', '?')}")

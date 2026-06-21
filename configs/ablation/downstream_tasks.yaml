@@ -139,6 +139,28 @@ tasks:
   #     agg-layers: 2
   #     agg-heads: 4
 
+  # ── 3b. Arrhythmia Classification 5-class (Acute) ────────────────
+  # MIMIC-III-Ext-PPG, ECG+PPG, 5-class(SR/AF/STACH/SBRAD/AFLT). ECG 직결이라
+  # 신뢰도 높은 task. 데이터는 fold 당 완성 파일(arrhythmia_ecg_ppg_fold{F}.pt)이라
+  # run.py 가 prefix + --fold 로 해당 fold 파일을 로드(_load_data fold-prefix 지원).
+  - name: arrhythmia
+    category: acute_event
+    module: downstream.acute_event.arrhythmia.run
+    data_path: "${env:DOWNSTREAM_DATA_ROOT}/arrhythmia/arrhythmia_ecg_ppg"
+    modes: [linear_probe, lora]
+    applies_to_groups: [baseline, loss_component, lscnorm, cross_modal,
+                        phase_stage, attn_bias]
+    n_folds: 5                 # fold 당 완성 파일 (_fold{F}.pt)
+    batch_size: 32
+    epochs:
+      linear_probe: 20
+      lora: 30
+    lr:
+      linear_probe: 1.0e-3
+      lora: 1.0e-4
+    extra_args:
+      model-version: v2
+
   # ── 4. Waveform Forecasting (Generation) ─────────────────────────
   - name: waveform_forecasting
     category: generation
