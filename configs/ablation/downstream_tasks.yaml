@@ -197,14 +197,20 @@ tasks:
   #   no_patch_arg: true
   #   extra_args: {model-version: v2, scenario: "PPG->ABP"}
 
-  # ── 5. ICH Sparse Variant (Sampling group only) ──────────────────
-  - name: ich_sparse
+  # ── 5. Intracranial Hypertension (Acute, ICP) ────────────────────
+  # ABP+ECG+ICP, w900s(15min)/h30min (paper canonical). 데이터 fold-chunked
+  # (intracranial_hypertension_abp_ecg_icp_w900s_h30min_fold{F}_{split}_chunk{C}.pt)
+  # → prefix(.pt 없음) + n_folds=5. sparse 코호트(~100-130명)라 linear_probe 만
+  # (LoRA 학습 분산 큼). standard eval. CI 넓을 수 있음(작은 코호트 수용).
+  - name: ich
     category: acute_event
     module: downstream.acute_event.intracranial_hypertension.run
-    data_path: "${env:DOWNSTREAM_DATA_ROOT}/ich/intracranial_hypertension_icp_w300s_h0min"
-    # 실제 파일: ..._fold{F}_{split}[_chunk{C}].pt — runner expand.
-    modes: [linear_probe]      # sparse cohort: LoRA 학습 분산 큼 → linear_probe 만
-    applies_to_groups: [sampling]
-    batch_size: 32             # run.py 기본 (window 작음)
+    data_path: "${env:DOWNSTREAM_DATA_ROOT}/intracranial_hypertension/intracranial_hypertension_abp_ecg_icp_w900s_h30min"
+    modes: [linear_probe]
+    applies_to_groups: [baseline, loss_component, lscnorm, cross_modal,
+                        phase_stage, attn_bias]
+    n_folds: 5                 # fold-chunked 5-fold OOF
+    batch_size: 32
     extra_args:
-      eval-mode: standard      # loso 는 별도 ablation 필요 시 추가
+      model-version: v2
+      eval-mode: standard
