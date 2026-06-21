@@ -160,35 +160,20 @@ tasks:
       signal-type: ecg         # paper canonical (main); appendix 는 abp/ppg/co2
       target-sec: [10]         # 단일 horizon
 
-  # ── 6. Cross-Modal PPG->ABP Generation (진짜 PPG-only, shape-only) ──
-  # Paper Table 4 generation 컬럼. PPG 만 입력(ABP 완전 부재 → 진짜 cross-modal,
-  # 누수 0)으로 ABP 파형을 복원. 사전학습 cross_pred 는 zero-shot 으로 PPG-only
-  # 가 OOD 라 실패(r≈0.05) → frozen/LoRA 인코더 + Conv decoder 를 학습한다.
-  #   - linear_probe: encoder frozen + Conv decoder 학습 (인코더 품질 판별용, ablation 깨끗)
-  #   - lora:         encoder LoRA + Conv decoder 학습 (fine-tune 상한)
-  # target 은 per-window z-score(절대 BP 는 PPG 로 복원 불가) → shape-only(per-window r).
-  # 데이터 fold-chunked → prefix(.pt 없음) + n_folds=5. run.py 에 --patch-size 없음.
-  - name: cross_modal_ppg_abp
-    category: generation
-    module: downstream.generation.cross_modal.run
-    data_path: "${env:DOWNSTREAM_DATA_ROOT}/cross_modal_recon/cross_modal_vitaldb_ecg_abp_ppg_w30s"
-    modes: [linear_probe, lora]
-    applies_to_groups: [baseline, loss_component, lscnorm, cross_modal,
-                        phase_stage, attn_bias]
-    n_folds: 5                 # fold-chunked 5-fold OOF
-    no_patch_arg: true         # cross_modal run.py 에 --patch-size 없음
-    batch_size:                # w30s 짧은 윈도우
-      linear_probe: 128        #   frozen+conv: feature 캐싱 → 크게
-      lora: 64                 #   LoRA: encoder grad → moderate
-    epochs:
-      linear_probe: 30
-      lora: 30
-    lr:
-      linear_probe: 1.0e-3
-      lora: 1.0e-4
-    extra_args:
-      model-version: v2
-      scenario: "PPG->ABP"
+  # ── 6. Cross-Modal PPG->ABP Generation ── DROPPED (2026-06-21) ──
+  # PPG-only cross-modal 생성(shape-only, LoRA+Conv decoder)이 유의미한 수준에
+  # 도달하지 못함(train loss 정체, r 저조). generation 컬럼은 waveform_forecasting
+  # (#4, intra-modal, 사전학습 next-pred head)으로 대체. 코드(cross_modal/run.py
+  # generate/linear_probe/lora 모드)는 reference 로 유지. 되살리려면 주석 해제.
+  # - name: cross_modal_ppg_abp
+  #   category: generation
+  #   module: downstream.generation.cross_modal.run
+  #   data_path: "${env:DOWNSTREAM_DATA_ROOT}/cross_modal_recon/cross_modal_vitaldb_ecg_abp_ppg_w30s"
+  #   modes: [linear_probe, lora]
+  #   applies_to_groups: [baseline, loss_component, lscnorm, cross_modal, phase_stage, attn_bias]
+  #   n_folds: 5
+  #   no_patch_arg: true
+  #   extra_args: {model-version: v2, scenario: "PPG->ABP"}
 
   # ── 5. ICH Sparse Variant (Sampling group only) ──────────────────
   - name: ich_sparse
