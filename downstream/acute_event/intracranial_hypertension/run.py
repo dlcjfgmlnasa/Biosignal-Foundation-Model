@@ -115,16 +115,26 @@ def _mean_pool(
 
 def train_linear_probe(model, probe, train_batches, epochs, lr, device):
     probe = probe.to(device)
-    probe.train()
     optimizer = torch.optim.Adam(probe.parameters(), lr=lr)
     criterion = nn.BCEWithLogitsLoss()
+
+    # ── frozen encoder feature 를 1회만 추출해 CPU 캐싱 ──────────────
+    # encoder 가 고정(linear_probe)이라 feature 는 epoch 마다 동일하다. 기존엔 매
+    # epoch 마다 extract_features 를 재호출해 큰 윈도우(15min×3신호) encoder forward
+    # 가 epochs 배(예: 30×) 중복돼 매우 느렸다. 1회만 추출해 두고 probe 만 cached
+    # feature 로 학습하면 encoder forward 가 1패스로 줄어 대폭 가속(수치 동일).
+    cached: list[tuple[torch.Tensor, torch.Tensor]] = []
+    with torch.no_grad():
+        for batch, labels in train_batches:
+            features = model.extract_features(batch, pool="mean").detach().cpu()
+            cached.append((features, labels))
+
     losses = []
+    probe.train()
     for epoch in range(epochs):
         epoch_loss, n = 0.0, 0
-        for batch, labels in train_batches:
-            with torch.no_grad():
-                features = model.extract_features(batch, pool="mean").to(device)
-            logits = probe(features)
+        for features, labels in cached:
+            logits = probe(features.to(device))
             loss = criterion(logits, labels.to(device).unsqueeze(-1))
             optimizer.zero_grad()
             loss.backward()
