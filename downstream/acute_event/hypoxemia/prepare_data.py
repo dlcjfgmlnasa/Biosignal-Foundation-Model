@@ -487,6 +487,8 @@ def prepare_hypoxemia_sweep(
     required_signals: list[str] | None = None,
     signal_dtype: torch.dtype = torch.float16,
     seed: int = 42,
+    spo2_threshold: float = 90.0,
+    sustained_sec: float = 60.0,
 ) -> list[Path]:
     max_window = max(window_secs)
     max_horizon_sec = max(horizon_mins) * 60.0
@@ -503,6 +505,7 @@ def prepare_hypoxemia_sweep(
     print(f"  Windows:   {window_secs}")
     print(f"  Horizons:  {horizon_mins}")
     print(f"  Min dur:   {min_duration_sec / 60:.1f} min")
+    print(f"  Label:     SpO2 < {spo2_threshold:.0f}% sustained >= {sustained_sec:.0f}s")
     print(f"{'=' * 60}")
 
     print("\n[1/4] Loading aligned multi-channel waveform (manifest intersection)...")
@@ -542,7 +545,9 @@ def prepare_hypoxemia_sweep(
 
     print(f"\n[3/4] Stratified {n_folds}-fold patient-level CV split...")
     patient_ids = sorted({c["patient_id"] for c in cases})
-    patient_to_labels = _patient_level_hypoxemia_labels(cases, spo2_map)
+    patient_to_labels = _patient_level_hypoxemia_labels(
+        cases, spo2_map, spo2_threshold=spo2_threshold,
+    )
     pos_pts = sum(1 for pid in patient_ids if any(patient_to_labels.get(pid, [])))
     print(
         f"  Patient-level positive (any SpO2<90%): {pos_pts}/{len(patient_ids)} "
@@ -589,6 +594,7 @@ def prepare_hypoxemia_sweep(
                     samples = extract_forecast_samples(
                         case_batch, spo2_map, input_signals, window_sec, stride_sec, horizon_sec,
                         gap_stats=gap_stats,
+                        spo2_threshold=spo2_threshold, sustained_sec=sustained_sec,
                     )
                     if not samples:
                         continue
@@ -634,6 +640,11 @@ def main() -> None:
                         help="Stratified patient-level K-fold CV (default 5).")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--out-dir", default="outputs/downstream/hypoxemia")
+    parser.add_argument("--spo2-threshold", type=float, default=90.0,
+                        help="hypoxemia 임계 SpO2(%). 완화 시 92~93 권장 (양성↑)")
+    parser.add_argument("--sustained-sec", type=float, default=60.0,
+                        help="positive 로 인정할 SpO2<threshold 연속 지속(초). "
+                             "완화 시 10~30 권장 (양성↑)")
     dtype_map = add_signal_dtype_arg(parser)
     args = parser.parse_args()
 
@@ -650,6 +661,8 @@ def main() -> None:
         out_dir=args.out_dir,
         required_signals=args.required_signals,
         signal_dtype=dtype_map(args.signal_dtype),
+        spo2_threshold=args.spo2_threshold,
+        sustained_sec=args.sustained_sec,
     )
 
 
