@@ -181,25 +181,21 @@ tasks:
     extra_args:
       model-version: v2
 
-  # ── 3d. EtCO2 Abnormality (Acute) ────────────────────────────────
-  # ECG+PPG+AWP, w180s(3min)/h10min (paper canonical). 데이터 fold-chunked
-  # (etco2_ecg_ppg_awp_w180s_h10min_fold{F}_{split}_chunk{C}.pt) → prefix + n_folds=5.
-  # run.py _load_data 가 load_prepared_split_chunked 로 fold 로드(스트리밍+캐싱 적용).
-  - name: etco2_abnormal
-    category: acute_event
-    module: downstream.acute_event.etco2_abnormal.run
-    data_path: "${env:DOWNSTREAM_DATA_ROOT}/etco2_abnormal/etco2_ecg_ppg_awp_w180s_h10min"
-    modes: [linear_probe]
-    applies_to_groups: [baseline, loss_component, lscnorm, cross_modal,
-                        phase_stage, attn_bias]
-    n_folds: 5
-    batch_size: 32
-    epochs:
-      linear_probe: 20
-    lr:
-      linear_probe: 1.0e-3
-    extra_args:
-      model-version: v2
+  # ── 3d. EtCO2 Abnormality (Acute) ── DROPPED (2026-06-22) ────────
+  # 드롭 확정. 데이터로 실증: positive(abnormal <35 OR >45 양방향) base rate 63.7%
+  # (train/val/test 일관) → 드문 사건 조기경고가 아니라 "흔한 상태 분류". 게다가
+  # VitalDB OR intraop EtCO2 는 마취과의 환기세팅이 직접 결정(조작 confounding),
+  # 양방향 merged 라벨은 기전 정반대, #4 Cardiac arrest/#6 Hypoxemia 와 생리 연속선상.
+  # CO2/AWP 모달리티는 #4·#6 에서 커버. 재정의(low-only/capnography-only)로도 base
+  # rate 문제 불변이라 가치 없음 → 완전 제외.
+  # - name: etco2_abnormal
+  #   category: acute_event
+  #   module: downstream.acute_event.etco2_abnormal.run
+  #   data_path: "${env:DOWNSTREAM_DATA_ROOT}/etco2_abnormal/etco2_ecg_ppg_awp_w180s_h10min"
+  #   modes: [linear_probe]
+  #   applies_to_groups: [baseline, loss_component, lscnorm, cross_modal, phase_stage, attn_bias]
+  #   n_folds: 5
+  #   extra_args: {model-version: v2}
 
   # ── 4. Waveform Forecasting (Generation) ─────────────────────────
   - name: waveform_forecasting
