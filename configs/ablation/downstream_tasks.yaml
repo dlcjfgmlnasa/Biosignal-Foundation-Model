@@ -181,6 +181,26 @@ tasks:
     extra_args:
       model-version: v2
 
+  # ── 3d. EtCO2 Abnormality (Acute) ────────────────────────────────
+  # ECG+PPG+AWP, w180s(3min)/h10min (paper canonical). 데이터 fold-chunked
+  # (etco2_ecg_ppg_awp_w180s_h10min_fold{F}_{split}_chunk{C}.pt) → prefix + n_folds=5.
+  # run.py _load_data 가 load_prepared_split_chunked 로 fold 로드(스트리밍+캐싱 적용).
+  - name: etco2_abnormal
+    category: acute_event
+    module: downstream.acute_event.etco2_abnormal.run
+    data_path: "${env:DOWNSTREAM_DATA_ROOT}/etco2_abnormal/etco2_ecg_ppg_awp_w180s_h10min"
+    modes: [linear_probe]
+    applies_to_groups: [baseline, loss_component, lscnorm, cross_modal,
+                        phase_stage, attn_bias]
+    n_folds: 5
+    batch_size: 32
+    epochs:
+      linear_probe: 20
+    lr:
+      linear_probe: 1.0e-3
+    extra_args:
+      model-version: v2
+
   # ── 4. Waveform Forecasting (Generation) ─────────────────────────
   - name: waveform_forecasting
     category: generation
