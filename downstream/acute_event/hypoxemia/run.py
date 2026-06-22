@@ -1,5 +1,5 @@
 # -*- coding:utf-8 -*-
-"""Task 1: Hypoxemia Prediction (SpO2 < 90%, >=1min sustained).
+"""Task 1: Hypoxemia Prediction (SpO2 < 92%, >=1min sustained).
 
 2가지 모드:
   - linear_probe: Frozen encoder + LinearProbe (representation 품질 평가)

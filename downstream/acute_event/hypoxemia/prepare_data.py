@@ -1,7 +1,8 @@
 # -*- coding:utf-8 -*-
 """Intraoperative Hypoxemia Prediction — 데이터 준비 (VitalDB primary).
 
-미래 5~15분 후 SpO2 < 90% (≥1분 지속) 예측을 위한 (input_window, future_label) 쌍 생성.
+미래 horizon 구간 SpO2 < 92% (≥1분 지속) 예측을 위한 (input_window, future_label) 쌍 생성.
+SpO2 임계 92%: BTF/WHO 중재 수준이자 수술중 hypoxemia 예측 표준(Lundberg 2018, ≤92).
 
 Label 소스: SpO2 trend (raw .vital → vitaldb library 로 PLETH_SPO2 1Hz 추출)
 Input 소스: parsed .pt 디렉토리의 wave (ECG/ABP/PPG)
@@ -241,7 +242,7 @@ def extract_forecast_samples(
     window_sec: float,
     stride_sec: float,
     horizon_sec: float,
-    spo2_threshold: float = 90.0,
+    spo2_threshold: float = 92.0,
     sustained_sec: float = 60.0,
     valid_ratio_threshold: float = DEFAULT_VALID_RATIO_THRESHOLD,
     gap_stats: GapStats | None = None,
@@ -404,7 +405,7 @@ def save_split_dataset(
             "horizon_sec": horizon_sec,
             "window_sec": window_sec,
             "sampling_rate": TARGET_SR,
-            "spo2_threshold": 90.0,
+            "spo2_threshold": 92.0,
             "sustained_sec": 60.0,
             "gap_policy": "drop+mask",
             "valid_ratio_threshold": DEFAULT_VALID_RATIO_THRESHOLD,
@@ -456,7 +457,7 @@ def print_stats(name: str, samples: list[ForecastSample]) -> None:
 def _patient_level_hypoxemia_labels(
     cases: list[dict],
     spo2_map: dict[str, np.ndarray],
-    spo2_threshold: float = 90.0,
+    spo2_threshold: float = 92.0,
 ) -> dict[str, list[int]]:
     """환자별 case 레벨 hypoxemia label (stratification 용).
 
@@ -487,7 +488,7 @@ def prepare_hypoxemia_sweep(
     required_signals: list[str] | None = None,
     signal_dtype: torch.dtype = torch.float16,
     seed: int = 42,
-    spo2_threshold: float = 90.0,
+    spo2_threshold: float = 92.0,
     sustained_sec: float = 60.0,
 ) -> list[Path]:
     max_window = max(window_secs)
@@ -550,7 +551,7 @@ def prepare_hypoxemia_sweep(
     )
     pos_pts = sum(1 for pid in patient_ids if any(patient_to_labels.get(pid, [])))
     print(
-        f"  Patient-level positive (any SpO2<90%): {pos_pts}/{len(patient_ids)} "
+        f"  Patient-level positive (any SpO2<{int(spo2_threshold)}%): {pos_pts}/{len(patient_ids)} "
         f"({100.0 * pos_pts / max(1, len(patient_ids)):.1f}%)"
     )
     splits = stratified_kfold_patient_splits(
@@ -640,8 +641,8 @@ def main() -> None:
                         help="Stratified patient-level K-fold CV (default 5).")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--out-dir", default="outputs/downstream/hypoxemia")
-    parser.add_argument("--spo2-threshold", type=float, default=90.0,
-                        help="hypoxemia 임계 SpO2(%). 완화 시 92~93 권장 (양성↑)")
+    parser.add_argument("--spo2-threshold", type=float, default=92.0,
+                        help="hypoxemia 임계 SpO2(%). default 92 (Lundberg 2018·WHO ≤92, 수술중 예측 표준)")
     parser.add_argument("--sustained-sec", type=float, default=60.0,
                         help="positive 로 인정할 SpO2<threshold 연속 지속(초). "
                              "완화 시 10~30 권장 (양성↑)")
