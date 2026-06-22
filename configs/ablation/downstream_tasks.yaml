@@ -201,9 +201,9 @@ tasks:
   - name: waveform_forecasting
     category: generation
     module: downstream.generation.intra_modal_forecast.run
-    # 데이터는 fold-chunked (forecasting_vitaldb_ecg_ctx30s_tgt10s_fold{F}_{split}
+    # 데이터는 fold-chunked (forecasting_vitaldb_ecg_ctx60s_tgt10s_fold{F}_{split}
     # _chunk{C}.pt) → prefix(.pt 없음) + n_folds=5. run.py 가 fold 별 test chunk 로드.
-    data_path: "${env:DOWNSTREAM_DATA_ROOT}/forecasting/forecasting_vitaldb_ecg_ctx30s_tgt10s"
+    data_path: "${env:DOWNSTREAM_DATA_ROOT}/forecasting/forecasting_vitaldb_ecg_ctx60s_tgt10s"
     modes: [linear_probe]      # placeholder — run.py 가 mode 인자 미사용(no_mode_arg)
     applies_to_groups: [baseline, loss_component, lscnorm, cross_modal,
                         phase_stage, sampling, attn_bias]

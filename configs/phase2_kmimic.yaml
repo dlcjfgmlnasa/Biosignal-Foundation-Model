@@ -20,13 +20,13 @@
 # ── Phase 1 K-MIMIC checkpoint ──
 resume: outputs/phase1_kmimic/kmimic_d256_L12_10min_p200_k2/checkpoints/best.pt
 
-# ── 모델 (Phase 1 과 동일 — checkpoint 에서 로드) ──
+# ── 모델 (Phase 1 과 동일 — checkpoint 에서 로드: d=384, L=16, ~30M) ──
 model_config:
-  d_model: 256
-  num_layers: 12
+  d_model: 384
+  num_layers: 16
   patch_size: 200              # 100Hz × 2초 = 200 samples/patch
   stride: null                 # non-overlapping (= patch_size)
-  num_heads: 8                 # head_dim = 256/8 = 32
+  num_heads: 6                 # head_dim = 384/6 = 64
   num_groups: null             # MHA (= num_heads)
   num_signal_types: 10       # v2 단일 modality 10종 (ECG0~RESP_Flow9, PAP6 슬롯 유지)
   use_glu: true
@@ -52,6 +52,10 @@ crop_ratio_min: 0.01           # Long recording(≥600s) 만 crop
 crop_ratio_max: 1.0
 min_patches: 5                 # 10s floor (cross-modal multi-tier truncate 기준)
 
+# ── Modality-balanced sampling (Phase 1과 통일, √-inverse) ──
+modality_balanced_alpha: 0.5         # p_m ∝ n_m^(1-α); 0.5 = 제곱근 tempering
+modality_balanced_w_max_ratio: 5.0   # recording 가중치 상한 = 5 × mean(w)
+
 # ── Shard backend ──
 shard_index_path: /home/coder/workspace/k-mimic-/bio_fm/data/train/k_mimic_shard/shard_index.json
 shard_cache_size: 1            # OOM 회피
@@ -66,7 +70,7 @@ mask_ratio: 0.4
 gradient_clip: 1.0
 seed: 42
 collate_mode: any_variate      # Phase 2 핵심: 다변량 collate
-max_batches: 4000
+max_batches: 2000              # 4-GPU(global 256) 기준: 2-GPU 설계 토큰예산 복원. 2-GPU로 돌릴 땐 4000
 
 # ── Loss 가중치 (Phase 2: MPM + Next-Pred + Cross-Modal + Contrastive) ──
 alpha: 0.7                     # masked reconstruction
@@ -75,7 +79,7 @@ gamma: 0.15                    # cross-modal
 delta: 0.5                     # cross-modal contrastive (InfoNCE)
 peak_alpha: 1.0                # Peak-Weighted MSE
 lambda_spec: 0.2               # Multi-Resolution STFT Loss
-spec_n_ffts: [32, 64, 128]
+spec_n_ffts: [16, 32, 64]      # Phase 1과 통일 (phase별 window set 차이 제거)
 aux_loss_weight: 0.01
 contrastive_temperature: 0.07
 learnable_temperature: true

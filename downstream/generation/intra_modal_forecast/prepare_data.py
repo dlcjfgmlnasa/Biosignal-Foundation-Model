@@ -213,7 +213,7 @@ def extract_multi_input_samples(
     cases: list[dict],
     context_signals: list[str],
     target_signal: str,
-    context_sec: float = 30.0,
+    context_sec: float = 60.0,
     target_sec: float = 10.0,
     stride_sec: float = 15.0,
 ) -> list[MultiInputForecastSample]:
@@ -361,7 +361,7 @@ def save_multi_input_dataset(
 def extract_forecast_samples(
     cases: list[dict],
     signal_type: str,
-    context_sec: float = 30.0,
+    context_sec: float = 60.0,
     target_sec: float = 10.0,
     stride_sec: float = 15.0,
 ) -> list[ForecastSample]:
@@ -561,7 +561,7 @@ def prepare_forecasting(
     source: str = "mimic3",
     signal_type: str = "ecg",
     n_cases: int = 10,
-    context_sec: float = 30.0,
+    context_sec: float = 60.0,
     target_sec: float = 10.0,
     stride_sec: float = 15.0,
     train_ratio: float = 0.7,
@@ -693,7 +693,7 @@ def prepare_multi_input_forecasting(
     waveform_dir: str,
     context_signals: list[str],
     target_signal: str,
-    context_sec: float = 30.0,
+    context_sec: float = 60.0,
     target_sec: float = 10.0,
     stride_sec: float = 15.0,
     train_ratio: float = 0.7,
@@ -802,7 +802,7 @@ def main() -> None:
                         help="Signal type to forecast ('all' for all types, "
                              "single-input only)")
     parser.add_argument("--n-cases", type=int, default=10)
-    parser.add_argument("--context-sec", type=float, default=30.0,
+    parser.add_argument("--context-sec", type=float, default=60.0,
                         help="Context window length (seconds)")
     parser.add_argument("--target-sec", type=float, default=10.0,
                         help="Target prediction length (seconds)")
