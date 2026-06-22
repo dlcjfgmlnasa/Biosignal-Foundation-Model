@@ -43,7 +43,7 @@ from downstream.metrics import (
     compute_sensitivity_specificity,
 )
 from downstream.model_wrapper import LinearProbe
-from downstream.window_task import make_window_batches
+from downstream.window_task import make_window_batches, iter_window_batches
 from downstream._eval_utils import dump_fold_predictions
 
 # ── 설정 ──────────────────────────────────────────────────────
@@ -135,33 +135,75 @@ def _mean_pool(
 # ── Linear Probe (encoder frozen) ───────────────────────────
 
 
+@torch.no_grad()
+def _stream_extract_features(
+    model, windows, batch_size, patch_size, device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """iter_window_batches 로 batch 를 하나씩 빌드·forward·폐기 (peak = batch 1개).
+
+    make_window_batches 는 모든 batch 를 리스트로 미리 빌드 → 큰 윈도우(30s×다신호)
+    × 수만 윈도우에서 host-RAM OOM 이 났다. 스트리밍하면 한 번에 batch 1개만 메모리에
+    두고 d_model feature(작음)만 누적한다. frozen encoder 라 feature 는 1회 추출이면
+    충분(매 epoch 재추출 제거). 멀티클래스 → labels 는 long 유지.
+
+    returns (features (N, d_model) cpu, labels (N,) cpu long).
+    """
+    feats: list[torch.Tensor] = []
+    labs: list[torch.Tensor] = []
+    for batch, labels in iter_window_batches(
+        windows, batch_size, patch_size,
+        to_samples=_multi_window_to_samples,
+        get_label=lambda w: w.label,
+        label_dtype=torch.long,
+    ):
+        f = model.extract_features(batch, pool="mean").detach().cpu()
+        feats.append(f)
+        labs.append(labels)
+    if not feats:
+        return torch.empty(0), torch.empty(0, dtype=torch.long)
+    return torch.cat(feats, dim=0), torch.cat(labs, dim=0)
+
+
 def train_linear_probe(
     model,
     probe: LinearProbe,
-    train_batches: list[tuple[PackedBatch, torch.Tensor]],
+    train_windows: list[MultiSignalWindow],
+    batch_size: int,
+    patch_size: int,
     epochs: int,
     lr: float,
     device: torch.device,
 ) -> list[float]:
+    # frozen encoder feature 를 스트리밍으로 1회만 추출(전체 batch 리스트 미빌드 →
+    # OOM 회피) 후, probe 만 cached feature 로 학습한다(encoder forward 1패스).
+    # contiguous chunk 순회 → make_window_batches 와 동일한 minibatch 경계·순서
+    # 보존(수치적 동일).
     probe = probe.to(device)
-    probe.train()
     optimizer = torch.optim.Adam(probe.parameters(), lr=lr)
     criterion = nn.CrossEntropyLoss()
-    losses = []
 
+    print("  Caching frozen encoder features (streaming, 1 pass)...")
+    features, labels = _stream_extract_features(
+        model, train_windows, batch_size, patch_size, device,
+    )
+    features = features.to(device)
+    labels = labels.to(device)
+    n = features.size(0)
+
+    losses = []
+    probe.train()
     for epoch in range(epochs):
-        epoch_loss, n = 0.0, 0
-        for batch, labels in train_batches:
-            with torch.no_grad():
-                features = model.extract_features(batch, pool="mean").to(device)
-            logits = probe(features)  # (B, N_CLASSES)
-            loss = criterion(logits, labels.to(device))
+        epoch_loss, nb = 0.0, 0
+        for i in range(0, n, batch_size):
+            feats = features[i: i + batch_size]
+            logits = probe(feats)  # (B, N_CLASSES)
+            loss = criterion(logits, labels[i: i + batch_size])
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item()
-            n += 1
-        avg = epoch_loss / max(n, 1)
+            nb += 1
+        avg = epoch_loss / max(nb, 1)
         losses.append(avg)
         if (epoch + 1) % 5 == 0 or epoch == 0:
             print(f"  Epoch {epoch + 1}/{epochs}  loss={avg:.4f}")
@@ -172,20 +214,18 @@ def train_linear_probe(
 def evaluate_linear_probe(
     model,
     probe: LinearProbe,
-    test_batches: list[tuple[PackedBatch, torch.Tensor]],
+    test_windows: list[MultiSignalWindow],
+    batch_size: int,
+    patch_size: int,
     device: torch.device,
 ) -> dict:
     probe.to(device).eval()
-    all_labels, all_probs = [], []
-    for batch, labels in test_batches:
-        features = model.extract_features(batch, pool="mean").to(device)
-        logits = probe(features)  # (B, N_CLASSES)
-        probs = torch.softmax(logits, dim=-1).cpu().numpy()
-        all_labels.append(labels.numpy())
-        all_probs.append(probs)
-    return _compute_multiclass_metrics(
-        np.concatenate(all_labels), np.concatenate(all_probs)
+    features, labels = _stream_extract_features(
+        model, test_windows, batch_size, patch_size, device,
     )
+    logits = probe(features.to(device))  # (N, N_CLASSES)
+    probs = torch.softmax(logits, dim=-1).cpu().numpy()
+    return _compute_multiclass_metrics(labels.numpy(), probs)
 
 
 # ── LoRA fine-tuning ─────────────────────────────────────────
@@ -443,27 +483,32 @@ def main() -> None:
         print("Insufficient data.", file=sys.stderr)
         sys.exit(1)
 
-    first_sig = next(iter(train_windows[0].signals.values()))
-    max_length = len(first_sig)
-    train_batches = _make_batches(
-        train_windows, args.batch_size, args.patch_size, max_length
-    )
-    test_batches = _make_batches(
-        test_windows, args.batch_size, args.patch_size, max_length
-    )
-
     # ── 학습 ──
     probe = LinearProbe(d_model, n_classes=N_CLASSES)
 
     if args.mode == "linear_probe":
+        # 스트리밍 추출 → 전체 batch 리스트 미빌드(OOM 회피). windows 를 그대로 전달.
         print(f"\nTraining LinearProbe (frozen encoder, d_model={d_model})...")
         train_losses = train_linear_probe(
-            model, probe, train_batches, args.epochs, args.lr, device
+            model, probe, train_windows, args.batch_size, args.patch_size,
+            args.epochs, args.lr, device,
         )
         print("\nEvaluating...")
-        metrics = evaluate_linear_probe(model, probe, test_batches, device)
+        metrics = evaluate_linear_probe(
+            model, probe, test_windows, args.batch_size, args.patch_size, device,
+        )
 
     elif args.mode == "lora":
+        # lora: encoder fine-tune → feature 캐싱 불가, pre-built batches 필요.
+        # 주의: 큰 윈도우면 RAM 위험 — ablation 은 linear_probe 만 사용.
+        first_sig = next(iter(train_windows[0].signals.values()))
+        max_length = len(first_sig)
+        train_batches = _make_batches(
+            train_windows, args.batch_size, args.patch_size, max_length
+        )
+        test_batches = _make_batches(
+            test_windows, args.batch_size, args.patch_size, max_length
+        )
         n_lora = sum(p.numel() for p in model.lora_parameters())
         n_probe = sum(p.numel() for p in probe.parameters())
         print(f"\nTraining LoRA + Probe (rank={args.lora_rank}, "

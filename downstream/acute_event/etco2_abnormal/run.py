@@ -45,7 +45,7 @@ from downstream.metrics import (
 )
 from downstream.viz import plot_roc_curve
 from downstream.model_wrapper import LinearProbe
-from downstream.window_task import make_window_batches
+from downstream.window_task import make_window_batches, iter_window_batches
 from downstream._eval_utils import dump_fold_predictions
 
 
@@ -141,55 +141,141 @@ def _mean_pool(
 # ── Linear Probe (encoder frozen) ───────────────────────────
 
 
+@torch.no_grad()
+def _stream_extract_features(
+    model,
+    windows: list[MultiSignalWindow],
+    batch_size: int,
+    patch_size: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """iter_window_batches 로 batch 를 하나씩 빌드·forward·폐기 (peak = batch 1개).
+
+    make_window_batches 는 모든 batch 를 리스트로 미리 빌드 → 큰 윈도우(10min×다신호)
+    × 수만 윈도우에서 host-RAM OOM 이 났다. 스트리밍하면 한 번에 batch 1개만 메모리에
+    두고 d_model feature(작음)만 누적한다. frozen encoder 라 feature 는 1회 추출이면
+    충분(매 epoch 재추출 제거).
+
+    returns (features (N, d_model) cpu, labels (N,) cpu float).
+    """
+    feats: list[torch.Tensor] = []
+    labs: list[torch.Tensor] = []
+    for batch, labels in iter_window_batches(
+        windows, batch_size, patch_size,
+        to_samples=_multi_window_to_samples,
+        get_label=lambda w: w.label,
+    ):
+        f = model.extract_features(batch, pool="mean").detach().cpu()
+        feats.append(f)
+        labs.append(labels)
+    if not feats:
+        return torch.empty(0), torch.empty(0)
+    return torch.cat(feats, dim=0), torch.cat(labs, dim=0).float()
+
+
 def train_linear_probe(
     model,
     probe: LinearProbe,
-    train_batches: list[tuple[PackedBatch, torch.Tensor]],
+    train_windows: list[MultiSignalWindow],
+    val_windows: list[MultiSignalWindow],
+    batch_size: int,
+    patch_size: int,
     epochs: int,
     lr: float,
     device: torch.device,
-) -> list[float]:
+) -> tuple[list[float], list[float], float, int]:
+    """Frozen encoder linear probe + val-AUROC best-ckpt 선택.
+
+    frozen encoder feature 를 train/val 각각 스트리밍으로 1회만 추출(전체 batch 리스트
+    미빌드 → host-RAM OOM 회피, 매 epoch 재추출 제거)해 캐시한 뒤, probe 만 cached
+    feature 로 학습한다. contiguous chunk 순회로 make_window_batches 와 동일한 minibatch
+    경계·순서를 보존(수치적 동일). best probe state 는 in-place 로 복원한다.
+
+    returns (train_losses, val_aurocs, best_val_auroc, best_epoch).
+    """
     probe = probe.to(device)
-    probe.train()
     optimizer = torch.optim.Adam(probe.parameters(), lr=lr)
     criterion = nn.BCEWithLogitsLoss()
-    losses = []
+
+    print("  Caching frozen encoder features (streaming, 1 pass)...")
+    train_features, train_labels = _stream_extract_features(
+        model, train_windows, batch_size, patch_size, device,
+    )
+    val_features, val_labels = _stream_extract_features(
+        model, val_windows, batch_size, patch_size, device,
+    )
+    train_features = train_features.to(device)
+    train_labels = train_labels.to(device)
+    val_features = val_features.to(device)
+    val_labels_np = val_labels.numpy()
+    n = train_features.size(0)
+
+    train_losses: list[float] = []
+    val_aurocs: list[float] = []
+    best_val_auroc = -1.0
+    best_epoch = -1
+    best_probe_state: dict | None = None
 
     for epoch in range(epochs):
-        epoch_loss, n = 0.0, 0
-        for batch, labels in train_batches:
-            with torch.no_grad():
-                features = model.extract_features(batch, pool="mean").to(device)
-            logits = probe(features)
-            loss = criterion(logits, labels.to(device).unsqueeze(-1))
+        probe.train()
+        epoch_loss, n_steps = 0.0, 0
+        for i in range(0, n, batch_size):
+            feats = train_features[i: i + batch_size]
+            logits = probe(feats)
+            loss = criterion(logits, train_labels[i: i + batch_size].unsqueeze(-1))
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item()
-            n += 1
-        avg = epoch_loss / max(n, 1)
-        losses.append(avg)
-        if (epoch + 1) % 5 == 0 or epoch == 0:
-            print(f"  Epoch {epoch + 1}/{epochs}  loss={avg:.4f}")
-    return losses
+            n_steps += 1
+        avg_loss = epoch_loss / max(n_steps, 1)
+        train_losses.append(avg_loss)
+
+        # ── val eval (cached features, no encoder forward) ──
+        probe.eval()
+        with torch.no_grad():
+            val_logits = probe(val_features)
+            val_scores = torch.sigmoid(val_logits).squeeze(-1).cpu().numpy()
+        val_metrics = _compute_metrics(val_labels_np, val_scores)
+        val_auroc = float(val_metrics["auroc"])
+        val_aurocs.append(val_auroc)
+
+        if val_auroc > best_val_auroc:
+            best_val_auroc = val_auroc
+            best_epoch = epoch
+            # deepcopy to detach from current parameters (probe is small — cheap).
+            best_probe_state = copy.deepcopy(probe.state_dict())
+
+        if (epoch + 1) % 5 == 0 or epoch == 0 or epoch == epochs - 1:
+            print(
+                f"  Epoch {epoch + 1}/{epochs}  loss={avg_loss:.4f}  "
+                f"val_auroc={val_auroc:.4f}  "
+                f"(best={best_val_auroc:.4f}@ep{best_epoch + 1})"
+            )
+
+    if best_probe_state is None:
+        print("WARNING: no best ckpt captured; using last epoch.", file=sys.stderr)
+    else:
+        probe.load_state_dict(best_probe_state)
+    return train_losses, val_aurocs, best_val_auroc, best_epoch
 
 
 @torch.no_grad()
 def evaluate_linear_probe(
     model,
     probe: LinearProbe,
-    test_batches: list[tuple[PackedBatch, torch.Tensor]],
+    test_windows: list[MultiSignalWindow],
+    batch_size: int,
+    patch_size: int,
     device: torch.device,
 ) -> dict:
     probe.to(device).eval()
-    all_labels, all_scores = [], []
-    for batch, labels in test_batches:
-        features = model.extract_features(batch, pool="mean").to(device)
-        logits = probe(features)
-        probs = torch.sigmoid(logits).squeeze(-1).cpu().numpy()
-        all_labels.append(labels.numpy())
-        all_scores.append(probs)
-    return _compute_metrics(np.concatenate(all_labels), np.concatenate(all_scores))
+    features, labels = _stream_extract_features(
+        model, test_windows, batch_size, patch_size, device,
+    )
+    logits = probe(features.to(device))
+    scores = torch.sigmoid(logits).squeeze(-1).cpu().numpy()
+    return _compute_metrics(labels.numpy(), scores)
 
 
 # ── LoRA fine-tuning (encoder frozen + LoRA adapters) ────────
@@ -587,30 +673,31 @@ def main() -> None:
         )
         sys.exit(1)
 
-    first_sig = next(iter(train_labeled[0].signals.values()))
-    max_length = len(first_sig)
-    train_batches = _make_batches(
-        train_labeled, args.batch_size, args.patch_size, max_length
-    )
-    val_batches = _make_batches(
-        val_labeled, args.batch_size, args.patch_size, max_length
-    )
-    test_batches = _make_batches(
-        test_labeled, args.batch_size, args.patch_size, max_length
-    )
-
     # ── 학습 + Best-ckpt selection on val (Patch A) ──
     probe = LinearProbe(d_model, n_classes=1)
 
     is_lora = args.mode == "lora"
     if is_lora:
+        # lora: encoder fine-tune → feature 캐싱 불가, pre-built batches 필요.
+        # 주의: 큰 윈도우면 RAM 위험 — ablation 은 linear_probe 만 사용.
+        first_sig = next(iter(train_labeled[0].signals.values()))
+        max_length = len(first_sig)
+        train_batches = _make_batches(
+            train_labeled, args.batch_size, args.patch_size, max_length
+        )
+        val_batches = _make_batches(
+            val_labeled, args.batch_size, args.patch_size, max_length
+        )
+        test_batches = _make_batches(
+            test_labeled, args.batch_size, args.patch_size, max_length
+        )
+
         n_lora = sum(p.numel() for p in model.lora_parameters())
         n_probe = sum(p.numel() for p in probe.parameters())
         print(
             f"\nTraining LoRA + Probe (rank={args.lora_rank}, "
             f"LoRA={n_lora:,} + Probe={n_probe:,} params)..."
         )
-        evaluate_fn = evaluate_lora
         probe = probe.to(device)
         probe.train()
         model.model.train()
@@ -622,83 +709,83 @@ def main() -> None:
             ],
             weight_decay=0.01,
         )
-    else:
-        print(f"\nTraining LinearProbe (frozen encoder, d_model={d_model})...")
-        evaluate_fn = evaluate_linear_probe
-        probe = probe.to(device)
-        probe.train()
-        optimizer = torch.optim.Adam(probe.parameters(), lr=args.lr)
+        criterion = nn.BCEWithLogitsLoss()
+        train_losses: list[float] = []
+        val_aurocs: list[float] = []
+        best_val_auroc = -1.0
+        best_epoch = -1
+        best_probe_state: dict | None = None
+        best_model_state: dict | None = None  # LoRA mode 에서만 저장
 
-    criterion = nn.BCEWithLogitsLoss()
-    train_losses: list[float] = []
-    val_aurocs: list[float] = []
-    best_val_auroc = -1.0
-    best_epoch = -1
-    best_probe_state: dict | None = None
-    best_model_state: dict | None = None  # LoRA mode 에서만 저장
-
-    for epoch in range(args.epochs):
-        # ── train one epoch ──
-        probe.train()
-        if is_lora:
+        for epoch in range(args.epochs):
+            # ── train one epoch ──
+            probe.train()
             model.model.train()
-        epoch_loss, n_steps = 0.0, 0
+            epoch_loss, n_steps = 0.0, 0
 
-        for batch, labels in train_batches:
-            if is_lora:
+            for batch, labels in train_batches:
                 batch = model.batch_to_device(batch)
                 out = model.model(batch, task="masked")
                 features = _mean_pool(out["encoded"], out["patch_mask"])
-            else:
-                with torch.no_grad():
-                    features = model.extract_features(batch, pool="mean").to(device)
 
-            logits = probe(features)
-            loss = criterion(logits, labels.to(device).unsqueeze(-1))
-            optimizer.zero_grad()
-            loss.backward()
-            if is_lora:
+                logits = probe(features)
+                loss = criterion(logits, labels.to(device).unsqueeze(-1))
+                optimizer.zero_grad()
+                loss.backward()
                 nn.utils.clip_grad_norm_(
                     lora_params + list(probe.parameters()), 1.0
                 )
-            optimizer.step()
-            epoch_loss += loss.item()
-            n_steps += 1
+                optimizer.step()
+                epoch_loss += loss.item()
+                n_steps += 1
 
-        avg_loss = epoch_loss / max(n_steps, 1)
-        train_losses.append(avg_loss)
+            avg_loss = epoch_loss / max(n_steps, 1)
+            train_losses.append(avg_loss)
 
-        # ── val evaluation ──
-        val_metrics = evaluate_fn(model, probe, val_batches, device)
-        val_auroc = float(val_metrics["auroc"])
-        val_aurocs.append(val_auroc)
+            # ── val evaluation ──
+            val_metrics = evaluate_lora(model, probe, val_batches, device)
+            val_auroc = float(val_metrics["auroc"])
+            val_aurocs.append(val_auroc)
 
-        if val_auroc > best_val_auroc:
-            best_val_auroc = val_auroc
-            best_epoch = epoch
-            # deepcopy to detach from current parameters (probe is small — cheap).
-            best_probe_state = copy.deepcopy(probe.state_dict())
-            if is_lora:
+            if val_auroc > best_val_auroc:
+                best_val_auroc = val_auroc
+                best_epoch = epoch
+                # deepcopy to detach from current parameters (probe is small — cheap).
+                best_probe_state = copy.deepcopy(probe.state_dict())
                 # LoRA params live inside model.model — copy entire encoder state.
                 best_model_state = copy.deepcopy(model.model.state_dict())
 
-        if (epoch + 1) % 5 == 0 or epoch == 0 or epoch == args.epochs - 1:
-            print(
-                f"  Epoch {epoch + 1}/{args.epochs}  loss={avg_loss:.4f}  "
-                f"val_auroc={val_auroc:.4f}  "
-                f"(best={best_val_auroc:.4f}@ep{best_epoch + 1})"
-            )
+            if (epoch + 1) % 5 == 0 or epoch == 0 or epoch == args.epochs - 1:
+                print(
+                    f"  Epoch {epoch + 1}/{args.epochs}  loss={avg_loss:.4f}  "
+                    f"val_auroc={val_auroc:.4f}  "
+                    f"(best={best_val_auroc:.4f}@ep{best_epoch + 1})"
+                )
 
-    # ── Restore best ckpt and run test ONCE (Patch A) ──
-    if best_probe_state is None:
-        print("WARNING: no best ckpt captured; using last epoch.", file=sys.stderr)
+        # ── Restore best ckpt and run test ONCE (Patch A) ──
+        if best_probe_state is None:
+            print("WARNING: no best ckpt captured; using last epoch.", file=sys.stderr)
+        else:
+            probe.load_state_dict(best_probe_state)
+            if best_model_state is not None:
+                model.model.load_state_dict(best_model_state)
+
+        print("\nEvaluating on test set with best-val ckpt...")
+        metrics = evaluate_lora(model, probe, test_batches, device)
     else:
-        probe.load_state_dict(best_probe_state)
-        if is_lora and best_model_state is not None:
-            model.model.load_state_dict(best_model_state)
+        # linear_probe: frozen encoder feature 를 스트리밍으로 1회만 추출(전체 batch
+        # 리스트 미빌드 → OOM 회피, 매 epoch 재추출 제거). probe 만 cached feature 로
+        # 학습하며 val-AUROC 기준 best-ckpt 선택(기존 동작 보존).
+        print(f"\nTraining LinearProbe (frozen encoder, d_model={d_model})...")
+        train_losses, val_aurocs, best_val_auroc, best_epoch = train_linear_probe(
+            model, probe, train_labeled, val_labeled,
+            args.batch_size, args.patch_size, args.epochs, args.lr, device,
+        )
 
-    print("\nEvaluating on test set with best-val ckpt...")
-    metrics = evaluate_fn(model, probe, test_batches, device)
+        print("\nEvaluating on test set with best-val ckpt...")
+        metrics = evaluate_linear_probe(
+            model, probe, test_labeled, args.batch_size, args.patch_size, device,
+        )
 
     # ── 결과 출력 ──
     y_true = metrics.pop("y_true")
