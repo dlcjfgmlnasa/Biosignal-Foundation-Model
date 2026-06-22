@@ -1,8 +1,8 @@
 # Phase 1: Channel-Independent Pre-training — K-MIMIC only with shard backend
 # ──────────────────────────────────────────────────────────────
 # Server: Biosignal-FM2 — 2xL40S 48GB, 32vCPU, 192GB RAM
-# Dataset: K-MIMIC ICU ~3,500 subjects, ~1.94M recordings, 224GB
-#          → ~109 shards (1024MB each, shard backend 필수)
+# Dataset: K-MIMIC ICU 725 patients, 1.203B tokens (patch=200 @100Hz)
+#          → ~1,793 shards (500MB each, shard backend 필수)
 # Window: 10분 (600초, 300 patches @patch_size=200)
 #
 # 핵심 차이 (vs phase1_combined.yaml):
@@ -17,13 +17,13 @@
 # Smoke test:
 #   python -m train.1_channel_independency --config configs/phase1_kmimic.yaml --dry-run
 
-# ── 모델 (Base: d=256, L=12, ~10M params) ──
+# ── 모델 (Main: d=384, L=16, ~30M params / 30.21M) ──
 model_config:
-  d_model: 256
-  num_layers: 12
+  d_model: 384
+  num_layers: 16
   patch_size: 200            # 100Hz × 2초 = 200 samples/patch (300 patches/10min)
   stride: null               # non-overlapping (= patch_size)
-  num_heads: 8               # head_dim = 256/8 = 32
+  num_heads: 6               # head_dim = 384/6 = 64
   num_groups: null           # MHA (= num_heads)
   num_signal_types: 10       # v2 단일 modality 10종 (ECG0~RESP_Flow9, PAP6 슬롯 유지)
   use_glu: true
@@ -49,23 +49,27 @@ crop_ratio_min: 0.01           # 이론상 6s (실효는 min_patches floor에 �
 crop_ratio_max: 1.0
 min_patches: 5                 # 임상 최소 입력 — 10s floor (patch_size=200 × 5 / 100Hz)
 
-# ── Shard backend (1.94M recording, file backend 비현실적) ──
+# ── Modality-balanced sampling (√-inverse, sparse modality 보정) ──
+modality_balanced_alpha: 0.5         # p_m ∝ n_m^(1-α); 0.5 = 제곱근 tempering
+modality_balanced_w_max_ratio: 5.0   # recording 가중치 상한 = 5 × mean(w)
+
+# ── Shard backend (shard backend 필수, file backend 비현실적) ──
 # ⚠️ shard_cache_size 는 PER WORKER. 총 RAM ≈ workers × cache × shard_size_GB × num_ranks
-#   예: 4 workers × 1 cache × 1GB × 2 ranks = 8GB
-shard_index_path: /home/coder/workspace/k-mimic-/bio_fm/data/train/k_mimic_shard/shard_index.json
+#   예: 4 workers × 1 cache × 0.5GB × 2 ranks = 4GB (shard 500MB)
+shard_index_path: /home/coder/workspace/k-mimic-/bio_fm/data/train/k_mimic_shard_500mb/shard_index.json
 shard_cache_size: 1            # OOM 회피 (locality sampler 가 sequential read 보장)
 
 # ── 학습 ──
 batch_size: 128                # L40S 48GB×2
 lr: 8.0e-4
-n_epochs: 80
-warmup_epochs: 8               # 10% 비율 유지
+n_epochs: 40                   # over-training 회피 (estimator: 80ep≈토큰 25× 재방문). 부족 시 --resume 연장
+warmup_epochs: 4               # 10% 비율 유지 (40ep 기준)
 min_lr_ratio: 0.1              # 최종 LR = 8e-5
 mask_ratio: 0.4                # 40% 패치 마스킹
 gradient_clip: 1.0
 seed: 42
 collate_mode: ci
-max_batches: 10000             # 1 epoch당 10000 batch
+max_batches: 6000              # 1 epoch당 6000 batch (effective ~10× 재방문)
 
 # ── Loss 가중치 (Phase 1: MPM + Next-Pred) ──
 alpha: 1.0                     # masked reconstruction
@@ -90,7 +94,7 @@ use_amp: true                  # L40S BF16/FP16 tensor cores
 # ── Validation & Early Stopping ──
 val_ratio: 0.05                # subject 단위 5% validation
 val_max_batches: 500
-patience: 15
+patience: 10
 
 # ── 시스템 ──
 device: auto
@@ -98,4 +102,4 @@ num_workers: 4                 # 보수적 (안정 후 8 가능)
 output_dir: outputs/phase1_kmimic
 checkpoint_every: 5
 viz_every: 1
-exp_name: kmimic_d256_L12_10min_p200_k2
+exp_name: kmimic_d384_L16_10min_p200_k2
