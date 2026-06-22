@@ -41,8 +41,10 @@ from downstream._save_utils import (
 
 TARGET_SR: float = 100.0
 
-# WFDB sig_name → signal_type 매핑 (Task #7 Sepsis: ABP, ECG, PPG, RESP)
+# WFDB sig_name → signal_type 매핑
+# Table 3 (SSOT) #7 Sepsis: ABP, ECG, PPG, RespImp, CO₂.
 # RESP — qSOFA 의 RR component (Singer et al. JAMA 2016)
+# CO2 — capnography; MIMIC 환자별 가용 시에만 추출(availability-aware).
 MIMIC_SIGNAL_MAP: dict[str, str] = {
     "II": "ecg",
     "V": "ecg",
@@ -51,6 +53,8 @@ MIMIC_SIGNAL_MAP: dict[str, str] = {
     "PLETH": "ppg",
     # v2: RESP=impedance plethysmography → resp_impedance(8). SSOT: data.spatial_map.
     "RESP": "resp_impedance",
+    # CO2 / Capnography (Table 3 #7)
+    "CO2": "co2",
 }
 
 

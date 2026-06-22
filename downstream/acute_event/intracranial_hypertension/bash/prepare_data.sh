@@ -3,7 +3,7 @@
 # Paper Table S7 (Task 3) 정렬: 3 combos × 4 windows × 3 horizons
 #   Combos:   ABP+ICP / ABP+ICP+ECG / ABP+ICP+ECG+CVP
 #   Horizons: 10 / 15 / 30 min ahead
-#   Label:    ICP > 20 mmHg ≥ 1 min
+#   Label:    ICP > 22 mmHg ≥ 1 min (BTF 4th ed., Carney 2017)
 #
 # Step 1: ICP 레코드 스캔 (헤더만 읽어 ICP 채널 존재 확인)
 # Step 2: ICP 레코드 다운로드
@@ -25,8 +25,8 @@ RECORDS_FILE="${RECORDS_FILE:-${REPO_ROOT}/downstream/outcome/sepsis/RECORDS-wav
 ICP_RECORDS="${ICP_RECORDS:-downstream/acute_event/intracranial_hypertension/ICP-RECORDS}"
 WAVEFORM_DIR="${WAVEFORM_DIR:-${UPDOWN_ROOT}/raw/mimic3-waveform-ich}"
 OUT_DIR="${OUT_DIR:-${BIOFM_ROOT}/data/downstream/intracranial_hypertension}"
-WINDOWS="${WINDOWS:-60 180 300 600}"
-HORIZONS="${HORIZONS:-10 15 30}"
+WINDOWS="${WINDOWS:-600}"   # 600s=10min: Table 3 #3 canonical 단일 (10분=모델 최대 컨텍스트). S7 sweep 은 env override
+HORIZONS="${HORIZONS:-30}"  # 30min: Table 3 #3 canonical 단일 horizon
 STRIDE="${STRIDE:-30}"
 SKIP_DOWNLOAD="${SKIP_DOWNLOAD:-0}"
 
@@ -57,7 +57,7 @@ else
     echo -e "\n[Step 1-2] SKIP_DOWNLOAD=1 — using existing waveforms at $WAVEFORM_DIR"
 fi
 
-# Step 3: 3 combos paired comparison
+# Step 3: Table 3 #3 canonical 단일 조합 (ABP+ICP+ECG)
 run_combo() {
     local label="$1"
     local sigs="$2"
@@ -71,12 +71,13 @@ run_combo() {
         --out-dir "$OUT_DIR"
 }
 
-# Paper Table S7: ABP+ICP / ABP+ICP+ECG / ABP+ICP+ECG+CVP
-run_combo "1/3" "abp icp"
-run_combo "2/3" "abp icp ecg"
-run_combo "3/3" "abp icp ecg cvp"
+# Table 3 canonical: ABP+ICP+ECG 만 생성.
+run_combo "canonical" "abp icp ecg"
+# S7 modality-subset ablation 필요 시 아래 주석 해제 (+ WINDOWS/HORIZONS sweep env override):
+# run_combo "subset-2ch" "abp icp"
+# run_combo "subset-4ch" "abp icp ecg cvp"
 
 echo -e "\n============================================================"
 echo "  Done! Output: $OUT_DIR"
-echo "  3 combos × $(echo $WINDOWS | wc -w) windows × $(echo $HORIZONS | wc -w) horizons"
+echo "  canonical: ABP+ICP+ECG, ${WINDOWS}s window, ${HORIZONS}min horizon"
 echo "============================================================"

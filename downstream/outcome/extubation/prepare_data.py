@@ -43,8 +43,8 @@ from downstream._save_utils import (
 TARGET_SR: float = 100.0
 
 # WFDB sig_name → 우리 signal_type 매핑
-# Task #10 Extubation Failure: ABP, ECG, PPG, CVP, CO2, AWP, RESP (7 modality).
-# PAP/ICP 제거 — vent cohort 보존 위해 main 분석에서 제외 (appendix subset 분석 별도).
+# Table 3 (SSOT) #9 Extubation Failure: ABP, ECG, PPG, RespImp (4 modality).
+# CVP/CO2/AWP/PAP/ICP 는 Table 3 조합 밖이므로 매핑에서 제외(추출되더라도 무시).
 MIMIC_SIGNAL_MAP: dict[str, str] = {
     # ECG — pretrained lead만
     "II": "ecg",
@@ -54,12 +54,6 @@ MIMIC_SIGNAL_MAP: dict[str, str] = {
     "ART": "abp",
     # PPG
     "PLETH": "ppg",
-    # CVP
-    "CVP": "cvp",
-    # CO2 / Capnography
-    "CO2": "co2",
-    # AWP / Airway Pressure
-    "AWP": "awp",
     # RESP / Respiration
     # v2 결정(2026-05-21): #10 임상 정의는 RESP-Flow(ventilator flow)이나,
     # 데이터 소스 MIMIC-III matched waveform 에는 flow 채널이 없고 RESP=impedance

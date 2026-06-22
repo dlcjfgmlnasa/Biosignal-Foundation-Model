@@ -43,8 +43,9 @@ from downstream._save_utils import (
 TARGET_SR: float = 100.0
 
 # WFDB sig_name → 우리 signal_type 매핑
-# Task #8 Mortality: All 9 modality (availability-aware masking).
-# 환자별 가용 modality 만 추출되며, 결측 modality 는 학습 시 mask token 으로 처리.
+# Table 3 (SSOT) #8 Mortality: ECG, ABP, PPG, RespImp, CO₂ (5 modality).
+# 환자별 가용 modality 만 추출되며(availability-aware), 결측은 학습 시 mask token 처리.
+# CVP/AWP/PAP/ICP 는 Table 3 조합 밖이므로 매핑에서 제외(추출되더라도 무시).
 MIMIC_SIGNAL_MAP: dict[str, str] = {
     # ECG — pretrained lead만
     "II": "ecg",
@@ -54,16 +55,8 @@ MIMIC_SIGNAL_MAP: dict[str, str] = {
     "ART": "abp",
     # PPG
     "PLETH": "ppg",
-    # CVP
-    "CVP": "cvp",
     # CO2 / Capnography
     "CO2": "co2",
-    # AWP / Airway Pressure (인공호흡기 환자)
-    "AWP": "awp",
-    # PAP / Pulmonary Artery Pressure (Swan-Ganz)
-    "PAP": "pap",
-    # ICP / Intracranial Pressure (TBI / neuro 환자)
-    "ICP": "icp",
     # RESP / Respiration (impedance) — v2: resp_impedance(8). SSOT: data.spatial_map.
     "RESP": "resp_impedance",
 }

@@ -28,7 +28,7 @@ LR_LORA=1e-4
 LORA_RANK=8
 
 echo "============================================================"
-echo "  Intracranial Hypertension Detection (ICP > 20mmHg)"
+echo "  Intracranial Hypertension Detection (ICP > 22mmHg)"
 echo "  Checkpoint: $CHECKPOINT"
 echo "  Data:       $DATA_DIR"
 echo "  Output:     $OUT_DIR"
