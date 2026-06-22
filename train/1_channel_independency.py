@@ -47,7 +47,11 @@ from .train_utils import (
     validate,
 )
 from model.checkpoint import load_checkpoint
-from .visualize import save_reconstruction_figure, save_next_pred_figure
+from .visualize import (
+    save_reconstruction_figure,
+    save_next_pred_figure,
+    save_loss_curve_figure,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -603,6 +607,17 @@ def main():
                 csv_logger.log(
                     epoch, "Phase1_CI", losses, val_losses, current_lr, epoch_sec
                 )
+
+            # Loss 곡선 그림 (매 epoch 갱신 — 학습 진행 모니터링용, 실패해도 무시)
+            try:
+                lc_path = save_loss_curve_figure(
+                    output_dir / "training_log.csv",
+                    output_dir / "figures",
+                )
+                if lc_path is not None and epoch == start_epoch:
+                    print(f"  -> Loss curve figure: {lc_path}")
+            except Exception as e:
+                print(f"  [warn] loss curve plot 실패(무시): {e}")
 
             # Reconstruction & Next-Pred 시각화
             if viz_batches is not None and (

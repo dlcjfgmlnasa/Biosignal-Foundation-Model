@@ -722,3 +722,84 @@ def save_next_pred_figure(
     )
     model.train()
     return path
+
+
+def save_loss_curve_figure(
+    csv_path: str | Path,
+    output_dir: str | Path,
+    filename: str = "loss_curve.png",
+) -> Path | None:
+    """training_log.csv 를 읽어 train/val loss 곡선을 그린다.
+
+    매 에폭 호출되어 같은 파일(loss_curve.png)을 덮어쓰므로, 학습 진행을
+    한눈에 모니터링하는 용도. 데이터가 없거나 파싱 실패 시 None 을 반환하며
+    (학습에는 영향 없음), 호출부에서 예외를 다시 감싸 안전하게 무시한다.
+
+    Parameters
+    ----------
+    csv_path:
+        CSVLogger 가 기록한 training_log.csv 경로.
+    output_dir:
+        figure 저장 디렉토리 (없으면 생성).
+    """
+    import csv as _csv
+
+    csv_path = Path(csv_path)
+    output_dir = Path(output_dir)
+    if not csv_path.exists():
+        return None
+
+    epochs: list[int] = []
+    series: dict[str, list[float]] = {
+        "train_total": [],
+        "val_total": [],
+        "train_masked": [],
+        "train_next": [],
+    }
+    try:
+        with open(csv_path, newline="", encoding="utf-8") as f:
+            for row in _csv.DictReader(f):
+                try:
+                    ep = int(row["epoch"])
+                except (KeyError, ValueError, TypeError):
+                    continue
+                epochs.append(ep)
+                for key in series:
+                    try:
+                        series[key].append(float(row.get(key, "")))
+                    except (ValueError, TypeError):
+                        series[key].append(float("nan"))
+    except OSError:
+        return None
+
+    if not epochs:
+        return None
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    # 좌: total loss (train vs val)
+    ax1.plot(epochs, series["train_total"], "-o", ms=3, label="train_total", color="tab:blue")
+    if any(not np.isnan(v) for v in series["val_total"]):
+        ax1.plot(epochs, series["val_total"], "-o", ms=3, label="val_total", color="tab:orange")
+    ax1.set_xlabel("epoch")
+    ax1.set_ylabel("loss")
+    ax1.set_title("Total loss")
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+
+    # 우: train loss 구성요소 (masked / next)
+    ax2.plot(epochs, series["train_masked"], "-o", ms=3, label="masked", color="tab:green")
+    ax2.plot(epochs, series["train_next"], "-o", ms=3, label="next", color="tab:red")
+    ax2.set_xlabel("epoch")
+    ax2.set_ylabel("loss")
+    ax2.set_title("Train loss components")
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+
+    fig.suptitle(f"Training progress (through epoch {max(epochs)})")
+    fig.tight_layout()
+    path = output_dir / filename
+    fig.savefig(path, dpi=100, bbox_inches="tight")
+    plt.close(fig)
+    return path

@@ -99,7 +99,7 @@ patience: 10
 # ── 시스템 ──
 device: auto
 num_workers: 4                 # 보수적 (안정 후 8 가능)
-output_dir: outputs/phase1_kmimic
+output_dir: /home/coder/workspace/k-mimic-/bio_fm/outputs/main/phase1
 checkpoint_every: 5
 viz_every: 1
 exp_name: kmimic_d384_L16_10min_p200_k2
