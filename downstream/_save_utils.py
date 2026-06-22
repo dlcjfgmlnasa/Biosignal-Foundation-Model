@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import gc
 import re
+import time
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -23,6 +24,42 @@ try:
 except ImportError:  # tqdm 미설치 시 no-op 폴백
     def tqdm(it, **_kwargs):  # type: ignore[no-redef]
         return it
+
+
+# torch.load 원본 별칭 — 아래 robust 래퍼가 자기 자신을 호출하지 않도록 보존.
+_torch_load = torch.load
+
+
+def _robust_torch_load(
+    path: Any,
+    *,
+    weights_only: bool = False,
+    retries: int = 3,
+    delay: float = 3.0,
+):
+    """네트워크 마운트 read 의 일시적 실패/중단(IO interrupt)에 견디는 torch.load.
+
+    downstream 데이터는 네트워크 마운트에 있어 chunk torch.load 가 분 단위로 느리고,
+    간헐적 read 오류(OSError/RuntimeError/EOFError 등)로 전체 run 이 죽을 수 있다.
+    실패 시 지수 backoff 로 ``retries`` 회 재시도하고, 그래도 실패하면 마지막 예외를
+    올린다(정상 경로는 1회 호출과 동일, 오버헤드 없음).
+    """
+    last_exc: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            return _torch_load(path, weights_only=weights_only)
+        except Exception as exc:  # noqa: BLE001 — IO 계열 광범위 포착(재시도 목적)
+            last_exc = exc
+            if attempt >= retries:
+                break
+            wait = delay * attempt
+            print(
+                f"  [io-retry] torch.load 실패 ({attempt}/{retries}) {path}: "
+                f"{type(exc).__name__}: {exc} — {wait:.0f}s 후 재시도",
+                flush=True,
+            )
+            time.sleep(wait)
+    raise last_exc  # type: ignore[misc]
 
 
 def stack_arrays_destructive(
@@ -256,11 +293,11 @@ def load_prepared_chunked(
     # 1) 단일 파일 우선 (back-compat). fold 미지정 시에만.
     if fold is None:
         if p.is_file():
-            return torch.load(p, weights_only=False)
+            return _robust_torch_load(p, weights_only=False)
         if p.suffix != ".pt":
             single = p.with_suffix(".pt")
             if single.is_file():
-                return torch.load(single, weights_only=False)
+                return _robust_torch_load(single, weights_only=False)
 
     # 2) chunk 집계: prefix 를 기준으로 <prefix>_<split>_chunk<idx>.pt glob
     stem = p.name[:-3] if p.name.endswith(".pt") else p.name
@@ -299,7 +336,7 @@ def load_prepared_chunked(
         items.sort(key=lambda x: x[0])
         payloads: list[dict] = []
         for _, f in items:
-            ck = torch.load(f, weights_only=False)
+            ck = _robust_torch_load(f, weights_only=False)
             if metadata is None and isinstance(ck.get("metadata"), dict):
                 metadata = dict(ck["metadata"])
             payloads.append(
@@ -355,11 +392,11 @@ def load_prepared_split_chunked(
 
     # 1) 실제 파일이면 단일 통합 산출물 — 그대로 로드 (back-compat).
     if p.is_file():
-        return torch.load(p, weights_only=False)
+        return _robust_torch_load(p, weights_only=False)
     if fold is None and p.suffix != ".pt":
         single = p.with_suffix(".pt")
         if single.is_file():
-            return torch.load(single, weights_only=False)
+            return _robust_torch_load(single, weights_only=False)
 
     # 2) prefix 모드: <base>[_fold{K}]_<split>*.pt 를 split 별로 glob → concat.
     base = p.name[:-3] if p.name.endswith(".pt") else p.name
@@ -380,7 +417,7 @@ def load_prepared_split_chunked(
             unit="chunk",
             mininterval=0.5,
         ):
-            ck = torch.load(f, weights_only=False)
+            ck = _robust_torch_load(f, weights_only=False)
             if metadata is None and isinstance(ck.get("metadata"), dict):
                 metadata = dict(ck["metadata"])
             # split payload 는 "data" 로 wrap 됨. 누락 시 chunk 전체에서 추출.
@@ -437,14 +474,14 @@ def iter_prepared_split_chunks(
 
     # 1) 단일 통합 파일 — 그대로 로드 후 해당 split 1회 yield (back-compat).
     if p.is_file():
-        data = torch.load(p, weights_only=False)
+        data = _robust_torch_load(p, weights_only=False)
         if split in data:
             yield data[split]
         return
     if fold is None and p.suffix != ".pt":
         single = p.with_suffix(".pt")
         if single.is_file():
-            data = torch.load(single, weights_only=False)
+            data = _robust_torch_load(single, weights_only=False)
             if split in data:
                 yield data[split]
             return
@@ -461,7 +498,7 @@ def iter_prepared_split_chunks(
         unit="chunk",
         mininterval=0.5,
     ):
-        ck = torch.load(f, weights_only=False)
+        ck = _robust_torch_load(f, weights_only=False)
         yield ck["data"] if "data" in ck else ck
 
 
