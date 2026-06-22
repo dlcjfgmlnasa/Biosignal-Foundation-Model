@@ -117,6 +117,30 @@ def train_model(
     best_state: dict = {}
     best_epoch = 0
 
+    # ── 성능/OOM: frozen encoder(linear_probe)면 train/val 윈도우 인코딩을 1회만 수행하고
+    # CPU 에 캐시한다. encoder 가 frozen 이라 매 epoch reprs 가 동일하므로 epoch 루프 안에서
+    # (train batch 와 per-epoch val 평가 모두) 인코더 forward 를 반복할 필요가 없다
+    # (수치 동일, 중복 재계산·재 I/O 제거). LoRA 는 매 epoch encoder 갱신 → 캐시 불가.
+    def _encode_all(
+        patients: list[dict],
+    ) -> list[tuple[torch.Tensor, torch.Tensor | None]]:
+        cache: list[tuple[torch.Tensor, torch.Tensor | None]] = []
+        for p in patients:
+            reprs, times = encode_patient_windows(
+                model, p, patch_size, max_windows,
+                use_lora=False, session_prefix="aki",
+                return_time_secs=True,
+            )
+            t = times.detach().cpu() if times is not None else None
+            cache.append((reprs.detach().cpu(), t))
+        return cache
+
+    cached_train: list[tuple[torch.Tensor, torch.Tensor | None]] | None = None
+    cached_val: list[tuple[torch.Tensor, torch.Tensor | None]] | None = None
+    if not use_lora:
+        cached_train = _encode_all(train_patients)
+        cached_val = _encode_all(val_patients)
+
     for epoch in range(epochs):
         aggregator.train()
         probe.train()
@@ -136,11 +160,15 @@ def train_model(
             batch_labels = []
             for idx in batch_indices:
                 p = train_patients[idx]
-                reprs, times = encode_patient_windows(
-                    model, p, patch_size, max_windows,
-                    use_lora=use_lora, session_prefix="aki",
-                    return_time_secs=True,
-                )
+                if cached_train is not None:
+                    # frozen encoder → epoch 마다 동일한 캐시 재사용 (인코더 forward 없음)
+                    reprs, times = cached_train[idx]
+                else:
+                    reprs, times = encode_patient_windows(
+                        model, p, patch_size, max_windows,
+                        use_lora=use_lora, session_prefix="aki",
+                        return_time_secs=True,
+                    )
                 patient_reprs.append(reprs)
                 patient_times.append(times)
                 batch_labels.append(p["label"])
@@ -171,6 +199,7 @@ def train_model(
         val_metrics = evaluate_model(
             model, aggregator, probe, val_patients, label_mode,
             device=device, patch_size=patch_size, max_windows=max_windows,
+            cached_encodings=cached_val,
         )
         val_metrics.pop("y_true", None)
         val_metrics.pop("y_score", None)
@@ -226,6 +255,7 @@ def evaluate_model(
     patch_size: int,
     max_windows: int,
     fixed_threshold: float | None = None,
+    cached_encodings: list[tuple[torch.Tensor, torch.Tensor | None]] | None = None,
 ) -> dict:
     aggregator.to(device).eval()
     probe.to(device).eval()
@@ -235,10 +265,14 @@ def evaluate_model(
     all_labels: list[int] = []
     all_scores: list[np.ndarray] = []  # binary: scalar, stage: (4,) softmax
 
-    for p in test_patients:
-        reprs, times = encode_patient_windows(
-            model, p, patch_size, max_windows, return_time_secs=True,
-        )
+    for i, p in enumerate(test_patients):
+        if cached_encodings is not None:
+            # frozen encoder → 미리 인코딩된 (reprs, times) 재사용 (인코더 forward 없음)
+            reprs, times = cached_encodings[i]
+        else:
+            reprs, times = encode_patient_windows(
+                model, p, patch_size, max_windows, return_time_secs=True,
+            )
         padded = reprs.unsqueeze(0).to(device)  # (1, K, d_model)
         mask = torch.ones(1, reprs.shape[0], dtype=torch.bool, device=device)
         time_secs = times.unsqueeze(0).to(device) if times is not None else None

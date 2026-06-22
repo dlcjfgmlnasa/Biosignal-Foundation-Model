@@ -86,6 +86,20 @@ def train_model(
     criterion = nn.BCEWithLogitsLoss()
     losses = []
 
+    # ── 성능/OOM: frozen encoder(linear_probe)면 환자 윈도우 인코딩을 1회만 수행하고
+    # CPU 에 캐시한다. encoder 가 frozen 이라 매 epoch reprs 가 동일하므로 epoch 루프
+    # 안에서 인코더 forward 를 반복할 필요가 없다 (수치 동일, 중복 재계산·재 I/O 제거).
+    # LoRA 는 encoder 가 매 epoch 갱신되어 features 가 바뀌므로 캐시 불가 → 기존 경로 유지.
+    cached_reprs: list[torch.Tensor] | None = None
+    if not use_lora:
+        cached_reprs = []
+        for p in train_patients:
+            reprs = encode_patient_windows(
+                model, p, patch_size, max_windows,
+                use_lora=False, session_prefix="mort",
+            )
+            cached_reprs.append(reprs.detach().cpu())
+
     for epoch in range(epochs):
         # 환자 셔플
         rng = np.random.default_rng(epoch)
@@ -101,10 +115,14 @@ def train_model(
             batch_labels = []
             for idx in batch_indices:
                 p = train_patients[idx]
-                reprs = encode_patient_windows(
-                    model, p, patch_size, max_windows,
-                    use_lora=use_lora, session_prefix="mort",
-                )
+                if cached_reprs is not None:
+                    # frozen encoder → epoch 마다 동일한 캐시된 repr 재사용 (인코더 forward 없음)
+                    reprs = cached_reprs[idx]
+                else:
+                    reprs = encode_patient_windows(
+                        model, p, patch_size, max_windows,
+                        use_lora=use_lora, session_prefix="mort",
+                    )
                 patient_reprs.append(reprs)
                 batch_labels.append(p["mortality"])
 

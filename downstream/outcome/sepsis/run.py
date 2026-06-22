@@ -35,6 +35,7 @@ from downstream.metrics import (
 from downstream.viz import plot_roc_curve
 from downstream.model_wrapper import LinearProbe
 from downstream._eval_utils import dump_fold_predictions
+from downstream._save_utils import load_prepared_split_chunked
 from downstream.aggregator import (
     SIGNAL_TYPE_INT,
     TransformerAggregator,
@@ -78,6 +79,21 @@ def train_model(
     criterion = nn.BCEWithLogitsLoss()
     losses = []
 
+    # linear_probe: encoder 가 frozen 이므로 환자별 윈도우 repr 은 epoch 마다 동일.
+    # epoch 루프 진입 전 1회만 인코딩해 (detach→cpu) 캐시하고, 이후엔 aggregator+probe
+    # 만 학습한다 (per-epoch frozen 재추출 제거). LoRA 는 encoder 가 매 step 변하므로
+    # 캐시 불가 — 기존 경로 유지.
+    cached_reprs: list[torch.Tensor] | None = None
+    if not use_lora:
+        print(f"  Caching frozen encoder reprs for {len(train_patients)} patients...")
+        cached_reprs = []
+        for p in train_patients:
+            reprs = encode_patient_windows(
+                model, p, patch_size, max_windows,
+                use_lora=False, session_prefix="sepsis",
+            )
+            cached_reprs.append(reprs.detach().cpu())
+
     for epoch in range(epochs):
         rng = np.random.default_rng(epoch)
         order = rng.permutation(len(train_patients))
@@ -90,10 +106,13 @@ def train_model(
             batch_labels = []
             for idx in batch_indices:
                 p = train_patients[idx]
-                reprs = encode_patient_windows(
-                    model, p, patch_size, max_windows,
-                    use_lora=use_lora, session_prefix="sepsis",
-                )
+                if cached_reprs is not None:
+                    reprs = cached_reprs[idx]
+                else:
+                    reprs = encode_patient_windows(
+                        model, p, patch_size, max_windows,
+                        use_lora=use_lora, session_prefix="sepsis",
+                    )
                 patient_reprs.append(reprs)
                 batch_labels.append(p["label"])
 
@@ -190,9 +209,18 @@ def _compute_metrics(y_true, y_score):
 # ── 데이터 로딩 ──────────────────────────────────────────────
 
 
-def _load_data(data_path: str) -> tuple[list[dict], list[dict], dict]:
-    print(f"\nLoading data: {data_path}")
-    data = torch.load(data_path, weights_only=False)
+def _load_data(
+    data_path: str, fold: int = 0, n_folds: int = 1,
+) -> tuple[list[dict], list[dict], dict]:
+    """환자 단위로 그룹핑된 .pt 를 로드한다.
+
+    단일 통합 .pt (back-compat) 또는 per-(fold,split)[_chunk] prefix 묶음
+    (ablation runner) 양쪽을 처리한다. n_folds>1 이면 해당 fold 의 chunk 만 로드.
+    chunk 들의 ``data`` (patient dict 리스트) 는 split 별로 extend concat 된다.
+    """
+    load_fold = int(fold) if int(n_folds) > 1 else None
+    print(f"\nLoading data: {data_path} (fold={load_fold})")
+    data = load_prepared_split_chunked(data_path, fold=load_fold)
     meta = data.get("metadata", {})
     print(f"  Task: {meta.get('task', '?')}")
     print(f"  Signals: {meta.get('input_signals', '?')}")
@@ -244,7 +272,9 @@ def main() -> None:
     if use_lora:
         model.inject_lora(rank=args.lora_rank, alpha=args.lora_alpha)
 
-    train_patients, test_patients, meta = _load_data(args.data_path)
+    train_patients, test_patients, meta = _load_data(
+        args.data_path, args.fold, args.n_folds,
+    )
 
     n_pos_train = sum(1 for p in train_patients if p["label"] == 1)
     n_pos_test = sum(1 for p in test_patients if p["label"] == 1)
