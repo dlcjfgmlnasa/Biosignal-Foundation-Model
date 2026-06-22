@@ -504,6 +504,7 @@ def prepare_ich_sweep(
     signal_dtype: torch.dtype = torch.float16,
     seed: int = 42,
     required_signals: list[str] | None = None,
+    icp_threshold: float = ICP_THRESHOLD,
 ) -> list[Path]:
     """(window, horizon) 조합 × stratified K-fold CV 데이터셋 생성.
 
@@ -541,7 +542,9 @@ def prepare_ich_sweep(
         splits = [(set(patient_ids), set(), set())]
     else:
         print(f"\n[2/3] Stratified {n_folds}-fold patient-level CV...")
-        patient_to_labels = _patient_level_ich_labels(cases)
+        patient_to_labels = _patient_level_ich_labels(
+            cases, icp_threshold=icp_threshold,
+        )
         pos_pts = sum(1 for pid in patient_ids if any(patient_to_labels.get(pid, [])))
         print(
             f"  Patient-level positive (any ICP>{ICP_THRESHOLD}): "
@@ -593,6 +596,7 @@ def prepare_ich_sweep(
                         case_batch, input_signals, window_sec, stride_sec, horizon_sec,
                         gap_stats=gap_stats,
                         sample_dtype=sample_dtype_str,
+                        icp_threshold=icp_threshold,
                     )
                     if not samples:
                         continue
@@ -678,6 +682,11 @@ def main() -> None:
              "지정하지 않으면 --input-signals 가 그대로 강제됨. "
              "ICP 는 라벨 산출용으로 항상 자동 포함.",
     )
+    parser.add_argument(
+        "--icp-threshold", type=float, default=ICP_THRESHOLD,
+        help=f"intracranial hypertension 임계 ICP(mmHg). default {ICP_THRESHOLD:.0f}. "
+             "BTF 2016 가이드라인 표준은 22.",
+    )
     args = parser.parse_args()
 
     dtype_map = {"float16": torch.float16, "float32": torch.float32}
@@ -694,6 +703,7 @@ def main() -> None:
         split_mode=args.split_mode,
         signal_dtype=dtype_map[args.signal_dtype],
         required_signals=args.required_signals,
+        icp_threshold=args.icp_threshold,
     )
 
 
