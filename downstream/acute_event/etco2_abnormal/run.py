@@ -648,11 +648,22 @@ def main() -> None:
         print("ERROR: --checkpoint or --dummy required.", file=sys.stderr)
         sys.exit(1)
 
-    sig_str = " + ".join(s.upper() for s in args.input_signals)
-    print(f"Mode: {args.mode} | Input: {sig_str} | Window: {args.window_sec}s")
-
     # ── 데이터 로드 (Patch A: train/val/test 3-way) ──
     train_labeled, val_labeled, test_labeled = _load_data(args)
+
+    # 실제 사용 신호/윈도우 = 로드된 데이터 기준. prepared-data 는 args 가 아니라
+    # 파일의 signals 를 쓰므로, print/저장 metadata 가 args 기본값을 잘못 보이지
+    # 않도록 데이터에서 직접 추출한다.
+    if train_labeled:
+        actual_signals = list(train_labeled[0].signals.keys())
+        actual_window_sec = (
+            len(next(iter(train_labeled[0].signals.values()))) / DEFAULT_SR
+        )
+    else:
+        actual_signals = list(args.input_signals)
+        actual_window_sec = float(args.window_sec)
+    sig_str = " + ".join(s.upper() for s in actual_signals)
+    print(f"Mode: {args.mode} | Input: {sig_str} | Window: {actual_window_sec:.0f}s")
 
     def _pos_stats(name: str, ws: list[MultiSignalWindow]) -> None:
         n_pos = sum(1 for lw in ws if lw.label == 1)
@@ -861,11 +872,11 @@ def main() -> None:
         "val_aurocs": val_aurocs,
         "config": {
             "mode": args.mode,
-            "input_signals": args.input_signals,
+            "input_signals": actual_signals,
             "lora_rank": args.lora_rank if args.mode == "lora" else None,
             "lora_alpha": args.lora_alpha if args.mode == "lora" else None,
             "n_cases": args.n_cases,
-            "window_sec": args.window_sec,
+            "window_sec": actual_window_sec,
             "stride_sec": args.stride_sec,
             "epochs": args.epochs,
             "lr": args.lr,
