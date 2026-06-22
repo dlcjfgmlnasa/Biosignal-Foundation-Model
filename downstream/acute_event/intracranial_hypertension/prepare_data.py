@@ -520,7 +520,7 @@ def prepare_ich_sweep(
     print(f"  Input:    {mode_str}")
     print(f"  Windows:  {window_secs}")
     print(f"  Horizons: {horizon_mins}")
-    print(f"  ICP threshold: {ICP_THRESHOLD} mmHg, sustained: {SUSTAINED_SEC}s")
+    print(f"  ICP threshold: {icp_threshold} mmHg, sustained: {SUSTAINED_SEC}s")
     print(f"{'=' * 60}")
 
     # 1. 데이터 로딩 — required_signals 강제 시 sample 마다 동일 채널 보장
@@ -547,7 +547,7 @@ def prepare_ich_sweep(
         )
         pos_pts = sum(1 for pid in patient_ids if any(patient_to_labels.get(pid, [])))
         print(
-            f"  Patient-level positive (any ICP>{ICP_THRESHOLD}): "
+            f"  Patient-level positive (any ICP>{icp_threshold}): "
             f"{pos_pts}/{len(patient_ids)} "
             f"({100.0 * pos_pts / max(1, len(patient_ids)):.1f}%)"
         )
