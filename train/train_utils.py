@@ -1212,9 +1212,15 @@ class CSVLogger:
 def create_scaler(
     config: TrainConfig, device: torch.device
 ) -> torch.amp.GradScaler | None:
-    """AMP가 활성이고 CUDA 디바이스일 때 GradScaler를 생성한다."""
-    if config.use_amp and device.type == "cuda":
-        return torch.amp.GradScaler("cuda")
+    """AMP용 GradScaler — bf16 autocast 에서는 불필요하여 항상 None 반환.
+
+    학습 autocast dtype 은 bf16 고정(train_one_epoch/validate 의 amp_dtype).
+    bf16 은 fp32 와 동일한 8-bit exponent(동적 범위)라 gradient underflow 가
+    없어 loss scaling(GradScaler)이 필요 없다. inf/nan gradient 보호는
+    train_one_epoch 의 grad_norm 유한성 체크가 이미 담당한다 (scaler is None
+    분기 = optimizer.step() 직접 호출).
+    ⚠️ amp_dtype 을 fp16 으로 되돌릴 경우 여기서 GradScaler 를 다시 켜야 한다.
+    """
     return None
 
 
