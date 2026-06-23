@@ -37,7 +37,7 @@ model_config:
   dropout_p: 0.1
 
   # ── Task heads ──
-  next_block_size: 4             # Phase 1과 동일
+  next_block_size: 3             # Block Next Prediction K=3 — 6s 미래 예측 (Phase 1과 동일, 호흡 1주기)
   contrastive_proj_dim: 128      # Phase 2 활성 — Phase 1 ckpt에 없으므로 random init
 
 # ── 데이터 (Phase 1과 동일 source) ──

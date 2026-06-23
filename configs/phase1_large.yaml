@@ -30,7 +30,7 @@ model_config:
   dropout_p: 0.1
 
   # ── Task heads ──
-  next_block_size: 4         # Block Next Prediction — 미래 K patches 동시 예측
+  next_block_size: 3         # Block Next Prediction K=3 — 미래 6s (3 patch × 2s), 호흡 1주기 보장 / MPM block_size_min 과 정합
   contrastive_proj_dim: 0    # Phase 1에서는 비활성
 
 # ── 데이터 (VitalDB + K-MIMIC 통합) ──

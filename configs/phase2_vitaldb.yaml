@@ -31,7 +31,7 @@ model_config:
   dropout_p: 0.1
 
   # ── Task heads ──
-  next_block_size: 4           # Block Next Prediction — Phase 1과 일치
+  next_block_size: 3           # Block Next Prediction K=3 — 6s 미래 예측 (Phase 1과 일치, 호흡 1주기)
   contrastive_proj_dim: 128    # Contrastive projection head (Phase 2 활성)
 
 # ── 데이터 (VitalDB OR 전용) ──

@@ -31,7 +31,7 @@ model_config:
   use_var_attn_bias: true
   use_spatial_embed: true
   dropout_p: 0.1
-  next_block_size: 4
+  next_block_size: 3          # Block Next Prediction K=3 — 미래 6s (3 patch × 2s), 호흡 1주기 보장 / MPM block_size_min 과 정합
   contrastive_proj_dim: 0
 
 data_dir:
