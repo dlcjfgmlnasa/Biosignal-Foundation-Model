@@ -31,6 +31,7 @@ from .train_utils import (
     EarlyStopping,
     TrainConfig,
     cleanup_ddp,
+    create_optimizer,
     create_scaler,
     create_scheduler,
     is_main_process,
@@ -525,9 +526,9 @@ def main():
         contrastive_temperature=config.contrastive_temperature,
         learnable_temperature=config.learnable_temperature,
     ).to(device)
-    optimizer = torch.optim.Adam(
+    optimizer = create_optimizer(
         list(model.parameters()) + list(criterion.parameters()),
-        lr=config.lr,
+        config,
     )
     scheduler = create_scheduler(optimizer, config)
     scaler = create_scaler(config, device)

@@ -62,6 +62,7 @@ shard_cache_size: 1            # OOM 회피 (locality sampler 가 sequential rea
 # ── 학습 ──
 batch_size: 128                # L40S 48GB×2
 lr: 8.0e-4
+weight_decay: 0.1              # AdamW decoupled WD (norm/bias/temperature 제외, 2D+ 텐서만)
 n_epochs: 40                   # over-training 회피 (estimator: 80ep≈토큰 25× 재방문). 부족 시 --resume 연장
 warmup_epochs: 4               # 10% 비율 유지 (40ep 기준)
 min_lr_ratio: 0.1              # 최종 LR = 8e-5

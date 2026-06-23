@@ -76,6 +76,7 @@ class TrainConfig:
     # 학습
     batch_size: int = 16
     lr: float = 1e-3
+    weight_decay: float = 0.1        # AdamW decoupled weight decay (2D+ 텐서에만 적용)
     n_epochs: int = 70
     warmup_epochs: int = 5
     min_lr_ratio: float = 0.1
@@ -1259,6 +1260,31 @@ def is_main_process() -> bool:
     if not dist.is_initialized():
         return True
     return dist.get_rank() == 0
+
+
+def create_optimizer(
+    params: "list[torch.nn.Parameter]",
+    config: TrainConfig,
+) -> torch.optim.Optimizer:
+    """AdamW (decoupled weight decay) 옵티마이저를 생성한다.
+
+    표준 transformer 사전학습 관행을 따라, 2D 이상 텐서(linear/embedding weight)에만
+    weight decay를 적용하고 1D 파라미터(norm gain, bias, scalar log-temperature)는
+    decay 대상에서 제외한다. ``config.weight_decay = 0`` 이면 AdamW는 Adam과 동일하다.
+    """
+    decay, no_decay = [], []
+    for p in params:
+        if not p.requires_grad:
+            continue
+        if p.ndim >= 2:
+            decay.append(p)
+        else:
+            no_decay.append(p)
+    param_groups = [
+        {"params": decay, "weight_decay": config.weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
+    return torch.optim.AdamW(param_groups, lr=config.lr)
 
 
 def create_scheduler(

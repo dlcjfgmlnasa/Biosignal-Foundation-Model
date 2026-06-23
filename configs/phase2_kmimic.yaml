@@ -63,6 +63,7 @@ shard_cache_size: 1            # OOM 회피
 # ── 학습 ──
 batch_size: 64                 # any_variate multi-channel packing
 lr: 2.0e-4                     # Phase 1(8e-4) 대비 낮은 LR (fine-tuning)
+weight_decay: 0.1              # AdamW decoupled WD (Phase 1과 통일)
 n_epochs: 50
 warmup_epochs: 3
 min_lr_ratio: 0.1              # 최종 LR = 2e-5
@@ -88,8 +89,8 @@ learnable_temperature: true
 variate_mask_prob: 0.3         # 30% 확률로 전체 variate 마스킹 (virtual sensing)
 variate_drop_prob: 0.1         # 10% 확률로 variate 를 attention 에서 완전 제거 (zero-shot용)
 block_mask: true
-block_size_min: 2
-block_size_max: 3
+block_size_min: 3              # Phase 1과 통일 — 최소 3패치(6초)로 호흡 1 cycle(~5초) 보장
+block_size_max: 8              # Phase 1과 통일 — 최대 8패치(16초)
 
 # ── Mixed Precision ──
 use_amp: true
