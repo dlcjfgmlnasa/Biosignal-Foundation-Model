@@ -70,7 +70,7 @@ mask_ratio: 0.4                # 40% 패치 마스킹
 gradient_clip: 1.0
 seed: 42
 collate_mode: ci
-max_batches: 3000              # 4-GPU(global 512) 기준: 3000 batch = 2-GPU 설계 토큰예산 복원 (~15× 재방문). 2-GPU로 돌릴 땐 6000
+max_batches: 4000              # 4-GPU(global 384, batch96) 기준: batch 128→96 하향으로 줄어든 토큰예산 복원 (384×4000 = 512×3000, ~15× 재방문). 2-GPU로 돌릴 땐 8000
 
 # ── Loss 가중치 (Phase 1: MPM + Next-Pred) ──
 alpha: 1.0                     # masked reconstruction
