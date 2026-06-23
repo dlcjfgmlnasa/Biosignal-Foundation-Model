@@ -8,7 +8,7 @@
 # 핵심 차이 (vs phase1_combined.yaml):
 #   * data_dir: K-MIMIC only (VitalDB 제외 — 단독 학습)
 #   * shard_index_path 추가 — 1.94M recording 은 file backend 비현실적
-#   * next_block_size: 4 → 2 (8s → 4s 미래 예측, sweet spot)
+#   * next_block_size: 3 (6s 미래 예측, 호흡 1주기)
 #
 # Usage (2-GPU DDP):
 #   torchrun --nproc_per_node=2 -m train.1_channel_independency \
@@ -34,7 +34,7 @@ model_config:
   dropout_p: 0.1
 
   # ── Task heads ──
-  next_block_size: 2         # Block Next Prediction K=2 — 미래 4s (2 patch × 2s)
+  next_block_size: 3         # Block Next Prediction K=3 — 미래 6s (3 patch × 2s), 호흡 1주기 보장 / MPM block_size_min 과 정합
   contrastive_proj_dim: 0    # Contrastive (Phase 2에서 활성)
 
 # ── 데이터 (K-MIMIC ICU 전용) ──

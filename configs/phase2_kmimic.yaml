@@ -7,7 +7,7 @@
 # 핵심 차이 (vs phase2_base.yaml):
 #   * data_dir: K-MIMIC only (VitalDB 제외)
 #   * shard_index_path 추가 (1.94M recording → shard backend 필수)
-#   * next_block_size: 4 → 2 (8s → 4s 미래 예측)
+#   * next_block_size: 3 (6s 미래 예측, 호흡 1주기)
 #   * resume: K-MIMIC Phase 1 best.pt
 #
 # Usage (2-GPU DDP):
@@ -37,7 +37,7 @@ model_config:
   dropout_p: 0.1
 
   # ── Task heads ──
-  next_block_size: 2           # Block Next Prediction K=2 — 4s 미래 예측 (Phase 1 과 동일)
+  next_block_size: 3           # Block Next Prediction K=3 — 6s 미래 예측 (Phase 1 과 동일, 호흡 1주기)
   contrastive_proj_dim: 128    # Contrastive projection head (Phase 2 활성)
 
 # ── 데이터 (K-MIMIC ICU 전용) ──
