@@ -60,7 +60,7 @@ shard_index_path: /home/coder/workspace/k-mimic-/bio_fm/data/train/k_mimic_shard
 shard_cache_size: 1            # OOM 회피 (locality sampler 가 sequential read 보장)
 
 # ── 학습 ──
-batch_size: 96                 # L40S 44GB — 128에서 OOM(rank별 PackCollate 불균형 + K=3 STFT) → 96 하향
+batch_size: 128                # L40S 44GB. OOM 시 우선 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True(단편화 ~4.5GB 회복), 그래도면 96으로 하향
 lr: 8.0e-4
 weight_decay: 0.1              # AdamW decoupled WD (norm/bias/temperature 제외, 2D+ 텐서만)
 n_epochs: 40                   # over-training 회피 (estimator: 80ep≈토큰 25× 재방문). 부족 시 --resume 연장
