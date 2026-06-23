@@ -1291,7 +1291,10 @@ def create_optimizer(
         {"params": decay, "weight_decay": config.weight_decay},
         {"params": no_decay, "weight_decay": 0.0},
     ]
-    return torch.optim.AdamW(param_groups, lr=config.lr)
+    # betas=(0.9, 0.95): 대형 transformer 사전학습 표준 (GPT-3/LLaMA). β₂=0.95는
+    # 분산 추정 윈도우를 ~20 step으로 줄여 high-LR 구간 loss spike 안정성을 높인다
+    # (PyTorch 기본 β₂=0.999는 CV·소규모 task 기준).
+    return torch.optim.AdamW(param_groups, lr=config.lr, betas=(0.9, 0.95))
 
 
 def create_scheduler(
