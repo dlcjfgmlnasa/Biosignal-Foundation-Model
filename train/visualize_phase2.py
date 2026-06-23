@@ -21,6 +21,7 @@ from data.spatial_map import CROSS_PRED_ALLOWED_PAIRS
 from model import BiosignalFoundationModel
 
 
+# v2 (2026-06-23 PAP 제거 후 연속 9종): ICP 7→6, RESP 8→Impedance(7)/Flow(8).
 SIGNAL_TYPE_NAMES = {
     0: "ECG",
     1: "ABP",
@@ -28,8 +29,9 @@ SIGNAL_TYPE_NAMES = {
     3: "CVP",
     4: "CO2",
     5: "AWP",
-    6: "PAP",
-    7: "ICP",
+    6: "ICP",
+    7: "RESP_Impedance",
+    8: "RESP_Flow",
 }
 
 SIGNAL_TYPE_COLORS = {
@@ -39,8 +41,9 @@ SIGNAL_TYPE_COLORS = {
     3: "#984ea3",  # CVP - purple
     4: "#ff7f00",  # CO2 - orange
     5: "#a65628",  # AWP - brown
-    6: "#f781bf",  # PAP - pink
-    7: "#999999",  # ICP - gray
+    6: "#999999",  # ICP - gray
+    7: "#f781bf",  # RESP_Impedance - pink
+    8: "#dede00",  # RESP_Flow - yellow
 }
 
 MECHANISM_GROUP_COLORS = {
@@ -48,15 +51,19 @@ MECHANISM_GROUP_COLORS = {
     1: "#ff7f0e",  # Respiratory - orange
 }
 
+# v2 mechanism group (data/spatial_map.MECHANISM_GROUP 와 정합):
+#   Cardiovascular(0): ECG, ABP, PPG, CVP, ICP
+#   Respiratory(1): CO2, AWP, RESP_Impedance, RESP_Flow
 MECHANISM_GROUP = {
-    0: 0,
-    1: 0,
-    2: 0,
-    3: 0,  # Cardiovascular
-    4: 1,
-    5: 1,  # Respiratory
-    6: 0,
-    7: 0,  # Cardiovascular
+    0: 0,  # ECG            → Cardiovascular
+    1: 0,  # ABP            → Cardiovascular
+    2: 0,  # PPG            → Cardiovascular
+    3: 0,  # CVP            → Cardiovascular
+    4: 1,  # CO2            → Respiratory
+    5: 1,  # AWP            → Respiratory
+    6: 0,  # ICP            → Cardiovascular
+    7: 1,  # RESP_Impedance → Respiratory
+    8: 1,  # RESP_Flow      → Respiratory
 }
 
 
@@ -449,7 +456,8 @@ def _plot_cross_modal_figure(
 ) -> Path:
     """Cross-modal prediction 쌍을 시각화한다.
 
-    허용된 pair: ECG↔ABP, ECG↔PPG, ABP↔PPG, ABP↔PAP, CVP↔PAP, ABP↔ICP
+    허용된 pair (v2 γ 강결합, data/spatial_map.CROSS_PRED_ALLOWED_PAIRS):
+    ECG↔ABP, ECG↔PPG, ABP↔PPG, AWP↔RESP_Flow.
     각 쌍마다 2행 (source→target, target→source).
     """
     n_rows = len(pairs) * 2

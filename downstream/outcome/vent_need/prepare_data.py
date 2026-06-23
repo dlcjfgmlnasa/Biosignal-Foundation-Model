@@ -58,7 +58,7 @@ MIMIC_SIGNAL_MAP: dict[str, str] = {
     # RESP / Respiration (impedance, non-invasive)
     # v2: Task #11 은 RESP-Impedance(삽관 전 비침습 흉부 임피던스) 가 임상 정의.
     # MIMIC-III matched waveform 의 RESP 채널 = impedance plethysmography 이므로
-    # signal_type 8(resp_impedance) 로 직접 매핑. string→int SSOT 는
+    # signal_type 7(resp_impedance) 로 직접 매핑. string→int SSOT 는
     # data.spatial_map.SIGNAL_KEY_TO_TYPE (aggregator.SIGNAL_TYPE_INT) 사용.
     "RESP": "resp_impedance",
 }
@@ -95,7 +95,7 @@ def parse_waveform_record(
     record_dir: Path,
     record_name: str,
 ) -> dict[str, np.ndarray] | None:
-    """WFDB 레코드에서 ECG/ABP/PPG/CVP/PAP/ICP 신호를 추출한다.
+    """WFDB 레코드에서 ECG/ABP/PPG/CVP/ICP 신호를 추출한다.
 
     mimic3_waveform.py의 _apply_pipeline을 사용하여
     pretraining과 동일한 전처리 적용.

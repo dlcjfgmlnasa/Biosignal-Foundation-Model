@@ -47,20 +47,13 @@ from downstream._gap_mask import (
 from downstream._kfold_utils import stratified_kfold_patient_splits, summarize_splits
 from downstream._save_utils import add_signal_dtype_arg, consume_gap_masks, consume_input_signals
 from downstream._seg_intersect import load_aligned_signals_intersection
+from data.spatial_map import SIGNAL_TYPE_TO_KEY
 
 TARGET_SR: float = 100.0
 
-# signal_type 정수 → 문자열 매핑
-SIGNAL_TYPE_MAP: dict[int, str] = {
-    0: "ecg",
-    1: "abp",
-    2: "ppg",
-    3: "cvp",
-    4: "co2",
-    5: "awp",
-    6: "pap",
-    7: "icp",
-}
+# signal_type 정수 → 문자열 매핑 : data.spatial_map 의 SSOT(v2, 9종) 사용.
+# (PAP 제거 후 연속 번호: icp=6 / resp_impedance=7 / resp_flow=8.)
+SIGNAL_TYPE_MAP: dict[int, str] = SIGNAL_TYPE_TO_KEY
 
 
 # ---- 데이터 구조 ----

@@ -43,12 +43,13 @@ TARGET_SR: float = 100.0
 
 # Task #13 Waveform Forecasting: All modality.
 # Main paper: ECG, ABP, PPG, CO2 (universal coverage).
-# Appendix: RESP_Impedance, AWP, CVP, ICP, PAP (rare/specialized cohorts).
-# v2: RESP → resp_impedance(8). RESP_Flow(9)는 다운스트림 데이터 소스 부재
+# Appendix: RESP_Impedance, AWP, CVP, ICP (rare/specialized cohorts).
+# v2: RESP → resp_impedance(7). RESP_Flow(8)는 다운스트림 데이터 소스 부재
 # (MIMIC-III=impedance only, VitalDB Open=resp 없음, flow는 K-MIMIC pretrain 전용)
-# 이므로 forecast 타깃에서 제외. SSOT: data.spatial_map.SIGNAL_KEY_TO_TYPE.
+# 이므로 forecast 타깃에서 제외. PAP 는 v2(2026-06-23)에서 완전 제거.
+# SSOT: data.spatial_map.SIGNAL_KEY_TO_TYPE.
 MAIN_SIGNAL_TYPES = ["ecg", "abp", "ppg", "co2"]
-APPENDIX_SIGNAL_TYPES = ["resp_impedance", "awp", "cvp", "icp", "pap"]
+APPENDIX_SIGNAL_TYPES = ["resp_impedance", "awp", "cvp", "icp"]
 ALL_SIGNAL_TYPES = MAIN_SIGNAL_TYPES + APPENDIX_SIGNAL_TYPES
 
 
@@ -90,7 +91,7 @@ def _load_mimic3_signal(
 
     if signal_type not in ("abp", "ecg", "ppg"):
         # Task #13 main 4 (incl. co2) 및 appendix 5: 단일 채널 single-input 은
-        # 현재 scan_abp_records (ABP-필수) 경로만 지원. CO2/RESP/AWP/CVP/ICP/PAP 는
+        # 현재 scan_abp_records (ABP-필수) 경로만 지원. CO2/RESP/AWP/CVP/ICP 는
         # --multi-input 모드 + ICH waveform_dir 경유 추출 필요.
         print(
             f"  WARNING: single-input MIMIC-III loader supports abp/ecg/ppg only "

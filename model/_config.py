@@ -43,9 +43,9 @@ class ModelConfig:
     dropout_p:
         드롭아웃 확률.
     num_signal_types:
-        신호 타입(modality) 수. v2: 10
-        (ECG0, ABP1, PPG2, CVP3, CO24, AWP5, PAP6(슬롯 유지), ICP7,
-        RESP_Impedance8, RESP_Flow9).
+        신호 타입(modality) 수. v2: 9 (2026-06-23 PAP 제거 후 연속 번호)
+        (ECG0, ABP1, PPG2, CVP3, CO24, AWP5, ICP6,
+        RESP_Impedance7, RESP_Flow8).
     next_block_size:
         Block Next Prediction에서 각 position이 병렬 예측하는 future patch 수 (K).
     """
@@ -69,9 +69,9 @@ class ModelConfig:
     dropout_p: float = 0.0
 
     # Signal types (v2: single modality embedding)
-    # ECG0, ABP1, PPG2, CVP3, CO24, AWP5, PAP6(슬롯 유지), ICP7,
-    # RESP_Impedance8, RESP_Flow9 — 2026-05-21 Option A 단일 modality 전환.
-    num_signal_types: int = 10
+    # ECG0, ABP1, PPG2, CVP3, CO24, AWP5, ICP6,
+    # RESP_Impedance7, RESP_Flow8 — 2026-06-23 PAP 제거 후 9종 연속 번호.
+    num_signal_types: int = 9
     # NOTE: num_spatial_ids는 v2에서 폐지됨 (spatial_id 소분류 임베딩 제거).
     # 구 yaml/checkpoint에 남은 num_spatial_ids 키는 from_dict가 무시한다.
 

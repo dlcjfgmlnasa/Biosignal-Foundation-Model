@@ -55,7 +55,7 @@ MIMIC_SIGNAL_MAP: dict[str, str] = {
     "ABP": "abp",
     "ART": "abp",
     "PLETH": "ppg",
-    # v2: RESP=impedance plethysmography → resp_impedance(8). SSOT: data.spatial_map.
+    # v2: RESP=impedance plethysmography → resp_impedance(7). SSOT: data.spatial_map.
     "RESP": "resp_impedance",
     # CO2 / Capnography (Table 3 #4)
     "CO2": "co2",

@@ -50,7 +50,7 @@ DEFAULT_PATCH_SIZE = 100
 DEFAULT_SR = 100.0
 
 # v2: data.spatial_map 의 SSOT(SIGNAL_KEY_TO_TYPE) 사용. ICH 는 ECG/ABP/PPG/
-# CVP/PAP/ICP 만 입력하지만, 번호 정의는 단일 소스로 통일한다(로컬 dict drift 방지).
+# CVP/ICP 등 일부만 입력하지만, 번호 정의는 단일 소스로 통일한다(로컬 dict drift 방지).
 SIGNAL_TYPE_INT: dict[str, int] = SIGNAL_KEY_TO_TYPE
 
 

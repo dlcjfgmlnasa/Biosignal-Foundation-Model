@@ -104,9 +104,9 @@ class BiosignalFoundationModel(nn.Module):
     dropout_p:
         드롭아웃 확률.
     num_signal_types:
-        신호 타입(modality) 수. v2: 10
-        (ecg=0, abp=1, ppg=2, cvp=3, co2=4, awp=5, pap=6, icp=7,
-        resp_impedance=8, resp_flow=9).
+        신호 타입(modality) 수. v2: 9 (2026-06-23 PAP 제거 후 연속 번호)
+        (ecg=0, abp=1, ppg=2, cvp=3, co2=4, awp=5, icp=6,
+        resp_impedance=7, resp_flow=8).
     use_spatial_embed:
         단일 modality(signal_type) 임베딩 사용 여부.
         (이름은 하위 호환을 위해 유지 — v2에서 의미를 "modality embedding"으로
@@ -135,9 +135,9 @@ class BiosignalFoundationModel(nn.Module):
         use_var_attn_bias: bool = True,
         scaler: PackedScaler | None = None,
         dropout_p: float = 0.0,
-        # v2 단일 modality embedding: ECG0,ABP1,PPG2,CVP3,CO24,AWP5,PAP6,ICP7,
-        # RESP_Impedance8, RESP_Flow9.
-        num_signal_types: int = 10,
+        # v2 단일 modality embedding: ECG0,ABP1,PPG2,CVP3,CO24,AWP5,ICP6,
+        # RESP_Impedance7, RESP_Flow8 (2026-06-23 PAP 제거 후 9종 연속).
+        num_signal_types: int = 9,
         use_spatial_embed: bool = True,
         next_block_size: int = 4,
         next_head_d_inner: int | None = None,

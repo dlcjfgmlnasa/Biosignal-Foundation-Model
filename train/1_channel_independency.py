@@ -92,7 +92,8 @@ def parse_args() -> argparse.Namespace:
         type=int,
         nargs="+",
         default=[0, 1, 2, 3, 4, 5],
-        help="Signal type IDs (0=ECG, 1=ABP, 2=PPG, 3=CVP, 4=CO2, 5=AWP, 6=PAP, 7=ICP)",
+        help="Signal type IDs (0=ECG, 1=ABP, 2=PPG, 3=CVP, 4=CO2, 5=AWP, "
+        "6=ICP, 7=RESP_Impedance, 8=RESP_Flow). v2: PAP 제거 후 연속 9종.",
     )
     g.add_argument("--max_subjects", type=int, default=None)
     g.add_argument("--window_seconds", type=float, default=30.0)

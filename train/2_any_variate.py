@@ -117,7 +117,10 @@ def parse_args() -> argparse.Namespace:
     # Data
     g = p.add_argument_group("Data")
     g.add_argument("--data_dir", type=str, default="datasets/processed")
-    g.add_argument("--signal_types", type=int, nargs="+", default=[0, 1, 2, 3, 4, 5, 6])
+    # v2 연속 9종 (2026-06-23 PAP 제거): 0 ECG~5 AWP, 6 ICP, 7 RESP_Imp, 8 RESP_Flow.
+    g.add_argument(
+        "--signal_types", type=int, nargs="+", default=[0, 1, 2, 3, 4, 5, 6, 7, 8]
+    )
     g.add_argument("--max_subjects", type=int, default=None)
     g.add_argument("--window_seconds", type=float, default=30.0)
     g.add_argument("--max_length", type=int, default=50000)

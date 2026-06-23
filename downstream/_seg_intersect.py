@@ -31,7 +31,7 @@ from data.spatial_map import SIGNAL_TYPE_TO_KEY
 TARGET_SR: float = 100.0
 
 # signal_type 번호 → 소문자 key : data.spatial_map 의 SSOT(v2) 사용.
-# (10 signal_type, spatial_id 폐지, 8=resp_impedance / 9=resp_flow.)
+# (9 signal_type, spatial_id 폐지, 7=resp_impedance / 8=resp_flow, PAP 제거.)
 SIGNAL_TYPE_STR: dict[int, str] = SIGNAL_TYPE_TO_KEY
 
 

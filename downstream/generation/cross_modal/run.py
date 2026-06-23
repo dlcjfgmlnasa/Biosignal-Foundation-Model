@@ -52,7 +52,7 @@ from data.spatial_map import SIGNAL_KEY_TO_TYPE
 from downstream._save_utils import load_prepared_chunked
 
 # signal_type_key -> signal_type_id : data.spatial_map 의 SSOT(v2) 사용.
-# (10 signal_type, spatial_id 폐지, resp_impedance=8 / resp_flow=9.)
+# (9 signal_type, spatial_id 폐지, resp_impedance=7 / resp_flow=8, PAP 제거.)
 SIGNAL_TYPE_IDS: dict[str, int] = SIGNAL_KEY_TO_TYPE
 
 # Mechanism groups for analysis
@@ -65,7 +65,6 @@ MECHANISM_GROUPS: dict[str, str] = {
     "awp": "respiratory",
     "resp_impedance": "respiratory",
     "resp_flow": "respiratory",
-    "pap": "cardiovascular",
     "icp": "neurological",
 }
 
@@ -122,7 +121,7 @@ def get_default_scenarios() -> list[Scenario]:
       - ECG → ABP (비침습 → 침습 동맥압)          (0,1)
       - PPG → ABP (비침습 말초 맥파 → 침습 동맥압) (1,2)
       - ECG+PPG → ABP (비침습 2채널 → 침습 ABP)   (0,1)+(1,2)  ← multi-input
-      - AWP → RESP_Flow (ventilator P–Q 인과)     (5,9)
+      - AWP → RESP_Flow (ventilator P–Q 인과)     (5,8)
 
     제외:
       - ECG → PPG: cardiac→peripheral 이나, 임상 활용도 높은 PPG → ABP
@@ -130,8 +129,6 @@ def get_default_scenarios() -> list[Scenario]:
       - ABP → PPG: 강 → 약 방향이라 임상 의의 낮음 → ECG+PPG → ABP 로 대체.
       - ABP → ICP: ICP 가 VitalDB 에 없음(평가 소스 부재) → 제외.
       - CO2 → RESP_Impedance: 약결합 + downstream RESP 데이터 소스 부재.
-      - ABP → PAP / CVP → PAP: PAP 는 사전학습에서 제외(slot 6 데이터 없음) →
-        타깃이 pretrain 에 미등장하여 복원 대상 부적합.
     """
     scenarios = [
         # 강결합 cardiovascular (γ) — 약 → 강 방향
@@ -300,7 +297,6 @@ _SYNTH_FREQS: dict[str, float] = {
     "cvp": 0.9,
     "co2": 0.25,
     "awp": 0.3,
-    "pap": 1.0,
     "icp": 0.15,
     "resp_impedance": 0.25,  # 호흡 effort (~15 bpm)
     "resp_flow": 0.25,       # ventilator flow (~15 bpm)

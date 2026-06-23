@@ -24,6 +24,7 @@ from model import BiosignalFoundationModel
 
 # ── 상수 & 데이터 구조 ────────────────────────────────────────
 
+# v2 (2026-06-23 PAP 제거 후 연속 9종): ICP 7→6, RESP 8→Impedance(7)/Flow(8).
 SIGNAL_TYPE_NAMES = {
     0: "ECG",
     1: "ABP",
@@ -31,8 +32,9 @@ SIGNAL_TYPE_NAMES = {
     3: "CVP",
     4: "CO2",
     5: "AWP",
-    6: "PAP",
-    7: "ICP",
+    6: "ICP",
+    7: "RESP_Impedance",
+    8: "RESP_Flow",
 }
 
 

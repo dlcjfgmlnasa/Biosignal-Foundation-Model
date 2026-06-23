@@ -12,7 +12,7 @@ from __future__ import annotations
   같은 (session_id, physical_time_ms)의 채널들을 항상 같은 배치에 넣어서
   PackCollate의 any_variate 그루핑이 제대로 동작하도록 보장한다.
 
-- ModalityBalancedRecordingSampler: 희소 modality(ICP/PAP/rare-ECG-lead) 보정용.
+- ModalityBalancedRecordingSampler: 희소 modality(ICP 등) 보정용.
   RecordingLocalitySampler 의 shard-aware locality 를 그대로 유지하면서,
   (signal_type, spatial_id) 빈도의 √-inverse 로 recording 별 multiplicity 를
   부여하여 expanded list 를 만든다. α=0 이면 RecordingLocalitySampler 와 동치.
@@ -600,7 +600,7 @@ class ModalityBalancedRecordingSampler(Sampler[int]):
         """(st, sp) 별 multiplicity 분포를 보기 좋게 출력 (training 시작 시 1회 권장)."""
         from data.spatial_map import SPATIAL_MAP, SIGNAL_TYPE_NAMES
 
-        SIGNAL_NAMES = SIGNAL_TYPE_NAMES  # SSOT (v2: 10종, RESP→Imp/Flow 분리)
+        SIGNAL_NAMES = SIGNAL_TYPE_NAMES  # SSOT (v2: 9종, PAP 제거·RESP→Imp/Flow 분리)
         print_fn(
             f"\n[ModalityBalancedSampler] alpha={self.alpha} "
             f"w_max_ratio={self.w_max_ratio}"

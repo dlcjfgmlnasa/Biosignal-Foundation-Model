@@ -44,7 +44,7 @@ TARGET_SR: float = 100.0
 
 # WFDB sig_name → 우리 signal_type 매핑
 # Table 3 (SSOT) #9 Extubation Failure: ABP, ECG, PPG, RespImp (4 modality).
-# CVP/CO2/AWP/PAP/ICP 는 Table 3 조합 밖이므로 매핑에서 제외(추출되더라도 무시).
+# CVP/CO2/AWP/ICP 는 Table 3 조합 밖이므로 매핑에서 제외(추출되더라도 무시).
 MIMIC_SIGNAL_MAP: dict[str, str] = {
     # ECG — pretrained lead만
     "II": "ecg",
@@ -58,9 +58,9 @@ MIMIC_SIGNAL_MAP: dict[str, str] = {
     # v2 결정(2026-05-21): #10 임상 정의는 RESP-Flow(ventilator flow)이나,
     # 데이터 소스 MIMIC-III matched waveform 에는 flow 채널이 없고 RESP=impedance
     # plethysmography 만 존재한다. VitalDB 전환은 재삽관(extubation failure) 라벨
-    # 부재로 불가 판정. 따라서 RESP-Impedance(8) 를 proxy 로 사용한다.
+    # 부재로 불가 판정. 따라서 RESP-Impedance(7) 를 proxy 로 사용한다.
     # (flow 미사용 한계는 paper limitation 으로 기술. SOT: docs/paper_task_modality.md.)
-    # string→int SSOT 는 data.spatial_map.SIGNAL_KEY_TO_TYPE (signal_type=8).
+    # string→int SSOT 는 data.spatial_map.SIGNAL_KEY_TO_TYPE (signal_type=7).
     "RESP": "resp_impedance",
 }
 
@@ -96,7 +96,7 @@ def parse_waveform_record(
     record_dir: Path,
     record_name: str,
 ) -> dict[str, np.ndarray] | None:
-    """WFDB 레코드에서 ECG/ABP/PPG/CVP/PAP/ICP 신호를 추출한다.
+    """WFDB 레코드에서 ECG/ABP/PPG/CVP/ICP 신호를 추출한다.
 
     mimic3_waveform.py의 _apply_pipeline을 사용하여
     pretraining과 동일한 전처리 적용.

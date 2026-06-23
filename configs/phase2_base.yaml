@@ -38,7 +38,7 @@ model_config:
 data_dir:
   - /home/coder/workspace/updown/bio_fm/data/train/vitaldb/
   - /home/coder/workspace/k-mimic-/bio_fm/data/train/k_mimic/
-signal_types: [0, 1, 2, 3, 4, 5, 7, 8, 9]  # ECG ABP PPG CVP CO2 AWP ICP RESP_Imp RESP_Flow (PAP=6 데이터 제외)
+signal_types: [0, 1, 2, 3, 4, 5, 6, 7, 8]  # ECG ABP PPG CVP CO2 AWP ICP RESP_Imp RESP_Flow (v2 9종 연속, 2026-06-23 PAP 제거)
 max_subjects: null
 window_seconds: 600.0             # 600초 (10분) 윈도우 — 다변량 세션
 max_length: 180000                # row당 다수 unit packing 지원 (cross-session neg 풍부)
@@ -66,7 +66,7 @@ gamma: 0.15                    # cross-modal (criterion fix 후 β와 분리; �
 delta: 0.5                     # cross-modal contrastive (InfoNCE)
 peak_alpha: 1.0                # Peak-Weighted MSE
 lambda_spec: 0.2               # Multi-Resolution STFT Loss
-spec_n_ffts: [32, 64, 128]
+spec_n_ffts: [16, 32, 64]      # Phase 1과 통일 (phase별 window set 차이 제거)
 aux_loss_weight: 0.01
 contrastive_temperature: 0.07
 learnable_temperature: true

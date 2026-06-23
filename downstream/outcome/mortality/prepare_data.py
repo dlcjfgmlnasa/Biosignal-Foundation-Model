@@ -45,7 +45,7 @@ TARGET_SR: float = 100.0
 # WFDB sig_name → 우리 signal_type 매핑
 # Table 3 (SSOT) #8 Mortality: ECG, ABP, PPG, RespImp, CO₂ (5 modality).
 # 환자별 가용 modality 만 추출되며(availability-aware), 결측은 학습 시 mask token 처리.
-# CVP/AWP/PAP/ICP 는 Table 3 조합 밖이므로 매핑에서 제외(추출되더라도 무시).
+# CVP/AWP/ICP 는 Table 3 조합 밖이므로 매핑에서 제외(추출되더라도 무시).
 MIMIC_SIGNAL_MAP: dict[str, str] = {
     # ECG — pretrained lead만
     "II": "ecg",
@@ -57,7 +57,7 @@ MIMIC_SIGNAL_MAP: dict[str, str] = {
     "PLETH": "ppg",
     # CO2 / Capnography
     "CO2": "co2",
-    # RESP / Respiration (impedance) — v2: resp_impedance(8). SSOT: data.spatial_map.
+    # RESP / Respiration (impedance) — v2: resp_impedance(7). SSOT: data.spatial_map.
     "RESP": "resp_impedance",
 }
 
@@ -93,7 +93,7 @@ def parse_waveform_record(
     record_dir: Path,
     record_name: str,
 ) -> dict[str, np.ndarray] | None:
-    """WFDB 레코드에서 ECG/ABP/PPG/CVP/PAP/ICP 신호를 추출한다.
+    """WFDB 레코드에서 ECG/ABP/PPG/CVP/ICP 신호를 추출한다.
 
     mimic3_waveform.py의 _apply_pipeline을 사용하여
     pretraining과 동일한 전처리 적용.

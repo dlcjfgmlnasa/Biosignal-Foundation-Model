@@ -4,7 +4,7 @@
 # Label: 같은 ICU stay 내 발관(vent_end) 후 48h 내 재삽관(reintubation)
 #
 # v2(2026-05-21): 입력 RESP 는 prepare_data 내부 MIMIC_SIGNAL_MAP 에서 자동으로
-#   resp_impedance(8) 로 매핑된다(CLI signal 인자 없음). MIMIC-III 에 flow 채널이
+#   resp_impedance(7) 로 매핑된다(CLI signal 인자 없음). MIMIC-III 에 flow 채널이
 #   없어 RESP/Flow → RESP/Impedance proxy 사용(한계는 paper limitation). SSOT:
 #   data/spatial_map.py SIGNAL_KEY_TO_TYPE.
 #

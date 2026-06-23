@@ -207,8 +207,9 @@ class NextPredictionLoss(nn.Module):
         target의 signal type에 해당하는 cross_pred를 선택하여 MSE를 계산한다.
 
         ``CROSS_PRED_ALLOWED_PAIRS``(data/spatial_map.py)에 정의된 생리학적으로
-        타당한 쌍만 허용. 현재: ECG↔ABP, ECG↔PPG, ABP↔PPG, ABP↔PAP, CVP↔PAP,
-        ABP↔ICP. (CO2↔AWP, ABP↔CVP 등은 명시적으로 기각.)
+        타당한 쌍만 허용 (v2, 2026-06-23 PAP 제거 후 번호 재배치). 현재 γ 강결합:
+        ECG↔ABP, ECG↔PPG, ABP↔PPG, AWP↔RESP_Flow. (약결합 ECG↔CVP·ABP↔ICP·
+        CO2↔RESP_Imp·RESP_Imp↔Flow 는 δ contrastive 전용으로 기각.)
         """
         # group_key: (batch, sample_id, time_id)가 같은 패치를 그룹핑
         b, n = time_id.shape

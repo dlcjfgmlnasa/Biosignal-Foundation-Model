@@ -17,7 +17,7 @@ VitalDB CSV 스키마 (확인됨):
   ※ dt는 수술 시작이 아니라 *case 시작* 기준이므로 반드시 opend로 postop 구간 잘라야 함
 
 입력 신호: K-MIMIC pretrain overlap (ABP, ECG, PPG, CVP)
-  → EEG/AWP/CO2/PAP/ICP는 K-MIMIC overlap 부분만 채택
+  → EEG/AWP/CO2/ICP는 K-MIMIC overlap 부분만 채택
 
 사용법:
     python -m downstream.outcome.aki.prepare_data \

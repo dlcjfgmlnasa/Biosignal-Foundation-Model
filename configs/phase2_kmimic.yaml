@@ -28,7 +28,7 @@ model_config:
   stride: null                 # non-overlapping (= patch_size)
   num_heads: 6                 # head_dim = 384/6 = 64
   num_groups: null             # MHA (= num_heads)
-  num_signal_types: 10       # v2 단일 modality 10종 (ECG0~RESP_Flow9, PAP6 슬롯 유지)
+  num_signal_types: 9        # v2 단일 modality 9종 (ECG0~RESP_Flow8, 2026-06-23 PAP 제거)
   use_glu: true
   use_moe: false
   use_rope: true
@@ -43,7 +43,7 @@ model_config:
 # ── 데이터 (K-MIMIC ICU 전용) ──
 data_dir:
   - /home/coder/workspace/k-mimic-/bio_fm/data/train/k_mimic/
-signal_types: [0, 1, 2, 3, 4, 5, 7, 8, 9]  # ECG ABP PPG CVP CO2 AWP ICP RESP_Imp RESP_Flow (PAP=6 데이터 제외)
+signal_types: [0, 1, 2, 3, 4, 5, 6, 7, 8]  # ECG ABP PPG CVP CO2 AWP ICP RESP_Imp RESP_Flow (v2 9종 연속, 2026-06-23 PAP 제거)
 max_subjects: null
 window_seconds: 600.0          # 10분 윈도우 — 다변량 세션
 max_length: 180000             # row 당 다수 unit packing 지원 (cross-session neg 풍부)

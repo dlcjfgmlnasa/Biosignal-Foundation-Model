@@ -9,15 +9,15 @@
 # ── Resume (variant 별 override) ──
 resume: /home/coder/workspace/k-mimic-/bio_fm/outputs/ablation/ablation_phase1_base/checkpoints/best.pt
 
-# ── 모델 (Phase 1 과 동일) ──
+# ── 모델 (Phase 1 과 동일: d=384, L=16, ~30M) ──
 model_config:
-  d_model: 256
-  num_layers: 12
+  d_model: 384
+  num_layers: 16
   patch_size: 200
   stride: null
-  num_heads: 8
+  num_heads: 6
   num_groups: null
-  num_signal_types: 10
+  num_signal_types: 9        # v2 단일 modality 9종 (ECG0~RESP_Flow8, 2026-06-23 PAP 제거)
   use_glu: true
   use_moe: false
   use_rope: true
@@ -32,7 +32,7 @@ model_config:
 # ── 데이터 ──
 data_dir:
   - /home/coder/workspace/k-mimic-/bio_fm/data/train/k_mimic/
-signal_types: [0, 1, 2, 3, 4, 5, 7, 8, 9]
+signal_types: [0, 1, 2, 3, 4, 5, 6, 7, 8]
 max_subjects: null
 subject_ids_file: configs/ablation/subset_25pct_subjects.txt  # 본 학습 (25% subset)
 window_seconds: 600.0
@@ -72,7 +72,7 @@ gamma: 0.15
 delta: 0.5
 peak_alpha: 1.0
 lambda_spec: 0.2
-spec_n_ffts: [32, 64, 128]
+spec_n_ffts: [16, 32, 64]      # Phase 1과 통일 (phase별 window set 차이 제거)
 aux_loss_weight: 0.01
 contrastive_temperature: 0.07
 learnable_temperature: true

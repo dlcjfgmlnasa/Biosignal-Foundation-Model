@@ -3,7 +3,7 @@
 # Label: ICU 입원 24h 내 invasive ventilation 시작 여부
 #
 # v2(2026-05-21): 입력 RESP 는 prepare_data 내부 MIMIC_SIGNAL_MAP 에서 자동으로
-#   resp_impedance(8) 로 매핑된다(CLI signal 인자 없음). #11 임상 정의가 삽관 전
+#   resp_impedance(7) 로 매핑된다(CLI signal 인자 없음). #11 임상 정의가 삽관 전
 #   비침습 흉부 임피던스이므로 RESP=impedance 가 정합. SSOT: data/spatial_map.py.
 #   AWP/CO2 는 명시적 제외(insertion 전 ventilator/capnography 없음 — 임상적 불가능).
 #

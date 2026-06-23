@@ -51,11 +51,12 @@ class TrainConfig:
 
     # 데이터
     data_dir: str | list[str] = "datasets/processed"
-    # v2 signal_type (remap 후 기준): 0 ECG / 1 ABP / 2 PPG / 3 CVP / 4 CO2 /
-    # 5 AWP / 6 PAP(데이터 제외) / 7 ICP / 8 RESP_Impedance / 9 RESP_Flow.
-    # PAP(6)은 remap 단계에서 drop 되므로 명시적으로 제외한다.
+    # v2 signal_type (remap 후 기준, 2026-06-23 PAP 제거 후 연속 9종):
+    # 0 ECG / 1 ABP / 2 PPG / 3 CVP / 4 CO2 / 5 AWP / 6 ICP /
+    # 7 RESP_Impedance / 8 RESP_Flow. PAP(구 disk 6)은 remap_record_v2 단계에서
+    # 완전히 drop 되므로 이 필터 목록에는 애초에 등장하지 않는다.
     signal_types: list[int] = field(
-        default_factory=lambda: [0, 1, 2, 3, 4, 5, 7, 8, 9]
+        default_factory=lambda: [0, 1, 2, 3, 4, 5, 6, 7, 8]
     )
     max_subjects: int | None = None
     # 특정 subject 만 학습에 사용. None 이면 전체.
