@@ -1,6 +1,6 @@
 # Phase 1: Channel-Independent Pre-training — K-MIMIC only with shard backend
 # ──────────────────────────────────────────────────────────────
-# Server: Biosignal-FM2 — 2xL40S 48GB, 32vCPU, 192GB RAM
+# Server: 4×L40S 44GB (canonical run = 4-GPU DDP)
 # Dataset: K-MIMIC ICU 725 patients, 1.203B tokens (patch=200 @100Hz)
 #          → ~1,793 shards (500MB each, shard backend 필수)
 # Window: 10분 (600초, 300 patches @patch_size=200)
@@ -10,9 +10,11 @@
 #   * shard_index_path 추가 — 1.94M recording 은 file backend 비현실적
 #   * next_block_size: 3 (6s 미래 예측, 호흡 1주기)
 #
-# Usage (2-GPU DDP):
-#   torchrun --nproc_per_node=2 -m train.1_channel_independency \
+# Usage (4-GPU DDP):
+#   export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+#   torchrun --nproc_per_node=4 -m train.1_channel_independency \
 #       --config configs/phase1_kmimic.yaml
+#   resume: 위 명령에 --resume <checkpoints/..._best.pt> 추가
 #
 # Smoke test:
 #   python -m train.1_channel_independency --config configs/phase1_kmimic.yaml --dry-run
