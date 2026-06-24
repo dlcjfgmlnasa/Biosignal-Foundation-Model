@@ -1,5 +1,5 @@
 # -*- coding:utf-8 -*-
-"""전처리된 데이터셋의 총 토큰/샘플/용량 집계.
+"""전처리된 데이터셋의 총 토큰/샘플/용량 집계 (v2 단일 modality remap 적용).
 
 Foundation model의 "token" = patch (기본 patch_size=200 samples @ 100Hz → 2s).
 manifest(`manifest_full.jsonl` 우선, 없으면 개별 `manifest.json` fallback)를
@@ -9,6 +9,15 @@ manifest(`manifest_full.jsonl` 우선, 없으면 개별 `manifest.json` fallback
   - 디스크 footprint 추정
   - LLM 스케일 대비 비교
 를 출력한다.
+
+⚠️ v2 (단일 modality embedding):
+  디스크 manifest 는 구 disk spec(PAP=6·ICP=7·RESP=8) 그대로이므로, 각 record 를
+  `remap_record_v2` 로 변환한 결과 기준으로 집계한다. 따라서:
+    - 구 RESP(8) 가 RESP_Impedance(7) / RESP_Flow(8) 로 분기됨
+    - PAP(구 6)은 drop (집계 제외, 데이터 완전 폐기). 별도 [DROPPED] 행으로 보고
+    - 뒤 번호 당김 (ICP 7→6) 반영
+  signal_type 이름은 `data/spatial_map.SIGNAL_TYPE_NAMES` (SOT)를 사용한다.
+  raw disk spec 그대로 보려면 `--no-remap`.
 
 사용법:
     # 단일 dataset
@@ -32,17 +41,16 @@ from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
+from data.spatial_map import SIGNAL_TYPE_NAMES, remap_record_v2
 
-# (name, signal_type int) — 코드베이스의 SIGNAL_TYPES와 동기화
-SIGNAL_NAMES: dict[int, str] = {
-    0: "ECG",
-    1: "ABP",
-    2: "PPG",
-    3: "CVP",
-    4: "CO2",
-    5: "AWP",
-    6: "PAP",
-    7: "ICP",
+
+# v2 signal_type 이름 SOT — RESP 는 Impedance(7)/Flow(8)로 분리, PAP 제거.
+SIGNAL_NAMES: dict[int, str] = dict(SIGNAL_TYPE_NAMES)
+
+# --no-remap (raw disk spec) 전용 라벨 — 구 disk 번호(PAP=6·ICP=7·RESP=8).
+RAW_SIGNAL_NAMES: dict[int, str] = {
+    0: "ECG", 1: "ABP", 2: "PPG", 3: "CVP", 4: "CO2",
+    5: "AWP", 6: "PAP", 7: "ICP", 8: "RESP",
 }
 
 DEFAULT_PATCH_SIZE = 200
@@ -60,6 +68,8 @@ class Stats:
     per_signal_samples: dict[int, int] | None = None  # signal_type → samples
     per_signal_count: dict[int, int] | None = None  # signal_type → n recordings
     missing_files: int = 0
+    dropped_count: int = 0  # v2 remap 에서 drop 된 record 수 (PAP)
+    dropped_samples: int = 0  # drop 된 채널 합산 sample 수
     subjects: set | None = None  # internal: session_id accumulator
 
     def __post_init__(self) -> None:
@@ -147,9 +157,10 @@ def _extract_records(subject_manifest: dict):
       (b) K-MIMIC 중첩 — {"subject_id": ..., "sessions": [
               {"session_id": ..., "recordings": [...]}, ...]}
 
-    yield (n_channels, n_timesteps, signal_type, subject_key)
+    yield (n_channels, n_timesteps, signal_type, spatial_ids, subject_key)
       subject_key는 unique-subject 카운트용 — `subject_id` 우선,
       없으면 session_id로 fallback. 같은 subject 의 여러 session 이 한 명으로 셈.
+      spatial_ids 는 v2 remap (구 RESP 분기 판단)용 — 누락 시 None.
     """
     # (b) K-MIMIC: sessions[] 중첩 구조 — subject_id 로 통합 카운트
     sessions = subject_manifest.get("sessions")
@@ -168,6 +179,7 @@ def _extract_records(subject_manifest: dict):
                     int(r.get("n_channels", 1)),
                     int(r.get("n_timesteps", r.get("length", 0))),
                     int(r.get("signal_type", 0)),
+                    r.get("spatial_ids"),
                     subject_key,
                 )
         return
@@ -186,12 +198,21 @@ def _extract_records(subject_manifest: dict):
             int(r.get("n_channels", 1)),
             int(r.get("n_timesteps", r.get("length", 0))),
             int(r.get("signal_type", 0)),
+            r.get("spatial_ids"),
             subject_key,
         )
 
 
-def scan_dataset(data_dir: Path, signal_filter: set[int] | None = None) -> Stats:
-    """하나의 processed directory를 스캔하여 Stats 집계."""
+def scan_dataset(
+    data_dir: Path,
+    signal_filter: set[int] | None = None,
+    apply_remap: bool = True,
+) -> Stats:
+    """하나의 processed directory를 스캔하여 Stats 집계.
+
+    apply_remap=True (기본) 면 각 record 를 ``remap_record_v2`` 로 v2 spec
+    (PAP drop · RESP Imp/Flow 분기 · ICP 7→6) 로 변환한 뒤 집계한다.
+    """
     stats = Stats()
 
     full_jsonl = data_dir / "manifest_full.jsonl"
@@ -202,14 +223,26 @@ def scan_dataset(data_dir: Path, signal_filter: set[int] | None = None) -> Stats
         source = "manifest.jsonl 또는 glob"
         iterator = _iter_per_subject_manifests(data_dir)
 
-    print(f"  Scanning {data_dir} ({source}) ...")
+    mode = "v2 remap" if apply_remap else "raw disk spec"
+    print(f"  Scanning {data_dir} ({source}, {mode}) ...")
     for sm in iterator:
-        for n_ch, n_ts, stype, sess in _extract_records(sm):
+        for n_ch, n_ts, stype, spatial_ids, sess in _extract_records(sm):
             if n_ts <= 0:
                 continue
-            if signal_filter is not None and stype not in signal_filter:
+            eff_stype, eff_nch = stype, n_ch
+            if apply_remap:
+                sids = spatial_ids if spatial_ids else [0] * n_ch
+                remapped = remap_record_v2(stype, [int(s) for s in sids])
+                if remapped is None:
+                    # PAP drop — 정상 집계 제외, 별도 추적 (v2 제외량)
+                    stats.dropped_count += 1
+                    stats.dropped_samples += n_ts * n_ch
+                    continue
+                eff_stype, new_sids = remapped
+                eff_nch = len(new_sids)
+            if signal_filter is not None and eff_stype not in signal_filter:
                 continue
-            stats.add_record(n_ch, n_ts, stype, sess)
+            stats.add_record(eff_nch, n_ts, eff_stype, sess)
 
     stats.finalize()
     return stats
@@ -248,7 +281,9 @@ def print_summary(
     per_dataset: dict[str, Stats],
     patch_size: int,
     sampling_rate: float,
+    apply_remap: bool = True,
 ) -> None:
+    names = SIGNAL_NAMES if apply_remap else RAW_SIGNAL_NAMES
     print()
     print("=" * 72)
     print(f"  Token Count Summary (patch_size={patch_size}, SR={sampling_rate} Hz)")
@@ -276,6 +311,13 @@ def print_summary(
     )
     if total.missing_files:
         print(f"  Missing files    : {total.missing_files}")
+    if total.dropped_count:
+        dropped_hr = total.dropped_samples / sampling_rate / 3600
+        print(
+            f"  [DROPPED] PAP    : recs={_fmt_si(total.dropped_count)}, "
+            f"samples={_fmt_si(total.dropped_samples)} "
+            f"({dropped_hr:,.1f} hr) — v2 제외, 위 합산에 미포함"
+        )
 
     # Per-dataset
     if len(per_dataset) > 1:
@@ -304,7 +346,7 @@ def print_summary(
         n_tok = n_sam // patch_size
         hrs = n_sam / sampling_rate / 3600
         print(
-            f"  {stype:<6d} {SIGNAL_NAMES.get(stype, '?'):<6s} "
+            f"  {stype:<6d} {names.get(stype, '?'):<6s} "
             f"{_fmt_si(n_rec):>12s} {_fmt_si(n_sam):>15s} "
             f"{_fmt_si(n_tok):>14s} {hrs:>10,.1f}"
         )
@@ -366,12 +408,18 @@ def main() -> None:
     )
     parser.add_argument(
         "--signals", type=int, nargs="*", default=None,
-        help="특정 signal_type만 필터 (0=ECG, 1=ABP, ..., 7=ICP). "
-             "미지정 시 전체.",
+        help="특정 signal_type만 필터 (v2 번호: 0=ECG, 1=ABP, 2=PPG, 3=CVP, "
+             "4=CO2, 5=AWP, 6=ICP, 7=RESP_Impedance, 8=RESP_Flow). "
+             "미지정 시 전체. PAP 는 v2 에서 drop.",
+    )
+    parser.add_argument(
+        "--no-remap", action="store_true",
+        help="v2 remap 미적용 — raw disk spec(PAP=6·ICP=7·RESP=8) 그대로 집계.",
     )
     args = parser.parse_args()
 
     signal_filter = set(args.signals) if args.signals else None
+    apply_remap = not args.no_remap
 
     total = Stats()
     per_dataset: dict[str, Stats] = {}
@@ -381,13 +429,15 @@ def main() -> None:
         if not path.exists():
             print(f"WARN: {path} 없음, skip", file=sys.stderr)
             continue
-        s = scan_dataset(path, signal_filter=signal_filter)
+        s = scan_dataset(path, signal_filter=signal_filter, apply_remap=apply_remap)
         per_dataset[str(path)] = s
 
         # 합산 — subjects 합집합 유지
         total.n_recordings += s.n_recordings
         total.total_samples += s.total_samples
         total.total_bytes += s.total_bytes
+        total.dropped_count += s.dropped_count
+        total.dropped_samples += s.dropped_samples
         for k, v in s.per_signal_samples.items():
             total.per_signal_samples[k] += v
         for k, v in s.per_signal_count.items():
@@ -400,7 +450,10 @@ def main() -> None:
         print("ERROR: 수집된 manifest 없음. --data-dir 경로 확인 요망.", file=sys.stderr)
         sys.exit(1)
 
-    print_summary(total, per_dataset, args.patch_size, args.sampling_rate)
+    print_summary(
+        total, per_dataset, args.patch_size, args.sampling_rate,
+        apply_remap=apply_remap,
+    )
 
 
 if __name__ == "__main__":
