@@ -17,8 +17,8 @@
 # Smoke test:
 #   python -m train.2_any_variate --config configs/phase2_kmimic.yaml --dry-run
 
-# ── Phase 1 K-MIMIC checkpoint ──
-resume: outputs/phase1_kmimic/kmimic_d256_L12_10min_p200_k2/checkpoints/best.pt
+# ── Phase 1 K-MIMIC checkpoint (d384/L16, epoch039 = best=final, val 1.0768) ──
+resume: /home/coder/workspace/k-mimic-/bio_fm/outputs/main/phase1/kmimic_d384_L16_10min_p200_k2/checkpoints/checkpoint_phase1_ci_epoch039_final.pt
 
 # ── 모델 (Phase 1 과 동일 — checkpoint 에서 로드: d=384, L=16, ~30M) ──
 model_config:
@@ -57,7 +57,7 @@ modality_balanced_alpha: 0.5         # p_m ∝ n_m^(1-α); 0.5 = 제곱근 tempe
 modality_balanced_w_max_ratio: 5.0   # recording 가중치 상한 = 5 × mean(w)
 
 # ── Shard backend ──
-shard_index_path: /home/coder/workspace/k-mimic-/bio_fm/data/train/k_mimic_shard/shard_index.json
+shard_index_path: /home/coder/workspace/k-mimic-/bio_fm/data/train/k_mimic_shard_500mb/shard_index.json
 shard_cache_size: 1            # OOM 회피
 
 # ── 학습 ──
@@ -103,7 +103,7 @@ patience: 15
 # ── 시스템 ──
 device: auto
 num_workers: 4                 # 보수적
-output_dir: outputs/phase2_kmimic
+output_dir: /home/coder/workspace/k-mimic-/bio_fm/outputs/main/phase2
 checkpoint_every: 5
 viz_every: 1
 exp_name: kmimic_phase2_k2
