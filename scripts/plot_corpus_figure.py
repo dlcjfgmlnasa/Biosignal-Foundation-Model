@@ -25,6 +25,9 @@ from pathlib import Path
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
+# 벡터 출력(EPS/PDF) 폰트 임베드 — Type 3 거부 저널 대비 Type 42(TrueType) 사용
+matplotlib.rcParams["ps.fonttype"] = 42
+matplotlib.rcParams["pdf.fonttype"] = 42
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle, Wedge, FancyBboxPatch
 
