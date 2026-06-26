@@ -54,7 +54,7 @@ def load(patients: Path, ids_path: Path | None):
     return recs
 
 
-def render(recs, out: Path):
+def render(recs, out: Path, pct: bool = False):
     cross = defaultdict(lambda: {"M": 0, "F": 0})
     for r in recs:
         band = (r.get("anchor_age") or "").strip()
@@ -62,33 +62,46 @@ def render(recs, out: Path):
         if band in BAND_LABEL and sex in ("M", "F"):
             cross[band][sex] += 1
     bands = [b for b in BAND_ORDER if b in cross]
-    males = [cross[b]["M"] for b in bands]
-    females = [cross[b]["F"] for b in bands]
+    m_cnt = [cross[b]["M"] for b in bands]
+    f_cnt = [cross[b]["F"] for b in bands]
     n = len(bands)
     y = range(n)
-    tot_m, tot_f = sum(males), sum(females)
+    tot_m, tot_f = sum(m_cnt), sum(f_cnt)
+    total = tot_m + tot_f
+    # % 모드: 전체 코호트 대비 (남+여 합 = 100%)
+    sc = (100.0 / total) if (pct and total) else 1.0
+    males = [c * sc for c in m_cnt]
+    females = [c * sc for c in f_cnt]
 
     fig, ax = plt.subplots(figsize=(7, 6))
     ax.barh(y, [-m for m in males], color=M_COLOR, label=f"Male (n={tot_m:,})")
     ax.barh(y, females, color=F_COLOR, label=f"Female (n={tot_f:,})")
     ax.set_yticks(list(y))
     ax.set_yticklabels([BAND_LABEL[b] for b in bands], fontsize=9)
-    ax.set_xlabel("Patients")
+    ax.set_xlabel("% of cohort" if pct else "Patients")
     ax.set_title("Age × Sex Distribution", fontsize=15, weight="bold")
     # x축 음수 → 절대값 라벨
     xmax = max(max(males), max(females))
-    step = 20 if xmax <= 120 else 50
-    ticks = list(range(-((xmax // step + 1) * step), (xmax // step + 1) * step + 1, step))
+    if pct:
+        step = 2 if xmax <= 12 else 5
+        top = (int(xmax // step) + 1) * step
+        ticks = list(range(-top, top + 1, step))
+        labels = [f"{abs(t)}%" for t in ticks]
+    else:
+        step = 20 if xmax <= 120 else 50
+        top = (int(xmax // step) + 1) * step
+        ticks = list(range(-top, top + 1, step))
+        labels = [str(abs(t)) for t in ticks]
     ax.set_xticks(ticks)
-    ax.set_xticklabels([str(abs(t)) for t in ticks], fontsize=9)
+    ax.set_xticklabels(labels, fontsize=9)
     ax.axvline(0, color="#888", lw=0.8)
     ax.legend(loc="lower right", fontsize=10, frameon=False)
     ax.spines[["top", "right"]].set_visible(False)
-    ax.text(0.0, 1.005, f"N = {tot_m + tot_f:,}", transform=ax.transAxes,
+    ax.text(0.0, 1.005, f"N = {total:,}", transform=ax.transAxes,
             fontsize=9, color="#666")
     fig.tight_layout()
     fig.savefig(out, facecolor="white", dpi=150)
-    print(f"[saved] {out}  (M={tot_m}, F={tot_f})")
+    print(f"[saved] {out}  (M={tot_m}, F={tot_f}, mode={'%' if pct else 'count'})")
 
 
 def main():
@@ -98,8 +111,9 @@ def main():
     ap.add_argument("--ids", type=Path, default=None,
                     help="파형 코호트 subject_id JSON 리스트 (없으면 전체)")
     ap.add_argument("--out", type=Path, default=Path("pyramid.eps"))
+    ap.add_argument("--pct", action="store_true", help="절대수 대신 전체 대비 %")
     a = ap.parse_args()
-    render(load(a.patients, a.ids), a.out)
+    render(load(a.patients, a.ids), a.out, pct=a.pct)
 
 
 if __name__ == "__main__":

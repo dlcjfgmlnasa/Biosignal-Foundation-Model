@@ -35,25 +35,32 @@ GENDER_COLORS = {"M": "#4e79a7", "MALE": "#4e79a7", "남": "#4e79a7",
                  "F": "#e8a0b8", "FEMALE": "#e8a0b8", "여": "#e8a0b8"}
 
 
-def plot_hours(st: dict, out: Path) -> None:
+def plot_hours(st: dict, out: Path, pct: bool = False) -> None:
     per = {m["name"]: m["hours"] for m in st["per_modality"]}
     names = [n for n in MOD_ORDER if n in per]
-    hours_k = [per[n] / 1e3 for n in names]   # ×10³ h
+    total_h = st["total_hours"]
+    if pct:
+        vals = [per[n] / total_h * 100 for n in names]
+        ylabel, vfmt = "% of total hours", lambda v: f"{v:.1f}"
+    else:
+        vals = [per[n] / 1e3 for n in names]   # ×10³ h
+        ylabel, vfmt = "Hours (×10³)", lambda v: f"{v:.0f}"
     fig, ax = plt.subplots(figsize=(6.2, 4.2))
-    bars = ax.bar(range(len(names)), hours_k,
+    bars = ax.bar(range(len(names)), vals,
                   color=[MOD_COLORS[n] for n in names])
     ax.set_title("Hours per Modality", fontsize=15, weight="bold")
-    ax.set_ylabel("Hours (×10³)", fontsize=12)
+    ax.set_ylabel(ylabel, fontsize=12)
     ax.set_xticks(range(len(names)))
     ax.set_xticklabels([n.replace("RESP_Impedance", "RespImp")
                         .replace("RESP_Flow", "RespFlow").replace("CO2", "CO₂")
                         for n in names], rotation=45, ha="right", fontsize=10)
-    for b, h in zip(bars, hours_k):
-        ax.text(b.get_x() + b.get_width() / 2, h, f"{h:.0f}",
+    for b, v in zip(bars, vals):
+        ax.text(b.get_x() + b.get_width() / 2, v, vfmt(v),
                 ha="center", va="bottom", fontsize=8, color="#333")
     ax.spines[["top", "right"]].set_visible(False)
-    total_k = st["total_hours"] / 1e3
-    ax.text(0.98, 0.95, f"Total {total_k:,.0f}×10³ h", transform=ax.transAxes,
+    note = (f"Total {total_h/1e3:,.0f}×10³ h" if not pct
+            else f"Total {total_h/1e3:,.0f}×10³ h = 100%")
+    ax.text(0.98, 0.95, note, transform=ax.transAxes,
             ha="right", va="top", fontsize=10, color="#666")
     fig.tight_layout()
     fig.savefig(out, facecolor="white")
@@ -102,11 +109,12 @@ def main() -> None:
     ap.add_argument("--panel", choices=["hours", "gender", "both"], default="both")
     ap.add_argument("--fmt", default="eps", help="출력 포맷 (eps/pdf/png)")
     ap.add_argument("--prefix", default="panel", help="출력 파일 prefix")
+    ap.add_argument("--pct", action="store_true", help="hours 막대를 % 로")
     args = ap.parse_args()
 
     st = json.loads(args.stats.read_text(encoding="utf-8"))
     if args.panel in ("hours", "both"):
-        plot_hours(st, Path(f"{args.prefix}_hours.{args.fmt}"))
+        plot_hours(st, Path(f"{args.prefix}_hours.{args.fmt}"), pct=args.pct)
     if args.panel in ("gender", "both"):
         plot_gender(st, Path(f"{args.prefix}_gender.{args.fmt}"))
 

@@ -119,7 +119,7 @@ def synth_wave(kind: str, n=600):
 
 
 # ── 메인 렌더 ────────────────────────────────────────────────
-def render(st: dict, is_real: bool, out: Path) -> None:
+def render(st: dict, is_real: bool, out: Path, pct: bool = False) -> None:
     fig = plt.figure(figsize=(16, 10))
     gs = fig.add_gridspec(3, 4, height_ratios=[1.0, 1.0, 1.05],
                           hspace=0.45, wspace=0.32,
@@ -170,7 +170,9 @@ def render(st: dict, is_real: bool, out: Path) -> None:
     age = (emr.get("age_wave_cohort") or emr.get("age_all_deceased")) if emr.get("available") else None
     if age:
         labels = list(age["hist"].keys())
-        vals = list(age["hist"].values())
+        cnt = list(age["hist"].values())
+        tot = sum(cnt) or 1
+        vals = [c / tot * 100 for c in cnt] if pct else cnt
         ax.barh(range(len(labels)), vals, color="#e8a0b8")
         ax.set_yticks(range(len(labels))); ax.set_yticklabels(labels)
         box = (f"Total: {age['n']:,}\nMean Age: {age['mean']}\n"
@@ -178,7 +180,7 @@ def render(st: dict, is_real: bool, out: Path) -> None:
                f"Max Age: {age['max']}")
         ax.text(0.97, 0.97, box, transform=ax.transAxes, va="top", ha="right",
                 fontsize=11, bbox=dict(boxstyle="round", fc="white", ec="#333"))
-        ax.set_xlabel("Patients")
+        ax.set_xlabel("% of patients" if pct else "Patients")
     else:
         ax.barh(range(7), [3, 8, 14, 16, 13, 9, 5], color="#eed6df")  # illustrative
         ax.set_yticks(range(7))
@@ -204,14 +206,20 @@ def render(st: dict, is_real: bool, out: Path) -> None:
 
     # (6) 모달리티별 막대 (recordings)
     ax = fig.add_subplot(gs[1, 2])
-    ax.set_title("Recordings per modality", fontsize=12, weight="bold")
     names = [m[0] for m in mods_sorted]
-    recs = [m[1] / 1e3 for m in mods_sorted]
+    if pct:
+        tot_rec = sum(m[1] for m in mods_sorted) or 1
+        recs = [m[1] / tot_rec * 100 for m in mods_sorted]
+        ax.set_title("Recordings per modality (%)", fontsize=12, weight="bold")
+        ax.set_ylabel("% of recordings")
+    else:
+        recs = [m[1] / 1e3 for m in mods_sorted]
+        ax.set_title("Recordings per modality", fontsize=12, weight="bold")
+        ax.set_ylabel("×10³ recordings")
     ax.bar(range(len(names)), recs, color=[MOD_COLORS[n] for n in names])
     ax.set_xticks(range(len(names)))
     ax.set_xticklabels([n.replace("RESP_", "R-") for n in names], rotation=55,
                        ha="right", fontsize=8)
-    ax.set_ylabel("×10³ recordings")
 
     # (7) Recording length 도넛
     ax = fig.add_subplot(gs[2, 0])
@@ -276,9 +284,11 @@ def main() -> None:
     ap.add_argument("--stats", type=Path, default=None,
                     help="figure_corpus_stats.json (없으면 메모리 실측 FALLBACK)")
     ap.add_argument("--out", type=Path, default=Path("corpus_figure.png"))
+    ap.add_argument("--pct", action="store_true",
+                    help="연령·모달리티 막대를 절대수 대신 % 로")
     args = ap.parse_args()
     st, is_real = load_stats(args.stats)
-    render(st, is_real, args.out)
+    render(st, is_real, args.out, pct=args.pct)
 
 
 if __name__ == "__main__":
