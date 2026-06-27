@@ -1299,7 +1299,10 @@ def main() -> None:
             "val_split_seed": args.val_split_seed,
         },
     }
-    results_path = out_dir / f"task1_results_{args.mode}.json"
+    # n_folds>1 이면 fold suffix 를 붙여 fold 마다 별도 저장 (.npz 와 동일 규칙).
+    # single split(n_folds=1)은 기존 이름 유지 — 하위호환.
+    fold_suffix = f"_fold{args.fold}" if int(args.n_folds) > 1 else ""
+    results_path = out_dir / f"task1_results_{args.mode}{fold_suffix}.json"
     with open(results_path, "w") as f:
         json.dump(results, f, indent=2)
     print(f"Results saved: {results_path}")
