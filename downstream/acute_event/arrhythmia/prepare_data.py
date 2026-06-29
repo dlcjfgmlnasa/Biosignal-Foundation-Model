@@ -310,25 +310,37 @@ def save_dataset(
     fold_idx: int | None = None,
     n_folds: int = 1,
 ) -> Path:
-    """저장 포맷: spec대로 list[dict] (Sample마다 dict 하나).
+    """저장 포맷: split별 stacked tensor dict (run.py ``_pt_to_windows`` 가 기대).
+
+    각 split → ``{"signals": {st: (N, T) fp16 tensor}, "labels": (N,) long,
+    "patients": [...], "rhythms": [...], "segment_ids": [...]}``.
+
+    신호는 **float16** 으로 저장한다(disk·host-RAM 절반). 모델 forward 직전
+    run.py 가 ``.float()`` 로 업캐스트하므로 학습 정밀도는 영향 없다. 30s segment
+    (3000 샘플)라 chunk 없이도 fold당 단일 파일이 충분히 작다.
 
     fold_idx 주어지면 파일명에 _fold{i} 접미사 + metadata 기록.
     """
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
-    def _to_list(split: list[ArrhythmiaSample]) -> list[dict]:
-        return [
-            {
-                "signals": {st: s.signals[st] for st in input_signals},
-                "label": s.label,
-                "rhythm": s.rhythm,
-                "patient": s.patient,
-                "segment_id": s.segment_id,
-                "strat_fold": s.strat_fold,
-            }
-            for s in split
-        ]
+    target_len = int(SEGMENT_SEC * TARGET_SR)
+
+    def _to_split(split: list[ArrhythmiaSample]) -> dict:
+        signals = {}
+        for st in input_signals:
+            if split:
+                arr = np.stack([s.signals[st].astype(np.float16) for s in split])
+                signals[st] = torch.from_numpy(arr)  # (N, T) float16
+            else:
+                signals[st] = torch.empty((0, target_len), dtype=torch.float16)
+        return {
+            "signals": signals,
+            "labels": torch.tensor([s.label for s in split], dtype=torch.long),
+            "patients": [s.patient for s in split],
+            "rhythms": [s.rhythm for s in split],
+            "segment_ids": [s.segment_id for s in split],
+        }
 
     split_desc = (
         f"stratified patient-level 5-fold CV: fold {fold_idx} test, "
@@ -338,18 +350,21 @@ def save_dataset(
     )
 
     save_dict = {
-        "train": _to_list(train),
-        "val": _to_list(val),
-        "test": _to_list(test),
+        "train": _to_split(train),
+        "val": _to_split(val),
+        "test": _to_split(test),
         "metadata": {
             "task": "arrhythmia_5class",
             "source": "MIMIC-III-Ext-PPG",
             "classes": CLASS_NAMES,
+            "class_names": CLASS_NAMES,
+            "n_classes": len(CLASS_NAMES),
             "rhythm_to_label": RHYTHM_TO_LABEL,
             "input_signals": list(input_signals),
             "signal_type_map": SIGNAL_TYPE_MAP,
             "sampling_rate": TARGET_SR,
             "segment_sec": SEGMENT_SEC,
+            "signal_dtype": "float16",
             "split": split_desc,
             "n_train": len(train),
             "n_val": len(val),
