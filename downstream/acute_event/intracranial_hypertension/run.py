@@ -683,7 +683,8 @@ def main() -> None:
             "epochs": args.epochs, "lr": args.lr,
         },
     }
-    results_path = out_dir / f"ich_results_{args.mode}.json"
+    fold_suffix = f"_fold{args.fold}" if int(args.n_folds) > 1 else ""
+    results_path = out_dir / f"ich_results_{args.mode}{fold_suffix}.json"
     with open(results_path, "w") as f:
         json.dump(results, f, indent=2, default=str)
     print(f"Results: {results_path}")
