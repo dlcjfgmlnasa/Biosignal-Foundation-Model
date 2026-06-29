@@ -32,7 +32,7 @@ SIGNAL_COMBOS=("ecg_ppg")
 MODES=("linear_probe" "lora")
 
 echo "============================================================"
-echo "  Arrhythmia (VitalDB) — 5-class: NSR/AFIB/VENT/SVA/COND"
+echo "  Arrhythmia (VitalDB) — 5-class: NSR/AF/SV/VA/BradyCond"
 echo "  Checkpoint: $CHECKPOINT"
 echo "  ModelVer:   $MODEL_VERSION   Folds: $N_FOLDS"
 echo "  Data:       $DATA_DIR        Out: $OUT_DIR"

@@ -491,7 +491,7 @@ def _load_data(args) -> tuple[list[MultiSignalWindow], list[MultiSignalWindow]]:
     print(f"  N classes: {meta.get('n_classes', '?')}")
 
     # CLASS_NAMES/N_CLASSES 를 prepared data 의 metadata 에서 받아 source-agnostic 하게
-    # 만든다 (VitalDB collapse = NSR/AFIB/VENT/SVA/COND, MIMIC = SR/AF/STACH/SBRAD/AFLT).
+    # 만든다 (VitalDB collapse = NSR/AF/SV/VA/BradyCond, MIMIC = SR/AF/STACH/SBRAD/AFLT).
     # main() 에서 _load_data 호출 이후 LinearProbe(N_CLASSES)·메트릭이 모두 이 값을 읽음.
     global CLASS_NAMES, N_CLASSES
     _cn = meta.get("class_names") or meta.get("classes")
