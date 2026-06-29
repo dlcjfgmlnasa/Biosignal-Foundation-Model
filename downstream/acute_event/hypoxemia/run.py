@@ -48,6 +48,16 @@ from downstream.model_wrapper import LinearProbe
 from downstream.window_task import make_window_batches, iter_window_batches
 from downstream._eval_utils import dump_fold_predictions
 from downstream._save_utils import load_prepared_split_chunked
+from downstream._ddp_utils import (
+    ddp_enabled,
+    ddp_world_size,
+    equalize_shard,
+    gather_concat,
+    is_main,
+    maybe_init_ddp,
+    shard_for_rank,
+    wrap_lora_ddp,
+)
 
 
 # ── 설정 ──────────────────────────────────────────────────────
@@ -172,6 +182,137 @@ def _stream_extract_features(
     if not feats:
         return torch.empty(0), torch.empty(0)
     return torch.cat(feats, dim=0), torch.cat(labs, dim=0).float()
+
+
+def _extract_features_maybe_sharded(
+    model,
+    windows: list[MultiSignalWindow],
+    batch_size: int,
+    patch_size: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """linear_probe feature 추출 (torchrun 병렬화).
+
+    DDP 면 각 rank 가 windows 의 **shard 만** 스트리밍 추출(peak=batch 1개 유지)한 뒤
+    ``gather_concat`` 으로 전 rank 결과를 모으고, **글로벌 idx 로 argsort 해 원본 순서를
+    복원**한다 → rank 수와 무관하게 동일한 (feature,label) 순서(deterministic frozen
+    encoder). 비-DDP 면 ``_stream_extract_features`` 를 그대로 호출(기존 경로 byte-identical).
+
+    co-index: (글로벌 idx, feats, labels) 를 **한 rank=한 번들** 로 묶어(row-aligned)
+    한 번에 gather → feature/label 이 rank 경계에서 어긋나지 않는다. gather 직전 텐서는
+    cpu(_stream_extract_features 가 cpu 반환), rank0 가 사용 직전 device 로 올린다.
+
+    non-main rank 는 gather(collective)에만 참여하고 빈 텐서를 반환(직후 호출측이 종료).
+    """
+    if not ddp_enabled():
+        return _stream_extract_features(model, windows, batch_size, patch_size, device)
+    my_windows = shard_for_rank(windows)
+    my_gidx = shard_for_rank(list(range(len(windows))))
+    feats, labels = _stream_extract_features(
+        model, my_windows, batch_size, patch_size, device,
+    )
+    local = [(torch.tensor(my_gidx, dtype=torch.long), feats, labels)]
+    gathered = gather_concat(local)  # 전 rank 참여(collective: all_gather_object)
+    if not is_main():
+        return torch.empty(0), torch.empty(0)
+    parts = [g for g in gathered if g[0].numel() > 0]
+    if not parts:
+        return torch.empty(0), torch.empty(0)
+    idx_all = torch.cat([g[0] for g in parts])
+    feats_all = torch.cat([g[1] for g in parts], dim=0)
+    labels_all = torch.cat([g[2] for g in parts], dim=0)
+    order = torch.argsort(idx_all)  # 원본 순서 복원 (idx 유일 → 결정적)
+    return feats_all[order], labels_all[order]
+
+
+def _train_probe_with_val(
+    probe: LinearProbe,
+    train_features: torch.Tensor,
+    train_labels: torch.Tensor,
+    val_features: torch.Tensor,
+    val_labels: torch.Tensor,
+    batch_size: int,
+    epochs: int,
+    lr: float,
+    device: torch.device,
+) -> tuple[list[float], list[float], float, int]:
+    """미리 추출된 cached feature 로 probe 학습 + val-AUROC best-ckpt 선택.
+
+    ``train_linear_probe`` 의 학습부와 **동일**(추출만 분리). 단일 GPU 에서 (추출 →
+    이 함수) 시퀀스는 기존 train_linear_probe 와 byte-identical (추출은 RNG 미소비).
+    best probe state 는 in-place 복원. returns (train_losses, val_aurocs,
+    best_val_auroc, best_epoch).
+    """
+    probe = probe.to(device)
+    optimizer = torch.optim.Adam(probe.parameters(), lr=lr)
+    criterion = nn.BCEWithLogitsLoss()
+
+    train_features = train_features.to(device)
+    train_labels = train_labels.to(device)
+    val_features = val_features.to(device)
+    val_labels_np = val_labels.numpy()
+    n = train_features.size(0)
+
+    train_losses: list[float] = []
+    val_aurocs: list[float] = []
+    best_val_auroc = -1.0
+    best_epoch = -1
+    best_probe_state: dict | None = None
+
+    for epoch in range(epochs):
+        probe.train()
+        epoch_loss, n_steps = 0.0, 0
+        for i in range(0, n, batch_size):
+            feats = train_features[i: i + batch_size]
+            logits = probe(feats)
+            loss = criterion(logits, train_labels[i: i + batch_size].unsqueeze(-1))
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+            n_steps += 1
+        avg_loss = epoch_loss / max(n_steps, 1)
+        train_losses.append(avg_loss)
+
+        probe.eval()
+        with torch.no_grad():
+            val_logits = probe(val_features)
+            val_scores = torch.sigmoid(val_logits).squeeze(-1).cpu().numpy()
+        val_metrics = _compute_metrics(val_labels_np, val_scores)
+        val_auroc = float(val_metrics["auroc"])
+        val_aurocs.append(val_auroc)
+
+        if val_auroc > best_val_auroc:
+            best_val_auroc = val_auroc
+            best_epoch = epoch
+            best_probe_state = copy.deepcopy(probe.state_dict())
+
+        if (epoch + 1) % 5 == 0 or epoch == 0 or epoch == epochs - 1:
+            print(
+                f"  Epoch {epoch + 1}/{epochs}  loss={avg_loss:.4f}  "
+                f"val_auroc={val_auroc:.4f}  "
+                f"(best={best_val_auroc:.4f}@ep{best_epoch + 1})"
+            )
+
+    if best_probe_state is None:
+        print("WARNING: no best ckpt captured; using last epoch.", file=sys.stderr)
+    else:
+        probe.load_state_dict(best_probe_state)
+    return train_losses, val_aurocs, best_val_auroc, best_epoch
+
+
+@torch.no_grad()
+def _eval_probe_on_features(
+    probe: LinearProbe,
+    features: torch.Tensor,
+    labels: torch.Tensor,
+    device: torch.device,
+) -> dict:
+    """미리 추출된 cached feature 로 probe 평가 (evaluate_linear_probe 와 동일 산출)."""
+    probe.to(device).eval()
+    logits = probe(features.to(device))
+    scores = torch.sigmoid(logits).squeeze(-1).cpu().numpy()
+    return _compute_metrics(labels.numpy(), scores)
 
 
 def train_linear_probe(
@@ -625,7 +766,21 @@ def main() -> None:
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    device = torch.device(args.device)
+
+    # ── DDP (B안): torchrun 으로 실행되면 rank 별 GPU 핀 + device 강제.
+    # torchrun 이 아니면 maybe_init_ddp()=None → 단일 GPU 경로(기존) 그대로.
+    ddp_device = maybe_init_ddp()
+    use_ddp = ddp_device is not None
+    if use_ddp:
+        device = ddp_device
+        args.device = str(ddp_device)
+        # 두 모드 모두 torchrun 지원: lora=grad all-reduce 데이터 병렬,
+        # linear_probe=feature 추출 shard→gather(grad sync 없음). 저장은 rank0
+        # 전담이라 결과파일 race 없음.
+        if is_main():
+            print(f"[DDP] world_size={ddp_world_size()}  device={device}")
+    else:
+        device = torch.device(args.device)
 
     # ── 모델 로드 ──
     if args.dummy:
@@ -694,16 +849,43 @@ def main() -> None:
     if is_lora:
         # lora: encoder fine-tune → feature 캐싱 불가, pre-built batches 필요.
         # 주의: 큰 윈도우면 RAM 위험 — ablation 은 linear_probe 만 사용.
+        # ── DDP(B안): train window 를 rank 별로 분할 후 전 rank 최소 길이로 정렬
+        #   (step 동기화). val/test 는 분할하지 않는다(평가는 rank0 이 full set 수행).
+        if use_ddp:
+            n_full = len(train_labeled)
+            train_labeled = equalize_shard(shard_for_rank(train_labeled))
+            if is_main():
+                print(
+                    f"  [DDP] train shard: {n_full} → {len(train_labeled)}"
+                    f"/rank × {ddp_world_size()} ranks"
+                )
+            if len(train_labeled) == 0:
+                # world_size 가 train window 수보다 크면 빈 shard → random-init LoRA
+                # 가 "best"로 저장될 위험. 명시적으로 차단.
+                if is_main():
+                    print(
+                        "ERROR: DDP train shard 가 비었습니다 (nproc_per_node 가 "
+                        "train window 수보다 큼). nproc 를 줄이거나 단일 GPU 로 "
+                        "실행하세요.",
+                        file=sys.stderr,
+                    )
+                import torch.distributed as dist
+                dist.destroy_process_group()
+                sys.exit(2)
         first_sig = next(iter(train_labeled[0].signals.values()))
         max_length = len(first_sig)
         train_batches = _make_batches(
             train_labeled, args.batch_size, args.patch_size, max_length
         )
-        val_batches = _make_batches(
-            val_labeled, args.batch_size, args.patch_size, max_length
+        # val/test batch 는 rank0(평가 주체)만 빌드 — non-rank0 의 불필요한 RAM peak
+        # 회피. is_main() 은 비-DDP 면 항상 True → 단일 GPU 경로 불변.
+        val_batches = (
+            _make_batches(val_labeled, args.batch_size, args.patch_size, max_length)
+            if is_main() else None
         )
-        test_batches = _make_batches(
-            test_labeled, args.batch_size, args.patch_size, max_length
+        test_batches = (
+            _make_batches(test_labeled, args.batch_size, args.patch_size, max_length)
+            if is_main() else None
         )
 
         n_lora = sum(p.numel() for p in model.lora_parameters())
@@ -723,6 +905,9 @@ def main() -> None:
             ],
             weight_decay=0.01,
         )
+        # DDP: encode→pool→probe 를 한 forward 로 묶어 grad all-reduce 등록. 단일 GPU
+        # 면 use_ddp=False → ddp_module=None → 기존 forward 경로 그대로(불변).
+        ddp_module = wrap_lora_ddp(model.model, probe) if use_ddp else None
         criterion = nn.BCEWithLogitsLoss()
         train_losses: list[float] = []
         val_aurocs: list[float] = []
@@ -735,14 +920,20 @@ def main() -> None:
             # ── train one epoch ──
             probe.train()
             model.model.train()
+            if ddp_module is not None:
+                ddp_module.train()
             epoch_loss, n_steps = 0.0, 0
 
             for batch, labels in train_batches:
                 batch = model.batch_to_device(batch)
-                out = model.model(batch, task="masked")
-                features = _mean_pool(out["encoded"], out["patch_mask"])
-
-                logits = probe(features)
+                if ddp_module is not None:
+                    # DDP: forward 가 LoRATrainModule(encode→pool→probe)를 타야
+                    # grad all-reduce 가 등록된다(probe 가 모듈 안에 포함됨).
+                    logits = ddp_module(batch)
+                else:
+                    out = model.model(batch, task="masked")
+                    features = _mean_pool(out["encoded"], out["patch_mask"])
+                    logits = probe(features)
                 loss = criterion(logits, labels.to(device).unsqueeze(-1))
                 optimizer.zero_grad()
                 loss.backward()
@@ -756,25 +947,36 @@ def main() -> None:
             avg_loss = epoch_loss / max(n_steps, 1)
             train_losses.append(avg_loss)
 
-            # ── val evaluation ──
-            val_metrics = evaluate_lora(model, probe, val_batches, device)
-            val_auroc = float(val_metrics["auroc"])
-            val_aurocs.append(val_auroc)
+            # ── val evaluation + best-ckpt (DDP: rank0 만 수행) ──
+            # all-reduce + optimizer.step 후 전 rank 파라미터가 동일하므로 rank0
+            # 평가가 전체를 대표한다. best-ckpt deepcopy 도 rank0 에서만(저장 주체).
+            if is_main():
+                val_metrics = evaluate_lora(model, probe, val_batches, device)
+                val_auroc = float(val_metrics["auroc"])
+                val_aurocs.append(val_auroc)
 
-            if val_auroc > best_val_auroc:
-                best_val_auroc = val_auroc
-                best_epoch = epoch
-                # deepcopy to detach from current parameters (probe is small — cheap).
-                best_probe_state = copy.deepcopy(probe.state_dict())
-                # LoRA params live inside model.model — copy entire encoder state.
-                best_model_state = copy.deepcopy(model.model.state_dict())
+                if val_auroc > best_val_auroc:
+                    best_val_auroc = val_auroc
+                    best_epoch = epoch
+                    # deepcopy to detach from current parameters (probe is small — cheap).
+                    best_probe_state = copy.deepcopy(probe.state_dict())
+                    # LoRA params live inside model.model — copy entire encoder state.
+                    best_model_state = copy.deepcopy(model.model.state_dict())
 
-            if (epoch + 1) % 5 == 0 or epoch == 0 or epoch == args.epochs - 1:
-                print(
-                    f"  Epoch {epoch + 1}/{args.epochs}  loss={avg_loss:.4f}  "
-                    f"val_auroc={val_auroc:.4f}  "
-                    f"(best={best_val_auroc:.4f}@ep{best_epoch + 1})"
-                )
+                if (epoch + 1) % 5 == 0 or epoch == 0 or epoch == args.epochs - 1:
+                    print(
+                        f"  Epoch {epoch + 1}/{args.epochs}  loss={avg_loss:.4f}  "
+                        f"val_auroc={val_auroc:.4f}  "
+                        f"(best={best_val_auroc:.4f}@ep{best_epoch + 1})"
+                    )
+
+        # DDP: 학습 종료 동기화 후 test/저장은 rank0 전담 → non-rank0 는 정리·종료.
+        if use_ddp:
+            import torch.distributed as dist
+            dist.barrier()
+            if not is_main():
+                dist.destroy_process_group()
+                return
 
         # ── Restore best ckpt and run test ONCE (Patch A) ──
         if best_probe_state is None:
@@ -787,19 +989,37 @@ def main() -> None:
         print("\nEvaluating on test set with best-val ckpt...")
         metrics = evaluate_lora(model, probe, test_batches, device)
     else:
-        # linear_probe: frozen encoder feature 를 스트리밍으로 1회만 추출(전체 batch
-        # 리스트 미빌드 → OOM 회피, 매 epoch 재추출 제거). probe 만 cached feature 로
-        # 학습하며 val-AUROC 기준 best-ckpt 선택(기존 동작 보존).
+        # linear_probe: frozen encoder feature 1회 추출(스트리밍, OOM 회피) 후 probe 만
+        # cached feature 로 학습(val-AUROC best-ckpt). encoder backprop 없음 → DDP grad
+        # sync 불필요 → torchrun 에선 feature 추출만 rank 별 shard 병렬화하고 gather 한다.
+        #  · 추출은 split 별 1회(train/val/test) — 각각 gather collective 1회.
+        #  · 모든 rank 가 3 추출에 참여한 뒤 non-rank0 는 종료(이후 collective 없음).
+        #  · rank0 만 probe 학습·best-ckpt·평가·저장(결과파일 race 방지).
+        # 단일 GPU(use_ddp=False)면 _extract_features_maybe_sharded → _stream_extract_features
+        # 그대로 + 동일 학습 루프 → 기존 train_linear_probe/evaluate_linear_probe 와 byte-identical.
+        train_features, train_labels = _extract_features_maybe_sharded(
+            model, train_labeled, args.batch_size, args.patch_size, device,
+        )
+        val_features, val_labels = _extract_features_maybe_sharded(
+            model, val_labeled, args.batch_size, args.patch_size, device,
+        )
+        test_features, test_labels = _extract_features_maybe_sharded(
+            model, test_labeled, args.batch_size, args.patch_size, device,
+        )
+        if use_ddp and not is_main():
+            # 추출(gather) 완료 — non-rank0 는 여기서 정리·종료(이후 collective 없음).
+            import torch.distributed as dist
+            dist.destroy_process_group()
+            return
+
         print(f"\nTraining LinearProbe (frozen encoder, d_model={d_model})...")
-        train_losses, val_aurocs, best_val_auroc, best_epoch = train_linear_probe(
-            model, probe, train_labeled, val_labeled,
-            args.batch_size, args.patch_size, args.epochs, args.lr, device,
+        train_losses, val_aurocs, best_val_auroc, best_epoch = _train_probe_with_val(
+            probe, train_features, train_labels, val_features, val_labels,
+            args.batch_size, args.epochs, args.lr, device,
         )
 
         print("\nEvaluating on test set with best-val ckpt...")
-        metrics = evaluate_linear_probe(
-            model, probe, test_labeled, args.batch_size, args.patch_size, device,
-        )
+        metrics = _eval_probe_on_features(probe, test_features, test_labels, device)
 
     # ── 결과 출력 ──
     y_true = metrics.pop("y_true")
@@ -851,7 +1071,10 @@ def main() -> None:
     )
     print(f"{'=' * 50}")
 
-    roc_path = out_dir / f"task1_roc_{args.mode}.png"
+    # fold suffix: n_folds>1 동시 실행 시 ROC PNG 충돌(torn-file) 방지
+    # (.json/.npz 는 이미 fold suffix 가 붙어 안전).
+    _roc_suffix = f"_fold{args.fold}" if int(args.n_folds) > 1 else ""
+    roc_path = out_dir / f"task1_roc_{args.mode}{_roc_suffix}.png"
     plot_roc_curve(
         y_true, y_score, roc_path,
         title=f"Task 1: Hypoxemia — {args.mode} ROC",
@@ -897,6 +1120,11 @@ def main() -> None:
         y_true=y_true, y_score=y_score, patient_ids=patient_ids,
     )
     print(f"Fold predictions: {npz_path}")
+
+    # DDP: rank0 의 프로세스 그룹 정리(non-rank0 는 학습 직후 이미 정리·종료).
+    if use_ddp:
+        import torch.distributed as dist
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

@@ -45,6 +45,16 @@ from downstream.metrics import (
 from downstream.model_wrapper import LinearProbe
 from downstream.window_task import make_window_batches, iter_window_batches
 from downstream._eval_utils import dump_fold_predictions
+from downstream._ddp_utils import (
+    ddp_enabled,
+    ddp_world_size,
+    equalize_shard,
+    gather_concat,
+    is_main,
+    maybe_init_ddp,
+    shard_for_rank,
+    wrap_lora_ddp,
+)
 
 # ── 설정 ──────────────────────────────────────────────────────
 
@@ -228,6 +238,83 @@ def evaluate_linear_probe(
     return _compute_multiclass_metrics(labels.numpy(), probs)
 
 
+# ── linear_probe feature 추출 torchrun 병렬화 (multiclass) ────
+
+
+def _extract_features_maybe_sharded(
+    model, windows, batch_size, patch_size, device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """linear_probe feature 추출 (torchrun 병렬화, 멀티클래스 long labels).
+
+    DDP 면 각 rank 가 windows 의 **shard 만** 스트리밍 추출(peak=batch 1개 유지)한 뒤
+    ``gather_concat`` 으로 모으고 **글로벌 idx 로 argsort 해 원본 순서를 복원**한다 →
+    rank 수와 무관하게 동일한 (feature,label) 순서(deterministic frozen encoder).
+    비-DDP 면 ``_stream_extract_features`` 그대로(기존 경로 byte-identical).
+
+    co-index: (글로벌 idx, feats, labels) 를 한 rank=한 번들 로 묶어 한 번에 gather →
+    rank 경계에서 어긋나지 않는다. gather 직전 cpu, rank0 가 사용 직전 device 로 올림.
+    non-main 은 gather 참여 후 빈 텐서 반환(직후 호출측 종료).
+    """
+    if not ddp_enabled():
+        return _stream_extract_features(model, windows, batch_size, patch_size, device)
+    my_windows = shard_for_rank(windows)
+    my_gidx = shard_for_rank(list(range(len(windows))))
+    feats, labels = _stream_extract_features(
+        model, my_windows, batch_size, patch_size, device,
+    )
+    local = [(torch.tensor(my_gidx, dtype=torch.long), feats, labels)]
+    gathered = gather_concat(local)
+    if not is_main():
+        return torch.empty(0), torch.empty(0, dtype=torch.long)
+    parts = [g for g in gathered if g[0].numel() > 0]
+    if not parts:
+        return torch.empty(0), torch.empty(0, dtype=torch.long)
+    idx_all = torch.cat([g[0] for g in parts])
+    feats_all = torch.cat([g[1] for g in parts], dim=0)
+    labels_all = torch.cat([g[2] for g in parts], dim=0)
+    order = torch.argsort(idx_all)
+    return feats_all[order], labels_all[order]
+
+
+def _fit_probe_cached(probe, features, labels, batch_size, epochs, lr, device):
+    """미리 추출된 cached feature 로 probe 학습 (train_linear_probe 의 학습부와 동일,
+    멀티클래스 CrossEntropy, 순차 minibatch). 단일 GPU 에서 (추출 → 이 함수) 는 기존
+    train_linear_probe 와 byte-identical (순차·셔플 없음 → 순서 복원 시 동일)."""
+    probe = probe.to(device)
+    optimizer = torch.optim.Adam(probe.parameters(), lr=lr)
+    criterion = nn.CrossEntropyLoss()
+    features = features.to(device)
+    labels = labels.to(device)
+    n = features.size(0)
+    losses = []
+    probe.train()
+    for epoch in range(epochs):
+        epoch_loss, nb = 0.0, 0
+        for i in range(0, n, batch_size):
+            feats = features[i: i + batch_size]
+            logits = probe(feats)  # (B, N_CLASSES)
+            loss = criterion(logits, labels[i: i + batch_size])
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+            nb += 1
+        avg = epoch_loss / max(nb, 1)
+        losses.append(avg)
+        if (epoch + 1) % 5 == 0 or epoch == 0:
+            print(f"  Epoch {epoch + 1}/{epochs}  loss={avg:.4f}")
+    return losses
+
+
+@torch.no_grad()
+def _eval_probe_cached(probe, features, labels, device):
+    """미리 추출된 cached feature 로 probe 평가 (evaluate_linear_probe 와 동일 산출)."""
+    probe.to(device).eval()
+    logits = probe(features.to(device))  # (N, N_CLASSES)
+    probs = torch.softmax(logits, dim=-1).cpu().numpy()
+    return _compute_multiclass_metrics(labels.numpy(), probs)
+
+
 # ── LoRA fine-tuning ─────────────────────────────────────────
 
 
@@ -239,7 +326,15 @@ def train_lora(
     lr: float,
     device: torch.device,
     gradient_clip: float = 1.0,
+    ddp_module=None,
 ) -> list[float]:
+    """LoRA fine-tune (multi-class, CrossEntropy).
+
+    ``ddp_module`` 가 주어지면(torchrun) encode→pool→probe 를 DDP 래퍼 forward 로
+    호출해 grad all-reduce 가 등록되게 한다. wrap_lora_ddp 는 logits 만 반환하므로
+    CrossEntropy loss 는 모듈 밖에서 그대로 적용한다(BCE/CE 무관 동일 패턴).
+    ddp_module=None 이면 기존 단일 GPU 경로 그대로(수치·결과 불변).
+    """
     model.model.train()
     probe = probe.to(device)
     probe.train()
@@ -254,13 +349,21 @@ def train_lora(
     losses = []
 
     for epoch in range(epochs):
+        if ddp_module is not None:
+            ddp_module.train()
         epoch_loss, n = 0.0, 0
         for batch, labels in train_batches:
             batch = model.batch_to_device(batch)
-            out = model.model(batch, task="masked")
-            features = _mean_pool(out["encoded"], out["patch_mask"])
+            if ddp_module is not None:
+                # DDP: forward 가 LoRATrainModule(encode→pool→probe)를 타야
+                # grad all-reduce 가 등록된다(probe 가 모듈 안에 포함됨).
+                logits = ddp_module(batch)
+            else:
+                out = model.model(batch, task="masked")
+                features = _mean_pool(out["encoded"], out["patch_mask"])
+                logits = probe(features)
 
-            logits = probe(features)
+            # multi-class → CrossEntropy (labels long). 모듈 밖에서 적용.
             loss = criterion(logits, labels.to(device))
 
             optimizer.zero_grad()
@@ -276,7 +379,8 @@ def train_lora(
         avg = epoch_loss / max(n, 1)
         losses.append(avg)
         if (epoch + 1) % 5 == 0 or epoch == 0:
-            print(f"  Epoch {epoch + 1}/{epochs}  loss={avg:.4f}")
+            if is_main():  # DDP: rank0 만 출력(비-DDP 면 항상 True → 불변)
+                print(f"  Epoch {epoch + 1}/{epochs}  loss={avg:.4f}")
 
     return losses
 
@@ -445,7 +549,21 @@ def main() -> None:
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    device = torch.device(args.device)
+
+    # ── DDP (B안): torchrun 으로 실행되면 rank 별 GPU 핀 + device 강제.
+    # torchrun 이 아니면 maybe_init_ddp()=None → 단일 GPU 경로(기존) 그대로.
+    ddp_device = maybe_init_ddp()
+    use_ddp = ddp_device is not None
+    if use_ddp:
+        device = ddp_device
+        args.device = str(ddp_device)
+        # 두 모드 모두 torchrun 지원: lora=grad all-reduce 데이터 병렬,
+        # linear_probe=feature 추출 shard→gather(grad sync 없음). 저장은 rank0
+        # 전담이라 결과파일 race 없음.
+        if is_main():
+            print(f"[DDP] world_size={ddp_world_size()}  device={device}")
+    else:
+        device = torch.device(args.device)
 
     # ── 모델 로드 ──
     if args.dummy:
@@ -487,34 +605,81 @@ def main() -> None:
     probe = LinearProbe(d_model, n_classes=N_CLASSES)
 
     if args.mode == "linear_probe":
-        # 스트리밍 추출 → 전체 batch 리스트 미빌드(OOM 회피). windows 를 그대로 전달.
+        # linear_probe: frozen encoder feature 1회 추출 후 probe 만 학습. encoder
+        # backprop 없음 → DDP grad sync 불필요 → torchrun 에선 feature 추출만 rank 별
+        # shard 병렬화하고 gather(원본 순서 복원). train/test 각각 gather 1회 → 모든
+        # rank 가 2 추출 참여 후 non-rank0 종료, rank0 만 probe 학습·평가·저장.
+        # 단일 GPU(use_ddp=False)면 _extract_features_maybe_sharded→_stream_extract_features
+        # + 동일 학습 루프 → 기존 train/evaluate_linear_probe 와 byte-identical.
+        train_features, train_labels = _extract_features_maybe_sharded(
+            model, train_windows, args.batch_size, args.patch_size, device,
+        )
+        test_features, test_labels = _extract_features_maybe_sharded(
+            model, test_windows, args.batch_size, args.patch_size, device,
+        )
+        if use_ddp and not is_main():
+            import torch.distributed as dist
+            dist.destroy_process_group()
+            return
         print(f"\nTraining LinearProbe (frozen encoder, d_model={d_model})...")
-        train_losses = train_linear_probe(
-            model, probe, train_windows, args.batch_size, args.patch_size,
-            args.epochs, args.lr, device,
+        train_losses = _fit_probe_cached(
+            probe, train_features, train_labels,
+            args.batch_size, args.epochs, args.lr, device,
         )
         print("\nEvaluating...")
-        metrics = evaluate_linear_probe(
-            model, probe, test_windows, args.batch_size, args.patch_size, device,
-        )
+        metrics = _eval_probe_cached(probe, test_features, test_labels, device)
 
     elif args.mode == "lora":
         # lora: encoder fine-tune → feature 캐싱 불가, pre-built batches 필요.
         # 주의: 큰 윈도우면 RAM 위험 — ablation 은 linear_probe 만 사용.
+        # ── DDP(B안): train window 를 rank 별로 분할 후 전 rank 최소 길이로 정렬
+        #   (step 동기화). test 는 분할하지 않는다(평가는 rank0 이 full set 으로 수행).
+        if use_ddp:
+            n_full = len(train_windows)
+            train_windows = equalize_shard(shard_for_rank(train_windows))
+            if is_main():
+                print(
+                    f"  [DDP] train shard: {n_full} → {len(train_windows)}"
+                    f"/rank × {ddp_world_size()} ranks"
+                )
+            if len(train_windows) == 0:
+                # world_size 가 train window 수보다 크면 빈 shard → random-init LoRA
+                # 가 "결과"로 저장될 위험. 명시적으로 차단.
+                if is_main():
+                    print(
+                        "ERROR: DDP train shard 가 비었습니다 (nproc_per_node 가 "
+                        "train window 수보다 큼). nproc 를 줄이거나 단일 GPU 로 "
+                        "실행하세요.",
+                        file=sys.stderr,
+                    )
+                import torch.distributed as dist
+                dist.destroy_process_group()
+                sys.exit(2)
         first_sig = next(iter(train_windows[0].signals.values()))
         max_length = len(first_sig)
         train_batches = _make_batches(
             train_windows, args.batch_size, args.patch_size, max_length
         )
-        test_batches = _make_batches(
-            test_windows, args.batch_size, args.patch_size, max_length
-        )
         n_lora = sum(p.numel() for p in model.lora_parameters())
         n_probe = sum(p.numel() for p in probe.parameters())
         print(f"\nTraining LoRA + Probe (rank={args.lora_rank}, "
               f"LoRA={n_lora:,} + Probe={n_probe:,} params)...")
+        # DDP: encode→pool→probe 를 한 forward 로 묶어 grad all-reduce 등록. 단일 GPU
+        # 면 use_ddp=False → ddp_module=None → 기존 forward 경로 그대로(불변).
+        ddp_module = wrap_lora_ddp(model.model, probe) if use_ddp else None
         train_losses = train_lora(
-            model, probe, train_batches, args.epochs, args.lr, device
+            model, probe, train_batches, args.epochs, args.lr, device,
+            ddp_module=ddp_module,
+        )
+        # DDP: 학습 종료 동기화 후 test/저장은 rank0 전담 → non-rank0 는 정리·종료.
+        if use_ddp:
+            import torch.distributed as dist
+            dist.barrier()
+            if not is_main():
+                dist.destroy_process_group()
+                return
+        test_batches = _make_batches(
+            test_windows, args.batch_size, args.patch_size, max_length
         )
         print("\nEvaluating...")
         metrics = evaluate_lora(model, probe, test_batches, device)
@@ -562,7 +727,9 @@ def main() -> None:
             "lr": args.lr,
         },
     }
-    results_path = out_dir / f"arrhythmia_results_{args.mode}.json"
+    # fold suffix: n_folds>1 동시 실행 시 JSON 충돌(torn-file) 방지.
+    fold_suffix = f"_fold{args.fold}" if int(args.n_folds) > 1 else ""
+    results_path = out_dir / f"arrhythmia_results_{args.mode}{fold_suffix}.json"
     with open(results_path, "w") as f:
         json.dump(results, f, indent=2, default=str)
     print(f"Results saved: {results_path}")
@@ -574,6 +741,11 @@ def main() -> None:
         patient_ids=[str(w.patient) for w in test_windows], classes=CLASS_NAMES,
     )
     print(f"Fold predictions: {npz_path}")
+
+    # DDP: rank0 의 프로세스 그룹 정리(non-rank0 는 학습 직후 이미 정리·종료).
+    if use_ddp:
+        import torch.distributed as dist
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

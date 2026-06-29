@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import sys
 import warnings
 from pathlib import Path
 
@@ -48,6 +49,15 @@ from downstream.aggregator import (
     TransformerAggregator,
     collate_patients,
     encode_patient_windows,
+)
+from downstream._ddp_utils import (
+    ddp_world_size,
+    equalize_shard,
+    is_main,
+    maybe_init_ddp,
+    run_aggregator_forward,
+    shard_for_rank,
+    wrap_aggregator_ddp,
 )
 
 
@@ -73,6 +83,9 @@ def train_model(
     batch_size: int = 8,
     use_lora: bool = False,
     gradient_clip: float = 1.0,
+    ddp_module=None,
+    cached_train_override: list | None = None,
+    cached_val_override: list | None = None,
 ) -> tuple[list[float], list[float], dict, int]:
     """학습 + 매 epoch val에서 best AUROC ckpt 추적.
 
@@ -135,11 +148,17 @@ def train_model(
             cache.append((reprs.detach().cpu(), t))
         return cache
 
+    # cached_*_override: DDP sharded 추출 경로에서 rank0 가 gather 한 (reprs,times)
+    # 캐시 주입(재추출 생략). 단일 GPU 면 None → 기존처럼 내부 추출(불변).
     cached_train: list[tuple[torch.Tensor, torch.Tensor | None]] | None = None
     cached_val: list[tuple[torch.Tensor, torch.Tensor | None]] | None = None
     if not use_lora:
-        cached_train = _encode_all(train_patients)
-        cached_val = _encode_all(val_patients)
+        if cached_train_override is not None:
+            cached_train = cached_train_override
+            cached_val = cached_val_override
+        else:
+            cached_train = _encode_all(train_patients)
+            cached_val = _encode_all(val_patients)
 
     for epoch in range(epochs):
         aggregator.train()
@@ -155,30 +174,44 @@ def train_model(
         for batch_start in range(0, len(order), batch_size):
             batch_indices = order[batch_start: batch_start + batch_size]
 
-            patient_reprs = []
-            patient_times: list[torch.Tensor | None] = []
-            batch_labels = []
-            for idx in batch_indices:
-                p = train_patients[idx]
-                if cached_train is not None:
-                    # frozen encoder → epoch 마다 동일한 캐시 재사용 (인코더 forward 없음)
-                    reprs, times = cached_train[idx]
-                else:
-                    reprs, times = encode_patient_windows(
-                        model, p, patch_size, max_windows,
-                        use_lora=use_lora, session_prefix="aki",
-                        return_time_secs=True,
-                    )
-                patient_reprs.append(reprs)
-                patient_times.append(times)
-                batch_labels.append(p["label"])
+            if ddp_module is not None:
+                # ── DDP 경로: encode→aggregate→probe 를 한 forward 로 묶어 grad
+                # all-reduce 가 등록되게 한다 (단일 GPU 경로는 아래 else 그대로).
+                # use_time_secs=True 로 aki 의 continuous-time pos-embed 보존. ──
+                batch_patients = [train_patients[idx] for idx in batch_indices]
+                labels = torch.tensor(
+                    [p["label"] for p in batch_patients],
+                    dtype=torch.float32, device=device,
+                )
+                logits = run_aggregator_forward(
+                    ddp_module, model, batch_patients, patch_size, max_windows,
+                    session_prefix="aki", use_time_secs=True,
+                )
+            else:
+                patient_reprs = []
+                patient_times: list[torch.Tensor | None] = []
+                batch_labels = []
+                for idx in batch_indices:
+                    p = train_patients[idx]
+                    if cached_train is not None:
+                        # frozen encoder → epoch 마다 동일한 캐시 재사용 (인코더 forward 없음)
+                        reprs, times = cached_train[idx]
+                    else:
+                        reprs, times = encode_patient_windows(
+                            model, p, patch_size, max_windows,
+                            use_lora=use_lora, session_prefix="aki",
+                            return_time_secs=True,
+                        )
+                    patient_reprs.append(reprs)
+                    patient_times.append(times)
+                    batch_labels.append(p["label"])
 
-            padded, mask, labels, time_secs = collate_patients(
-                patient_reprs, batch_labels, device, time_secs=patient_times
-            )
-            patient_repr = aggregator(padded, mask, time_secs=time_secs)  # (B, d_model)
+                padded, mask, labels, time_secs = collate_patients(
+                    patient_reprs, batch_labels, device, time_secs=patient_times
+                )
+                patient_repr = aggregator(padded, mask, time_secs=time_secs)  # (B, d_model)
 
-            logits = probe(patient_repr)
+                logits = probe(patient_repr)
             if label_mode == "binary":
                 loss = criterion(logits.squeeze(-1), labels.float())
             else:
@@ -196,35 +229,39 @@ def train_model(
         losses.append(avg)
 
         # ── val 평가 + best-ckpt 추적 ──
-        val_metrics = evaluate_model(
-            model, aggregator, probe, val_patients, label_mode,
-            device=device, patch_size=patch_size, max_windows=max_windows,
-            cached_encodings=cached_val,
-        )
-        val_metrics.pop("y_true", None)
-        val_metrics.pop("y_score", None)
-        val_auroc = (
-            val_metrics.get("auroc")
-            if label_mode == "binary"
-            else val_metrics.get("macro_auroc")
-        )
-        val_auroc = float(val_auroc) if val_auroc is not None else float("nan")
-        val_aurocs.append(val_auroc)
+        # DDP: rank0 만 평가/deepcopy 한다. all-reduce + optimizer.step 후 전 rank
+        # 파라미터가 동일하므로 rank0 평가가 전체를 대표한다. 단일 GPU 면 is_main()
+        # 이 항상 True → 기존과 동일하게 매 epoch 실행(결과 불변).
+        if is_main():
+            val_metrics = evaluate_model(
+                model, aggregator, probe, val_patients, label_mode,
+                device=device, patch_size=patch_size, max_windows=max_windows,
+                cached_encodings=cached_val,
+            )
+            val_metrics.pop("y_true", None)
+            val_metrics.pop("y_score", None)
+            val_auroc = (
+                val_metrics.get("auroc")
+                if label_mode == "binary"
+                else val_metrics.get("macro_auroc")
+            )
+            val_auroc = float(val_auroc) if val_auroc is not None else float("nan")
+            val_aurocs.append(val_auroc)
 
-        if not np.isnan(val_auroc) and val_auroc > best_val_auroc:
-            best_val_auroc = val_auroc
-            best_epoch = epoch + 1
-            best_state = {
-                "aggregator": copy.deepcopy(aggregator.state_dict()),
-                "probe": copy.deepcopy(probe.state_dict()),
-            }
-            if use_lora and hasattr(model, "model"):
-                best_state["lora"] = copy.deepcopy(model.model.state_dict())
+            if not np.isnan(val_auroc) and val_auroc > best_val_auroc:
+                best_val_auroc = val_auroc
+                best_epoch = epoch + 1
+                best_state = {
+                    "aggregator": copy.deepcopy(aggregator.state_dict()),
+                    "probe": copy.deepcopy(probe.state_dict()),
+                }
+                if use_lora and hasattr(model, "model"):
+                    best_state["lora"] = copy.deepcopy(model.model.state_dict())
 
-        print(
-            f"  Epoch {epoch + 1}/{epochs}  loss={avg:.4f}  "
-            f"val_auroc={val_auroc:.4f}  (best={best_val_auroc:.4f}@ep{best_epoch})"
-        )
+            print(
+                f"  Epoch {epoch + 1}/{epochs}  loss={avg:.4f}  "
+                f"val_auroc={val_auroc:.4f}  (best={best_val_auroc:.4f}@ep{best_epoch})"
+            )
 
     if not best_state:
         warnings.warn(
@@ -472,7 +509,23 @@ def main() -> None:
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    device = torch.device(args.device)
+
+    # ── DDP (B안): torchrun 으로 실행되면 rank 별 GPU 핀 + device 강제. torchrun 이
+    # 아니면 maybe_init_ddp()=None → 단일 GPU 경로(기존) 그대로 (결과 불변). ──
+    ddp_device = maybe_init_ddp()
+    use_ddp = ddp_device is not None
+    if use_ddp:
+        device = ddp_device
+        args.device = str(ddp_device)
+        # lora: aggregator DDP. linear_probe: sharded frozen-feature 추출 → gather
+        # → rank0 단독 학습. 둘 다 허용(이전엔 linear_probe 차단).
+        if is_main():
+            print(
+                f"[DDP] world_size={ddp_world_size()}  device={device}  "
+                f"mode={args.mode}"
+            )
+    else:
+        device = torch.device(args.device)
 
     # ── 모델 로드 ──
     from downstream.model_wrapper import DownstreamModelWrapper
@@ -520,6 +573,77 @@ def main() -> None:
     print(f"  Avg windows/patient (train): {avg_win:.1f}")
     print(f"  Max windows per patient: {args.max_windows}")
 
+    # ── DDP 분기 ──
+    # lora: train 환자 shard(+equalize) → aggregator DDP. linear_probe: 각 rank 가
+    # train/val/test 환자 shard 만 frozen encoder 로 인코딩 → (reprs,times,label,
+    # case_id) 한 튜플로 묶어 gather_concat(정렬 co-index 보존) → rank0 단독으로
+    # aggregator+probe 학습(val best-ckpt)·test 평가·저장. aki 는 time_secs(continuous
+    # pos-embed)와 val 이 있으므로 reprs·times 를 함께 캐싱한다.
+    # 단일 GPU(use_ddp=False)면 두 분기 모두 skip → 기존 경로 그대로(불변).
+    train_cached: list | None = None
+    val_cached: list | None = None
+    test_cached: list | None = None
+    if use_ddp and use_lora:
+        n_full = len(train_patients)
+        train_patients = equalize_shard(shard_for_rank(train_patients))
+        if is_main():
+            print(
+                f"  [DDP] train shard: {n_full} → {len(train_patients)}"
+                f"/rank × {ddp_world_size()} ranks"
+            )
+        if len(train_patients) == 0:
+            if is_main():
+                print(
+                    "ERROR: DDP train shard 가 비었습니다 (nproc_per_node 가 train "
+                    "환자 수보다 큼). nproc 를 줄이거나 단일 GPU 로 실행하세요.",
+                    file=sys.stderr,
+                )
+            import torch.distributed as dist
+            dist.destroy_process_group()
+            sys.exit(2)
+    elif use_ddp and not use_lora:
+        def _extract_shard_tuples(patients):
+            # idxs 와 sharded patients 는 동일 stride(shard_for_rank)라 정렬된다.
+            idxs = shard_for_rank(list(range(len(patients))))
+            out = []
+            for gi in idxs:
+                p = patients[gi]
+                reprs, times = encode_patient_windows(
+                    model, p, patch_size, args.max_windows,
+                    use_lora=False, session_prefix="aki",
+                    return_time_secs=True,
+                )
+                t = times.detach().cpu() if times is not None else None
+                out.append(
+                    (gi, reprs.detach().cpu(), t, p["label"], str(p["subject_id"]))
+                )
+            return out
+
+        if is_main():
+            print(f"  [DDP] sharded frozen-feature 추출 × {ddp_world_size()} ranks")
+        g_train = gather_concat(_extract_shard_tuples(train_patients))
+        g_val = gather_concat(_extract_shard_tuples(val_patients))
+        g_test = gather_concat(_extract_shard_tuples(test_patients))
+        if not is_main():
+            import torch.distributed as dist
+            dist.destroy_process_group()
+            return
+        # rank0: gi 로 정렬해 원순서 복원 → 단일 GPU 와 동일 train/val 순서(동일
+        # minibatch, 학습 재현성 보존). co-index(reprs/times/label/case_id)는 한
+        # 튜플로 묶여 함께 정렬되므로 절대 어긋나지 않는다.
+        def _rebuild(g):
+            g.sort(key=lambda t: t[0])
+            pats = [
+                {"label": lbl, "subject_id": cid, "n_windows": r.shape[0]}
+                for (_gi, r, _t, lbl, cid) in g
+            ]
+            cache = [(r, t) for (_gi, r, t, _lbl, _cid) in g]
+            return pats, cache
+
+        train_patients, train_cached = _rebuild(g_train)
+        val_patients, val_cached = _rebuild(g_val)
+        test_patients, test_cached = _rebuild(g_test)
+
     # ── Aggregator + Probe ──
     n_classes = 1 if label_mode == "binary" else 4
     aggregator = TransformerAggregator(
@@ -539,6 +663,15 @@ def main() -> None:
         n_lora = sum(p.numel() for p in model.lora_parameters())
         print(f"  LoRA: {n_lora:,} params (rank={args.lora_rank})")
 
+    # DDP lora: encode→aggregate→probe 를 한 forward 로 묶어 grad all-reduce 등록.
+    # linear_probe DDP 는 rank0 단독 학습이라 wrap 불필요(ddp_module=None).
+    # 단일 GPU 면 ddp_module=None → 기존 직접 호출 경로(불변).
+    agg_ddp = None
+    if use_ddp and use_lora:
+        aggregator = aggregator.to(device)
+        probe = probe.to(device)
+        agg_ddp = wrap_aggregator_ddp(model.model, aggregator, probe)
+
     # ── 학습 (val에서 best AUROC ckpt 추적) ──
     print(f"\nTraining ({args.mode}, label_mode={label_mode})...")
     train_losses, val_aurocs, best_state, best_epoch = train_model(
@@ -546,7 +679,18 @@ def main() -> None:
         epochs=args.epochs, lr=args.lr, device=device,
         patch_size=patch_size, max_windows=args.max_windows,
         batch_size=args.batch_size, use_lora=use_lora,
+        ddp_module=agg_ddp,
+        cached_train_override=train_cached, cached_val_override=val_cached,
     )
+
+    # ── DDP lora: 학습 종료 동기화 후 non-rank0 종료 (평가/저장은 rank0 전담).
+    # (linear_probe DDP 는 추출 직후 non-rank0 가 이미 종료했다.) ──
+    if use_ddp and use_lora:
+        import torch.distributed as dist
+        dist.barrier()
+        if not is_main():
+            dist.destroy_process_group()
+            return
 
     # ── Best ckpt 복원 후 test 평가 ──
     print(f"\nRestoring best checkpoint (epoch {best_epoch})...")
@@ -562,6 +706,7 @@ def main() -> None:
         val_metrics = evaluate_model(
             model, aggregator, probe, val_patients, label_mode,
             device=device, patch_size=patch_size, max_windows=args.max_windows,
+            cached_encodings=val_cached,
         )
         val_threshold = float(val_metrics["optimal_threshold"])
         print(f"  Operating threshold (from val): {val_threshold:.3f}")
@@ -571,6 +716,7 @@ def main() -> None:
         model, aggregator, probe, test_patients, label_mode,
         device=device, patch_size=patch_size, max_windows=args.max_windows,
         fixed_threshold=val_threshold,
+        cached_encodings=test_cached,
     )
 
     y_true = metrics.pop("y_true")
@@ -614,6 +760,10 @@ def main() -> None:
     val_auroc_best = max(val_aurocs) if val_aurocs else float("nan")
     print(f"  Val AUROC:   {val_auroc_best:.4f}")
     print(f"{'=' * 60}")
+    # n_folds>1 이면 fold suffix 를 json·png 에 붙여 같은 out-dir 5-fold 동시/순차
+    # 실행 시 torn-write·덮어쓰기를 막는다(.npz 와 동일 규칙). single split 은 기존명.
+    # (label_mode 구분은 파일명에 이미 포함 — fold suffix 는 그 뒤에 덧붙인다.)
+    fold_suffix = f"_fold{args.fold}" if int(args.n_folds) > 1 else ""
     if label_mode == "binary":
         a_lo, a_hi = ci["auroc"]
         p_lo, p_hi = ci["auprc"]
@@ -625,7 +775,7 @@ def main() -> None:
         print(f"  Specificity: {metrics['specificity']:.4f}")
         print(f"  Prevalence:  {metrics['prevalence']:.3f} "
               f"({metrics['n_positive']}/{metrics['n_total']})")
-        roc_path = out_dir / f"aki_roc_{args.mode}.png"
+        roc_path = out_dir / f"aki_roc_{args.mode}{fold_suffix}.png"
         plot_roc_curve(
             y_true, y_score[:, 0], roc_path,
             title=f"Postop AKI — {args.mode} ROC",
@@ -645,7 +795,7 @@ def main() -> None:
         # 이항 환원 ROC (stage>=1 vs no AKI)
         y_true_bin = (y_true >= 1).astype(int)
         y_score_bin = 1.0 - y_score[:, 0]
-        roc_path = out_dir / f"aki_stage_binary_roc_{args.mode}.png"
+        roc_path = out_dir / f"aki_stage_binary_roc_{args.mode}{fold_suffix}.png"
         plot_roc_curve(
             y_true_bin, y_score_bin, roc_path,
             title=f"Postop AKI (stage≥1) — {args.mode} ROC",
@@ -677,7 +827,7 @@ def main() -> None:
             "bootstrap_iters": args.bootstrap_iters,
         },
     }
-    results_path = out_dir / f"aki_results_{args.mode}_{label_mode}.json"
+    results_path = out_dir / f"aki_results_{args.mode}_{label_mode}{fold_suffix}.json"
     with open(results_path, "w") as f:
         json.dump(results, f, indent=2, default=str)
     print(f"Results: {results_path}")
@@ -689,6 +839,11 @@ def main() -> None:
         classes=["0", "1", "2", "3"] if label_mode == "stage" else None,
     )
     print(f"Fold predictions: {npz_path}")
+
+    # DDP: rank0 의 프로세스 그룹 정리(non-rank0 는 학습 직후 이미 정리·종료).
+    if use_ddp:
+        import torch.distributed as dist
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

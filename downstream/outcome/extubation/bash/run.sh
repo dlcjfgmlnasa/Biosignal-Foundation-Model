@@ -1,21 +1,21 @@
 #!/bin/bash
-# Sepsis Prediction — 실험 스크립트 (patient-level Transformer Aggregator)
+# ICU Extubation Failure Prediction (#10) — patient-level Transformer Aggregator.
 # Linear Probe + LoRA 두 모드 실행.
 #
 # 사용법:
 #   # (1) 단일 GPU (기존 동작 — 결과 불변)
-#   bash downstream/outcome/sepsis/bash/run.sh
+#   bash downstream/outcome/extubation/bash/run.sh
 #
 #   # (2) B안 — torchrun+DDP: LoRA run 을 N GPU 로 데이터 병렬(환자 단위 분할).
-#   NPROC=4 bash downstream/outcome/sepsis/bash/run.sh
+#   NPROC=4 bash downstream/outcome/extubation/bash/run.sh
 
 set -e
 
 # ── canonical 경로 (k-mimic-/bio_fm — updown 기본은 stale, memory
 #    project_kmimic_bio_fm_paths). 모두 ${VAR:-default} 라 env override 가능. ──
 CHECKPOINT=${CHECKPOINT:-/home/coder/workspace/k-mimic-/bio_fm/outputs/main/phase2/kmimic_phase2_k2/checkpoints/checkpoint_phase2_av_epoch049_final.pt}
-DATA_DIR=${DATA_DIR:-/home/coder/workspace/k-mimic-/bio_fm/data/downstream/sepsis}
-OUT_DIR=${OUT_DIR:-/home/coder/workspace/k-mimic-/bio_fm/result/main/sepsis}
+DATA_DIR=${DATA_DIR:-/home/coder/workspace/k-mimic-/bio_fm/data/downstream/extubation}
+OUT_DIR=${OUT_DIR:-/home/coder/workspace/k-mimic-/bio_fm/result/main/extubation}
 DEVICE=${DEVICE:-cuda}
 # v2 필수 (9 modality 단일 embedding — memory project_data_spec_v2). v1 로드 금지.
 MODEL_VERSION=${MODEL_VERSION:-v2}
@@ -49,10 +49,10 @@ else
     LAUNCH="python -m"
 fi
 
-DATA_PATH="${DATA_DIR}/sepsis_w${WINDOW_SEC}s.pt"
+DATA_PATH="${DATA_DIR}/extubation_w${WINDOW_SEC}s.pt"
 
 echo "============================================================"
-echo "  Sepsis Prediction (Transformer Aggregator)"
+echo "  ICU Extubation Failure (#10) — Transformer Aggregator"
 echo "  Checkpoint:  $CHECKPOINT"
 echo "  ModelVer:    $MODEL_VERSION"
 echo "  Data:        $DATA_PATH"
@@ -69,7 +69,7 @@ EXP_DIR="${OUT_DIR}/linear_probe"
 mkdir -p "$EXP_DIR"
 
 echo -e "\n[1/2] Linear Probe (launch: $LAUNCH)"
-$LAUNCH downstream.outcome.sepsis.run \
+$LAUNCH downstream.outcome.extubation.run \
     --checkpoint "$CHECKPOINT" \
     --model-version "$MODEL_VERSION" \
     --data-path "$DATA_PATH" \
@@ -86,7 +86,7 @@ EXP_DIR="${OUT_DIR}/lora"
 mkdir -p "$EXP_DIR"
 
 echo -e "\n[2/2] LoRA Fine-tuning (launch: $LAUNCH)"
-$LAUNCH downstream.outcome.sepsis.run \
+$LAUNCH downstream.outcome.extubation.run \
     --checkpoint "$CHECKPOINT" \
     --model-version "$MODEL_VERSION" \
     --data-path "$DATA_PATH" \

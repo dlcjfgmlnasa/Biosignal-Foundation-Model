@@ -41,6 +41,16 @@ from downstream.aggregator import (
     collate_patients,
     encode_patient_windows,
 )
+from downstream._ddp_utils import (
+    ddp_world_size,
+    equalize_shard,
+    gather_concat,
+    is_main,
+    maybe_init_ddp,
+    run_aggregator_forward,
+    shard_for_rank,
+    wrap_aggregator_ddp,
+)
 
 
 DEFAULT_PATCH_SIZE = 100
@@ -63,6 +73,8 @@ def train_model(
     batch_size: int = 8,
     use_lora: bool = False,
     gradient_clip: float = 1.0,
+    ddp_module=None,
+    cached_reprs_override: list[torch.Tensor] | None = None,
 ) -> list[float]:
     aggregator = aggregator.to(device)
     probe = probe.to(device)
@@ -82,15 +94,20 @@ def train_model(
     # CPU 에 캐시한다. encoder 가 frozen 이라 매 epoch reprs 가 동일하므로 epoch 루프
     # 안에서 인코더 forward 를 반복할 필요가 없다 (수치 동일, 중복 재계산·재 I/O 제거).
     # LoRA 는 encoder 가 매 epoch 갱신되어 features 가 바뀌므로 캐시 불가 → 기존 경로 유지.
+    # cached_reprs_override: DDP sharded 추출 경로에서 rank0 가 gather 한 reprs 주입
+    # (재추출 생략). 단일 GPU 면 None → 기존처럼 내부 추출(불변).
     cached_reprs: list[torch.Tensor] | None = None
     if not use_lora:
-        cached_reprs = []
-        for p in train_patients:
-            reprs = encode_patient_windows(
-                model, p, patch_size, max_windows,
-                use_lora=False, session_prefix="cardiac_arrest",
-            )
-            cached_reprs.append(reprs.detach().cpu())
+        if cached_reprs_override is not None:
+            cached_reprs = cached_reprs_override
+        else:
+            cached_reprs = []
+            for p in train_patients:
+                reprs = encode_patient_windows(
+                    model, p, patch_size, max_windows,
+                    use_lora=False, session_prefix="cardiac_arrest",
+                )
+                cached_reprs.append(reprs.detach().cpu())
 
     for epoch in range(epochs):
         rng = np.random.default_rng(epoch)
@@ -100,26 +117,40 @@ def train_model(
         for batch_start in range(0, len(order), batch_size):
             batch_indices = order[batch_start: batch_start + batch_size]
 
-            patient_reprs = []
-            batch_labels = []
-            for idx in batch_indices:
-                p = train_patients[idx]
-                if cached_reprs is not None:
-                    # frozen encoder → epoch 마다 동일한 캐시된 repr 재사용 (인코더 forward 없음)
-                    reprs = cached_reprs[idx]
-                else:
-                    reprs = encode_patient_windows(
-                        model, p, patch_size, max_windows,
-                        use_lora=use_lora, session_prefix="cardiac_arrest",
-                    )
-                patient_reprs.append(reprs)
-                batch_labels.append(p["label"])
+            if ddp_module is not None:
+                # ── DDP 경로: encode→aggregate→probe 를 한 forward 로 묶어 grad
+                # all-reduce 가 등록되게 한다 (단일 GPU 경로는 아래 else 그대로). ──
+                batch_patients = [train_patients[idx] for idx in batch_indices]
+                labels = torch.tensor(
+                    [p["label"] for p in batch_patients],
+                    dtype=torch.float32, device=device,
+                )
+                logits = run_aggregator_forward(
+                    ddp_module, model, batch_patients, patch_size, max_windows,
+                    session_prefix="cardiac_arrest",
+                )
+            else:
+                patient_reprs = []
+                batch_labels = []
+                for idx in batch_indices:
+                    p = train_patients[idx]
+                    if cached_reprs is not None:
+                        # frozen encoder → epoch 마다 동일한 캐시된 repr 재사용 (인코더 forward 없음)
+                        reprs = cached_reprs[idx]
+                    else:
+                        reprs = encode_patient_windows(
+                            model, p, patch_size, max_windows,
+                            use_lora=use_lora, session_prefix="cardiac_arrest",
+                        )
+                    patient_reprs.append(reprs)
+                    batch_labels.append(p["label"])
 
-            padded, mask, labels, _ = collate_patients(
-                patient_reprs, batch_labels, device
-            )
-            patient_repr = aggregator(padded, mask)
-            logits = probe(patient_repr)
+                padded, mask, labels, _ = collate_patients(
+                    patient_reprs, batch_labels, device
+                )
+                patient_repr = aggregator(padded, mask)
+                logits = probe(patient_repr)
+
             loss = criterion(logits.squeeze(-1), labels)
 
             optimizer.zero_grad()
@@ -150,6 +181,7 @@ def evaluate_model(
     device: torch.device,
     patch_size: int,
     max_windows: int,
+    precomputed_reprs: list[torch.Tensor] | None = None,
 ) -> dict:
     aggregator.to(device).eval()
     probe.to(device).eval()
@@ -158,8 +190,13 @@ def evaluate_model(
 
     all_labels, all_scores = [], []
 
-    for p in test_patients:
-        reprs = encode_patient_windows(model, p, patch_size, max_windows)
+    # precomputed_reprs: DDP sharded 추출 경로의 rank0 gather test reprs (co-index).
+    # 단일 GPU 면 None → 기존처럼 즉시 인코딩(불변).
+    for i, p in enumerate(test_patients):
+        if precomputed_reprs is not None:
+            reprs = precomputed_reprs[i]
+        else:
+            reprs = encode_patient_windows(model, p, patch_size, max_windows)
         padded = reprs.unsqueeze(0).to(device)
         mask = torch.ones(1, reprs.shape[0], dtype=torch.bool, device=device)
 
@@ -249,7 +286,23 @@ def main() -> None:
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    device = torch.device(args.device)
+
+    # ── DDP (B안): torchrun 으로 실행되면 rank 별 GPU 핀 + device 강제. torchrun 이
+    # 아니면 maybe_init_ddp()=None → 단일 GPU 경로(기존) 그대로 (결과 불변). ──
+    ddp_device = maybe_init_ddp()
+    use_ddp = ddp_device is not None
+    if use_ddp:
+        device = ddp_device
+        args.device = str(ddp_device)
+        # lora: aggregator DDP. linear_probe: sharded frozen-feature 추출 → gather
+        # → rank0 단독 학습. 둘 다 허용(이전엔 linear_probe 차단).
+        if is_main():
+            print(
+                f"[DDP] world_size={ddp_world_size()}  device={device}  "
+                f"mode={args.mode}"
+            )
+    else:
+        device = torch.device(args.device)
 
     from downstream.model_wrapper import DownstreamModelWrapper
 
@@ -272,6 +325,74 @@ def main() -> None:
     print(f"  Test:  {len(test_patients)} patients "
           f"({n_pos_test} arrest+)")
 
+    # ── DDP 분기 (sepsis 와 동일 원칙) ──
+    # lora: train 환자 shard(+equalize) → aggregator DDP. linear_probe: 각 rank 가
+    # 환자 shard 만 frozen encoder 로 인코딩 → (reprs_cpu,label,case_id) 튜플 묶어
+    # gather_concat(정렬 co-index 보존) → rank0 단독 학습/평가/저장.
+    # risk-set matched negative 구성은 _load_data 가 끝낸 train data 라 분할(stride)
+    # 해도 라벨 분포가 rank 간 고르게 섞이고, linear_probe 는 rank0 가 gather 후
+    # 전체를 학습하므로 risk-set 무결성이 그대로 보존된다.
+    # 단일 GPU(use_ddp=False)면 두 분기 모두 skip → 기존 경로 그대로(불변).
+    cached_train_override: list[torch.Tensor] | None = None
+    test_precomputed: list[torch.Tensor] | None = None
+    if use_ddp and use_lora:
+        n_full = len(train_patients)
+        train_patients = equalize_shard(shard_for_rank(train_patients))
+        if is_main():
+            print(
+                f"  [DDP] train shard: {n_full} → {len(train_patients)}"
+                f"/rank × {ddp_world_size()} ranks"
+            )
+        if len(train_patients) == 0:
+            if is_main():
+                print(
+                    "ERROR: DDP train shard 가 비었습니다 (nproc_per_node 가 train "
+                    "환자 수보다 큼). nproc 를 줄이거나 단일 GPU 로 실행하세요.",
+                    file=sys.stderr,
+                )
+            import torch.distributed as dist
+            dist.destroy_process_group()
+            sys.exit(2)
+    elif use_ddp and not use_lora:
+        # global index(gi)를 튜플에 포함 → gather 후 gi 로 정렬해 원순서 복원 →
+        # 단일 GPU 와 동일 train_patients 순서(동일 minibatch, 학습 재현성 보존).
+        # co-index(reprs↔label↔case_id)는 한 튜플로 묶여 함께 정렬되므로 유지된다.
+        # risk-set matched 구성도 원순서 복원으로 단일 GPU 와 동일하게 학습된다.
+        def _extract_shard_tuples(patients):
+            idxs = shard_for_rank(list(range(len(patients))))
+            out = []
+            for gi in idxs:
+                p = patients[gi]
+                reprs = encode_patient_windows(
+                    model, p, patch_size, args.max_windows,
+                    use_lora=False, session_prefix="cardiac_arrest",
+                )
+                out.append(
+                    (gi, reprs.detach().cpu(), p["label"], str(p["subject_id"]))
+                )
+            return out
+
+        if is_main():
+            print(f"  [DDP] sharded frozen-feature 추출 × {ddp_world_size()} ranks")
+        g_train = gather_concat(_extract_shard_tuples(train_patients))
+        g_test = gather_concat(_extract_shard_tuples(test_patients))
+        if not is_main():
+            import torch.distributed as dist
+            dist.destroy_process_group()
+            return
+        g_train.sort(key=lambda t: t[0])
+        g_test.sort(key=lambda t: t[0])
+        train_patients = [
+            {"label": lbl, "subject_id": cid, "n_windows": r.shape[0]}
+            for (_gi, r, lbl, cid) in g_train
+        ]
+        cached_train_override = [r for (_gi, r, _lbl, _cid) in g_train]
+        test_patients = [
+            {"label": lbl, "subject_id": cid, "n_windows": r.shape[0]}
+            for (_gi, r, lbl, cid) in g_test
+        ]
+        test_precomputed = [r for (_gi, r, _lbl, _cid) in g_test]
+
     aggregator = TransformerAggregator(
         d_model=d_model, n_heads=args.agg_heads,
         n_layers=args.agg_layers, max_windows=args.max_windows,
@@ -281,18 +402,39 @@ def main() -> None:
     n_agg = sum(p.numel() for p in aggregator.parameters())
     print(f"\n  Aggregator: {n_agg:,} params | Probe: {sum(p.numel() for p in probe.parameters()):,} params")
 
+    # DDP lora: encode→aggregate→probe 를 한 forward 로 묶어 grad all-reduce 등록.
+    # linear_probe DDP 는 rank0 단독 학습이라 wrap 불필요(ddp_module=None).
+    # 단일 GPU 면 ddp_module=None → 기존 직접 호출 경로(불변).
+    agg_ddp = None
+    if use_ddp and use_lora:
+        aggregator = aggregator.to(device)
+        probe = probe.to(device)
+        agg_ddp = wrap_aggregator_ddp(model.model, aggregator, probe)
+
     print(f"\nTraining ({args.mode})...")
     train_losses = train_model(
         model, aggregator, probe, train_patients,
         epochs=args.epochs, lr=args.lr, device=device,
         patch_size=patch_size, max_windows=args.max_windows,
         batch_size=args.batch_size, use_lora=use_lora,
+        ddp_module=agg_ddp, cached_reprs_override=cached_train_override,
     )
+
+    # ── DDP lora: 학습 종료 동기화 후 non-rank0 종료 (평가/저장은 rank0 전담).
+    # val/best-ckpt 가 없어 train→test 직행이므로 barrier 를 학습 직후에 둔다.
+    # (linear_probe DDP 는 추출 직후 non-rank0 가 이미 종료했다.) ──
+    if use_ddp and use_lora:
+        import torch.distributed as dist
+        dist.barrier()
+        if not is_main():
+            dist.destroy_process_group()
+            return
 
     print("\nEvaluating...")
     metrics = evaluate_model(
         model, aggregator, probe, test_patients,
         device=device, patch_size=patch_size, max_windows=args.max_windows,
+        precomputed_reprs=test_precomputed,
     )
 
     y_true = metrics.pop("y_true")
@@ -312,7 +454,10 @@ def main() -> None:
           f"({metrics['n_positive']}/{metrics['n_total']})")
     print(f"{'=' * 60}")
 
-    roc_path = out_dir / f"cardiac_arrest_roc_{args.mode}.png"
+    # n_folds>1 이면 fold suffix 를 json·png 에 붙여 같은 out-dir 동시/순차 5-fold
+    # 실행 시 torn-write·덮어쓰기를 막는다(.npz 와 동일 규칙). single split 은 기존명.
+    fold_suffix = f"_fold{args.fold}" if int(args.n_folds) > 1 else ""
+    roc_path = out_dir / f"cardiac_arrest_roc_{args.mode}{fold_suffix}.png"
     plot_roc_curve(y_true, y_score, roc_path,
                    title=f"Cardiac Arrest — {args.mode} ROC")
 
@@ -329,7 +474,7 @@ def main() -> None:
             "data_path": args.data_path, "epochs": args.epochs, "lr": args.lr,
         },
     }
-    results_path = out_dir / f"cardiac_arrest_results_{args.mode}.json"
+    results_path = out_dir / f"cardiac_arrest_results_{args.mode}{fold_suffix}.json"
     with open(results_path, "w") as f:
         json.dump(results, f, indent=2, default=str)
     print(f"Results: {results_path}")
@@ -339,6 +484,11 @@ def main() -> None:
         y_true=y_true, y_score=y_score, patient_ids=patient_ids,
     )
     print(f"Fold predictions: {npz_path}")
+
+    # DDP: rank0 의 프로세스 그룹 정리(non-rank0 는 학습 직후 이미 정리·종료).
+    if use_ddp:
+        import torch.distributed as dist
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
