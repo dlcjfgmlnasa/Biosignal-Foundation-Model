@@ -16,7 +16,7 @@ PhysioNet ``vitaldb-arrhythmia`` (annotation only) + VitalDB Open ``.vital``
     0 NSR  : N
     1 AFIB : AFIB/AFL
     2 VENT : VT, Patterned Ventricular Ectopy
-    3 SVT  : SVTA, Patterned Atrial Ectopy, WAP/MAT
+    3 SVA  : SVTA, Patterned Atrial Ectopy, WAP/MAT  (supraventricular 묶음)
     4 COND : SND, AVB
     (drop): Noise, '', Unclassifiable + bad_signal_quality 윈도우
 
@@ -87,7 +87,7 @@ RHYTHM_COLLAPSE: dict[str, int] = {
     "AVB": 4,
     # drop (매핑 없음): "Noise", "", "Unclassifiable"
 }
-CLASS_NAMES = ["NSR", "AFIB", "VENT", "SVT", "COND"]
+CLASS_NAMES = ["NSR", "AFIB", "VENT", "SVA", "COND"]  # SVA=supraventricular(SVTA+atrial ectopy+WAP/MAT)
 N_CLASSES = len(CLASS_NAMES)
 
 # input-signals → vital track 우선순위 (TRACK_MAP 키)
