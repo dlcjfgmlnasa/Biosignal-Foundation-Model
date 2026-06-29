@@ -160,6 +160,11 @@ def wrap_lora_ddp(encoder: nn.Module, probe: nn.Module):
     if not ddp_enabled():
         return mod
     local = ddp_local_rank()
+    # DDP 는 wrap 모듈의 모든 파라미터가 같은 device 에 있어야 한다. encoder(model.model)
+    # 는 이미 GPU 이지만 probe 가 아직 CPU 일 수 있어(호출측이 wrap 전 .to(device) 를
+    # 안 했을 때) {'cuda','cpu'} 혼재 ValueError 가 난다. head 를 encoder 의 device 로
+    # 맞춰 robust 하게 처리(encoder 는 건드리지 않음 → model.device 동기 유지).
+    mod.probe.to(next(encoder.parameters()).device)
     return nn.parallel.DistributedDataParallel(
         mod,
         device_ids=[local],
@@ -312,6 +317,11 @@ def wrap_aggregator_ddp(
     if not ddp_enabled():
         return mod
     local = ddp_local_rank()
+    # head(aggregator·probe)를 encoder 의 device 로 맞춘다(wrap 전 .to(device) 누락 시
+    # {'cuda','cpu'} 혼재 ValueError 방지). encoder 는 그대로 둬 model.device 동기 유지.
+    enc_dev = next(encoder.parameters()).device
+    mod.aggregator.to(enc_dev)
+    mod.probe.to(enc_dev)
     return nn.parallel.DistributedDataParallel(
         mod,
         device_ids=[local],
