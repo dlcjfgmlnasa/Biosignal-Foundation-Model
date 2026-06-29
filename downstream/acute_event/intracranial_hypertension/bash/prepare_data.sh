@@ -3,7 +3,7 @@
 # Paper Table S7 (Task 3) 정렬: 3 combos × 4 windows × 3 horizons
 #   Combos:   ABP+ICP / ABP+ICP+ECG / ABP+ICP+ECG+CVP
 #   Horizons: 10 / 15 / 30 min ahead
-#   Label:    ICP > 22 mmHg ≥ 1 min (BTF 4th ed., Carney 2017)
+#   Label:    ICP > 20 mmHg ≥ 1 min (가장 널리 쓰이는 ICH 정의; sustained >1min)
 #
 # Step 1: ICP 레코드 스캔 (헤더만 읽어 ICP 채널 존재 확인)
 # Step 2: ICP 레코드 다운로드

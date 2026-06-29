@@ -2,9 +2,9 @@
 """Intracranial Hypertension Detection — 데이터 준비 (MIMIC-III).
 
 MIMIC-III Waveform에서 ICP 채널이 있는 레코드를 파싱하여
-ICP > 22mmHg (≥1분 지속) 예측용 (input_window, future_label) 쌍을 생성한다.
+ICP > 20mmHg (≥1분 지속) 예측용 (input_window, future_label) 쌍을 생성한다.
 
-Label 소스: ICP (미래 구간의 평균 ICP > 22mmHg 지속 여부)
+Label 소스: ICP (미래 구간의 평균 ICP > 20mmHg 지속 여부)
 Input 소스: ICP + 동시 기록된 ECG, ABP, PPG 등
 
 데이터 소스: MIMIC-III Waveform Matched Subset (PhysioNet)
@@ -41,7 +41,7 @@ from downstream._save_utils import consume_gap_masks
 TARGET_SR: float = 100.0
 
 # ICP 임상 기준
-ICP_THRESHOLD: float = 22.0  # mmHg (BTF 4th ed., Carney 2017)
+ICP_THRESHOLD: float = 20.0  # mmHg (sustained >1min; 20mmHg = 가장 널리 쓰이는 ICH 정의)
 SUSTAINED_SEC: float = 60.0  # 1분 이상 지속
 
 # MIMIC-III 채널명 → signal_type 매핑 (Task #3 ICH: ABP, ECG, PPG, CO2 + ICP for label)
