@@ -32,7 +32,7 @@ MODES=(${MODES_OVERRIDE:-linear_probe lora})
 
 # 변수명 전 task 공통 컨벤션. batch: LP=512, LoRA=128(NPROC=4 시 eff 512).
 LP_EPOCHS="${LP_EPOCHS:-1000}"
-LORA_EPOCHS="${LORA_EPOCHS:-100}"
+LORA_EPOCHS="${LORA_EPOCHS:-30}"
 LP_LR="${LP_LR:-1e-3}"
 LORA_LR="${LORA_LR:-1e-4}"
 LP_BATCH="${LP_BATCH:-512}"
