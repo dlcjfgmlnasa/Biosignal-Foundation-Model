@@ -27,8 +27,8 @@ OUT=${OUT:-/home/coder/workspace/k-mimic-/bio_fm/result/main}
 NPROC=${NPROC:-4}
 
 # 고정 하이퍼 (전 cell 통일)
-LP_BATCH=${LP_BATCH:-128};    LP_LR=${LP_LR:-1e-3};    LP_EPOCHS=${LP_EPOCHS:-200}
-LORA_BATCH=${LORA_BATCH:-32}; LORA_LR=${LORA_LR:-2e-4}; LORA_EPOCHS=${LORA_EPOCHS:-200}
+LP_BATCH=${LP_BATCH:-128};    LP_LR=${LP_LR:-1e-3};    LP_EPOCHS=${LP_EPOCHS:-250}
+LORA_BATCH=${LORA_BATCH:-32}; LORA_LR=${LORA_LR:-2e-4}; LORA_EPOCHS=${LORA_EPOCHS:-250}
 LORA_RANK=${LORA_RANK:-8};    LORA_ALPHA=${LORA_ALPHA:-16}
 
 # 강제 재실행: FORCE=1 이면 완료 마커 무시하고 전부 다시 돈다.

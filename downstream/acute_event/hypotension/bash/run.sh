@@ -42,12 +42,12 @@ log()  { if [ "$PRINT_ONLY" = "1" ]; then echo    "$@" >&2; else echo    "$@"; f
 loge() { if [ "$PRINT_ONLY" = "1" ]; then echo -e "$@" >&2; else echo -e "$@"; fi; }
 
 # Linear Probe 설정 (frozen feature 캐싱 — batch 는 probe SGD 미니배치에만 영향)
-LP_EPOCHS=${LP_EPOCHS:-20}
+LP_EPOCHS=${LP_EPOCHS:-250}
 LP_LR=${LP_LR:-1e-3}
 LP_BATCH=${LP_BATCH:-32}
 
 # LoRA 설정 (모두 env override 가능)
-LORA_EPOCHS=${LORA_EPOCHS:-30}
+LORA_EPOCHS=${LORA_EPOCHS:-250}
 LORA_LR=${LORA_LR:-1e-4}
 LORA_RANK=${LORA_RANK:-8}
 LORA_ALPHA=${LORA_ALPHA:-16}

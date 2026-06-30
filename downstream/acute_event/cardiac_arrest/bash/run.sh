@@ -15,12 +15,13 @@ CKPT=${CKPT:-/home/coder/workspace/k-mimic-/bio_fm/outputs/main/phase2/kmimic_ph
 DATA=${DATA:-/home/coder/workspace/k-mimic-/bio_fm/data/downstream/cardiac_arrest}
 OUT=${OUT:-/home/coder/workspace/k-mimic-/bio_fm/result/main/cardiac_arrest}
 NPROC=${NPROC:-4}
-SIGNALS=${SIGNALS:-ecg_ppg}   # prefix 채널 토큰 (prepare_data --input-signals 순서 = ecg ppg)
+TASK=${TASK:-arrest}          # prepare_data_scope --task (arrest|death) → prefix scope_{task}_...
+SIGNALS=${SIGNALS:-ecg_ppg}   # prefix 채널 토큰 (prepare_data_scope --input-signals 순서 = ecg ppg)
 WINDOW=${WINDOW:-600}
 HORIZONS=${HORIZONS:-5 15 30}
 
-LP_BATCH=${LP_BATCH:-128};    LP_LR=${LP_LR:-1e-3};    LP_EPOCHS=${LP_EPOCHS:-200}
-LORA_BATCH=${LORA_BATCH:-32}; LORA_LR=${LORA_LR:-2e-4}; LORA_EPOCHS=${LORA_EPOCHS:-200}
+LP_BATCH=${LP_BATCH:-128};    LP_LR=${LP_LR:-1e-3};    LP_EPOCHS=${LP_EPOCHS:-250}
+LORA_BATCH=${LORA_BATCH:-32}; LORA_LR=${LORA_LR:-2e-4}; LORA_EPOCHS=${LORA_EPOCHS:-250}
 LORA_RANK=${LORA_RANK:-8};    LORA_ALPHA=${LORA_ALPHA:-16}
 FORCE=${FORCE:-0}
 
