@@ -9,9 +9,9 @@ label leakage 가 없다(현재 신호만으로 미래 임계 초과를 "예측"
 Task 별 score (higher = positive risk 가 되도록 sign 적용):
   - hypotension (IOH)              : signal=abp, sign=-1  (현재 MAP 낮을수록 hypo 위험)
   - intracranial_hypertension (ICH): signal=icp, sign=+1  (현재 ICP 높을수록 ICH 위험)
-  - cardiac_arrest (CA, *provisional*): signal=abp, sign=-1 (pre-arrest hypotension proxy)
-        ⚠️ CA 는 carry-forward 할 연속 임계신호가 없어 "현재 MAP" 를 잠정 baseline
-        으로 둔다. HR/RR trend 등 더 적절한 baseline 으로 --signal/--sign 으로 교체 가능.
+  - cardiac_arrest (CA, *provisional*): signal=ppg, sign=-1 (PPG 진폭=관류 proxy, 입력 ECG+PPG)
+        ⚠️ CA 는 carry-forward 할 연속 임계신호가 없어 PPG 진폭을 잠정 baseline 으로
+        둔다(입력에 ABP 없음). HR/RR trend 등 정식 baseline 으로 --signal/--sign 교체 권장.
 
 임계신호는 prepare_data 가 **입력 채널로 저장한 경우에만** 계산 가능하다
 (예: ICH 는 --input-signals 에 icp 가 포함돼야 함).
@@ -64,9 +64,11 @@ PERSIST_CONFIG: dict[str, dict] = {
     "intracranial_hypertension": {
         "signal": "icp", "sign": +1.0, "tail_sec": 30.0, "group_by": "subject_ids",
     },
-    # provisional — 현재 MAP proxy (pre-arrest hypotension). 교체 가능.
+    # provisional — CA 입력은 ECG+PPG(비침습)라 ABP 없음. PPG 진폭(관류 proxy: 낮을수록
+    # 위험) 을 잠정 baseline 으로 둔다. carry-forward 할 연속 임계신호가 없는 task 라
+    # 정식 baseline(HR/RR trend 등)으로 --signal/--sign 교체 권장.
     "cardiac_arrest": {
-        "signal": "abp", "sign": -1.0, "tail_sec": 30.0, "group_by": "subject_ids",
+        "signal": "ppg", "sign": -1.0, "tail_sec": 30.0, "group_by": "subject_ids",
     },
 }
 

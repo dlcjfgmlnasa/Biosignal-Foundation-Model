@@ -1,30 +1,42 @@
 # -*- coding:utf-8 -*-
-"""cardiac arrest prediction (Cardiac Arrest 기준).
+"""Imminent Cardiac Arrest Detection (window-level).
 
-환자 단위 예측: 여러 10분 윈도우를 Foundation Model로 인코딩한 뒤,
-Transformer Aggregator로 환자 수준 표현을 생성하여 cardiac_arrest 발생을 예측한다.
+MIMIC-III waveform 기반, onset 까지의 절대 잔여시간으로 라벨된 window 를
+Foundation model representation 으로 분류한다 (IOH/ICH 와 동일한 window-level
+frozen-probe / LoRA 평가 — 옛 patient-aggregation 은 폐기).
 
-구조: Mortality task와 동일 (라벨만 cardiac_arrest)
-    윈도우 × K → Encoder (frozen) → h_1..h_K
-    → [CLS] + h_1..h_K → Transformer Aggregator → CLS → Probe → cardiac_arrest 예측
+2가지 모드:
+  - linear_probe: Frozen encoder + LinearProbe (representation 품질 평가, 헤드라인)
+  - lora:         Frozen encoder + LoRA adapters + LinearProbe (효율적 fine-tuning)
+
+입력: ECG/ABP/PPG (+가용 시 RespImp/CO2) 윈도우 → encoder → mean pool → LinearProbe
+라벨: arrest+(onset 앞 band) = 1, risk-set matched arrest- = 0
+
+교차 일반화: 한국 데이터(VitalDB) pretrain → 미국 데이터(MIMIC-III) 평가.
 
 사용법:
     python -m downstream.acute_event.cardiac_arrest.run \
         --checkpoint best.pt \
-        --data-path datasets/processed/cardiac_arrest/cardiac_arrest_w600s.pt \
-        --mode linear_probe --epochs 30
+        --data-path datasets/processed/cardiac_arrest/cardiac_arrest_ecg_ppg_w600s_h15min \
+        --mode linear_probe --n-folds 5 --fold 0 --epochs 100
 """
 
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import sys
+import warnings
 from pathlib import Path
 
 import numpy as np
 import torch
 from torch import nn
+
+from data.collate import PackedBatch
+from data.dataset import BiosignalSample
+from data.spatial_map import SIGNAL_KEY_TO_TYPE, get_global_spatial_id
 
 from downstream.metrics import (
     compute_auroc,
@@ -34,180 +46,165 @@ from downstream.metrics import (
 )
 from downstream.viz import plot_roc_curve
 from downstream.model_wrapper import LinearProbe
+from downstream.window_task import make_window_batches, iter_window_batches
 from downstream._eval_utils import dump_fold_predictions
-from downstream.aggregator import (
-    SIGNAL_TYPE_INT,
-    TransformerAggregator,
-    collate_patients,
-    encode_patient_windows,
-)
+from downstream._save_utils import load_prepared_split_chunked
 from downstream._ddp_utils import (
+    ddp_enabled,
     ddp_world_size,
     equalize_shard,
     gather_concat,
     is_main,
     maybe_init_ddp,
-    run_aggregator_forward,
     shard_for_rank,
-    wrap_aggregator_ddp,
+    wrap_lora_ddp,
 )
 
 
 DEFAULT_PATCH_SIZE = 100
 DEFAULT_SR = 100.0
 
+# v2: data.spatial_map 의 SSOT(SIGNAL_KEY_TO_TYPE) 사용 (로컬 dict drift 방지).
+SIGNAL_TYPE_INT: dict[str, int] = SIGNAL_KEY_TO_TYPE
 
-# ── 학습 ─────────────────────────────────────────────────────
+
+# ── 배치 생성 ─────────────────────────────────────────────────
 
 
-def train_model(
-    model,
-    aggregator: TransformerAggregator,
-    probe: LinearProbe,
-    train_patients: list[dict],
-    epochs: int,
-    lr: float,
-    device: torch.device,
+def _make_samples(
+    signals: dict[str, np.ndarray],
+    idx: int,
+) -> list[BiosignalSample]:
+    samples = []
+    for ch, (sig_type, signal) in enumerate(signals.items()):
+        stype_int = SIGNAL_TYPE_INT.get(sig_type, 0)
+        spatial_id = get_global_spatial_id(stype_int, 0)
+        samples.append(
+            BiosignalSample(
+                values=torch.from_numpy(signal).float(),
+                length=len(signal),
+                channel_idx=ch,
+                recording_idx=idx,
+                sampling_rate=DEFAULT_SR,
+                n_channels=len(signals),
+                win_start=0,
+                signal_type=stype_int,
+                session_id=f"ca_{idx}",
+                spatial_id=spatial_id,
+            )
+        )
+    return samples
+
+
+def _make_batches(
+    windows: list[dict],
+    batch_size: int,
     patch_size: int,
-    max_windows: int,
-    batch_size: int = 8,
-    use_lora: bool = False,
-    gradient_clip: float = 1.0,
-    ddp_module=None,
-    cached_reprs_override: list[torch.Tensor] | None = None,
-) -> list[float]:
-    aggregator = aggregator.to(device)
-    probe = probe.to(device)
-    aggregator.train()
-    probe.train()
-
-    params = list(aggregator.parameters()) + list(probe.parameters())
-    if use_lora:
-        model.model.train()
-        params += model.lora_parameters()
-
-    optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=0.01)
-    criterion = nn.BCEWithLogitsLoss()
-    losses = []
-
-    # ── 성능/OOM: frozen encoder(linear_probe)면 환자 윈도우 인코딩을 1회만 수행하고
-    # CPU 에 캐시한다. encoder 가 frozen 이라 매 epoch reprs 가 동일하므로 epoch 루프
-    # 안에서 인코더 forward 를 반복할 필요가 없다 (수치 동일, 중복 재계산·재 I/O 제거).
-    # LoRA 는 encoder 가 매 epoch 갱신되어 features 가 바뀌므로 캐시 불가 → 기존 경로 유지.
-    # cached_reprs_override: DDP sharded 추출 경로에서 rank0 가 gather 한 reprs 주입
-    # (재추출 생략). 단일 GPU 면 None → 기존처럼 내부 추출(불변).
-    cached_reprs: list[torch.Tensor] | None = None
-    if not use_lora:
-        if cached_reprs_override is not None:
-            cached_reprs = cached_reprs_override
-        else:
-            cached_reprs = []
-            for p in train_patients:
-                reprs = encode_patient_windows(
-                    model, p, patch_size, max_windows,
-                    use_lora=False, session_prefix="cardiac_arrest",
-                )
-                cached_reprs.append(reprs.detach().cpu())
-
-    for epoch in range(epochs):
-        rng = np.random.default_rng(epoch)
-        order = rng.permutation(len(train_patients))
-        epoch_loss, n_batches = 0.0, 0
-
-        for batch_start in range(0, len(order), batch_size):
-            batch_indices = order[batch_start: batch_start + batch_size]
-
-            if ddp_module is not None:
-                # ── DDP 경로: encode→aggregate→probe 를 한 forward 로 묶어 grad
-                # all-reduce 가 등록되게 한다 (단일 GPU 경로는 아래 else 그대로). ──
-                batch_patients = [train_patients[idx] for idx in batch_indices]
-                labels = torch.tensor(
-                    [p["label"] for p in batch_patients],
-                    dtype=torch.float32, device=device,
-                )
-                logits = run_aggregator_forward(
-                    ddp_module, model, batch_patients, patch_size, max_windows,
-                    session_prefix="cardiac_arrest",
-                )
-            else:
-                patient_reprs = []
-                batch_labels = []
-                for idx in batch_indices:
-                    p = train_patients[idx]
-                    if cached_reprs is not None:
-                        # frozen encoder → epoch 마다 동일한 캐시된 repr 재사용 (인코더 forward 없음)
-                        reprs = cached_reprs[idx]
-                    else:
-                        reprs = encode_patient_windows(
-                            model, p, patch_size, max_windows,
-                            use_lora=use_lora, session_prefix="cardiac_arrest",
-                        )
-                    patient_reprs.append(reprs)
-                    batch_labels.append(p["label"])
-
-                padded, mask, labels, _ = collate_patients(
-                    patient_reprs, batch_labels, device
-                )
-                patient_repr = aggregator(padded, mask)
-                logits = probe(patient_repr)
-
-            loss = criterion(logits.squeeze(-1), labels)
-
-            optimizer.zero_grad()
-            loss.backward()
-            nn.utils.clip_grad_norm_(params, gradient_clip)
-            optimizer.step()
-
-            epoch_loss += loss.item()
-            n_batches += 1
-
-        avg = epoch_loss / max(n_batches, 1)
-        losses.append(avg)
-        if (epoch + 1) % 5 == 0 or epoch == 0:
-            print(f"  Epoch {epoch + 1}/{epochs}  loss={avg:.4f}")
-
-    return losses
+    max_length: int,
+) -> list[tuple[PackedBatch, torch.Tensor]]:
+    return make_window_batches(
+        windows,
+        batch_size,
+        patch_size,
+        to_samples=lambda w, idx: _make_samples(w["signals"], idx),
+        get_label=lambda w: w["label"],
+    )
 
 
-# ── 평가 ─────────────────────────────────────────────────────
+# ── Mean pooling ─────────────────────────────────────────────
+
+
+def _mean_pool(
+    encoded: torch.Tensor,  # (B, N, d_model)
+    patch_mask: torch.Tensor,  # (B, N)
+) -> torch.Tensor:  # (B, d_model)
+    mask_f = patch_mask.unsqueeze(-1).float()
+    return (encoded * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp(min=1.0)
+
+
+# ── Linear Probe (frozen feature 스트리밍 추출) ──────────────
 
 
 @torch.no_grad()
-def evaluate_model(
-    model,
-    aggregator: TransformerAggregator,
-    probe: LinearProbe,
-    test_patients: list[dict],
-    device: torch.device,
-    patch_size: int,
-    max_windows: int,
-    precomputed_reprs: list[torch.Tensor] | None = None,
-) -> dict:
-    aggregator.to(device).eval()
+def _stream_extract_features(
+    model, windows, batch_size, patch_size, device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """iter_window_batches 로 batch 를 하나씩 빌드·forward·폐기 (peak = batch 1개).
+
+    returns (features (N, d_model) cpu, labels (N,) cpu float).
+    """
+    feats: list[torch.Tensor] = []
+    labs: list[torch.Tensor] = []
+    for batch, labels in iter_window_batches(
+        windows, batch_size, patch_size,
+        to_samples=lambda w, idx: _make_samples(w["signals"], idx),
+        get_label=lambda w: w["label"],
+    ):
+        f = model.extract_features(batch, pool="mean").detach().cpu()
+        feats.append(f)
+        labs.append(labels)
+    if not feats:
+        return torch.empty(0), torch.empty(0)
+    return torch.cat(feats, dim=0), torch.cat(labs, dim=0).float()
+
+
+def _extract_features_maybe_sharded(
+    model, windows, batch_size, patch_size, device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """linear_probe feature 추출 (torchrun 병렬화).
+
+    DDP 면 각 rank 가 windows 의 shard 만 스트리밍 추출(peak=batch 1개)한 뒤
+    gather_concat 으로 모으고 글로벌 idx argsort 로 원본 순서 복원 → rank 수 무관
+    동일 (feature,label) 순서. 비-DDP 면 _stream_extract_features 그대로(byte-identical).
+    non-main 은 gather 참여 후 빈 텐서 반환(직후 호출측 종료).
+    """
+    if not ddp_enabled():
+        return _stream_extract_features(model, windows, batch_size, patch_size, device)
+    my_windows = shard_for_rank(windows)
+    my_gidx = shard_for_rank(list(range(len(windows))))
+    feats, labels = _stream_extract_features(
+        model, my_windows, batch_size, patch_size, device,
+    )
+    local = [(torch.tensor(my_gidx, dtype=torch.long), feats, labels)]
+    gathered = gather_concat(local)
+    if not is_main():
+        return torch.empty(0), torch.empty(0)
+    parts = [g for g in gathered if g[0].numel() > 0]
+    if not parts:
+        return torch.empty(0), torch.empty(0)
+    idx_all = torch.cat([g[0] for g in parts])
+    feats_all = torch.cat([g[1] for g in parts], dim=0)
+    labels_all = torch.cat([g[2] for g in parts], dim=0)
+    order = torch.argsort(idx_all)
+    return feats_all[order], labels_all[order]
+
+
+@torch.no_grad()
+def _eval_probe_cached(probe, features, labels, device):
+    """미리 추출된 cached feature 로 probe 평가."""
     probe.to(device).eval()
-    if hasattr(model, "model"):
-        model.model.eval()
+    logits = probe(features.to(device))
+    scores = torch.sigmoid(logits).squeeze(-1).cpu().numpy()
+    return _compute_metrics(labels.numpy().astype(int), scores)
 
+
+# ── LoRA ─────────────────────────────────────────────────────
+
+
+@torch.no_grad()
+def evaluate_lora(model, probe, test_batches, device):
+    model.model.eval()
+    probe.to(device).eval()
     all_labels, all_scores = [], []
-
-    # precomputed_reprs: DDP sharded 추출 경로의 rank0 gather test reprs (co-index).
-    # 단일 GPU 면 None → 기존처럼 즉시 인코딩(불변).
-    for i, p in enumerate(test_patients):
-        if precomputed_reprs is not None:
-            reprs = precomputed_reprs[i]
-        else:
-            reprs = encode_patient_windows(model, p, patch_size, max_windows)
-        padded = reprs.unsqueeze(0).to(device)
-        mask = torch.ones(1, reprs.shape[0], dtype=torch.bool, device=device)
-
-        patient_repr = aggregator(padded, mask)
-        logit = probe(patient_repr)
-        prob = torch.sigmoid(logit).squeeze().cpu().item()
-
-        all_labels.append(p["label"])
-        all_scores.append(prob)
-
-    return _compute_metrics(np.array(all_labels), np.array(all_scores))
+    for batch, labels in test_batches:
+        batch = model.batch_to_device(batch)
+        out = model.model(batch, task="masked")
+        features = _mean_pool(out["encoded"], out["patch_mask"])
+        logits = probe(features)
+        probs = torch.sigmoid(logits).squeeze(-1).cpu().numpy()
+        all_labels.append(labels.numpy())
+        all_scores.append(probs)
+    return _compute_metrics(np.concatenate(all_labels), np.concatenate(all_scores))
 
 
 # ── 메트릭 ───────────────────────────────────────────────────
@@ -245,15 +242,59 @@ def _compute_metrics(y_true, y_score):
 # ── 데이터 로딩 ──────────────────────────────────────────────
 
 
-def _load_data(data_path: str) -> tuple[list[dict], list[dict], dict]:
-    print(f"\nLoading data: {data_path}")
-    data = torch.load(data_path, weights_only=False)
+def _load_data(args):
+    if not args.data_path:
+        print("ERROR: --data-path required", file=sys.stderr)
+        sys.exit(1)
+
+    load_fold = int(args.fold) if int(args.n_folds) > 1 else None
+    print(f"\nLoading data: {args.data_path} (fold={load_fold})")
+    data = load_prepared_split_chunked(args.data_path, fold=load_fold)
     meta = data.get("metadata", {})
     print(f"  Task: {meta.get('task', '?')}")
     print(f"  Signals: {meta.get('input_signals', '?')}")
-    print(f"  Window: {meta.get('window_sec', '?')}s")
-    print(f"  Aggregation: {meta.get('aggregation', 'window_level')}")
-    return data["train"], data["test"], meta
+    print(f"  Window: {meta.get('window_sec', '?')}s, "
+          f"Horizon: {meta.get('horizon_sec', 0) / 60:.0f}min")
+
+    def _to_windows(split_data):
+        windows = []
+        labels = split_data["labels"]
+        sig_types = list(split_data["signals"].keys())
+        subject_ids = split_data.get("subject_ids", None)
+        case_ids = split_data.get("case_ids", None)
+        for i in range(len(labels)):
+            signals = {st: split_data["signals"][st][i].numpy() for st in sig_types}
+            windows.append({
+                "signals": signals,
+                "label": int(labels[i].item()),
+                "case_id": case_ids[i] if case_ids is not None else 0,
+                "subject_id": subject_ids[i] if subject_ids is not None else "unknown",
+            })
+        return windows
+
+    train_w = _to_windows(data["train"])
+    test_w = _to_windows(data["test"])
+    val_data = data.get("val")  # prepare_ca_sweep 가 저장하는 val split
+    if val_data is not None:
+        val_w = _to_windows(val_data)
+        print(f"  val split (from prepare_data): {len(val_w)} windows")
+    else:
+        # Backward-compat: legacy(no-val) 산출물 — train 에서 20% 동적 split.
+        warnings.warn(
+            "data['val'] not found; falling back to a 20% dynamic split of train. "
+            "Re-run prepare_data.py to get a deterministic val split.",
+            stacklevel=2,
+        )
+        seed = getattr(args, "val_split_seed", 42)
+        rng = np.random.default_rng(seed)
+        idx = np.arange(len(train_w))
+        rng.shuffle(idx)
+        n_val = max(1, int(len(train_w) * 0.2))
+        vset = set(idx[:n_val].tolist())
+        val_w = [w for i, w in enumerate(train_w) if i in vset]
+        train_w = [w for i, w in enumerate(train_w) if i not in vset]
+        print(f"  val split (dynamic, seed={seed}): {len(val_w)} windows")
+    return train_w, val_w, test_w
 
 
 # ── CLI ──────────────────────────────────────────────────────
@@ -261,7 +302,7 @@ def _load_data(data_path: str) -> tuple[list[dict], list[dict], dict]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="cardiac arrest prediction (Patient-Level Transformer Aggregation)"
+        description="Imminent Cardiac Arrest Detection (window-level)"
     )
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--model-version", type=str, default="v1", choices=["v1", "v2"])
@@ -270,37 +311,33 @@ def main() -> None:
                         choices=["linear_probe", "lora"])
     parser.add_argument("--lora-rank", type=int, default=8)
     parser.add_argument("--lora-alpha", type=float, default=16.0)
-    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--patch-size", type=int, default=DEFAULT_PATCH_SIZE)
-    parser.add_argument("--max-windows", type=int, default=24)
-    parser.add_argument("--agg-layers", type=int, default=2)
-    parser.add_argument("--agg-heads", type=int, default=4)
     parser.add_argument("--out-dir", type=str, default=".")
     parser.add_argument("--fold", type=int, default=0,
-                        help="현재 fold 인덱스 (run_eval OOF 집계용 .npz 라벨)")
+                        help="standard 모드 fold 인덱스 (run_eval OOF 집계용)")
     parser.add_argument("--n-folds", type=int, default=1, help="전체 fold 수")
+    parser.add_argument("--val-split-seed", type=int, default=42,
+                        help="legacy(no-val) 산출물에서 동적 val split 시 seed.")
     parser.add_argument("--device", type=str, default="cpu")
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── DDP (B안): torchrun 으로 실행되면 rank 별 GPU 핀 + device 강제. torchrun 이
-    # 아니면 maybe_init_ddp()=None → 단일 GPU 경로(기존) 그대로 (결과 불변). ──
+    # ── DDP (B안): torchrun 으로 실행되면 rank 별 GPU 핀 + device 강제.
+    # torchrun 이 아니면 maybe_init_ddp()=None → 단일 GPU 경로(기존) 그대로.
     ddp_device = maybe_init_ddp()
     use_ddp = ddp_device is not None
     if use_ddp:
         device = ddp_device
         args.device = str(ddp_device)
-        # lora: aggregator DDP. linear_probe: sharded frozen-feature 추출 → gather
-        # → rank0 단독 학습. 둘 다 허용(이전엔 linear_probe 차단).
+        # 두 모드 모두 torchrun 지원: lora=grad all-reduce 데이터 병렬,
+        # linear_probe=feature 추출 shard→gather(grad sync 없음). 저장은 rank0 전담.
         if is_main():
-            print(
-                f"[DDP] world_size={ddp_world_size()}  device={device}  "
-                f"mode={args.mode}"
-            )
+            print(f"[DDP] world_size={ddp_world_size()}  device={device}")
     else:
         device = torch.device(args.device)
 
@@ -309,141 +346,214 @@ def main() -> None:
     print(f"Loading checkpoint: {args.checkpoint}")
     model = DownstreamModelWrapper(args.checkpoint, args.model_version, args.device)
     d_model = model.d_model
-    patch_size = model.patch_size
 
-    use_lora = args.mode == "lora"
-    if use_lora:
+    if args.mode == "lora":
         model.inject_lora(rank=args.lora_rank, alpha=args.lora_alpha)
 
-    train_patients, test_patients, meta = _load_data(args.data_path)
+    train_windows, val_windows, test_windows = _load_data(args)
 
-    n_pos_train = sum(1 for p in train_patients if p["label"] == 1)
-    n_pos_test = sum(1 for p in test_patients if p["label"] == 1)
-    avg_win_train = np.mean([p["n_windows"] for p in train_patients])
-    print(f"  Train: {len(train_patients)} patients "
-          f"({n_pos_train} arrest+, avg {avg_win_train:.1f} windows)")
-    print(f"  Test:  {len(test_patients)} patients "
-          f"({n_pos_test} arrest+)")
+    n_pos_train = sum(1 for w in train_windows if w["label"] == 1)
+    n_pos_val = sum(1 for w in val_windows if w["label"] == 1)
+    n_pos_test = sum(1 for w in test_windows if w["label"] == 1)
+    print(f"  Train: {len(train_windows)} ({n_pos_train} arrest+, "
+          f"{n_pos_train / max(len(train_windows), 1) * 100:.1f}%)")
+    print(f"  Val:   {len(val_windows)} ({n_pos_val} arrest+, "
+          f"{n_pos_val / max(len(val_windows), 1) * 100:.1f}%)")
+    print(f"  Test:  {len(test_windows)} ({n_pos_test} arrest+, "
+          f"{n_pos_test / max(len(test_windows), 1) * 100:.1f}%)")
 
-    # ── DDP 분기 (sepsis 와 동일 원칙) ──
-    # lora: train 환자 shard(+equalize) → aggregator DDP. linear_probe: 각 rank 가
-    # 환자 shard 만 frozen encoder 로 인코딩 → (reprs_cpu,label,case_id) 튜플 묶어
-    # gather_concat(정렬 co-index 보존) → rank0 단독 학습/평가/저장.
-    # risk-set matched negative 구성은 _load_data 가 끝낸 train data 라 분할(stride)
-    # 해도 라벨 분포가 rank 간 고르게 섞이고, linear_probe 는 rank0 가 gather 후
-    # 전체를 학습하므로 risk-set 무결성이 그대로 보존된다.
-    # 단일 GPU(use_ddp=False)면 두 분기 모두 skip → 기존 경로 그대로(불변).
-    cached_train_override: list[torch.Tensor] | None = None
-    test_precomputed: list[torch.Tensor] | None = None
-    if use_ddp and use_lora:
-        n_full = len(train_patients)
-        train_patients = equalize_shard(shard_for_rank(train_patients))
-        if is_main():
-            print(
-                f"  [DDP] train shard: {n_full} → {len(train_patients)}"
-                f"/rank × {ddp_world_size()} ranks"
-            )
-        if len(train_patients) == 0:
-            if is_main():
-                print(
-                    "ERROR: DDP train shard 가 비었습니다 (nproc_per_node 가 train "
-                    "환자 수보다 큼). nproc 를 줄이거나 단일 GPU 로 실행하세요.",
-                    file=sys.stderr,
-                )
-            import torch.distributed as dist
-            dist.destroy_process_group()
-            sys.exit(2)
-    elif use_ddp and not use_lora:
-        # global index(gi)를 튜플에 포함 → gather 후 gi 로 정렬해 원순서 복원 →
-        # 단일 GPU 와 동일 train_patients 순서(동일 minibatch, 학습 재현성 보존).
-        # co-index(reprs↔label↔case_id)는 한 튜플로 묶여 함께 정렬되므로 유지된다.
-        # risk-set matched 구성도 원순서 복원으로 단일 GPU 와 동일하게 학습된다.
-        def _extract_shard_tuples(patients):
-            idxs = shard_for_rank(list(range(len(patients))))
-            out = []
-            for gi in idxs:
-                p = patients[gi]
-                reprs = encode_patient_windows(
-                    model, p, patch_size, args.max_windows,
-                    use_lora=False, session_prefix="cardiac_arrest",
-                )
-                out.append(
-                    (gi, reprs.detach().cpu(), p["label"], str(p["subject_id"]))
-                )
-            return out
+    probe = LinearProbe(d_model, n_classes=1)
+    is_lora = args.mode == "lora"
 
-        if is_main():
-            print(f"  [DDP] sharded frozen-feature 추출 × {ddp_world_size()} ranks")
-        g_train = gather_concat(_extract_shard_tuples(train_patients))
-        g_test = gather_concat(_extract_shard_tuples(test_patients))
-        if not is_main():
+    # ── 준비: linear_probe=frozen feature 캐싱 / lora=batch 빌드 + DDP shard ──
+    # IOH/ICH 와 동일하게 매 epoch val AUROC 로 best-ckpt 를 잡고, 마지막에 best-val
+    # 시점을 복원해 test 1회. 긴 학습에서도 overfitting 이 test 지표를 안 해친다.
+    max_length: int | None = None
+    train_features = train_labels = None
+    val_features = val_labels = None
+    test_features = test_labels = None
+    train_batches = None
+    val_batches = None
+    lora_params = None
+    ddp_module = None
+
+    if not is_lora:
+        # frozen encoder feature 1회 추출(train/val/test). DDP 면 rank 별 shard 추출
+        # → gather(원본 순서 복원) → rank0 만 probe 학습·평가. 단일 GPU 면 동일 경로.
+        train_features, train_labels = _extract_features_maybe_sharded(
+            model, train_windows, args.batch_size, args.patch_size, device,
+        )
+        val_features, val_labels = _extract_features_maybe_sharded(
+            model, val_windows, args.batch_size, args.patch_size, device,
+        )
+        test_features, test_labels = _extract_features_maybe_sharded(
+            model, test_windows, args.batch_size, args.patch_size, device,
+        )
+        if use_ddp and not is_main():
             import torch.distributed as dist
             dist.destroy_process_group()
             return
-        g_train.sort(key=lambda t: t[0])
-        g_test.sort(key=lambda t: t[0])
-        train_patients = [
-            {"label": lbl, "subject_id": cid, "n_windows": r.shape[0]}
-            for (_gi, r, lbl, cid) in g_train
-        ]
-        cached_train_override = [r for (_gi, r, _lbl, _cid) in g_train]
-        test_patients = [
-            {"label": lbl, "subject_id": cid, "n_windows": r.shape[0]}
-            for (_gi, r, lbl, cid) in g_test
-        ]
-        test_precomputed = [r for (_gi, r, _lbl, _cid) in g_test]
-
-    aggregator = TransformerAggregator(
-        d_model=d_model, n_heads=args.agg_heads,
-        n_layers=args.agg_layers, max_windows=args.max_windows,
-    )
-    probe = LinearProbe(d_model, n_classes=1)
-
-    n_agg = sum(p.numel() for p in aggregator.parameters())
-    print(f"\n  Aggregator: {n_agg:,} params | Probe: {sum(p.numel() for p in probe.parameters()):,} params")
-
-    # DDP lora: encode→aggregate→probe 를 한 forward 로 묶어 grad all-reduce 등록.
-    # linear_probe DDP 는 rank0 단독 학습이라 wrap 불필요(ddp_module=None).
-    # 단일 GPU 면 ddp_module=None → 기존 직접 호출 경로(불변).
-    agg_ddp = None
-    if use_ddp and use_lora:
-        aggregator = aggregator.to(device)
         probe = probe.to(device)
-        agg_ddp = wrap_aggregator_ddp(model.model, aggregator, probe)
+        optimizer = torch.optim.Adam(probe.parameters(), lr=args.lr)
+        train_features = train_features.to(device)
+        train_labels = train_labels.to(device)
+        val_features = val_features.to(device)
+        print(f"\nTraining LinearProbe (d_model={d_model}) with val best-ckpt...")
+    else:
+        # lora: encoder fine-tune → feature 캐싱 불가, pre-built batches 필요.
+        # ── DDP(B안): train window 를 rank 별 분할 + 전 rank 최소 길이 정렬(step 동기화).
+        #   val/test 는 분할하지 않는다(평가는 rank0 가 full set 으로 수행).
+        if use_ddp:
+            n_full = len(train_windows)
+            train_windows = equalize_shard(shard_for_rank(train_windows))
+            if is_main():
+                print(
+                    f"  [DDP] train shard: {n_full} → {len(train_windows)}"
+                    f"/rank × {ddp_world_size()} ranks"
+                )
+            if len(train_windows) == 0:
+                # world_size 가 train window 수보다 크면 빈 shard → random-init LoRA
+                # 가 "결과"로 저장될 위험. 명시적으로 차단.
+                if is_main():
+                    print(
+                        "ERROR: DDP train shard 가 비었습니다 (nproc_per_node 가 "
+                        "train window 수보다 큼). nproc 를 줄이거나 단일 GPU 로 "
+                        "실행하세요.",
+                        file=sys.stderr,
+                    )
+                import torch.distributed as dist
+                dist.destroy_process_group()
+                sys.exit(2)
+        first_sig = next(iter(train_windows[0]["signals"].values()))
+        max_length = len(first_sig)
+        train_batches = _make_batches(
+            train_windows, args.batch_size, args.patch_size, max_length,
+        )
+        # val batch 는 rank0 만 평가에 쓴다(분할 X — full val set).
+        if is_main():
+            val_batches = _make_batches(
+                val_windows, args.batch_size, args.patch_size, max_length,
+            )
+        probe = probe.to(device)
+        lora_params = model.lora_parameters()
+        optimizer = torch.optim.AdamW(
+            [
+                {"params": lora_params, "lr": args.lr},
+                {"params": probe.parameters(), "lr": args.lr},
+            ],
+            weight_decay=0.01,
+        )
+        # DDP: encode→pool→probe 를 한 forward 로 묶어 grad all-reduce 등록. 단일 GPU
+        # 면 use_ddp=False → ddp_module=None → 기존 _make/forward 경로 그대로(불변).
+        ddp_module = wrap_lora_ddp(model.model, probe) if use_ddp else None
+        n_lora = sum(p.numel() for p in model.lora_parameters())
+        print(f"\nTraining LoRA + Probe (rank={args.lora_rank}, LoRA={n_lora:,}) "
+              f"with val best-ckpt...")
 
-    print(f"\nTraining ({args.mode})...")
-    train_losses = train_model(
-        model, aggregator, probe, train_patients,
-        epochs=args.epochs, lr=args.lr, device=device,
-        patch_size=patch_size, max_windows=args.max_windows,
-        batch_size=args.batch_size, use_lora=use_lora,
-        ddp_module=agg_ddp, cached_reprs_override=cached_train_override,
-    )
+    criterion = nn.BCEWithLogitsLoss()
+    train_losses: list[float] = []
+    best_val_auroc = -1.0
+    best_epoch = -1
+    best_probe_state: dict | None = None
+    best_model_state: dict | None = None  # lora 에서만
 
-    # ── DDP lora: 학습 종료 동기화 후 non-rank0 종료 (평가/저장은 rank0 전담).
-    # val/best-ckpt 가 없어 train→test 직행이므로 barrier 를 학습 직후에 둔다.
-    # (linear_probe DDP 는 추출 직후 non-rank0 가 이미 종료했다.) ──
-    if use_ddp and use_lora:
+    for epoch in range(args.epochs):
+        probe.train()
+        if is_lora:
+            model.model.train()
+            if ddp_module is not None:
+                ddp_module.train()
+        epoch_loss, n_steps = 0.0, 0
+
+        if not is_lora:
+            n = train_features.size(0)
+            perm = torch.randperm(n, device=device)
+            for i in range(0, n, args.batch_size):
+                idx = perm[i: i + args.batch_size]
+                logits = probe(train_features[idx])
+                loss = criterion(logits, train_labels[idx].unsqueeze(-1))
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                epoch_loss += loss.item()
+                n_steps += 1
+        else:
+            for batch, labels in train_batches:
+                batch = model.batch_to_device(batch)
+                if ddp_module is not None:
+                    logits = ddp_module(batch)
+                else:
+                    out = model.model(batch, task="masked")
+                    features = _mean_pool(out["encoded"], out["patch_mask"])
+                    logits = probe(features)
+                loss = criterion(logits, labels.to(device).unsqueeze(-1))
+                optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(
+                    lora_params + list(probe.parameters()), 1.0,
+                )
+                optimizer.step()
+                epoch_loss += loss.item()
+                n_steps += 1
+
+        avg = epoch_loss / max(n_steps, 1)
+        train_losses.append(avg)
+
+        # ── val best-ckpt (DDP: rank0 만; all-reduce 후 전 rank 파라미터 동일) ──
+        if is_main():
+            probe.eval()
+            if not is_lora:
+                vm = _eval_probe_cached(probe, val_features, val_labels, device)
+            else:
+                model.model.eval()
+                vm = evaluate_lora(model, probe, val_batches, device)
+            val_auroc = float(vm["auroc"])
+            if val_auroc > best_val_auroc:
+                best_val_auroc = val_auroc
+                best_epoch = epoch
+                best_probe_state = copy.deepcopy(probe.state_dict())
+                if is_lora:
+                    best_model_state = copy.deepcopy(model.model.state_dict())
+            if (epoch + 1) % 5 == 0 or epoch == 0 or epoch == args.epochs - 1:
+                print(
+                    f"  Epoch {epoch + 1}/{args.epochs}  loss={avg:.4f}  "
+                    f"val_auroc={val_auroc:.4f}  "
+                    f"(best={best_val_auroc:.4f}@ep{best_epoch + 1})"
+                )
+
+    # DDP(lora): 학습 종료 동기화 후 test/저장은 rank0 전담 → non-rank0 정리·종료.
+    # (linear_probe non-main 은 위 feature 추출 직후 이미 종료했다.)
+    if use_ddp and is_lora:
         import torch.distributed as dist
         dist.barrier()
         if not is_main():
             dist.destroy_process_group()
             return
 
-    print("\nEvaluating...")
-    metrics = evaluate_model(
-        model, aggregator, probe, test_patients,
-        device=device, patch_size=patch_size, max_windows=args.max_windows,
-        precomputed_reprs=test_precomputed,
-    )
+    # ── best-val ckpt 복원 후 test 1회 ──
+    if best_probe_state is None:
+        print("WARNING: no best ckpt captured; using last epoch.", file=sys.stderr)
+    else:
+        probe.load_state_dict(best_probe_state)
+        if is_lora and best_model_state is not None:
+            model.model.load_state_dict(best_model_state)
+
+    print("\nEvaluating on test set with best-val ckpt...")
+    if not is_lora:
+        metrics = _eval_probe_cached(probe, test_features, test_labels, device)
+    else:
+        test_batches = _make_batches(
+            test_windows, args.batch_size, args.patch_size, max_length,
+        )
+        metrics = evaluate_lora(model, probe, test_batches, device)
 
     y_true = metrics.pop("y_true")
     y_score = metrics.pop("y_score")
-    # patient-level grouping id (test_patients 순서 = 예측 순서).
-    patient_ids = [str(p["subject_id"]) for p in test_patients]
+    # subject-level grouping id (test_windows 순서 = 예측 순서).
+    patient_ids = [str(w.get("subject_id", "unknown")) for w in test_windows]
 
     print(f"\n{'=' * 60}")
-    print(f"  cardiac arrest prediction — {args.mode} (Transformer Aggregator)")
+    print(f"  Imminent Cardiac Arrest Detection - {args.mode}")
     print(f"{'=' * 60}")
     print(f"  AUROC:       {metrics['auroc']:.4f}")
     print(f"  AUPRC:       {metrics['auprc']:.4f}")
@@ -454,12 +564,12 @@ def main() -> None:
           f"({metrics['n_positive']}/{metrics['n_total']})")
     print(f"{'=' * 60}")
 
-    # n_folds>1 이면 fold suffix 를 json·png 에 붙여 같은 out-dir 동시/순차 5-fold
-    # 실행 시 torn-write·덮어쓰기를 막는다(.npz 와 동일 규칙). single split 은 기존명.
+    # fold suffix: n_folds>1 동시 실행 시 ROC PNG/JSON 충돌(torn-file) 방지.
     fold_suffix = f"_fold{args.fold}" if int(args.n_folds) > 1 else ""
     roc_path = out_dir / f"cardiac_arrest_roc_{args.mode}{fold_suffix}.png"
     plot_roc_curve(y_true, y_score, roc_path,
-                   title=f"Cardiac Arrest — {args.mode} ROC")
+                   title=f"Imminent Cardiac Arrest - {args.mode} ROC")
+    print(f"\nROC curve: {roc_path}")
 
     results = {
         **metrics,
@@ -468,10 +578,10 @@ def main() -> None:
         "patient_ids": patient_ids,
         "train_losses": train_losses,
         "config": {
-            "task": "cardiac_arrest_prediction", "mode": args.mode,
-            "aggregation": "transformer",
-            "agg_layers": args.agg_layers, "max_windows": args.max_windows,
-            "data_path": args.data_path, "epochs": args.epochs, "lr": args.lr,
+            "task": "cardiac_arrest_prediction",
+            "mode": args.mode,
+            "data_path": args.data_path,
+            "epochs": args.epochs, "lr": args.lr,
         },
     }
     results_path = out_dir / f"cardiac_arrest_results_{args.mode}{fold_suffix}.json"
@@ -480,8 +590,9 @@ def main() -> None:
     print(f"Results: {results_path}")
 
     npz_path = dump_fold_predictions(
-        out_dir, task="cardiac_arrest", fold_idx=args.fold, n_folds=args.n_folds,
-        y_true=y_true, y_score=y_score, patient_ids=patient_ids,
+        out_dir, task="cardiac_arrest", fold_idx=args.fold,
+        n_folds=args.n_folds, y_true=y_true, y_score=y_score,
+        patient_ids=patient_ids,
     )
     print(f"Fold predictions: {npz_path}")
 
