@@ -61,12 +61,12 @@ LORA_ALPHA=${LORA_ALPHA:-16}
 # 전 fold/config 는 동일 (실행모드 × effective batch × LR) 로 고정해야 표 비교 성립.
 LORA_BATCH=${LORA_BATCH:-128}
 
-# ── B안: NPROC>1 이면 lora 를 torchrun 데이터 병렬(단일 fold DDP)로 실행 ──
-# linear_probe 는 frozen feature 캐싱이라 DDP 이득 없음 → 항상 python -m.
-# PRINT_ONLY(A안 run_sharded 용 단일 GPU job 출력)와는 배타적: PRINT_ONLY=1 이면
-# lora 도 반드시 python -m 으로 출력한다(run_sharded 가 GPU 1장에 핀하므로 torchrun
-# 금지). 두 가속(A안 job-sharding × B안 torchrun)을 동시에 쓰면 GPU 이중 배정.
-NPROC=${NPROC:-1}
+# ── 한 fold 를 여러 GPU 로 DDP 실행 (단일 fold 데이터 병렬, fold 는 순차) ──
+# 기본 NPROC=4: 각 fold 를 torchrun --nproc_per_node=4 로 4-GPU DDP 실행한다
+# (linear_probe=feature 추출 shard→gather, lora=grad all-reduce; 저장은 rank0 전담).
+# 단일 GPU 로 돌리려면 NPROC=1. PRINT_ONLY(A안 run_sharded=GPU 1장 핀)면 torchrun
+# 금지 → 강제로 python -m 출력(아래). 두 가속(job-sharding × torchrun) 동시 사용 금지.
+NPROC=${NPROC:-4}
 if [ "$NPROC" -gt 1 ]; then
     LORA_LAUNCH="torchrun --nproc_per_node=$NPROC -m"
 else
