@@ -47,7 +47,10 @@ LP_LR=${LP_LR:-1e-3}
 LP_BATCH=${LP_BATCH:-512}
 
 # LoRA 설정 (모두 env override 가능)
-LORA_EPOCHS=${LORA_EPOCHS:-30}
+# epoch 은 상한(ceiling). early-stop(LORA_PATIENCE)이 val 수렴 시 자동 중단하므로
+# 넉넉히 두면 "수렴 보장 + 시간 절약". LP 는 캐시 위 학습이라 early-stop 없이 1000 고정.
+LORA_EPOCHS=${LORA_EPOCHS:-200}
+LORA_PATIENCE=${LORA_PATIENCE:-20}   # val best 20 epoch 미개선 시 중단(run.py EARLY_STOP_PATIENCE)
 LORA_LR=${LORA_LR:-1e-4}
 LORA_RANK=${LORA_RANK:-8}
 LORA_ALPHA=${LORA_ALPHA:-16}
@@ -132,11 +135,13 @@ for SIGNALS in "${SIGNAL_COMBOS[@]}"; do
                     LR=$LP_LR
                     BATCH=$LP_BATCH
                     EXTRA_ARGS=""
+                    PAT=0                       # LP 는 early-stop 없이 1000 고정
                 else
                     EPOCHS=$LORA_EPOCHS
                     LR=$LORA_LR
                     BATCH=$LORA_BATCH
                     EXTRA_ARGS="--lora-rank $LORA_RANK --lora-alpha $LORA_ALPHA"
+                    PAT=$LORA_PATIENCE          # LoRA 는 early-stop(상한 LORA_EPOCHS)
                 fi
 
                 EXP_DIR="${OUT_DIR}/${MODE}/${SIGNALS}_w${W}s_h${H}min"
@@ -162,7 +167,7 @@ for SIGNALS in "${SIGNAL_COMBOS[@]}"; do
 
                     loge "\n[${COUNT}/${TOTAL}] ${MODE} | ${SIGNALS} | w=${W}s h=${H}min | fold ${f}"
 
-                    CMD="$LAUNCH downstream.acute_event.hypotension.run \
+                    CMD="EARLY_STOP_PATIENCE=$PAT $LAUNCH downstream.acute_event.hypotension.run \
                         --checkpoint $CHECKPOINT \
                         --model-version $MODEL_VERSION \
                         --mode $MODE \

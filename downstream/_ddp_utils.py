@@ -119,6 +119,26 @@ def equalize_shard(items: list) -> list:
     return items[:n_min]
 
 
+def broadcast_should_stop(should_stop: bool, device) -> bool:
+    """rank0 의 early-stop 결정을 전 rank 로 broadcast (비-DDP 면 입력 그대로 반환).
+
+    DDP(lora) 에서 val 은 rank0 만 보므로 stop 판단도 rank0 만 한다. 그대로 break
+    하면 rank 별 epoch 수가 달라져 다음 collective(grad all-reduce/barrier)에서
+    desync→hang 한다. 따라서 rank0 의 bool 을 broadcast 해 **모든 rank 가 같은
+    epoch 에 함께 break** 하게 한다.
+
+    ⚠ 호출 조건: DDP 면서 **전 rank 가 학습 루프에 함께 있을 때만**(=lora) 호출.
+    linear_probe 는 non-rank0 가 feature 추출 직후 종료해 rank0 단독이므로, 이
+    함수를 부르면 떠난 peer 를 기다리며 hang 한다 → LP/단일GPU 는 호출하지 말고
+    로컬 bool 을 그대로 쓸 것.
+    """
+    if not ddp_enabled():
+        return should_stop
+    t = torch.tensor([1 if should_stop else 0], device=device)
+    dist.broadcast(t, src=0)
+    return bool(t.item())
+
+
 # ── DDP forward 래퍼 ─────────────────────────────────────────
 
 

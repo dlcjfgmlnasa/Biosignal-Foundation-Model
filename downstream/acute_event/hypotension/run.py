@@ -24,6 +24,7 @@ import contextlib
 import copy
 import gc
 import json
+import os
 import sys
 import warnings
 from dataclasses import dataclass
@@ -64,6 +65,7 @@ from downstream._save_utils import (
     load_prepared_split_chunked,
 )
 from downstream._ddp_utils import (
+    broadcast_should_stop,
     ddp_enabled,
     ddp_world_size,
     equalize_shard,
@@ -1292,6 +1294,10 @@ def main() -> None:
     best_epoch = -1
     best_probe_state: dict | None = None
     best_model_state: dict | None = None  # LoRA mode 에서만 저장
+    # early stopping: val best 가 patience epoch 동안 미개선이면 중단(0=비활성).
+    # epoch 상한은 넉넉히 두고 수렴 시 자동 종료 → 수렴 보장 + 시간 절약.
+    patience = int(os.environ.get("EARLY_STOP_PATIENCE", "0"))
+    no_improve = 0
 
     # 캐싱은 위 데이터 로드 단계에서 이미 완료(linear_probe). cached_* 는
     # frozen-encoder feature 라 epoch 간 불변 → encoder forward 반복 제거.
@@ -1402,6 +1408,19 @@ def main() -> None:
                     f"val_auroc={val_auroc:.4f}  "
                     f"(best={best_val_auroc:.4f}@ep{best_epoch + 1})"
                 )
+
+        # ── early stopping ──
+        # no_improve 추적은 best 갱신 주체인 rank0 에서만. DDP(lora) 는 rank0 의 stop
+        # 결정을 broadcast 해 전 rank 가 같은 epoch 에 함께 break(desync 방지).
+        # linear_probe 는 non-rank0 가 이미 종료해 rank0 단독 → broadcast 없이 로컬 판단.
+        if is_main():
+            no_improve = 0 if best_epoch == epoch else no_improve + 1
+        stop_local = patience > 0 and is_main() and no_improve >= patience
+        stop = broadcast_should_stop(stop_local, device) if (use_ddp and is_lora) else stop_local
+        if stop:
+            if is_main():
+                print(f"  [early-stop] epoch {epoch + 1}: val 무개선 {patience} epoch → 중단")
+            break
 
     # DDP(lora): 학습 종료 동기화 후 test/저장은 rank0 전담 → non-rank0 정리·종료.
     # ⚠ linear_probe 에서는 non-rank0 가 feature 추출 직후(위 _stream/_cache 블록) 이미
