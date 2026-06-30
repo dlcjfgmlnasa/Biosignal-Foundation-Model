@@ -48,6 +48,7 @@ import argparse
 import gc
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -63,17 +64,169 @@ from data.parser.vitaldb import (
     _apply_range_check,
     _fill_short_nan_gaps,
 )
+from downstream._gap_mask import (
+    DEFAULT_VALID_RATIO_THRESHOLD,
+    GapStats,
+    apply_gap_mask_multichannel,
+    compute_valid_ratio,
+)
 from downstream._kfold_utils import (
     stratified_kfold_patient_splits,
     summarize_splits,
 )
-from downstream._save_utils import add_signal_dtype_arg
-from downstream.acute_event.cardiac_arrest.prepare_data import (
-    TARGET_SR,
-    GapStats,
-    _consume_to_tensors_ca,
-    extract_ca_window_samples,
-)
+from downstream._save_utils import add_signal_dtype_arg, consume_gap_masks
+
+# 100Hz 통일 (pretraining 과 동일). prepare_data.py 의 동명 상수와 동일 값.
+TARGET_SR: float = 100.0
+
+
+# ── window 추출/패킹 (drift 방지 위해 self-contained — 커밋된 유틸만 의존) ─────
+# NOTE: MIMIC prepare_data.py 의 extract_ca_window_samples / _consume_to_tensors_ca
+#       와 알고리즘 동일. 서버 코드 드리프트(prepare_data.py 미커밋)에 영향받지
+#       않도록 SCOPE 모듈에 내장한다.
+
+
+@dataclass
+class CAWindowSample:
+    """곧 일어날 acute event(arrest/death) 예측용 window-level 샘플."""
+
+    input_signals: dict[str, np.ndarray]
+    input_gap_masks: dict[str, np.ndarray]  # bool, True=원본이 NaN (gap)
+    label: int  # 0=neg(Discharge), 1=pos(event)
+    label_value: float  # tte (window end → center, 분)
+    case_id: str
+    patient_id: str
+    win_start_sec: float
+    horizon_sec: float
+
+
+def extract_ca_window_samples(
+    patients: list[dict],
+    input_signals: list[str],
+    window_sec: float = 600.0,
+    stride_sec: float = 30.0,
+    horizon_sec: float = 900.0,
+    max_lead_sec: float = 600.0,
+    valid_ratio_threshold: float = DEFAULT_VALID_RATIO_THRESHOLD,
+    gap_stats: GapStats | None = None,
+    sample_dtype: str = "float16",
+) -> list[CAWindowSample]:
+    """anchor-relative window-level (input, label) 쌍 추출.
+
+    윈도우 종료 절대시각 t_end 의 center 까지 잔여시간 tte = center − t_end.
+    ``horizon_sec ≤ tte ≤ horizon_sec + max_lead_sec`` 인 윈도우만 emit
+    (onset 보다 최소 h, 최대 h+max_lead 앞에서 끝남 → leakage 없음).
+    Gap policy: valid_ratio < threshold → drop, 통과분 NaN→0 + gap_mask 저장.
+    """
+    win_samples = int(window_sec * TARGET_SR)
+    stride_samples = int(stride_sec * TARGET_SR)
+    samples: list[CAWindowSample] = []
+
+    for patient in patients:
+        center = patient["center"]
+        pid = patient["patient_id"]
+        label = int(patient["label"])
+
+        for rec_idx, (rec_start, signals) in enumerate(patient["records"]):
+            avail = [s for s in input_signals if s in signals]
+            if not avail:
+                continue
+            min_len = min(len(signals[s]) for s in avail)
+            if min_len < win_samples:
+                continue
+
+            for start in range(0, min_len - win_samples + 1, stride_samples):
+                end = start + win_samples
+                t_end = rec_start + timedelta(seconds=end / TARGET_SR)
+                tte = (center - t_end).total_seconds()
+                if tte < horizon_sec or tte > horizon_sec + max_lead_sec:
+                    continue
+
+                input_dict = {
+                    s: signals[s][start:end] for s in input_signals if s in signals
+                }
+                if not input_dict:
+                    continue
+
+                valid_ratio = compute_valid_ratio(list(input_dict.values()))
+                if valid_ratio < valid_ratio_threshold:
+                    if gap_stats is not None:
+                        gap_stats.add_drop()
+                    continue
+
+                filled_dict, gap_mask_dict = apply_gap_mask_multichannel(
+                    input_dict, output_dtype=sample_dtype,
+                )
+                if gap_stats is not None:
+                    n_total_s = sum(arr.size for arr in filled_dict.values())
+                    n_gap_s = sum(int(m.sum()) for m in gap_mask_dict.values())
+                    gap_stats.add_window(n_total_s, n_gap_s)
+
+                samples.append(
+                    CAWindowSample(
+                        input_signals=filled_dict,
+                        input_gap_masks=gap_mask_dict,
+                        label=label,
+                        label_value=tte / 60.0,
+                        case_id=f"{pid}_rec{rec_idx}_w{start}",
+                        patient_id=pid,
+                        win_start_sec=start / TARGET_SR,
+                        horizon_sec=horizon_sec,
+                    )
+                )
+
+    return samples
+
+
+def _consume_to_tensors_ca(
+    samples: list[CAWindowSample],
+    input_signals: list[str],
+    signal_dtype: torch.dtype,
+) -> dict:
+    """CA samples → packed dict (in-place, samples 비워짐). torch.stack 2× peak 회피."""
+    if not samples:
+        return {"signals": {}, "gap_masks": {},
+                "labels": torch.tensor([], dtype=torch.long),
+                "label_values": torch.tensor([], dtype=torch.float32),
+                "case_ids": [], "subject_ids": []}
+
+    labels = torch.tensor([s.label for s in samples], dtype=torch.long)
+    label_values = torch.tensor(
+        [s.label_value for s in samples], dtype=torch.float32
+    )
+    case_ids = [s.case_id for s in samples]
+    subject_ids = [s.patient_id for s in samples]
+
+    sig_tensors: dict[str, torch.Tensor] = {}
+    for stype in input_signals:
+        T = next(
+            (int(s.input_signals[stype].shape[0])
+             for s in samples if stype in s.input_signals),
+            None,
+        )
+        if T is None:
+            continue
+        n = sum(1 for s in samples if stype in s.input_signals)
+        out = torch.empty((n, T), dtype=signal_dtype)
+        i = 0
+        for s in samples:
+            arr = s.input_signals.pop(stype, None)
+            if arr is None:
+                continue
+            out[i].copy_(torch.from_numpy(arr))
+            i += 1
+        sig_tensors[stype] = out
+
+    gap_tensors = consume_gap_masks(samples, input_signals, attr="input_gap_masks")
+
+    return {
+        "signals": sig_tensors,
+        "gap_masks": gap_tensors,
+        "labels": labels,
+        "label_values": label_values,
+        "case_ids": case_ids,
+        "subject_ids": subject_ids,
+    }
 
 
 # outcome 를 anchor 한 고정 reference: 2100-01-01 00:00:00 UTC (POSIX 4102444800).
