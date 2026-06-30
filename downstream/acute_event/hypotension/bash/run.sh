@@ -42,7 +42,7 @@ log()  { if [ "$PRINT_ONLY" = "1" ]; then echo    "$@" >&2; else echo    "$@"; f
 loge() { if [ "$PRINT_ONLY" = "1" ]; then echo -e "$@" >&2; else echo -e "$@"; fi; }
 
 # Linear Probe 설정 (frozen feature 캐싱 — batch 는 probe SGD 미니배치에만 영향)
-LP_EPOCHS=${LP_EPOCHS:-1000}
+LP_EPOCHS=${LP_EPOCHS:-2000}
 LP_LR=${LP_LR:-1e-3}
 LP_BATCH=${LP_BATCH:-512}
 
