@@ -83,8 +83,10 @@ SIGNAL_COMBOS=(${SIGNALS_OVERRIDE:-ecg_ppg_abp})
 WINDOWS=(${WINDOWS_OVERRIDE:-300})
 HORIZONS=(${HORIZONS_OVERRIDE:-5 10 15})
 MODES=(${MODES_OVERRIDE:-linear_probe lora})
+N_FOLDS=${N_FOLDS:-5}   # stratified k-fold CV — fold 별로 실행(--n-folds/--fold)
+FORCE=${FORCE:-0}       # 1 이면 완료된 fold(preds_fold{f}.npz)도 재실행
 
-TOTAL=$(( ${#SIGNAL_COMBOS[@]} * ${#WINDOWS[@]} * ${#HORIZONS[@]} * ${#MODES[@]} ))
+TOTAL=$(( ${#SIGNAL_COMBOS[@]} * ${#WINDOWS[@]} * ${#HORIZONS[@]} * ${#MODES[@]} * N_FOLDS ))
 COUNT=0
 
 log "============================================================"
@@ -109,25 +111,21 @@ log "============================================================"
 for SIGNALS in "${SIGNAL_COMBOS[@]}"; do
     for W in "${WINDOWS[@]}"; do
         for H in "${HORIZONS[@]}"; do
-            # .pt 파일 경로
-            PT_FILE="${DATA_DIR}/hypotension_${SIGNALS}_w${W}s_h${H}min.pt"
+            # ⚠ 데이터는 단일 .pt 가 아니라 per-(fold,split)[_chunk] prefix 묶음이다.
+            #   예: hypotension_ecg_ppg_abp_w300s_h5min_fold0_train_chunk0.pt
+            #   run.py 는 --data-path PREFIX(.pt 없이) + --n-folds/--fold 로 해당 fold
+            #   chunk 들을 로드한다(load_prepared_split_chunked).
+            PREFIX="${DATA_DIR}/hypotension_${SIGNALS}_w${W}s_h${H}min"
 
-            if [ ! -f "$PT_FILE" ]; then
-                log "  SKIP: $PT_FILE not found"
+            if ! ls "${PREFIX}"_fold0_*.pt >/dev/null 2>&1; then
+                log "  SKIP: ${PREFIX}_fold0_*.pt not found (prepare_data 필요)"
                 continue
             fi
 
+            # --input-signals: underscore → space 변환
+            INPUT_SIGNALS=$(echo "$SIGNALS" | tr '_' ' ')
+
             for MODE in "${MODES[@]}"; do
-                COUNT=$((COUNT + 1))
-                EXP_DIR="${OUT_DIR}/${MODE}/${SIGNALS}_w${W}s_h${H}min"
-                # PRINT_ONLY 면 디렉토리 생성 보류(실제 실행 시점에 run.py 가 만든다).
-                # stale OUT_DIR 에 디렉토리를 미리 파지 않도록.
-                if [ "$PRINT_ONLY" != "1" ]; then
-                    mkdir -p "$EXP_DIR"
-                fi
-
-                loge "\n[${COUNT}/${TOTAL}] ${MODE} | ${SIGNALS} | w=${W}s h=${H}min"
-
                 # 모드별 인자 설정
                 if [ "$MODE" = "linear_probe" ]; then
                     EPOCHS=$LP_EPOCHS
@@ -140,41 +138,54 @@ for SIGNALS in "${SIGNAL_COMBOS[@]}"; do
                     BATCH=$LORA_BATCH
                     EXTRA_ARGS="--lora-rank $LORA_RANK --lora-alpha $LORA_ALPHA"
                 fi
-                # launcher 선택 (linear_probe·lora 공통): PRINT_ONLY(A안 run_sharded =
-                # GPU 1장 핀)면 반드시 python -m, 아니면 $LORA_LAUNCH(NPROC>1 시 torchrun).
-                # 두 모드 모두 torchrun 병렬 지원: lora=grad 데이터병렬,
-                # linear_probe=feature 추출 shard→gather(저장은 rank0 전담).
+
+                EXP_DIR="${OUT_DIR}/${MODE}/${SIGNALS}_w${W}s_h${H}min"
+                if [ "$PRINT_ONLY" != "1" ]; then
+                    mkdir -p "$EXP_DIR"
+                fi
+
+                # launcher 선택: PRINT_ONLY(run_sharded = GPU 1장 핀)면 python -m,
+                # 아니면 $LORA_LAUNCH(NPROC>1 시 torchrun DDP).
                 if [ "$PRINT_ONLY" = "1" ]; then
                     LAUNCH="python -m"
                 else
                     LAUNCH="$LORA_LAUNCH"
                 fi
 
-                # --input-signals: underscore → space 변환
-                INPUT_SIGNALS=$(echo "$SIGNALS" | tr '_' ' ')
+                for f in $(seq 0 $((N_FOLDS - 1))); do
+                    COUNT=$((COUNT + 1))
+                    # resume: 완료 fold(preds_fold{f}.npz)는 건너뜀. FORCE=1 이면 재실행.
+                    if [ "$FORCE" != "1" ] && [ -f "${EXP_DIR}/preds_fold${f}.npz" ]; then
+                        log "  [skip] done: ${EXP_DIR} (fold $f)"
+                        continue
+                    fi
 
-                CMD="$LAUNCH downstream.acute_event.hypotension.run \
-                    --checkpoint $CHECKPOINT \
-                    --model-version $MODEL_VERSION \
-                    --mode $MODE \
-                    --data-path $PT_FILE \
-                    --input-signals $INPUT_SIGNALS \
-                    --window-sec $W \
-                    --epochs $EPOCHS \
-                    --lr $LR \
-                    --batch-size $BATCH \
-                    --device $DEVICE \
-                    --out-dir $EXP_DIR \
-                    $EXTRA_ARGS"
+                    loge "\n[${COUNT}/${TOTAL}] ${MODE} | ${SIGNALS} | w=${W}s h=${H}min | fold ${f}"
 
-                if [ "$PRINT_ONLY" = "1" ]; then
-                    # 한 줄 명령으로 정규화해 출력 (run_sharded 가 한 줄=한 작업).
-                    echo "$CMD" | tr -s ' \t\n' ' '
-                    echo
-                else
-                    eval "$CMD"
-                fi
+                    CMD="$LAUNCH downstream.acute_event.hypotension.run \
+                        --checkpoint $CHECKPOINT \
+                        --model-version $MODEL_VERSION \
+                        --mode $MODE \
+                        --data-path $PREFIX \
+                        --n-folds $N_FOLDS \
+                        --fold $f \
+                        --input-signals $INPUT_SIGNALS \
+                        --window-sec $W \
+                        --epochs $EPOCHS \
+                        --lr $LR \
+                        --batch-size $BATCH \
+                        --device $DEVICE \
+                        --out-dir $EXP_DIR \
+                        $EXTRA_ARGS"
 
+                    if [ "$PRINT_ONLY" = "1" ]; then
+                        # 한 줄 명령으로 정규화해 출력 (run_sharded 가 한 줄=한 작업).
+                        echo "$CMD" | tr -s ' \t\n' ' '
+                        echo
+                    else
+                        eval "$CMD"
+                    fi
+                done
             done
         done
     done
