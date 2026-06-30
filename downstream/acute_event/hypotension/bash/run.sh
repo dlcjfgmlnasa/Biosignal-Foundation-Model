@@ -44,7 +44,7 @@ loge() { if [ "$PRINT_ONLY" = "1" ]; then echo -e "$@" >&2; else echo -e "$@"; f
 # Linear Probe 설정 (frozen feature 캐싱 — batch 는 probe SGD 미니배치에만 영향)
 LP_EPOCHS=${LP_EPOCHS:-250}
 LP_LR=${LP_LR:-1e-3}
-LP_BATCH=${LP_BATCH:-32}
+LP_BATCH=${LP_BATCH:-512}
 
 # LoRA 설정 (모두 env override 가능)
 LORA_EPOCHS=${LORA_EPOCHS:-250}
@@ -59,7 +59,7 @@ LORA_ALPHA=${LORA_ALPHA:-16}
 # 또는 명시 재튜닝이 적절 — estimator 검증.) 보수적으로 가려면 LORA_BATCH=32 유지.
 # torchrun(B안) 에선 effective batch = LORA_BATCH × nproc 이라 더 커짐 — 한 task 의
 # 전 fold/config 는 동일 (실행모드 × effective batch × LR) 로 고정해야 표 비교 성립.
-LORA_BATCH=${LORA_BATCH:-128}
+LORA_BATCH=${LORA_BATCH:-512}
 
 # ── 한 fold 를 여러 GPU 로 DDP 실행 (단일 fold 데이터 병렬, fold 는 순차) ──
 # 기본 NPROC=4: 각 fold 를 torchrun --nproc_per_node=4 로 4-GPU DDP 실행한다

@@ -21,7 +21,7 @@ LORA_EPOCHS="${LORA_EPOCHS:-250}"
 LORA_LR="${LORA_LR:-1e-4}"
 LORA_RANK="${LORA_RANK:-8}"
 LORA_ALPHA="${LORA_ALPHA:-16}"
-LORA_BATCH="${LORA_BATCH:-128}"   # ⚠ batch≠32 면 LR 재튜닝 필요 (memory lora_acceleration)
+LORA_BATCH="${LORA_BATCH:-512}"   # ⚠ batch≠32 면 LR 재튜닝 필요 (memory lora_acceleration)
 
 # NPROC>1 → lora 는 torchrun DDP. linear_probe 는 frozen feature 캐싱이라 항상 python -m.
 NPROC=${NPROC:-1}

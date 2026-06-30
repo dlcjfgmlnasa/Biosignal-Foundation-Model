@@ -32,7 +32,7 @@ LP_EPOCHS="${LP_EPOCHS:-250}"
 LORA_EPOCHS="${LORA_EPOCHS:-250}"
 LP_LR="${LP_LR:-1e-3}"
 LORA_LR="${LORA_LR:-1e-4}"
-LP_BATCH="${LP_BATCH:-128}"
+LP_BATCH="${LP_BATCH:-512}"
 LORA_RANK="${LORA_RANK:-8}"
 N_FOLDS="${N_FOLDS:-5}"   # stratified k-fold — fold 별 실행(--n-folds/--fold)
 FORCE="${FORCE:-0}"       # 1 이면 완료 fold(preds_fold{f}.npz)도 재실행
@@ -41,7 +41,7 @@ FORCE="${FORCE:-0}"       # 1 이면 완료 fold(preds_fold{f}.npz)도 재실행
 # 단, batch≠32 면 LoRA 최적화 궤적이 달라져 batch=32 시절 결과와 직접 비교 불가
 # (LR 재튜닝 필요). torchrun(B안)에선 effective batch = LORA_BATCH × nproc.
 # 보수적으로 가려면 LORA_BATCH=32 로 override.
-LORA_BATCH="${LORA_BATCH:-128}"
+LORA_BATCH="${LORA_BATCH:-512}"
 
 # ── 한 fold 를 여러 GPU 로 DDP 실행 (fold 순차, 각 fold torchrun 4-GPU) ──
 # 기본 NPROC=4 (cardiac_arrest/hypotension 과 동일). 단일 GPU 는 NPROC=1.
