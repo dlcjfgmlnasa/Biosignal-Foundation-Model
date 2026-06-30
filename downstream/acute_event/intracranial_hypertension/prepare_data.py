@@ -6,6 +6,8 @@ ICP > 20mmHg (≥1분 지속) 예측용 (input_window, future_label) 쌍을 생�
 
 Label 소스: ICP (미래 구간의 평균 ICP > 20mmHg 지속 여부)
 Input 소스: ICP + 동시 기록된 ECG, ABP, PPG 등
+현재-ICH 제외(HPI 표준): 예측 시점(입력 끝 30초 baseline) ICP<20 인 window 만 사용
+  → 진행 중 두개내압 상승의 연속(trivial positive)을 배제, 신규 발생만 예측.
 
 데이터 소스: MIMIC-III Waveform Matched Subset (PhysioNet)
 
@@ -282,6 +284,17 @@ def extract_forecast_samples(
             # Step 1: gap-policy window drop (multi-channel valid_ratio)
             valid_ratio = compute_valid_ratio(list(input_dict.values()))
             if valid_ratio < valid_ratio_threshold:
+                if gap_stats is not None:
+                    gap_stats.add_drop()
+                continue
+
+            # ── 현재-ICH 제외 (HPI 표준): 예측 시점(T=입력 끝)에 이미 ICP>threshold 면 drop. ──
+            #   진행 중 두개내압 상승의 연속(trivial positive)을 배제, 신규 발생만 예측.
+            #   입력 끝 30초 baseline ICP 평균이 threshold 이상(또는 확인 불가)이면 버린다.
+            base_start = max(start, start + win_samples - 3 * icp_win)
+            baseline_icp = icp[base_start: start + win_samples]
+            base_valid = baseline_icp[~np.isnan(baseline_icp)]
+            if base_valid.size < icp_win or float(np.mean(base_valid)) >= icp_threshold:
                 if gap_stats is not None:
                     gap_stats.add_drop()
                 continue
