@@ -27,11 +27,15 @@ MODEL_VERSION="${MODEL_VERSION:-v2}"
 # 예) WINDOW_SECS_OVERRIDE=600 HORIZON_MINS_OVERRIDE="10 30" bash run.sh
 WINDOW_SECS=(${WINDOW_SECS_OVERRIDE:-1200})       # 20min 고정
 HORIZON_MINS=(${HORIZON_MINS_OVERRIDE:-5 10 15})  # 이것만 변경
-EPOCHS_LP="${EPOCHS_LP:-250}"
-EPOCHS_LORA="${EPOCHS_LORA:-250}"
-LR_LP="${LR_LP:-1e-3}"
-LR_LORA="${LR_LORA:-1e-4}"
+# 변수명은 전 task 공통 컨벤션: LP_EPOCHS/LORA_EPOCHS, LP_LR/LORA_LR, LP_BATCH/LORA_BATCH
+LP_EPOCHS="${LP_EPOCHS:-250}"
+LORA_EPOCHS="${LORA_EPOCHS:-250}"
+LP_LR="${LP_LR:-1e-3}"
+LORA_LR="${LORA_LR:-1e-4}"
+LP_BATCH="${LP_BATCH:-128}"
 LORA_RANK="${LORA_RANK:-8}"
+N_FOLDS="${N_FOLDS:-5}"   # stratified k-fold — fold 별 실행(--n-folds/--fold)
+FORCE="${FORCE:-0}"       # 1 이면 완료 fold(preds_fold{f}.npz)도 재실행
 # ── C안: LoRA batch-size 상향 (가속) — ⚠ 결과가 바뀌므로 비교성 주의 ──
 # bf16+frozen encoder 라 VRAM 여유가 커 batch 를 키우면 step 수가 줄어 빨라진다.
 # 단, batch≠32 면 LoRA 최적화 궤적이 달라져 batch=32 시절 결과와 직접 비교 불가
@@ -39,10 +43,9 @@ LORA_RANK="${LORA_RANK:-8}"
 # 보수적으로 가려면 LORA_BATCH=32 로 override.
 LORA_BATCH="${LORA_BATCH:-128}"
 
-# ── B안: NPROC>1 이면 lora 를 torchrun 데이터 병렬(단일 fold DDP)로 실행 ──
-# linear_probe 는 frozen feature 캐싱이라 DDP 이득 없음 → 항상 python -m.
-#   NPROC=4 bash run.sh   →   lora 가 torchrun --nproc_per_node=4 로 실행됨.
-NPROC=${NPROC:-1}
+# ── 한 fold 를 여러 GPU 로 DDP 실행 (fold 순차, 각 fold torchrun 4-GPU) ──
+# 기본 NPROC=4 (cardiac_arrest/hypotension 과 동일). 단일 GPU 는 NPROC=1.
+NPROC=${NPROC:-4}
 if [ "$NPROC" -gt 1 ]; then
     LORA_LAUNCH="torchrun --nproc_per_node=$NPROC -m"
 else
@@ -63,45 +66,50 @@ fi
 
 for WIN in "${WINDOW_SECS[@]}"; do
     for HORIZON in "${HORIZON_MINS[@]}"; do
-        DATA_PATH="${DATA_DIR}/intracranial_hypertension_icp_w${WIN}s_h${HORIZON}min.pt"
+        # ⚠ 데이터는 단일 .pt 가 아니라 per-(fold,split)[_chunk] prefix 묶음이다.
+        #   예: intracranial_hypertension_icp_w1200s_h5min_fold0_train_chunk0.pt
+        #   run.py 는 --data-path PREFIX(.pt 없이) + --n-folds/--fold 로 로드.
+        PREFIX="${DATA_DIR}/intracranial_hypertension_icp_w${WIN}s_h${HORIZON}min"
 
-        if [ ! -f "$DATA_PATH" ]; then
-            echo "[SKIP] Not found: $DATA_PATH"
+        if ! ls "${PREFIX}"_fold0_*.pt >/dev/null 2>&1; then
+            echo "[SKIP] ${PREFIX}_fold0_*.pt not found (prepare_data 필요)"
             continue
         fi
 
         EXP_NAME="w${WIN}s_h${HORIZON}min"
-        echo -e "\n[${EXP_NAME}]"
 
-        # Linear Probe (NPROC>1 이면 feature 추출을 torchrun shard→gather 병렬화)
-        EXP_DIR="${OUT_DIR}/${EXP_NAME}/linear_probe"
-        mkdir -p "$EXP_DIR"
+        for MODE in linear_probe lora; do
+            if [ "$MODE" = "linear_probe" ]; then
+                EPOCHS="$LP_EPOCHS"; LR="$LP_LR"
+                EXTRA="--batch-size $LP_BATCH"
+            else
+                EPOCHS="$LORA_EPOCHS"; LR="$LORA_LR"
+                EXTRA="--lora-rank $LORA_RANK --batch-size $LORA_BATCH"
+            fi
+            EXP_DIR="${OUT_DIR}/${EXP_NAME}/${MODE}"
+            mkdir -p "$EXP_DIR"
 
-        $LORA_LAUNCH downstream.acute_event.intracranial_hypertension.run \
-            --checkpoint "$CHECKPOINT" \
-            --model-version "$MODEL_VERSION" \
-            --data-path "$DATA_PATH" \
-            --mode linear_probe \
-            --epochs "$EPOCHS_LP" \
-            --lr "$LR_LP" \
-            --device "$DEVICE" \
-            --out-dir "$EXP_DIR"
-
-        # LoRA (NPROC>1 이면 torchrun DDP, 아니면 python -m)
-        EXP_DIR="${OUT_DIR}/${EXP_NAME}/lora"
-        mkdir -p "$EXP_DIR"
-
-        $LORA_LAUNCH downstream.acute_event.intracranial_hypertension.run \
-            --checkpoint "$CHECKPOINT" \
-            --model-version "$MODEL_VERSION" \
-            --data-path "$DATA_PATH" \
-            --mode lora \
-            --epochs "$EPOCHS_LORA" \
-            --lr "$LR_LORA" \
-            --lora-rank "$LORA_RANK" \
-            --batch-size "$LORA_BATCH" \
-            --device "$DEVICE" \
-            --out-dir "$EXP_DIR"
+            for f in $(seq 0 $((N_FOLDS - 1))); do
+                # resume: 완료 fold(preds_fold{f}.npz)는 건너뜀. FORCE=1 이면 재실행.
+                if [ "$FORCE" != "1" ] && [ -f "${EXP_DIR}/preds_fold${f}.npz" ]; then
+                    echo "  [skip] done: ${EXP_DIR} (fold $f)"
+                    continue
+                fi
+                echo -e "\n[${EXP_NAME} | ${MODE} | fold ${f}]"
+                $LORA_LAUNCH downstream.acute_event.intracranial_hypertension.run \
+                    --checkpoint "$CHECKPOINT" \
+                    --model-version "$MODEL_VERSION" \
+                    --data-path "$PREFIX" \
+                    --n-folds "$N_FOLDS" \
+                    --fold "$f" \
+                    --mode "$MODE" \
+                    --epochs "$EPOCHS" \
+                    --lr "$LR" \
+                    --device "$DEVICE" \
+                    --out-dir "$EXP_DIR" \
+                    $EXTRA
+            done
+        done
     done
 done
 

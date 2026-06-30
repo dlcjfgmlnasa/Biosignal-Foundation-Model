@@ -11,9 +11,9 @@
 #   nohup bash downstream/acute_event/cardiac_arrest/bash/run.sh > ca_sweep.log 2>&1 &
 #   tail -f ca_sweep.log
 
-CKPT=${CKPT:-/home/coder/workspace/k-mimic-/bio_fm/outputs/main/phase2/kmimic_phase2_k2/checkpoints/checkpoint_phase2_av_epoch049_final.pt}
-DATA=${DATA:-/home/coder/workspace/k-mimic-/bio_fm/data/downstream/cardiac_arrest}
-OUT=${OUT:-/home/coder/workspace/k-mimic-/bio_fm/result/main/cardiac_arrest}
+CHECKPOINT=${CHECKPOINT:-/home/coder/workspace/k-mimic-/bio_fm/outputs/main/phase2/kmimic_phase2_k2/checkpoints/checkpoint_phase2_av_epoch049_final.pt}
+DATA_DIR=${DATA_DIR:-/home/coder/workspace/k-mimic-/bio_fm/data/downstream/cardiac_arrest}
+OUT_DIR=${OUT_DIR:-/home/coder/workspace/k-mimic-/bio_fm/result/main/cardiac_arrest}
 NPROC=${NPROC:-4}
 TASK=${TASK:-arrest}          # prepare_data_scope --task (arrest|death) → prefix scope_{task}_...
 SIGNALS=${SIGNALS:-ecg_ppg}   # prefix 채널 토큰 (prepare_data_scope --input-signals 순서 = ecg ppg)
@@ -41,24 +41,24 @@ echo "  Imminent Cardiac Arrest Sweep | NPROC=$NPROC | FORCE=$FORCE"
 echo "  Signals=$SIGNALS Window=${WINDOW}s Horizons=$HORIZONS"
 echo "  LP: batch=$LP_BATCH lr=$LP_LR epochs=$LP_EPOCHS"
 echo "  LoRA: batch=$LORA_BATCH (eff $((LORA_BATCH*NPROC))) lr=$LORA_LR epochs=$LORA_EPOCHS rank=$LORA_RANK"
-echo "  CKPT: $CKPT | OUT: $OUT"
+echo "  CHECKPOINT: $CHECKPOINT | OUT_DIR: $OUT_DIR"
 echo "============================================================"
 
 for H in $HORIZONS; do
-  PREFIX=$DATA/cardiac_arrest_${SIGNALS}_w${WINDOW}s_h${H}min
+  PREFIX=$DATA_DIR/cardiac_arrest_${SIGNALS}_w${WINDOW}s_h${H}min
   for f in 0 1 2 3 4; do
-    LP_OUT=$OUT/linear_probe/${SIGNALS}_w${WINDOW}s_h${H}min
+    LP_OUT=$OUT_DIR/linear_probe/${SIGNALS}_w${WINDOW}s_h${H}min
     maybe_run "$LP_OUT" "$f" \
       torchrun --nproc_per_node=$NPROC -m downstream.acute_event.cardiac_arrest.run \
-        --checkpoint $CKPT --model-version v2 \
+        --checkpoint $CHECKPOINT --model-version v2 \
         --data-path $PREFIX --mode linear_probe --n-folds 5 --fold $f \
         --epochs $LP_EPOCHS --lr $LP_LR --batch-size $LP_BATCH --device cuda \
         --out-dir "$LP_OUT"
 
-    LORA_OUT=$OUT/lora/${SIGNALS}_w${WINDOW}s_h${H}min
+    LORA_OUT=$OUT_DIR/lora/${SIGNALS}_w${WINDOW}s_h${H}min
     maybe_run "$LORA_OUT" "$f" \
       torchrun --nproc_per_node=$NPROC -m downstream.acute_event.cardiac_arrest.run \
-        --checkpoint $CKPT --model-version v2 \
+        --checkpoint $CHECKPOINT --model-version v2 \
         --data-path $PREFIX --mode lora --lora-rank $LORA_RANK --lora-alpha $LORA_ALPHA \
         --n-folds 5 --fold $f \
         --epochs $LORA_EPOCHS --lr $LORA_LR --batch-size $LORA_BATCH --device cuda \
@@ -67,5 +67,5 @@ for H in $HORIZONS; do
 done
 
 echo "============================================================"
-echo "  Done. results under $OUT/{linear_probe,lora}/"
+echo "  Done. results under $OUT_DIR/{linear_probe,lora}/"
 echo "============================================================"
