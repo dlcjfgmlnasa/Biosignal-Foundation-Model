@@ -20,9 +20,11 @@ MIMIC-III ICP 기반 두개내 고혈압 탐지 — Foundation model representat
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import json
 import sys
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -414,7 +416,29 @@ def _load_data(args):
             })
         return windows
 
-    return _to_windows(data["train"]), _to_windows(data["test"])
+    train_w = _to_windows(data["train"])
+    test_w = _to_windows(data["test"])
+    val_data = data.get("val")  # prepare_ich_sweep 가 저장하는 val split
+    if val_data is not None:
+        val_w = _to_windows(val_data)
+        print(f"  val split (from prepare_data): {len(val_w)} windows")
+    else:
+        # Backward-compat: legacy(no-val) 산출물 — train 에서 20% 동적 split.
+        warnings.warn(
+            "data['val'] not found; falling back to a 20% dynamic split of train. "
+            "Re-run prepare_data.py to get a deterministic val split.",
+            stacklevel=2,
+        )
+        seed = getattr(args, "val_split_seed", 42)
+        rng = np.random.default_rng(seed)
+        idx = np.arange(len(train_w))
+        rng.shuffle(idx)
+        n_val = max(1, int(len(train_w) * 0.2))
+        vset = set(idx[:n_val].tolist())
+        val_w = [w for i, w in enumerate(train_w) if i in vset]
+        train_w = [w for i, w in enumerate(train_w) if i not in vset]
+        print(f"  val split (dynamic, seed={seed}): {len(val_w)} windows")
+    return train_w, val_w, test_w
 
 
 # ── LOSO (Leave-One-Subject-Out) ─────────────────────────────
@@ -691,6 +715,8 @@ def main() -> None:
     parser.add_argument("--fold", type=int, default=0,
                         help="standard 모드 fold 인덱스 (run_eval OOF 집계용)")
     parser.add_argument("--n-folds", type=int, default=1, help="전체 fold 수")
+    parser.add_argument("--val-split-seed", type=int, default=42,
+                        help="legacy(no-val) 산출물에서 동적 val split 시 seed.")
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--eval-mode", type=str, default="standard",
                         choices=["standard", "loso"],
@@ -724,12 +750,15 @@ def main() -> None:
     if args.mode == "lora":
         model.inject_lora(rank=args.lora_rank, alpha=args.lora_alpha)
 
-    train_windows, test_windows = _load_data(args)
+    train_windows, val_windows, test_windows = _load_data(args)
 
     n_pos_train = sum(1 for w in train_windows if w["label"] == 1)
+    n_pos_val = sum(1 for w in val_windows if w["label"] == 1)
     n_pos_test = sum(1 for w in test_windows if w["label"] == 1)
     print(f"  Train: {len(train_windows)} ({n_pos_train} ICH, "
           f"{n_pos_train / max(len(train_windows), 1) * 100:.1f}%)")
+    print(f"  Val:   {len(val_windows)} ({n_pos_val} ICH, "
+          f"{n_pos_val / max(len(val_windows), 1) * 100:.1f}%)")
     print(f"  Test:  {len(test_windows)} ({n_pos_test} ICH, "
           f"{n_pos_test / max(len(test_windows), 1) * 100:.1f}%)")
 
@@ -750,21 +779,34 @@ def main() -> None:
         if args.mode != "linear_probe":
             print("ERROR: LOSO mode only supports --mode linear_probe", file=sys.stderr)
             sys.exit(1)
-        all_windows = train_windows + test_windows
+        all_windows = train_windows + val_windows + test_windows
         run_loso(model, d_model, all_windows, args, out_dir, device)
         return
 
     probe = LinearProbe(d_model, n_classes=1)
+    is_lora = args.mode == "lora"
 
-    if args.mode == "linear_probe":
-        # linear_probe: frozen encoder feature 1회 추출 후 probe 만 학습. encoder
-        # backprop 없음 → DDP grad sync 불필요 → torchrun 에선 feature 추출만 rank 별
-        # shard 병렬화하고 gather(원본 순서 복원). train/test 각각 gather 1회 →
-        # 모든 rank 가 2 추출 참여 후 non-rank0 종료, rank0 만 probe 학습·평가·저장.
-        # 단일 GPU(use_ddp=False)면 _extract_features_maybe_sharded→_stream_extract_features
-        # + 동일 학습 루프 → 기존 train/evaluate_linear_probe 와 byte-identical.
+    # ── 준비: linear_probe=frozen feature 캐싱 / lora=batch 빌드 + DDP shard ──
+    # hypotension 과 동일하게 매 epoch val AUROC 로 best-ckpt 를 잡고, 마지막에
+    # best-val 시점을 복원해 test 1회. 100 epochs 같은 긴 학습에서도 overfitting 이
+    # test 지표를 해치지 않게 한다(두 task protocol 일치 → 비교성).
+    max_length: int | None = None
+    train_features = train_labels = None
+    val_features = val_labels = None
+    test_features = test_labels = None
+    train_batches = None
+    val_batches = None
+    lora_params = None
+    ddp_module = None
+
+    if not is_lora:
+        # frozen encoder feature 1회 추출(train/val/test). DDP 면 rank 별 shard 추출
+        # → gather(원본 순서 복원) → rank0 만 probe 학습·평가. 단일 GPU 면 동일 경로.
         train_features, train_labels = _extract_features_maybe_sharded(
             model, train_windows, args.batch_size, args.patch_size, device,
+        )
+        val_features, val_labels = _extract_features_maybe_sharded(
+            model, val_windows, args.batch_size, args.patch_size, device,
         )
         test_features, test_labels = _extract_features_maybe_sharded(
             model, test_windows, args.batch_size, args.patch_size, device,
@@ -773,17 +815,16 @@ def main() -> None:
             import torch.distributed as dist
             dist.destroy_process_group()
             return
-        print(f"\nTraining LinearProbe (d_model={d_model})...")
-        train_losses = _fit_probe_cached(
-            probe, train_features, train_labels,
-            args.batch_size, args.epochs, args.lr, device,
-        )
-        metrics = _eval_probe_cached(probe, test_features, test_labels, device)
+        probe = probe.to(device)
+        optimizer = torch.optim.Adam(probe.parameters(), lr=args.lr)
+        train_features = train_features.to(device)
+        train_labels = train_labels.to(device)
+        val_features = val_features.to(device)
+        print(f"\nTraining LinearProbe (d_model={d_model}) with val best-ckpt...")
     else:
         # lora: encoder fine-tune → feature 캐싱 불가, pre-built batches 필요.
-        # 주의: 큰 윈도우면 RAM 위험 — ablation 은 linear_probe 만 사용.
-        # ── DDP(B안): train window 를 rank 별로 분할 후 전 rank 최소 길이로 정렬
-        #   (step 동기화). test 는 분할하지 않는다(평가는 rank0 이 full set 으로 수행).
+        # ── DDP(B안): train window 를 rank 별 분할 + 전 rank 최소 길이 정렬(step 동기화).
+        #   val/test 는 분할하지 않는다(평가는 rank0 가 full set 으로 수행).
         if use_ddp:
             n_full = len(train_windows)
             train_windows = equalize_shard(shard_for_rank(train_windows))
@@ -807,24 +848,125 @@ def main() -> None:
                 sys.exit(2)
         first_sig = next(iter(train_windows[0]["signals"].values()))
         max_length = len(first_sig)
-        train_batches = _make_batches(train_windows, args.batch_size, args.patch_size, max_length)
-        n_lora = sum(p.numel() for p in model.lora_parameters())
-        print(f"\nTraining LoRA + Probe (rank={args.lora_rank}, LoRA={n_lora:,})...")
+        train_batches = _make_batches(
+            train_windows, args.batch_size, args.patch_size, max_length,
+        )
+        # val batch 는 rank0 만 평가에 쓴다(분할 X — full val set).
+        if is_main():
+            val_batches = _make_batches(
+                val_windows, args.batch_size, args.patch_size, max_length,
+            )
+        probe = probe.to(device)
+        lora_params = model.lora_parameters()
+        optimizer = torch.optim.AdamW(
+            [
+                {"params": lora_params, "lr": args.lr},
+                {"params": probe.parameters(), "lr": args.lr},
+            ],
+            weight_decay=0.01,
+        )
         # DDP: encode→pool→probe 를 한 forward 로 묶어 grad all-reduce 등록. 단일 GPU
         # 면 use_ddp=False → ddp_module=None → 기존 _make/forward 경로 그대로(불변).
         ddp_module = wrap_lora_ddp(model.model, probe) if use_ddp else None
-        train_losses = train_lora(
-            model, probe, train_batches, args.epochs, args.lr, device,
-            ddp_module=ddp_module,
+        n_lora = sum(p.numel() for p in model.lora_parameters())
+        print(f"\nTraining LoRA + Probe (rank={args.lora_rank}, LoRA={n_lora:,}) "
+              f"with val best-ckpt...")
+
+    criterion = nn.BCEWithLogitsLoss()
+    train_losses: list[float] = []
+    best_val_auroc = -1.0
+    best_epoch = -1
+    best_probe_state: dict | None = None
+    best_model_state: dict | None = None  # lora 에서만
+
+    for epoch in range(args.epochs):
+        probe.train()
+        if is_lora:
+            model.model.train()
+            if ddp_module is not None:
+                ddp_module.train()
+        epoch_loss, n_steps = 0.0, 0
+
+        if not is_lora:
+            n = train_features.size(0)
+            perm = torch.randperm(n, device=device)
+            for i in range(0, n, args.batch_size):
+                idx = perm[i: i + args.batch_size]
+                logits = probe(train_features[idx])
+                loss = criterion(logits, train_labels[idx].unsqueeze(-1))
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                epoch_loss += loss.item()
+                n_steps += 1
+        else:
+            for batch, labels in train_batches:
+                batch = model.batch_to_device(batch)
+                if ddp_module is not None:
+                    logits = ddp_module(batch)
+                else:
+                    out = model.model(batch, task="masked")
+                    features = _mean_pool(out["encoded"], out["patch_mask"])
+                    logits = probe(features)
+                loss = criterion(logits, labels.to(device).unsqueeze(-1))
+                optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(
+                    lora_params + list(probe.parameters()), 1.0,
+                )
+                optimizer.step()
+                epoch_loss += loss.item()
+                n_steps += 1
+
+        avg = epoch_loss / max(n_steps, 1)
+        train_losses.append(avg)
+
+        # ── val best-ckpt (DDP: rank0 만; all-reduce 후 전 rank 파라미터 동일) ──
+        if is_main():
+            probe.eval()
+            if not is_lora:
+                vm = _eval_probe_cached(probe, val_features, val_labels, device)
+            else:
+                model.model.eval()
+                vm = evaluate_lora(model, probe, val_batches, device)
+            val_auroc = float(vm["auroc"])
+            if val_auroc > best_val_auroc:
+                best_val_auroc = val_auroc
+                best_epoch = epoch
+                best_probe_state = copy.deepcopy(probe.state_dict())
+                if is_lora:
+                    best_model_state = copy.deepcopy(model.model.state_dict())
+            if (epoch + 1) % 5 == 0 or epoch == 0 or epoch == args.epochs - 1:
+                print(
+                    f"  Epoch {epoch + 1}/{args.epochs}  loss={avg:.4f}  "
+                    f"val_auroc={val_auroc:.4f}  "
+                    f"(best={best_val_auroc:.4f}@ep{best_epoch + 1})"
+                )
+
+    # DDP(lora): 학습 종료 동기화 후 test/저장은 rank0 전담 → non-rank0 정리·종료.
+    # (linear_probe non-main 은 위 feature 추출 직후 이미 종료했다.)
+    if use_ddp and is_lora:
+        import torch.distributed as dist
+        dist.barrier()
+        if not is_main():
+            dist.destroy_process_group()
+            return
+
+    # ── best-val ckpt 복원 후 test 1회 ──
+    if best_probe_state is None:
+        print("WARNING: no best ckpt captured; using last epoch.", file=sys.stderr)
+    else:
+        probe.load_state_dict(best_probe_state)
+        if is_lora and best_model_state is not None:
+            model.model.load_state_dict(best_model_state)
+
+    print("\nEvaluating on test set with best-val ckpt...")
+    if not is_lora:
+        metrics = _eval_probe_cached(probe, test_features, test_labels, device)
+    else:
+        test_batches = _make_batches(
+            test_windows, args.batch_size, args.patch_size, max_length,
         )
-        # DDP: 학습 종료 동기화 후 test/저장은 rank0 전담 → non-rank0 는 정리·종료.
-        if use_ddp:
-            import torch.distributed as dist
-            dist.barrier()
-            if not is_main():
-                dist.destroy_process_group()
-                return
-        test_batches = _make_batches(test_windows, args.batch_size, args.patch_size, max_length)
         metrics = evaluate_lora(model, probe, test_batches, device)
 
     y_true = metrics.pop("y_true")
