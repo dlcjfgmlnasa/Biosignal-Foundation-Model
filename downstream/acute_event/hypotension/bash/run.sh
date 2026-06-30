@@ -1,6 +1,8 @@
 #!/bin/bash
-# Hypotension Prediction — 전체 실험 실행 스크립트 (Paired Comparison)
-# 4가지 신호 조합 × 4 windows × 3 horizons × 2 modes = 96 실험
+# Hypotension Prediction — 실행 스크립트
+# 입력 ECG+PPG+ABP 고정, window 고정, 예측 horizon 만 변경 (canonical 설계).
+# 기본: ecg_ppg_abp × window 1개 × horizons × modes(linear_probe,lora).
+# env override: SIGNALS_OVERRIDE / WINDOWS_OVERRIDE / HORIZONS_OVERRIDE / MODES_OVERRIDE
 #
 # 사전 조건: prepare_data.sh로 .pt 데이터셋이 생성되어 있어야 함
 #
@@ -74,11 +76,13 @@ if [ "$NPROC" -gt 1 ] && [ "$PRINT_ONLY" = "1" ]; then
     log "  ⚠ NPROC>1 + PRINT_ONLY=1: run_sharded 는 GPU 1장 핀 → lora 도 python -m 으로 출력(torchrun 무시)"
 fi
 
-# ── 실험 조합 (Paired: 동일 환자 풀) ──
-SIGNAL_COMBOS=("abp" "ecg" "ecg_ppg" "ecg_ppg_abp")
-WINDOWS=(30 60 300 600)
-HORIZONS=(5 10 15)
-MODES=("linear_probe" "lora")
+# ── 실험 조합 ──
+# 입력은 ECG+PPG+ABP 고정, window 도 고정(canonical). 예측 horizon 만 변경한다.
+# 모두 env override 가능(공백 구분): 예) WINDOWS_OVERRIDE=900 HORIZONS_OVERRIDE="5 10 15" bash run.sh
+SIGNAL_COMBOS=(${SIGNALS_OVERRIDE:-ecg_ppg_abp})
+WINDOWS=(${WINDOWS_OVERRIDE:-300})
+HORIZONS=(${HORIZONS_OVERRIDE:-5 10 15})
+MODES=(${MODES_OVERRIDE:-linear_probe lora})
 
 TOTAL=$(( ${#SIGNAL_COMBOS[@]} * ${#WINDOWS[@]} * ${#HORIZONS[@]} * ${#MODES[@]} ))
 COUNT=0

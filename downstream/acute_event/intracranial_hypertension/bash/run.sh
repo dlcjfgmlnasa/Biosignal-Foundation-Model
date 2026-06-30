@@ -22,8 +22,11 @@ DEVICE="${DEVICE:-cuda}"
 # v2 필수 (9 modality 단일 embedding — memory project_data_spec_v2). v1 로드 금지.
 MODEL_VERSION="${MODEL_VERSION:-v2}"
 
-WINDOW_SECS=(30 60 300 600)
-HORIZON_MINS=(5 10 15)
+# 입력은 ABP+ECG+ICP 고정(prepare_data 에서 결정). window 도 고정(canonical),
+# 예측 horizon 만 변경한다. env override: WINDOW_SECS_OVERRIDE / HORIZON_MINS_OVERRIDE
+# 예) WINDOW_SECS_OVERRIDE=600 HORIZON_MINS_OVERRIDE="10 30" bash run.sh
+WINDOW_SECS=(${WINDOW_SECS_OVERRIDE:-900})        # 15min 고정
+HORIZON_MINS=(${HORIZON_MINS_OVERRIDE:-5 10 15})  # 이것만 변경
 EPOCHS_LP="${EPOCHS_LP:-30}"
 EPOCHS_LORA="${EPOCHS_LORA:-30}"
 LR_LP="${LR_LP:-1e-3}"
