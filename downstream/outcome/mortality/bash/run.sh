@@ -42,7 +42,7 @@ LORA_ALPHA=${LORA_ALPHA:-16}
 # **기존 batch(8) 결과와 직접 비교 불가**(재실행 필요). torchrun 에선 effective
 # batch = LORA_BATCH × NPROC. 한 task 의 전 fold/config 는 동일 (실행모드 ×
 # effective batch × LR) 로 고정해야 표 비교 성립. 보수적으로 가려면 LORA_BATCH=8.
-LORA_BATCH=${LORA_BATCH:-512}
+LORA_BATCH=${LORA_BATCH:-128}
 
 # DDP: NPROC>1 이면 torchrun 데이터 병렬. linear_probe 는 sharded frozen-feature
 # 추출(각 rank 가 환자 shard 인코딩 → gather → rank0 단독 aggregator+probe 학습),

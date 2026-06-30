@@ -31,7 +31,7 @@ LORA_ALPHA="${LORA_ALPHA:-16}"
 # ── C안: LoRA batch-size 상향 (가속) — ⚠ 결과가 바뀌므로 비교성 주의 ──
 # batch≠32 면 LoRA 최적화 궤적이 달라져 batch=32 기준선과 직접 비교 불가(LR 재튜닝
 # 필요). torchrun(B안)에선 effective batch = LORA_BATCH × nproc. 보수적: LORA_BATCH=32.
-LORA_BATCH="${LORA_BATCH:-512}"
+LORA_BATCH="${LORA_BATCH:-128}"
 
 # ── B안: NPROC>1 이면 lora 를 torchrun 데이터 병렬(단일 fold DDP)로 실행 ──
 # linear_probe 는 frozen feature 캐싱이라 DDP 이득 없음 → 항상 python -m.

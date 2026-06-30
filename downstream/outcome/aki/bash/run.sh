@@ -48,7 +48,7 @@ LORA_ALPHA="${LORA_ALPHA:-16}"
 # batch(=환자 수/step)를 키우면 step 수가 줄어 빨라지나 LoRA 최적화 궤적이 달라져
 # **기존 batch(16) 결과와 직접 비교 불가**(재실행 필요). torchrun 에선 effective
 # batch = LORA_BATCH × NPROC. 보수적으로 가려면 LORA_BATCH=16.
-LORA_BATCH="${LORA_BATCH:-512}"
+LORA_BATCH="${LORA_BATCH:-128}"
 
 # DDP: NPROC>1 이면 fold 별로 torchrun 데이터 병렬. linear_probe 는 sharded
 # frozen-feature 추출(각 rank 가 환자 shard 인코딩 → gather → rank0 단독 학습),
