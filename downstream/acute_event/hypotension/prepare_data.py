@@ -4,6 +4,8 @@
 미래 5~15분 후 MAP<65 (≥1분 지속) 예측을 위한 (input_window, future_label) 쌍 생성.
 Label 소스: 항상 ABP (미래 구간의 MAP)
 Input 소스: 선택된 signal type 의 현재 윈도우
+현재-저혈압 제외(HPI 표준): 예측 시점(입력 끝 30초 baseline) MAP≥65 인 window 만 사용
+  → 진행 중 저혈압의 연속(trivial positive)을 배제, 신규 발생만 예측.
 
 Split: patient-level K-fold CV (clinical AI 표준, default n_folds=5)
        각 fold i — train (n_folds-2 folds) / val (1 fold) / test (1 fold).
@@ -270,6 +272,19 @@ def extract_forecast_samples(
             #   input window 의 multi-channel valid_ratio < threshold → drop
             valid_ratio = compute_valid_ratio(list(input_dict.values()))
             if valid_ratio < valid_ratio_threshold:
+                if gap_stats is not None:
+                    gap_stats.add_drop()
+                continue
+
+            # ── 현재-저혈압 제외 (HPI 표준): 예측 시점(T=입력 끝)에 이미 저혈압이면 drop. ──
+            #   진행 중 저혈압의 연속을 trivial positive 로 잡지 않도록, 입력 window
+            #   마지막 30초 baseline MAP 가 threshold 미만이면 이 window 를 버린다.
+            #   (baseline 이 NaN/artifact 로 확인 불가하면 보수적으로 drop.)
+            base_start = max(start, start + win_samples - 3 * map_win)
+            baseline_abp = abp[base_start : start + win_samples]
+            base_valid = baseline_abp[~np.isnan(baseline_abp)]
+            base_valid = base_valid[(base_valid >= 30.0) & (base_valid <= 200.0)]
+            if base_valid.size < map_win or float(np.mean(base_valid)) < map_threshold:
                 if gap_stats is not None:
                     gap_stats.add_drop()
                 continue
