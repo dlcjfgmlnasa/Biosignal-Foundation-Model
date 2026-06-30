@@ -2,12 +2,17 @@
 """Intracranial Hypertension Detection — 데이터 준비 (MIMIC-III).
 
 MIMIC-III Waveform에서 ICP 채널이 있는 레코드를 파싱하여
-ICP > 20mmHg (≥1분 지속) 예측용 (input_window, future_label) 쌍을 생성한다.
+ICP > 22mmHg (≥1분 지속) 예측용 (input_window, future_label) 쌍을 생성한다.
+  (임계 22mmHg = BTF 4판 Carney 2017 치료 임계 + ICP crisis ML 문헌 기준.)
 
-Label 소스: ICP (미래 구간의 평균 ICP > 20mmHg 지속 여부)
+Label 소스: ICP (미래 구간의 평균 ICP > 22mmHg 지속 여부)
 Input 소스: ICP + 동시 기록된 ECG, ABP, PPG 등
-현재-ICH 제외(HPI 표준): 예측 시점(입력 끝 30초 baseline) ICP<20 인 window 만 사용
-  → 진행 중 두개내압 상승의 연속(trivial positive)을 배제, 신규 발생만 예측.
+표본 구성(문헌 스타일, IOH 와 동일 원칙):
+  - 현재-ICH 제외: 예측 시점(입력 끝 30초 baseline) ICP<22 인 window 만 사용
+    → 진행 중 두개내압 상승의 연속(trivial positive) 배제, 신규 발생만 예측.
+  - clean negative: 미래 horizon 의 valid ICP 가 전부 정상(<15mmHg, Czosnyka 2004)인
+    경우만 negative (15~22 경계는 gray-zone 으로 제외).
+  - sparse sampling: 같은 case·class 최소 20분 간격으로만 표본 채택.
 
 데이터 소스: MIMIC-III Waveform Matched Subset (PhysioNet)
 
@@ -43,7 +48,8 @@ from downstream._save_utils import consume_gap_masks
 TARGET_SR: float = 100.0
 
 # ICP 임상 기준
-ICP_THRESHOLD: float = 20.0  # mmHg (sustained >1min; 20mmHg = 가장 널리 쓰이는 ICH 정의)
+ICP_THRESHOLD: float = 22.0  # mmHg (sustained >1min). BTF 4판(Carney 2017) 치료 임계 +
+#                              ICP crisis ML 문헌(ICP>22) 기준. 정상 ICP 7-15mmHg.
 SUSTAINED_SEC: float = 60.0  # 1분 이상 지속
 
 # MIMIC-III 채널명 → signal_type 매핑 (Task #3 ICH: ABP, ECG, PPG, CO2 + ICP for label)
@@ -239,7 +245,9 @@ def extract_forecast_samples(
     stride_sec: float = 30.0,
     horizon_sec: float = 300.0,
     icp_threshold: float = ICP_THRESHOLD,
+    neg_icp_threshold: float = 15.0,        # clean negative: 미래 내내 ICP<이 값(정상)
     sustained_sec: float = SUSTAINED_SEC,
+    min_sample_gap_sec: float = 1200.0,     # 같은 case·class 최소 sampling 간격(20분, 문헌)
     valid_ratio_threshold: float = DEFAULT_VALID_RATIO_THRESHOLD,
     gap_stats: GapStats | None = None,
     sample_dtype: str = "float16",  # OOM 회피
@@ -257,6 +265,8 @@ def extract_forecast_samples(
     icp_win_sec = 10.0
     icp_win = int(icp_win_sec * TARGET_SR)
     min_consecutive = max(1, int(sustained_sec / icp_win_sec))
+    min_gap_samples = int(min_sample_gap_sec * TARGET_SR)
+    n_future_win = max(1, horizon_samples // icp_win)  # horizon 내 기대 10초-윈도우 수
 
     total_needed = win_samples + horizon_samples
     samples: list[ICHSample] = []
@@ -271,6 +281,9 @@ def extract_forecast_samples(
 
         if min_len < total_needed:
             continue
+
+        # sparse sampling: case 내 class 별 마지막 채택 start (간격 강제용)
+        last_accepted: dict[int, int | None] = {0: None, 1: None}
 
         for start in range(0, min_len - total_needed + 1, stride_samples):
             input_dict = {}
@@ -315,11 +328,32 @@ def extract_forecast_samples(
                     gap_stats.add_drop()
                 continue
 
-            label = (
-                1
-                if _has_sustained_ich(future_icps, icp_threshold, min_consecutive)
-                else 0
+            # ── 라벨 결정 (문헌 스타일: clean positive / clean negative, gray-zone 제외) ──
+            #   positive    : 미래 horizon 내 ≥1분 지속 ICP>22 (신규 두개내압 상승;
+            #     BTF 4판 Carney 2017 / ICP crisis ML 문헌 기준).
+            #   negative(clean): 미래 horizon 의 valid ICP(≥80% 커버)가 전부 정상 범위
+            #     (< neg_icp_threshold, 기본 15; 정상 ICP 7-15mmHg, Czosnyka 2004).
+            #   둘 다 아니면(15~22 경계) skip — 문헌의 crisis/non-crisis epoch 구분과 정합.
+            is_pos = _has_sustained_ich(future_icps, icp_threshold, min_consecutive)
+            is_clean_neg = (
+                len(future_icps) >= int(0.8 * n_future_win)
+                and all(m < neg_icp_threshold for m in future_icps)
             )
+            if is_pos:
+                label = 1
+            elif is_clean_neg:
+                label = 0
+            else:
+                if gap_stats is not None:
+                    gap_stats.add_drop()
+                continue
+
+            # ── sparse sampling: 같은 case·class 최소 간격(기본 20분) 유지 ──
+            #   dense stride 인접 상관 window 누적 방지(문헌 epoch sampling 과 정합).
+            prev = last_accepted[label]
+            if prev is not None and (start - prev) < min_gap_samples:
+                continue
+            last_accepted[label] = start
 
             # Step 2: gap mask + 즉시 dtype 캐스팅 (OOM 회피)
             filled_dict, gap_mask_dict = apply_gap_mask_multichannel(
