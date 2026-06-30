@@ -20,6 +20,7 @@ WINDOWS="${WINDOWS:-300}"          # canonical: 5 min input window
 HORIZONS="${HORIZONS:-15}"          # canonical: 15 min ahead
 N_FOLDS="${N_FOLDS:-5}"             # clinical AI 표준: 5-fold patient-level CV
 REQUIRED="${REQUIRED:-ecg ppg abp}"
+MIN_GAP="${MIN_GAP:-1200}"          # sparse 표본 간격(초). 줄이면 표본 ↑ (예: 300=5분, 60=1분)
 
 echo "============================================================"
 echo "  Hypotension Prediction (Task #1) — canonical + ${N_FOLDS}-fold CV"
@@ -35,6 +36,7 @@ python -m downstream.acute_event.hypotension.prepare_data \
     --data-dir $DATA_DIR --input-signals ecg ppg abp \
     --required-signals $REQUIRED \
     --window-secs $WINDOWS --horizon-mins $HORIZONS \
+    --min-sample-gap-sec $MIN_GAP \
     --n-folds $N_FOLDS --out-dir $OUT_DIR
 
 echo -e "\n============================================================"

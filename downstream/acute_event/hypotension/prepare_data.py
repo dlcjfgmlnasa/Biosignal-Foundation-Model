@@ -556,6 +556,7 @@ def prepare_hypotension_sweep(
     window_secs: list[float],
     horizon_mins: list[float],
     stride_sec: float = 30.0,
+    min_sample_gap_sec: float = 1200.0,
     n_folds: int = 5,
     max_subjects: int | None = None,
     out_dir: str = "outputs/downstream/hypotension",
@@ -680,6 +681,7 @@ def prepare_hypotension_sweep(
                     case_batch = split_cases[batch_start:batch_start + CASES_PER_CHUNK]
                     samples = extract_forecast_samples(
                         case_batch, input_signals, window_sec, stride_sec, horizon_sec,
+                        min_sample_gap_sec=min_sample_gap_sec,
                         gap_stats=gap_stats,
                     )
                     if not samples:
@@ -756,6 +758,13 @@ def main() -> None:
         help="Sliding window stride in seconds",
     )
     parser.add_argument(
+        "--min-sample-gap-sec",
+        type=float,
+        default=1200.0,
+        help="sparse sampling: 같은 case·class 최소 표본 간격(초). 작을수록 표본 ↑ "
+        "(상관 ↑·prevalence ↓). 기본 1200(20분, 문헌).",
+    )
+    parser.add_argument(
         "--n-folds",
         type=int,
         default=5,
@@ -790,6 +799,7 @@ def main() -> None:
         window_secs=args.window_secs,
         horizon_mins=args.horizon_mins,
         stride_sec=args.stride_sec,
+        min_sample_gap_sec=args.min_sample_gap_sec,
         n_folds=args.n_folds,
         seed=args.seed,
         max_subjects=args.max_subjects,
