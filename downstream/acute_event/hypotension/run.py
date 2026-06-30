@@ -1403,9 +1403,12 @@ def main() -> None:
                     f"(best={best_val_auroc:.4f}@ep{best_epoch + 1})"
                 )
 
-    # DDP: 학습 종료 동기화. 이후 test/저장은 rank0 전담이므로 non-rank0 는 여기서
-    # 프로세스 그룹을 정리하고 종료한다(이후 collective 없음 → barrier 1회로 충분).
-    if use_ddp:
+    # DDP(lora): 학습 종료 동기화 후 test/저장은 rank0 전담 → non-rank0 정리·종료.
+    # ⚠ linear_probe 에서는 non-rank0 가 feature 추출 직후(위 _stream/_cache 블록) 이미
+    #   destroy+return 했으므로, 여기서 무조건 barrier 를 타면 rank0 가 혼자 호출해
+    #   peer 를 NCCL timeout(30분)까지 기다리는 hang 이 된다. lora(전 rank 가 함께 학습)
+    #   일 때만 동기화한다 — ich/cardiac_arrest 등 다른 task 와 동일 패턴.
+    if use_ddp and is_lora:
         import torch.distributed as dist
         dist.barrier()
         if not is_main():

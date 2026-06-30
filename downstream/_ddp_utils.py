@@ -67,9 +67,15 @@ def maybe_init_ddp() -> torch.device | None:
         return None
     os.environ.setdefault("MASTER_ADDR", "localhost")
     os.environ.setdefault("MASTER_PORT", "29500")
+    # rank 하나가 죽거나 collective 가 어긋나면, 나머지가 묵묵히 timeout 까지 hang 하는
+    # 대신 NCCL watchdog 이 그룹을 abort 하고 즉시 에러를 던지도록 한다(원인 추적 가능).
+    os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
+    os.environ.setdefault("NCCL_ASYNC_ERROR_HANDLING", "1")  # 구버전 PyTorch 호환
+    # 기본 30분(rank straggler 견딤). hang 을 더 빨리 끊고 싶으면 DDP_TIMEOUT_MIN 로 조정.
+    timeout_min = int(os.environ.get("DDP_TIMEOUT_MIN", "30"))
     dist.init_process_group(
         "nccl",
-        timeout=timedelta(minutes=30),  # pretrain 관례와 동일(rank straggler 견딤)
+        timeout=timedelta(minutes=timeout_min),
     )
     local = ddp_local_rank()
     torch.cuda.set_device(local)
