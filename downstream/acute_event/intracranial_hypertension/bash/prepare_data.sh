@@ -25,8 +25,8 @@ RECORDS_FILE="${RECORDS_FILE:-${REPO_ROOT}/downstream/outcome/sepsis/RECORDS-wav
 ICP_RECORDS="${ICP_RECORDS:-downstream/acute_event/intracranial_hypertension/ICP-RECORDS}"
 WAVEFORM_DIR="${WAVEFORM_DIR:-${UPDOWN_ROOT}/raw/mimic3-waveform-ich}"
 OUT_DIR="${OUT_DIR:-${BIOFM_ROOT}/data/downstream/intracranial_hypertension}"
-WINDOWS="${WINDOWS:-600}"   # 600s=10min: Table 3 #3 canonical 단일 (10분=모델 최대 컨텍스트). S7 sweep 은 env override
-HORIZONS="${HORIZONS:-30}"  # 30min: Table 3 #3 canonical 단일 horizon
+WINDOWS="${WINDOWS:-1200}"    # 1200s=20min 입력 window (ICP 느린 dynamics context)
+HORIZONS="${HORIZONS:-5 30 60}"  # 5/30/60분 전 예측 (lead-time 곡선)
 STRIDE="${STRIDE:-30}"
 MODE="${MODE:-unbiased}"    # unbiased(현실적·기본) | biased(과대평가·선행비교)
 MIN_GAP="${MIN_GAP:-1200}"  # biased 모드 sparse 간격(초)
