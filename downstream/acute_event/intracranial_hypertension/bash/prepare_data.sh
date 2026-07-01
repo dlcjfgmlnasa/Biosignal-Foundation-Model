@@ -28,6 +28,8 @@ OUT_DIR="${OUT_DIR:-${BIOFM_ROOT}/data/downstream/intracranial_hypertension}"
 WINDOWS="${WINDOWS:-600}"   # 600s=10min: Table 3 #3 canonical 단일 (10분=모델 최대 컨텍스트). S7 sweep 은 env override
 HORIZONS="${HORIZONS:-30}"  # 30min: Table 3 #3 canonical 단일 horizon
 STRIDE="${STRIDE:-30}"
+MODE="${MODE:-unbiased}"    # unbiased(현실적·기본) | biased(과대평가·선행비교)
+MIN_GAP="${MIN_GAP:-1200}"  # biased 모드 sparse 간격(초)
 SKIP_DOWNLOAD="${SKIP_DOWNLOAD:-0}"
 
 echo "============================================================"
@@ -68,6 +70,7 @@ run_combo() {
         --window-secs $WINDOWS \
         --horizon-mins $HORIZONS \
         --stride-sec $STRIDE \
+        --min-sample-gap-sec $MIN_GAP --sampling-mode $MODE \
         --out-dir "$OUT_DIR"
 }
 

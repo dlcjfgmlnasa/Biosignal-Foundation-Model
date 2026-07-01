@@ -7,12 +7,11 @@ ICP > 22mmHg (≥1분 지속) 예측용 (input_window, future_label) 쌍을 생�
 
 Label 소스: ICP (미래 구간의 평균 ICP > 22mmHg 지속 여부)
 Input 소스: ICP + 동시 기록된 ECG, ABP, PPG 등
-표본 구성(문헌 스타일, IOH 와 동일 원칙):
-  - 현재-ICH 제외: 예측 시점(입력 끝 30초 baseline) ICP<22 인 window 만 사용
-    → 진행 중 두개내압 상승의 연속(trivial positive) 배제, 신규 발생만 예측.
-  - clean negative: 미래 horizon 의 valid ICP 가 전부 정상(<15mmHg, Czosnyka 2004)인
-    경우만 negative (15~22 경계는 gray-zone 으로 제외).
-  - sparse sampling: 같은 case·class 최소 20분 간격으로만 표본 채택.
+표본 구성 (--sampling-mode, IOH 와 동일 원칙; 공통: 현재-ICH 제외 = 예측 시점 ICP<22 만):
+  - unbiased(기본): dense sliding, 미래 sustained ICP>22 = positive, 나머지(15~22 경계
+    포함) 전부 negative. sparse/clean-neg 없음 → 실제 forward 평가(현실적).
+  - biased(supplementary, 선행 crisis/non-crisis epoch 방식): clean-neg(미래 valid ICP 전부
+    <15, Czosnyka 2004)만 negative + 경계(15~22) 제외 + sparse 20분 → 과대평가.
 
 데이터 소스: MIMIC-III Waveform Matched Subset (PhysioNet)
 
@@ -245,9 +244,10 @@ def extract_forecast_samples(
     stride_sec: float = 30.0,
     horizon_sec: float = 300.0,
     icp_threshold: float = ICP_THRESHOLD,
-    neg_icp_threshold: float = 15.0,        # clean negative: 미래 내내 ICP<이 값(정상)
+    neg_icp_threshold: float = 15.0,        # biased 모드 clean-neg: 미래 내내 ICP<이 값(정상)
     sustained_sec: float = SUSTAINED_SEC,
-    min_sample_gap_sec: float = 1200.0,     # 같은 case·class 최소 sampling 간격(20분, 문헌)
+    min_sample_gap_sec: float = 1200.0,     # biased 모드 sparse 간격(20분)
+    sampling_mode: str = "unbiased",        # unbiased(현실적·기본) | biased(과대평가·선행비교)
     valid_ratio_threshold: float = DEFAULT_VALID_RATIO_THRESHOLD,
     gap_stats: GapStats | None = None,
     sample_dtype: str = "float16",  # OOM 회피
@@ -328,32 +328,34 @@ def extract_forecast_samples(
                     gap_stats.add_drop()
                 continue
 
-            # ── 라벨 결정 (문헌 스타일: clean positive / clean negative, gray-zone 제외) ──
-            #   positive    : 미래 horizon 내 ≥1분 지속 ICP>22 (신규 두개내압 상승;
-            #     BTF 4판 Carney 2017 / ICP crisis ML 문헌 기준).
-            #   negative(clean): 미래 horizon 의 valid ICP(≥80% 커버)가 전부 정상 범위
-            #     (< neg_icp_threshold, 기본 15; 정상 ICP 7-15mmHg, Czosnyka 2004).
-            #   둘 다 아니면(15~22 경계) skip — 문헌의 crisis/non-crisis epoch 구분과 정합.
+            # ── 라벨 결정 ──
+            #   positive: 미래 horizon 내 ≥1분 지속 ICP>22 (신규 두개내압 상승; BTF 4판
+            #     Carney 2017). 현재-ICH 제외는 두 모드 공통(위에서 이미 적용).
+            #   unbiased(기본): dense sliding, positive 외 나머지(15~22 경계 포함) 전부
+            #     negative. sparse/clean-neg 없음 → 실제 forward 평가(현실적).
+            #   biased(선행 crisis/non-crisis epoch 방식, supplementary): clean-neg(미래 valid
+            #     ICP 전부 <15, Czosnyka 2004)만 negative + 경계(15~22) 제외 + sparse → 과대평가.
             is_pos = _has_sustained_ich(future_icps, icp_threshold, min_consecutive)
-            is_clean_neg = (
-                len(future_icps) >= int(0.8 * n_future_win)
-                and all(m < neg_icp_threshold for m in future_icps)
-            )
-            if is_pos:
-                label = 1
-            elif is_clean_neg:
-                label = 0
-            else:
-                if gap_stats is not None:
-                    gap_stats.add_drop()
-                continue
-
-            # ── sparse sampling: 같은 case·class 최소 간격(기본 20분) 유지 ──
-            #   dense stride 인접 상관 window 누적 방지(문헌 epoch sampling 과 정합).
-            prev = last_accepted[label]
-            if prev is not None and (start - prev) < min_gap_samples:
-                continue
-            last_accepted[label] = start
+            if sampling_mode == "unbiased":
+                label = 1 if is_pos else 0
+            else:  # biased
+                is_clean_neg = (
+                    len(future_icps) >= int(0.8 * n_future_win)
+                    and all(m < neg_icp_threshold for m in future_icps)
+                )
+                if is_pos:
+                    label = 1
+                elif is_clean_neg:
+                    label = 0
+                else:
+                    if gap_stats is not None:
+                        gap_stats.add_drop()
+                    continue
+                # sparse sampling: 같은 case·class 최소 간격(20분) — biased 만.
+                prev = last_accepted[label]
+                if prev is not None and (start - prev) < min_gap_samples:
+                    continue
+                last_accepted[label] = start
 
             # Step 2: gap mask + 즉시 dtype 캐스팅 (OOM 회피)
             filled_dict, gap_mask_dict = apply_gap_mask_multichannel(
@@ -552,6 +554,8 @@ def prepare_ich_sweep(
     seed: int = 42,
     required_signals: list[str] | None = None,
     icp_threshold: float = ICP_THRESHOLD,
+    min_sample_gap_sec: float = 1200.0,
+    sampling_mode: str = "unbiased",
 ) -> list[Path]:
     """(window, horizon) 조합 × stratified K-fold CV 데이터셋 생성.
 
@@ -644,6 +648,8 @@ def prepare_ich_sweep(
                         gap_stats=gap_stats,
                         sample_dtype=sample_dtype_str,
                         icp_threshold=icp_threshold,
+                        min_sample_gap_sec=min_sample_gap_sec,
+                        sampling_mode=sampling_mode,
                     )
                     if not samples:
                         continue
@@ -734,6 +740,16 @@ def main() -> None:
         help=f"intracranial hypertension 임계 ICP(mmHg). default {ICP_THRESHOLD:.0f}. "
              "BTF 2016 가이드라인 표준은 22.",
     )
+    parser.add_argument(
+        "--min-sample-gap-sec", type=float, default=1200.0,
+        help="biased 모드 sparse 표본 간격(초). 기본 1200(20분).",
+    )
+    parser.add_argument(
+        "--sampling-mode", type=str, default="unbiased",
+        choices=["unbiased", "biased"],
+        help="unbiased(현실적·기본: dense·15~22 경계 포함) | "
+        "biased(과대평가·선행 비교용: clean-neg<15+sparse+경계 제외).",
+    )
     args = parser.parse_args()
 
     dtype_map = {"float16": torch.float16, "float32": torch.float32}
@@ -751,6 +767,8 @@ def main() -> None:
         signal_dtype=dtype_map[args.signal_dtype],
         required_signals=args.required_signals,
         icp_threshold=args.icp_threshold,
+        min_sample_gap_sec=args.min_sample_gap_sec,
+        sampling_mode=args.sampling_mode,
     )
 
 
