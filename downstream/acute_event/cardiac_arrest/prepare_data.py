@@ -374,10 +374,10 @@ def extract_ca_window_samples(
         label = int(patient["label"])
 
         for span_idx, (span_start, signals) in enumerate(patient["records"]):
-            avail = [s for s in input_signals if s in signals]
-            if not avail:
+            # 모든 입력 신호 동시존재 레코드만 사용 (부분 결여 → labels/signals 정렬 붕괴).
+            if any(s not in signals for s in input_signals):
                 continue
-            min_len = min(len(signals[s]) for s in avail)
+            min_len = min(len(signals[s]) for s in input_signals)
             if min_len < win_samples:
                 continue
 
@@ -393,7 +393,9 @@ def extract_ca_window_samples(
                 input_dict = {
                     s: signals[s][start:end] for s in input_signals if s in signals
                 }
-                if not input_dict:
+                if len(input_dict) != len(input_signals):
+                    if gap_stats is not None:
+                        gap_stats.add_drop()
                     continue
 
                 # Step 1: gap-policy window drop (multi-channel valid_ratio)
@@ -459,15 +461,17 @@ def _consume_to_tensors_ca(
         )
         if T is None:
             continue
-        n = sum(1 for s in samples if stype in s.input_signals)
+        # labels/case_ids 와 정렬·길이 일치 위해 전체 N개로 쌓는다 (결여 시 즉시 에러).
+        n = len(samples)
         out = torch.empty((n, T), dtype=signal_dtype)
-        i = 0
-        for s in samples:
+        for i, s in enumerate(samples):
             arr = s.input_signals.pop(stype, None)
             if arr is None:
-                continue
+                raise ValueError(
+                    f"sample {i} missing signal '{stype}' — extraction 이 모든 "
+                    f"input_signals 동시존재를 보장해야 함 (labels/signals 정렬 붕괴 방지)"
+                )
             out[i].copy_(torch.from_numpy(arr))
-            i += 1
         sig_tensors[stype] = out
 
     gap_tensors = consume_gap_masks(samples, input_signals, attr="input_gap_masks")

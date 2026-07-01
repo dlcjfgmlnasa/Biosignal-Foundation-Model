@@ -128,10 +128,11 @@ def extract_ca_window_samples(
         label = int(patient["label"])
 
         for rec_idx, (rec_start, signals) in enumerate(patient["records"]):
-            avail = [s for s in input_signals if s in signals]
-            if not avail:
+            # 모든 입력 신호(ecg+ppg)가 동시에 있는 레코드만 사용. 일부만 있으면
+            # window 가 신호 결여 → labels/signals 길이·정렬 불일치 유발하므로 제외.
+            if any(s not in signals for s in input_signals):
                 continue
-            min_len = min(len(signals[s]) for s in avail)
+            min_len = min(len(signals[s]) for s in input_signals)
             if min_len < win_samples:
                 continue
 
@@ -145,7 +146,10 @@ def extract_ca_window_samples(
                 input_dict = {
                     s: signals[s][start:end] for s in input_signals if s in signals
                 }
-                if not input_dict:
+                # 모든 입력 신호가 다 있어야 함(위 레코드 가드로 보장되나 belt-and-suspenders).
+                if len(input_dict) != len(input_signals):
+                    if gap_stats is not None:
+                        gap_stats.add_drop()
                     continue
 
                 valid_ratio = compute_valid_ratio(list(input_dict.values()))
@@ -206,15 +210,18 @@ def _consume_to_tensors_ca(
         )
         if T is None:
             continue
-        n = sum(1 for s in samples if stype in s.input_signals)
+        # labels/case_ids 와 정렬·길이 일치 위해 반드시 전체 N개로 쌓는다.
+        # (extract_ca_window_samples 가 모든 입력신호 동시존재를 보장) 결여 시 즉시 에러.
+        n = len(samples)
         out = torch.empty((n, T), dtype=signal_dtype)
-        i = 0
-        for s in samples:
+        for i, s in enumerate(samples):
             arr = s.input_signals.pop(stype, None)
             if arr is None:
-                continue
+                raise ValueError(
+                    f"sample {i} missing signal '{stype}' — extraction 이 모든 "
+                    f"input_signals 동시존재를 보장해야 함 (labels/signals 정렬 붕괴 방지)"
+                )
             out[i].copy_(torch.from_numpy(arr))
-            i += 1
         sig_tensors[stype] = out
 
     gap_tensors = consume_gap_masks(samples, input_signals, attr="input_gap_masks")
