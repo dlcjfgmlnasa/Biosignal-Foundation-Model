@@ -17,8 +17,10 @@ MODEL_VERSION="${MODEL_VERSION:-v2}"   # v2 필수 (9 modality 단일 embedding)
 N_FOLDS="${N_FOLDS:-5}"
 LP_EPOCHS="${LP_EPOCHS:-1000}"
 LP_LR="${LP_LR:-1e-3}"
+LP_PATIENCE="${LP_PATIENCE:-0}"    # LP: early-stop 없이 전 epoch, best-val ckpt 선택(관례)
 LORA_EPOCHS="${LORA_EPOCHS:-30}"
 LORA_LR="${LORA_LR:-1e-4}"
+LORA_PATIENCE="${LORA_PATIENCE:-20}"  # LoRA: val best 무개선 20 epoch → early stop
 LORA_RANK="${LORA_RANK:-8}"
 LORA_ALPHA="${LORA_ALPHA:-16}"
 LORA_BATCH="${LORA_BATCH:-128}"   # ⚠ batch≠32 면 LR 재튜닝 필요 (memory lora_acceleration)
@@ -49,9 +51,9 @@ for SIGNALS in "${SIGNAL_COMBOS[@]}"; do
         EXP_DIR="${OUT_DIR}/${MODE}/${SIGNALS}"
         mkdir -p "$EXP_DIR"
         if [ "$MODE" = "linear_probe" ]; then
-            EPOCHS=$LP_EPOCHS; LR=$LP_LR; EXTRA_ARGS=""; LAUNCH="python -m"
+            EPOCHS=$LP_EPOCHS; LR=$LP_LR; PAT=$LP_PATIENCE; EXTRA_ARGS=""; LAUNCH="python -m"
         else
-            EPOCHS=$LORA_EPOCHS; LR=$LORA_LR
+            EPOCHS=$LORA_EPOCHS; LR=$LORA_LR; PAT=$LORA_PATIENCE
             EXTRA_ARGS="--lora-rank $LORA_RANK --lora-alpha $LORA_ALPHA --batch-size $LORA_BATCH"
             LAUNCH="$LORA_LAUNCH"
         fi
@@ -65,6 +67,7 @@ for SIGNALS in "${SIGNAL_COMBOS[@]}"; do
                 --fold "$F" \
                 --n-folds "$N_FOLDS" \
                 --epochs "$EPOCHS" \
+                --patience "$PAT" \
                 --lr "$LR" \
                 --device "$DEVICE" \
                 --out-dir "$EXP_DIR" \

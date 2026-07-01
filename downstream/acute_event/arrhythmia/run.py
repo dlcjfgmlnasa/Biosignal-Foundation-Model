@@ -23,8 +23,10 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import sys
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -46,6 +48,7 @@ from downstream.model_wrapper import LinearProbe
 from downstream.window_task import make_window_batches, iter_window_batches
 from downstream._eval_utils import dump_fold_predictions
 from downstream._ddp_utils import (
+    broadcast_should_stop,
     ddp_enabled,
     ddp_world_size,
     equalize_shard,
@@ -276,19 +279,39 @@ def _extract_features_maybe_sharded(
     return feats_all[order], labels_all[order]
 
 
-def _fit_probe_cached(probe, features, labels, batch_size, epochs, lr, device):
-    """미리 추출된 cached feature 로 probe 학습 (train_linear_probe 의 학습부와 동일,
-    멀티클래스 CrossEntropy, 순차 minibatch). 단일 GPU 에서 (추출 → 이 함수) 는 기존
-    train_linear_probe 와 byte-identical (순차·셔플 없음 → 순서 복원 시 동일)."""
+def _fit_probe_cached(
+    probe, features, labels, batch_size, epochs, lr, device,
+    val_features=None, val_labels=None, patience: int = 0,
+):
+    """미리 추출된 cached feature 로 probe 학습 (멀티클래스 CrossEntropy, 순차 minibatch).
+
+    ``val_features`` 가 주어지면 매 epoch 후 val macro-AUROC 를 재고, best-val probe
+    state 를 보관한다(deepcopy). ``patience>0`` 이면 val 무개선 patience epoch 시
+    early stop. 학습 종료 시 best-val state 를 probe 에 복원하고 반환한다.
+    val 이 없으면(None) 기존 고정-epoch·마지막 상태 동작(byte-identical).
+
+    returns (losses, best_epoch, val_aurocs).
+    """
     probe = probe.to(device)
     optimizer = torch.optim.Adam(probe.parameters(), lr=lr)
     criterion = nn.CrossEntropyLoss()
     features = features.to(device)
     labels = labels.to(device)
     n = features.size(0)
-    losses = []
-    probe.train()
+
+    use_val = val_features is not None and val_features.numel() > 0
+    if use_val:
+        val_features = val_features.to(device)
+        val_labels_np = val_labels.cpu().numpy()
+
+    losses, val_aurocs = [], []
+    best_val = -float("inf")
+    best_epoch = -1
+    best_state = None
+    no_improve = 0
+
     for epoch in range(epochs):
+        probe.train()
         epoch_loss, nb = 0.0, 0
         for i in range(0, n, batch_size):
             feats = features[i: i + batch_size]
@@ -301,9 +324,38 @@ def _fit_probe_cached(probe, features, labels, batch_size, epochs, lr, device):
             nb += 1
         avg = epoch_loss / max(nb, 1)
         losses.append(avg)
-        if (epoch + 1) % 5 == 0 or epoch == 0:
-            print(f"  Epoch {epoch + 1}/{epochs}  loss={avg:.4f}")
-    return losses
+
+        if use_val:
+            probe.eval()
+            with torch.no_grad():
+                v_logits = probe(val_features)
+                v_probs = torch.softmax(v_logits, dim=-1).cpu().numpy()
+            val_auroc = _macro_auroc_from_probs(val_labels_np, v_probs)
+            val_aurocs.append(val_auroc)
+            if val_auroc > best_val:
+                best_val = val_auroc
+                best_epoch = epoch
+                best_state = copy.deepcopy(probe.state_dict())
+                no_improve = 0
+            else:
+                no_improve += 1
+            if (epoch + 1) % 5 == 0 or epoch == 0:
+                print(
+                    f"  Epoch {epoch + 1}/{epochs}  loss={avg:.4f}  "
+                    f"val_macroAUROC={val_auroc:.4f}  "
+                    f"(best={best_val:.4f}@ep{best_epoch + 1})"
+                )
+            if patience > 0 and no_improve >= patience:
+                print(f"  [early-stop] epoch {epoch + 1}: val 무개선 {patience} epoch → 중단")
+                break
+        else:
+            if (epoch + 1) % 5 == 0 or epoch == 0:
+                print(f"  Epoch {epoch + 1}/{epochs}  loss={avg:.4f}")
+
+    if use_val and best_state is not None:
+        probe.load_state_dict(best_state)
+        print(f"  Restored best-val probe (macroAUROC={best_val:.4f} @ep{best_epoch + 1})")
+    return losses, best_epoch, val_aurocs
 
 
 @torch.no_grad()
@@ -327,6 +379,10 @@ def train_lora(
     device: torch.device,
     gradient_clip: float = 1.0,
     ddp_module=None,
+    val_batches: list[tuple[PackedBatch, torch.Tensor]] | None = None,
+    patience: int = 0,
+    use_ddp: bool = False,
+    use_val: bool = False,
 ) -> list[float]:
     """LoRA fine-tune (multi-class, CrossEntropy).
 
@@ -334,6 +390,15 @@ def train_lora(
     호출해 grad all-reduce 가 등록되게 한다. wrap_lora_ddp 는 logits 만 반환하므로
     CrossEntropy loss 는 모듈 밖에서 그대로 적용한다(BCE/CE 무관 동일 패턴).
     ddp_module=None 이면 기존 단일 GPU 경로 그대로(수치·결과 불변).
+
+    ``use_val=True`` 이면 매 epoch 후 (rank0 에서) val macro-AUROC 를 재고 best-val
+    LoRA+probe state 를 보관한다. ``patience>0`` 이면 early stop 하되, DDP(lora)
+    에서는 rank0 의 stop 결정을 ``broadcast_should_stop`` 으로 전 rank 에 전파해 함께
+    break(desync 방지). 학습 종료 시 best-val state 를 복원한다(rank0).
+    ⚠ ``use_val`` 은 전 rank 에서 동일해야 한다 — early-stop broadcast 는 collective
+    라 일부 rank 만 호출하면 hang. ``val_batches`` 는 rank0 만 있으면 되고(non-rank0
+    는 None 가능), 실제 평가는 ``is_main()`` 에서만 수행한다.
+    val 이 없으면(use_val=False) 기존 고정-epoch·마지막 상태 동작(불변).
     """
     model.model.train()
     probe = probe.to(device)
@@ -348,7 +413,15 @@ def train_lora(
     criterion = nn.CrossEntropyLoss()
     losses = []
 
+    best_val = -float("inf")
+    best_epoch = -1
+    best_probe_state = None
+    best_model_state = None
+    no_improve = 0
+
     for epoch in range(epochs):
+        model.model.train()
+        probe.train()
         if ddp_module is not None:
             ddp_module.train()
         epoch_loss, n = 0.0, 0
@@ -378,9 +451,58 @@ def train_lora(
 
         avg = epoch_loss / max(n, 1)
         losses.append(avg)
-        if (epoch + 1) % 5 == 0 or epoch == 0:
-            if is_main():  # DDP: rank0 만 출력(비-DDP 면 항상 True → 불변)
+
+        # ── val evaluation + best-ckpt 선택 (DDP: rank0 만 수행) ──
+        # all-reduce + optimizer.step 후 전 rank 파라미터가 동일하므로 rank0 평가가
+        # 전체를 대표한다. best-ckpt deepcopy 도 rank0 에서만(저장 주체).
+        if use_val and is_main() and val_batches is not None:
+            v = evaluate_lora(model, probe, val_batches, device)
+            val_auroc = _macro_auroc_from_probs(v["y_true"], v["y_probs"])
+            if val_auroc > best_val:
+                best_val = val_auroc
+                best_epoch = epoch
+                best_probe_state = copy.deepcopy(probe.state_dict())
+                best_model_state = copy.deepcopy(model.model.state_dict())
+                no_improve = 0
+            else:
+                no_improve += 1
+            if (epoch + 1) % 5 == 0 or epoch == 0:
+                print(
+                    f"  Epoch {epoch + 1}/{epochs}  loss={avg:.4f}  "
+                    f"val_macroAUROC={val_auroc:.4f}  "
+                    f"(best={best_val:.4f}@ep{best_epoch + 1})"
+                )
+        elif (epoch + 1) % 5 == 0 or epoch == 0:
+            if is_main():
                 print(f"  Epoch {epoch + 1}/{epochs}  loss={avg:.4f}")
+
+        # ── early stopping (DDP: rank0 결정을 broadcast 해 함께 break) ──
+        if use_val and patience > 0:
+            stop_local = is_main() and no_improve >= patience
+            stop = (
+                broadcast_should_stop(stop_local, device)
+                if (use_ddp and ddp_module is not None) else stop_local
+            )
+            if stop:
+                if is_main():
+                    print(
+                        f"  [early-stop] epoch {epoch + 1}: val 무개선 "
+                        f"{patience} epoch → 중단"
+                    )
+                break
+
+    # ── best-val state 복원 (rank0; non-rank0 는 호출측에서 학습 후 종료) ──
+    if use_val and is_main():
+        if best_probe_state is not None:
+            probe.load_state_dict(best_probe_state)
+            model.model.load_state_dict(best_model_state)
+            print(
+                f"  Restored best-val LoRA+probe "
+                f"(macroAUROC={best_val:.4f} @ep{best_epoch + 1})"
+            )
+        else:
+            print("  WARNING: no best-val ckpt captured; using last epoch.",
+                  file=sys.stderr)
 
     return losses
 
@@ -465,10 +587,36 @@ def _compute_multiclass_metrics(
     }
 
 
+# ── Val 선택 지표 (macro OvR AUROC) ──────────────────────────
+
+
+def _macro_auroc_from_probs(
+    y_true: np.ndarray,   # (N,) int
+    y_probs: np.ndarray,  # (N, n_classes)
+) -> float:
+    """멀티클래스 macro AUROC (one-vs-rest). run_eval 의 auroc_macro 집계·본문 보고
+    지표와 동일 정의 → val 모델선택(early stop)이 최종 보고 지표와 정합.
+
+    한 클래스가 val 에 아예 없거나 전부이면(0/all-positive) 그 클래스는 제외하고
+    나머지로 평균한다. 유효 클래스가 없으면 nan.
+    """
+    aurocs = []
+    for cls_id in range(y_probs.shape[1]):
+        binary = (y_true == cls_id).astype(int)
+        if binary.sum() == 0 or binary.sum() == len(binary):
+            continue
+        aurocs.append(float(compute_auroc(binary, y_probs[:, cls_id])))
+    return float(np.mean(aurocs)) if aurocs else float("nan")
+
+
 # ── 데이터 로딩 ──────────────────────────────────────────────
 
 
-def _load_data(args) -> tuple[list[MultiSignalWindow], list[MultiSignalWindow]]:
+def _load_data(
+    args,
+) -> tuple[
+    list[MultiSignalWindow], list[MultiSignalWindow], list[MultiSignalWindow]
+]:
     # data_path 가 그대로 존재하면 단일 파일(back-compat). 없으면 fold-prefix 로
     # 해석해 ``{data_path}_fold{fold}.pt`` 를 로드한다 (ablation runner 는 prefix +
     # --fold 를 넘기고, arrhythmia 데이터는 fold 당 완성 파일이라 fold 별로 선택).
@@ -501,6 +649,7 @@ def _load_data(args) -> tuple[list[MultiSignalWindow], list[MultiSignalWindow]]:
 
     train_data = data["train"]
     test_data = data["test"]
+    val_data = data.get("val")  # prepare_data_vitaldb 가 저장하는 3-way val split
 
     input_keys = list(train_data["signals"].keys())
     if not input_keys:
@@ -526,7 +675,37 @@ def _load_data(args) -> tuple[list[MultiSignalWindow], list[MultiSignalWindow]]:
             )
         return windows
 
-    return _pt_to_windows(train_data), _pt_to_windows(test_data)
+    train_windows = _pt_to_windows(train_data)
+    test_windows = _pt_to_windows(test_data)
+
+    if val_data is not None and len(val_data.get("labels", [])) > 0:
+        val_windows = _pt_to_windows(val_data)
+        print(f"  val split (from prepare_data): {len(val_windows)} samples")
+    else:
+        # Backward-compat: 구 산출물(val 키 없음/빈 fold) — train 에서 20% 동적 split.
+        # patient 단위가 아닌 sample 단위(구 hypotension fallback 과 동일 정책) — 정식
+        # 산출물은 prepare_data 의 patient-level val 을 쓰므로 이 경로는 legacy 안전망.
+        warnings.warn(
+            "data['val'] not found (or empty); falling back to a 20% dynamic "
+            "split of train. Re-run prepare_data_vitaldb.py for a deterministic "
+            "patient-level val split.",
+            stacklevel=2,
+        )
+        rng = np.random.default_rng(args.val_split_seed)
+        n_train = len(train_windows)
+        idx = np.arange(n_train)
+        rng.shuffle(idx)
+        n_val = max(1, int(n_train * 0.2))
+        val_idx = set(idx[:n_val].tolist())
+        new_train = [w for i, w in enumerate(train_windows) if i not in val_idx]
+        val_windows = [w for i, w in enumerate(train_windows) if i in val_idx]
+        train_windows = new_train
+        print(
+            f"  val split (dynamic, seed={args.val_split_seed}): "
+            f"{len(val_windows)} samples"
+        )
+
+    return train_windows, val_windows, test_windows
 
 
 def main() -> None:
@@ -544,6 +723,12 @@ def main() -> None:
     parser.add_argument("--lora-rank", type=int, default=8)
     parser.add_argument("--lora-alpha", type=float, default=16.0)
     parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--patience", type=int, default=0,
+                        help="val macro-AUROC 무개선 시 early stop epoch 수 "
+                             "(0=early stop 없이 전 epoch 수행하되 best-val ckpt 는 "
+                             "여전히 선택·복원). hypotension 관례: LP=0, LoRA=20")
+    parser.add_argument("--val-split-seed", type=int, default=42,
+                        help="data['val'] 부재 시(legacy) train 20%% 동적 split seed")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--patch-size", type=int, default=DEFAULT_PATCH_SIZE)
@@ -595,18 +780,19 @@ def main() -> None:
     print(f"Mode: {args.mode} | Classes: {CLASS_NAMES}")
 
     # ── 데이터 로드 ──
-    train_windows, test_windows = _load_data(args)
+    train_windows, val_windows, test_windows = _load_data(args)
 
-    print(f"  Train: {len(train_windows)} samples")
-    for cls_id, cls_name in enumerate(CLASS_NAMES):
-        cnt = sum(1 for w in train_windows if w.label == cls_id)
-        print(f"    {cls_name}: {cnt}")
-    print(f"  Test: {len(test_windows)} samples")
-    for cls_id, cls_name in enumerate(CLASS_NAMES):
-        cnt = sum(1 for w in test_windows if w.label == cls_id)
-        print(f"    {cls_name}: {cnt}")
+    def _print_dist(name, windows):
+        print(f"  {name}: {len(windows)} samples")
+        for cls_id, cls_name in enumerate(CLASS_NAMES):
+            cnt = sum(1 for w in windows if w.label == cls_id)
+            print(f"    {cls_name}: {cnt}")
 
-    if not train_windows or not test_windows:
+    _print_dist("Train", train_windows)
+    _print_dist("Val", val_windows)
+    _print_dist("Test", test_windows)
+
+    if not train_windows or not val_windows or not test_windows:
         print("Insufficient data.", file=sys.stderr)
         sys.exit(1)
 
@@ -620,8 +806,14 @@ def main() -> None:
         # rank 가 2 추출 참여 후 non-rank0 종료, rank0 만 probe 학습·평가·저장.
         # 단일 GPU(use_ddp=False)면 _extract_features_maybe_sharded→_stream_extract_features
         # + 동일 학습 루프 → 기존 train/evaluate_linear_probe 와 byte-identical.
+        # train/val/test 모두 rank 별 shard→gather (frozen encoder, 순서 복원).
+        # 전 rank 가 3 추출에 함께 참여해야 gather collective 가 성립 → non-rank0 는
+        # 3 추출 이후 종료. best-val 모델선택은 rank0 가 cached feature 로 수행.
         train_features, train_labels = _extract_features_maybe_sharded(
             model, train_windows, args.batch_size, args.patch_size, device,
+        )
+        val_features, val_labels = _extract_features_maybe_sharded(
+            model, val_windows, args.batch_size, args.patch_size, device,
         )
         test_features, test_labels = _extract_features_maybe_sharded(
             model, test_windows, args.batch_size, args.patch_size, device,
@@ -631,11 +823,13 @@ def main() -> None:
             dist.destroy_process_group()
             return
         print(f"\nTraining LinearProbe (frozen encoder, d_model={d_model})...")
-        train_losses = _fit_probe_cached(
+        train_losses, _best_ep, _val_aurocs = _fit_probe_cached(
             probe, train_features, train_labels,
             args.batch_size, args.epochs, args.lr, device,
+            val_features=val_features, val_labels=val_labels,
+            patience=args.patience,
         )
-        print("\nEvaluating...")
+        print("\nEvaluating on test set with best-val probe...")
         metrics = _eval_probe_cached(probe, test_features, test_labels, device)
 
     elif args.mode == "lora":
@@ -676,9 +870,17 @@ def main() -> None:
         # DDP: encode→pool→probe 를 한 forward 로 묶어 grad all-reduce 등록. 단일 GPU
         # 면 use_ddp=False → ddp_module=None → 기존 forward 경로 그대로(불변).
         ddp_module = wrap_lora_ddp(model.model, probe) if use_ddp else None
+        # val batch 는 매 epoch rank0 만 평가(best-ckpt 선택)에 쓴다. non-rank0 는
+        # 만들 필요 없음(메모리 절약) — train_lora 에서 is_main() 만 val 을 본다.
+        val_batches = (
+            _make_batches(val_windows, args.batch_size, args.patch_size, max_length)
+            if is_main() else None
+        )
         train_losses = train_lora(
             model, probe, train_batches, args.epochs, args.lr, device,
             ddp_module=ddp_module,
+            val_batches=val_batches, patience=args.patience, use_ddp=use_ddp,
+            use_val=True,
         )
         # DDP: 학습 종료 동기화 후 test/저장은 rank0 전담 → non-rank0 는 정리·종료.
         if use_ddp:
@@ -690,7 +892,7 @@ def main() -> None:
         test_batches = _make_batches(
             test_windows, args.batch_size, args.patch_size, max_length
         )
-        print("\nEvaluating...")
+        print("\nEvaluating on test set with best-val ckpt...")
         metrics = evaluate_lora(model, probe, test_batches, device)
 
     # ── 결과 출력 ──
