@@ -45,7 +45,8 @@ echo "  CHECKPOINT: $CHECKPOINT | OUT_DIR: $OUT_DIR"
 echo "============================================================"
 
 for H in $HORIZONS; do
-  PREFIX=$DATA_DIR/cardiac_arrest_${SIGNALS}_w${WINDOW}s_h${H}min
+  # prepare_data_scope.py 저장 prefix = scope_{task}_{signals}_w{win}s_h{H}min
+  PREFIX=$DATA_DIR/scope_${TASK}_${SIGNALS}_w${WINDOW}s_h${H}min
   for f in 0 1 2 3 4; do
     LP_OUT=$OUT_DIR/linear_probe/${SIGNALS}_w${WINDOW}s_h${H}min
     maybe_run "$LP_OUT" "$f" \
