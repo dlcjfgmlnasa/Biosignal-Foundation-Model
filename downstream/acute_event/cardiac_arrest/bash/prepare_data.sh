@@ -20,6 +20,7 @@ WINDOW_SECS=${WINDOW_SECS:-600}
 HORIZON_MINS=${HORIZON_MINS:-5 15 30}
 N_FOLDS=${N_FOLDS:-5}
 WORKERS=${WORKERS:-8}
+TRAIN_NEG_CAP=${TRAIN_NEG_CAP:-0}   # train 음성 case 당 window 캡(0=없음). val/test 불변. 불균형 완화용
 
 echo "============================================================"
 echo "  Imminent Cardiac Arrest (SCOPE) — Data Preparation"
@@ -39,7 +40,8 @@ python -m downstream.acute_event.cardiac_arrest.prepare_data_scope \
     --horizon-mins $HORIZON_MINS \
     --n-folds $N_FOLDS \
     --out-dir "$OUT_DIR" \
-    --workers $WORKERS
+    --workers $WORKERS \
+    --train-neg-cap-per-case $TRAIN_NEG_CAP
 
 echo -e "\n============================================================"
 echo "  Done! Output prefix: $OUT_DIR/scope_${TASK}_${INPUT_SIGNALS// /_}_w${WINDOW_SECS}s_h{H}min"

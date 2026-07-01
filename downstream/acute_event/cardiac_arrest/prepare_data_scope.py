@@ -624,8 +624,15 @@ def run_pass2(
     signal_dtype: torch.dtype,
     seed: int,
     cases_per_chunk: int = 200,
+    train_neg_cap_per_case: int = 0,
 ) -> list[Path]:
-    """캐시 메타 → stratified case-level K-fold × (w,h) 윈도우 추출 → 저장."""
+    """캐시 메타 → stratified case-level K-fold × (w,h) 윈도우 추출 → 저장.
+
+    train_neg_cap_per_case > 0 이면 **train split 의 음성(Discharge) case 당 window 를
+    최대 이 개수로 무작위 subsample** (극심한 불균형 완화용). val/test 는 손대지 않아
+    자연 유병률 유지 → 평가 selection bias 없음 (train-side rebalancing 만).
+    """
+    neg_cap_rng = np.random.default_rng(seed + 1)
     case_ids = sorted({m["case_id"] for m in metas})
     case_to_labels = {m["case_id"]: [int(m["label"])] for m in metas}
     meta_by_case = {m["case_id"]: m for m in metas}
@@ -689,6 +696,12 @@ def run_pass2(
                         horizon_sec, max_lead_sec=max_lead_sec,
                         gap_stats=gap_stats, sample_dtype=sample_dtype_str,
                     )
+                    # train 음성 case 만 window 수 캡 (불균형 완화, val/test 불변).
+                    if (split_name == "train" and train_neg_cap_per_case > 0
+                            and int(m["label"]) == 0
+                            and len(samples) > train_neg_cap_per_case):
+                        keep = neg_cap_rng.permutation(len(samples))[:train_neg_cap_per_case]
+                        samples = [samples[j] for j in sorted(keep.tolist())]
                     buf.extend(samples)
                     n_cases_in_buf += 1
                     if n_cases_in_buf >= cases_per_chunk:
@@ -735,6 +748,11 @@ def main() -> None:
     parser.add_argument("--cache-dir", type=str, default=None,
                         help="band 캐시 디렉토리 (기본: <out-dir>/_band_cache/<task>)")
     parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument(
+        "--train-neg-cap-per-case", type=int, default=0,
+        help="train split 음성(Discharge) case 당 window 최대 개수(무작위 subsample). "
+        "0=캡 없음. val/test 는 자연분포 유지(평가 편향 없음). 극불균형 완화용.",
+    )
     dtype_map = add_signal_dtype_arg(parser)
     args = parser.parse_args()
 
@@ -773,6 +791,7 @@ def main() -> None:
         args.window_secs, args.horizon_mins, args.stride_sec,
         args.max_lead_sec, args.n_folds, args.out_dir,
         dtype_map(args.signal_dtype), args.seed,
+        train_neg_cap_per_case=args.train_neg_cap_per_case,
     )
 
 
