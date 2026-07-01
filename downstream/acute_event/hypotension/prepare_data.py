@@ -4,13 +4,13 @@
 미래 5~15분 후 MAP<65 (≥1분 지속) 예측을 위한 (input_window, future_label) 쌍 생성.
 Label 소스: 항상 ABP (미래 구간의 MAP)
 Input 소스: 선택된 signal type 의 현재 윈도우
-표본 구성(문헌 스타일, Lee et al. VitalDB IOH):
-  - 현재-저혈압 제외: 예측 시점(입력 끝 30초 baseline) MAP≥65 인 window 만 사용
-    → 진행 중 저혈압의 연속(trivial positive) 배제, 신규 발생만 예측.
-  - clean negative: 미래 horizon 의 valid MAP 가 전부 75 mmHg 초과인 경우만 negative
-    (애매한 65~75 구간은 gray-zone 으로 제외).
-  - sparse sampling: 같은 case·class 에서 최소 20분 간격으로만 표본 채택
-    (dense stride 의 인접 상관 window 누적 방지). 명시적 over/under-sampling 은 안 함.
+표본 구성 (--sampling-mode, 공통: 현재-저혈압 제외 = 예측 시점 baseline MAP≥65 만):
+  - unbiased (기본, Yang et al. BJA 2025): dense 1분 sliding, 미래 sustained MAP<65 =
+    positive, 나머지(gray-zone 65~75 포함) 전부 negative. sparse/clean-neg 없음.
+    → 실제 임상과 같은 forward 평가(현실적). 선행 IOH 고성능(AUROC~0.93)은 selection
+    bias(biased 구성)의 산물이며 unbiased 에선 ~0.85 로 내려온다(Yang 2025).
+  - biased (supplementary, 선행 HPI/Lee 비교용): clean-neg(미래 valid MAP 전부 >75)만
+    negative + gray-zone(65~75) 제외 + sparse 20분 간격 → 과대평가.
 
 Split: patient-level K-fold CV (clinical AI 표준, default n_folds=5)
        각 fold i — train (n_folds-2 folds) / val (1 fold) / test (1 fold).
@@ -219,9 +219,10 @@ def extract_forecast_samples(
     stride_sec: float = 30.0,
     horizon_sec: float = 300.0,
     map_threshold: float = 65.0,
-    neg_map_threshold: float = 75.0,        # clean negative: 미래 내내 MAP>이 값 (문헌)
+    neg_map_threshold: float = 75.0,        # biased 모드 clean-neg: 미래 내내 MAP>이 값
     sustained_sec: float = 60.0,
-    min_sample_gap_sec: float = 1200.0,     # 같은 case·class 최소 sampling 간격(20분, 문헌)
+    min_sample_gap_sec: float = 1200.0,     # biased 모드 sparse 간격(20분)
+    sampling_mode: str = "unbiased",        # unbiased(현실적·기본, Yang 2025) | biased(과대평가·선행비교)
     valid_ratio_threshold: float = DEFAULT_VALID_RATIO_THRESHOLD,
     gap_stats: GapStats | None = None,
     sample_dtype: str = "float16",  # OOM 회피: sample 누적 시 즉시 float16 캐스팅
@@ -324,33 +325,36 @@ def extract_forecast_samples(
                     gap_stats.add_drop()
                 continue
 
-            # ── 라벨 결정 (문헌 스타일: clean positive / clean negative, gray-zone 제외) ──
-            #   positive    : 미래 horizon 내 ≥1분 지속 MAP<65 (신규 저혈압).
-            #   negative(clean): 미래 horizon 의 valid MAP(≥80% 커버)가 전부
-            #     neg_threshold(75) 초과 → 확실한 정상.
-            #   둘 다 아니면(경계 구간) skip — 문헌과 동일하게 애매 케이스 배제.
+            # ── 라벨 결정 ──
+            #   positive: 미래 horizon 내 ≥1분 지속 MAP<65 (신규 저혈압). 현재-저혈압
+            #     제외는 두 모드 공통(위에서 이미 적용).
+            #   unbiased(Yang 2025, 기본): dense 1분 sliding, positive 외 나머지(gray-zone
+            #     65~75 포함) 전부 negative. sparse/clean-neg 없음 → 현실적(임상) 평가.
+            #   biased(선행 HPI/Lee 방식, supplementary): clean-neg(미래 valid MAP 전부 >75)
+            #     만 negative, gray-zone(65~75) 제외, sparse 20분 간격 → 낙관적(과대평가).
             is_pos = _has_sustained_hypotension(
                 future_maps, map_threshold, min_consecutive,
             )
-            is_clean_neg = (
-                len(future_maps) >= int(0.8 * n_future_win)
-                and all(m > neg_map_threshold for m in future_maps)
-            )
-            if is_pos:
-                label = 1
-            elif is_clean_neg:
-                label = 0
-            else:
-                if gap_stats is not None:
-                    gap_stats.add_drop()
-                continue
-
-            # ── sparse sampling: 같은 case·class 최소 간격(기본 20분) 유지 ──
-            #   dense stride 로 생기는 인접 상관 window 누적 방지(문헌 ~20분 간격과 정합).
-            prev = last_accepted[label]
-            if prev is not None and (start - prev) < min_gap_samples:
-                continue
-            last_accepted[label] = start
+            if sampling_mode == "unbiased":
+                label = 1 if is_pos else 0
+            else:  # biased
+                is_clean_neg = (
+                    len(future_maps) >= int(0.8 * n_future_win)
+                    and all(m > neg_map_threshold for m in future_maps)
+                )
+                if is_pos:
+                    label = 1
+                elif is_clean_neg:
+                    label = 0
+                else:
+                    if gap_stats is not None:
+                        gap_stats.add_drop()
+                    continue
+                # sparse sampling: 같은 case·class 최소 간격(20분) — biased 만.
+                prev = last_accepted[label]
+                if prev is not None and (start - prev) < min_gap_samples:
+                    continue
+                last_accepted[label] = start
 
             # label_value: 미래 MAP의 최솟값 (참고용)
             min_future_map = min(future_maps)
@@ -557,6 +561,7 @@ def prepare_hypotension_sweep(
     horizon_mins: list[float],
     stride_sec: float = 30.0,
     min_sample_gap_sec: float = 1200.0,
+    sampling_mode: str = "unbiased",
     n_folds: int = 5,
     max_subjects: int | None = None,
     out_dir: str = "outputs/downstream/hypotension",
@@ -682,6 +687,7 @@ def prepare_hypotension_sweep(
                     samples = extract_forecast_samples(
                         case_batch, input_signals, window_sec, stride_sec, horizon_sec,
                         min_sample_gap_sec=min_sample_gap_sec,
+                        sampling_mode=sampling_mode,
                         gap_stats=gap_stats,
                     )
                     if not samples:
@@ -761,8 +767,15 @@ def main() -> None:
         "--min-sample-gap-sec",
         type=float,
         default=1200.0,
-        help="sparse sampling: 같은 case·class 최소 표본 간격(초). 작을수록 표본 ↑ "
-        "(상관 ↑·prevalence ↓). 기본 1200(20분, 문헌).",
+        help="biased 모드 sparse 표본 간격(초). 기본 1200(20분).",
+    )
+    parser.add_argument(
+        "--sampling-mode",
+        type=str,
+        default="unbiased",
+        choices=["unbiased", "biased"],
+        help="unbiased(현실적·기본, Yang 2025: dense·gray-zone 포함) | "
+        "biased(과대평가·선행 HPI/Lee 비교용: clean-neg>75+sparse+gray-zone 제외).",
     )
     parser.add_argument(
         "--n-folds",
@@ -800,6 +813,7 @@ def main() -> None:
         horizon_mins=args.horizon_mins,
         stride_sec=args.stride_sec,
         min_sample_gap_sec=args.min_sample_gap_sec,
+        sampling_mode=args.sampling_mode,
         n_folds=args.n_folds,
         seed=args.seed,
         max_subjects=args.max_subjects,
