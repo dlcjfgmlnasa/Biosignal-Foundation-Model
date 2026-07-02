@@ -50,7 +50,7 @@ LP_BATCH=${LP_BATCH:-512}
 # epoch 은 상한(ceiling). early-stop(LORA_PATIENCE)이 val 수렴 시 자동 중단하므로
 # 넉넉히 두면 "수렴 보장 + 시간 절약". LP 는 캐시 위 학습이라 early-stop 없이 1000 고정.
 LORA_EPOCHS=${LORA_EPOCHS:-200}
-LORA_PATIENCE=${LORA_PATIENCE:-20}   # val best 20 epoch 미개선 시 중단(run.py EARLY_STOP_PATIENCE)
+LORA_PATIENCE=${LORA_PATIENCE:-10}   # val best 10 epoch 미개선 시 중단(run.py EARLY_STOP_PATIENCE)
 LORA_LR=${LORA_LR:-1e-4}
 LORA_RANK=${LORA_RANK:-8}
 LORA_ALPHA=${LORA_ALPHA:-16}
