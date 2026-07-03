@@ -627,9 +627,16 @@ def prepare_ich_sweep(
             train_cases = [c for c in cases if c["patient_id"] in train_pids]
             val_cases = [c for c in cases if c["patient_id"] in val_pids]
             test_cases = [c for c in cases if c["patient_id"] in test_pids]
-            # OOM 회피 (Stage 5) — case-batch chunked save
+            # OOM 회피 (Stage 5, 2026-07 재강화) — byte-예산 chunked save.
+            #   기존 고정 CASES_PER_CHUNK=200 은 window 크기에 무관해, window=1200s
+            #   처럼 sample 1개가 window_sec×100×2byte×채널로 커지는 경우 200 case
+            #   누적 buffer 가 수백 GB → OOM(Killed). 이제 case 를 하나씩 흘리며
+            #   누적 sample byte 가 예산을 넘으면 flush → window 크기와 무관하게
+            #   buffer peak 를 고정한다. (case 단위 호출은 extract 가 case 별 독립
+            #   처리라 결과·gap_stats byte-identical.) chunk 수가 늘어도 run.py 의
+            #   load_prepared_split_chunked 가 glob 로 모으므로 안전.
             cur_fold_idx = fold_idx if len(splits) > 1 else None
-            CASES_PER_CHUNK = 200
+            CHUNK_BYTES_BUDGET = 4 * 1024 ** 3  # 누적 4GB 초과 시 flush
 
             for split_name, split_cases in (
                 ("train", train_cases),
@@ -641,21 +648,13 @@ def prepare_ich_sweep(
                 gap_stats = GapStats()
                 chunk_idx = 0
                 total = 0
-                for batch_start in range(0, len(split_cases), CASES_PER_CHUNK):
-                    case_batch = split_cases[batch_start:batch_start + CASES_PER_CHUNK]
-                    samples = extract_forecast_samples(
-                        case_batch, input_signals, window_sec, stride_sec, horizon_sec,
-                        gap_stats=gap_stats,
-                        sample_dtype=sample_dtype_str,
-                        icp_threshold=icp_threshold,
-                        min_sample_gap_sec=min_sample_gap_sec,
-                        sampling_mode=sampling_mode,
-                    )
-                    if not samples:
-                        continue
-                    packed = _consume_to_tensors_ich(samples, input_signals, signal_dtype)
-                    samples.clear()
-                    del samples; gc.collect()
+                buffer: list[ICHSample] = []
+                buf_bytes = 0
+
+                def _flush(buf: list[ICHSample], cidx: int, split_name: str) -> int:
+                    packed = _consume_to_tensors_ich(buf, input_signals, signal_dtype)
+                    buf.clear()
+                    gc.collect()
                     n_in_chunk = int(packed.get("labels", torch.tensor([])).numel())
                     save_path = save_split_dataset(
                         packed, split_name, input_signals,
@@ -663,12 +662,39 @@ def prepare_ich_sweep(
                         signal_dtype=signal_dtype,
                         fold_idx=cur_fold_idx,
                         n_folds=len(splits),
-                        chunk_idx=chunk_idx,
+                        chunk_idx=cidx,
                     )
                     saved_paths.append(save_path)
-                    total += n_in_chunk
+                    del packed
+                    gc.collect()
+                    return n_in_chunk
+
+                for case in split_cases:
+                    samples = extract_forecast_samples(
+                        [case], input_signals, window_sec, stride_sec, horizon_sec,
+                        gap_stats=gap_stats,
+                        sample_dtype=sample_dtype_str,
+                        icp_threshold=icp_threshold,
+                        min_sample_gap_sec=min_sample_gap_sec,
+                        sampling_mode=sampling_mode,
+                    )
+                    for s in samples:
+                        buffer.append(s)
+                        buf_bytes += sum(a.nbytes for a in s.input_signals.values())
+                        buf_bytes += sum(m.nbytes for m in s.input_gap_masks.values())
+                    samples.clear()
+                    del samples
+                    if buf_bytes >= CHUNK_BYTES_BUDGET and buffer:
+                        total += _flush(buffer, chunk_idx, split_name)
+                        chunk_idx += 1
+                        buf_bytes = 0
+                        gc.collect()
+
+                if buffer:  # 잔여 flush
+                    total += _flush(buffer, chunk_idx, split_name)
                     chunk_idx += 1
-                    del packed; gc.collect()
+                    buf_bytes = 0
+
                 print(f"    {split_name.capitalize()}: {chunk_idx} chunk(s), {total} samples")
                 print(gap_stats.summary())
 
