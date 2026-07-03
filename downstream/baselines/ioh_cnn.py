@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import json
 import sys
 from pathlib import Path
 
@@ -40,6 +41,16 @@ from downstream.metrics import (
     compute_f1,
     compute_sensitivity_specificity,
 )
+
+
+def _youden_threshold(y_true: np.ndarray, y_score: np.ndarray) -> float:
+    """Val 에서 Youden's J(=tpr-fpr) 최대 지점의 threshold (test leakage 회피)."""
+    from sklearn.metrics import roc_curve
+
+    if len(np.unique(y_true)) < 2:
+        return 0.5
+    fpr, tpr, thr = roc_curve(y_true, y_score)
+    return float(thr[int(np.argmax(tpr - fpr))])
 
 
 # ── 데이터 ────────────────────────────────────────────────────
@@ -206,15 +217,53 @@ def main():
         model.load_state_dict(best_state)
     ys = _scores(model, Xte, args.batch_size, device)
     yt = yte.numpy().astype(int)
+    # threshold-dependent 지표는 val Youden threshold 로(test leakage 회피).
+    va_scores = _scores(model, Xva, args.batch_size, device)
+    thr = _youden_threshold(yva.numpy().astype(int), va_scores)
+    y_pred = (ys >= thr).astype(int)
+
     auroc = compute_auroc(yt, ys); auprc = compute_auprc(yt, ys)
+    f1 = compute_f1(yt, y_pred, average="macro")
+    ss = compute_sensitivity_specificity(yt, y_pred)
     print(f"\n[IOH-CNN] TEST  AUROC={auroc:.4f}  AUPRC={auprc:.4f}  "
           f"prevalence={yt.mean():.3f} ({yt.sum()}/{len(yt)})", flush=True)
 
+    # ── preds .npz (run_eval 집계용, CARMEN run.py 와 동일) ──
     dump_fold_predictions(
         out_dir, task="hypotension_cnn", fold_idx=args.fold,
         n_folds=args.n_folds, y_true=yt, y_score=ys, patient_ids=case_te,
     )
-    print(f"  saved preds_fold{args.fold}.npz → {out_dir}", flush=True)
+    # ── fold JSON (CARMEN fold{f}.json 과 동일 스키마 → 같은 방식으로 집계 가능) ──
+    fold_json = {
+        "auroc": float(auroc),
+        "auprc": float(auprc),
+        "f1": float(f1),
+        "optimal_threshold": float(thr),
+        "sensitivity": float(ss["sensitivity"]),
+        "specificity": float(ss["specificity"]),
+        "n_total": int(len(yt)),
+        "n_positive": int(yt.sum()),
+        "prevalence": float(yt.mean()),
+        "y_true": yt.astype(int).tolist(),
+        "y_score": ys.astype(float).tolist(),
+        "patient_ids": [str(c) for c in case_te],
+        "val_auroc_best": float(best_auroc),
+        "best_epoch": int(best_ep),
+        "config": {
+            "model": "resnet1d",
+            "width": args.width,
+            "input_signals": keys,
+            "epochs": args.epochs,
+            "lr": args.lr,
+            "batch_size": args.batch_size,
+            "patience": args.patience,
+        },
+    }
+    json_path = out_dir / f"fold{args.fold}.json"
+    with open(json_path, "w") as f:
+        json.dump(fold_json, f)
+    print(f"  saved preds_fold{args.fold}.npz + fold{args.fold}.json → {out_dir}",
+          flush=True)
 
 
 if __name__ == "__main__":
