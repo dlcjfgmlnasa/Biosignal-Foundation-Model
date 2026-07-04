@@ -75,12 +75,16 @@ def _youden_threshold(y_true: np.ndarray, y_score: np.ndarray) -> float:
 # ── 데이터: RAM-resident fp16 스트리밍 (OOM 하드닝, 디스크 불필요) ──────
 
 
-def _load_split_ram(data_path, fold, split, input_signals):
+def _load_split_ram(data_path, fold, split, input_signals, id_fields=("case_ids",)):
     """한 split 의 chunk 를 하나씩 스트리밍 → per-chunk fp16 (n,C,L) 텐서 리스트.
 
     원본 numpy 는 즉시 해제, fp32 승격/2x concat 없음 → 피크 = chunk 1개 + 누적 fp16.
-    반환: (keys, chunks(list[Tensor fp16]), labels(np float32), case_ids(list[str])).
+    반환: (keys, chunks(list[Tensor fp16]), labels(np float32), ids(list[str])).
     chunk 가 없으면 keys=[] 로 반환.
+
+    ``id_fields`` 는 grouping id 를 찾을 payload 키의 **우선순위** 다. IOH 는
+    ``("case_ids",)`` (기존과 동일), ICH/arrest 는 ``("subject_ids","case_ids")`` 로
+    환자단위 subject_ids 를 우선 사용한다 (CARMEN run.py 의 OOF bootstrap grouping 정합).
     """
     keys: list[str] | None = None
     chunks: list[torch.Tensor] = []
@@ -105,7 +109,12 @@ def _load_split_ram(data_path, fold, split, input_signals):
 
         y = np.asarray(payload["labels"]).reshape(-1).astype(np.float32)
         labels.append(y)
-        cid = payload.get("case_ids")
+        cid = None
+        for fld in id_fields:
+            v = payload.get(fld)
+            if v is not None:
+                cid = v
+                break
         if cid is None:
             cid = [f"{split}_{ci}_{r}" for r in range(len(y))]
         else:
@@ -153,21 +162,21 @@ class _RamWindowDataset(Dataset):
         return x, torch.tensor(self.labels[i], dtype=torch.float32)
 
 
-def _make_datasets(args):
+def _make_datasets(args, id_fields=("case_ids",)):
     """train/val/test Dataset + keys 를 RAM-resident 스트리밍으로 구성."""
     load_fold = int(args.fold) if int(args.n_folds) > 1 else None
     ktr, tr_ch, tr_y, tr_id = _load_split_ram(
-        args.data_path, load_fold, "train", args.input_signals
+        args.data_path, load_fold, "train", args.input_signals, id_fields
     )
     if not ktr:
         raise FileNotFoundError(
             f"no train chunks/signals for {args.data_path} (fold={load_fold})"
         )
     kva, va_ch, va_y, va_id = _load_split_ram(
-        args.data_path, load_fold, "val", args.input_signals
+        args.data_path, load_fold, "val", args.input_signals, id_fields
     )
     kte, te_ch, te_y, te_id = _load_split_ram(
-        args.data_path, load_fold, "test", args.input_signals
+        args.data_path, load_fold, "test", args.input_signals, id_fields
     )
 
     train_ds = _RamWindowDataset(tr_ch, tr_y, tr_id)
@@ -249,10 +258,10 @@ def _scores(model, loader, device):
     return torch.cat(out).numpy() if out else np.array([])
 
 
-def main():
-    p = argparse.ArgumentParser(description="IOH end-to-end 1D-CNN baseline")
+def add_common_args(p, default_signals):
+    """세 task(IOH/ICH/arrest) CNN baseline 공용 CLI 인자."""
     p.add_argument("--data-path", type=str, required=True)
-    p.add_argument("--input-signals", type=str, nargs="+", default=["ecg", "ppg", "abp"])
+    p.add_argument("--input-signals", type=str, nargs="+", default=list(default_signals))
     p.add_argument("--n-folds", type=int, default=5)
     p.add_argument("--fold", type=int, default=0)
     p.add_argument("--val-split-seed", type=int, default=42)
@@ -266,20 +275,27 @@ def main():
     p.add_argument("--keep-cache", action="store_true", help="(deprecated no-op)")
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--out-dir", type=str, default=".")
-    args = p.parse_args()
+    return p
 
+
+def run_cnn_baseline(args, task_name, tag, id_fields=("case_ids",)):
+    """1D-ResNet end-to-end 지도학습 → val best-ckpt → test 1회 → npz + fold JSON.
+
+    IOH/ICH/arrest 공용. ``task_name`` 은 npz task 태그, ``tag`` 는 로그 prefix,
+    ``id_fields`` 는 환자 grouping id 우선순위(IOH=case_ids, ICH/arrest=subject_ids).
+    """
     device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
     n_gpus = torch.cuda.device_count() if device.type == "cuda" else 1
     # 입력 길이가 고정(L)이라 cudnn 이 최적 conv 알고리즘을 캐시 → conv 가속.
     torch.backends.cudnn.benchmark = True
     out_dir = Path(args.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
 
-    train_ds, val_ds, test_ds, keys = _make_datasets(args)
+    train_ds, val_ds, test_ds, keys = _make_datasets(args, id_fields)
     ytr = train_ds.labels.astype(int)
     yva = val_ds.labels.astype(int)
     yte = test_ds.labels.astype(int)
     case_te = test_ds.case_ids
-    print(f"[IOH-CNN] fold={args.fold}/{args.n_folds}  signals={keys}  "
+    print(f"[{tag}] fold={args.fold}/{args.n_folds}  signals={keys}  "
           f"train={len(ytr)}({int(ytr.sum())} pos) val={len(yva)} "
           f"test={len(yte)}({int(yte.sum())} pos)  [RAM-resident fp16]", flush=True)
 
@@ -300,7 +316,7 @@ def main():
         # 한 fold 를 GPU n_gpus 개로: DataParallel(단일 프로세스 → 데이터는 RAM 에 1벌).
         # global batch 를 GPU 축으로 분할 → 각 GPU 는 batch//n_gpus 를 처리.
         model = nn.DataParallel(model)
-        print(f"[IOH-CNN] DataParallel across {n_gpus} GPUs "
+        print(f"[{tag}] DataParallel across {n_gpus} GPUs "
               f"(global batch {args.batch_size} → ~{args.batch_size // n_gpus}/GPU)", flush=True)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     _unwrap = lambda m: m.module if isinstance(m, nn.DataParallel) else m
@@ -347,12 +363,12 @@ def main():
     auroc = compute_auroc(yte, ys); auprc = compute_auprc(yte, ys)
     f1 = compute_f1(yte, y_pred, average="macro")
     ss = compute_sensitivity_specificity(yte, y_pred)
-    print(f"\n[IOH-CNN] TEST  AUROC={auroc:.4f}  AUPRC={auprc:.4f}  "
+    print(f"\n[{tag}] TEST  AUROC={auroc:.4f}  AUPRC={auprc:.4f}  "
           f"prevalence={yte.mean():.3f} ({yte.sum()}/{len(yte)})", flush=True)
 
     # ── preds .npz (run_eval 집계용, CARMEN run.py 와 동일) ──
     dump_fold_predictions(
-        out_dir, task="hypotension_cnn", fold_idx=args.fold,
+        out_dir, task=task_name, fold_idx=args.fold,
         n_folds=args.n_folds, y_true=yte, y_score=ys, patient_ids=case_te,
     )
     # ── fold JSON (CARMEN fold{f}.json 과 동일 스키마 → 같은 방식으로 집계 가능) ──
@@ -386,6 +402,17 @@ def main():
         json.dump(fold_json, f)
     print(f"  saved preds_fold{args.fold}.npz + fold{args.fold}.json → {out_dir}",
           flush=True)
+
+
+def main():
+    p = add_common_args(
+        argparse.ArgumentParser(description="IOH end-to-end 1D-CNN baseline"),
+        default_signals=["ecg", "ppg", "abp"],
+    )
+    args = p.parse_args()
+    # IOH 는 window 당 case 1개(수술 case) → case_ids 로 grouping (기존과 동일).
+    run_cnn_baseline(args, task_name="hypotension_cnn", tag="IOH-CNN",
+                     id_fields=("case_ids",))
 
 
 if __name__ == "__main__":
