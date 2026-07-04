@@ -25,6 +25,11 @@ MODEL_VERSION="${MODEL_VERSION:-v2}"
 # 입력은 ABP+ECG+ICP 고정(prepare_data 에서 결정). window 도 고정(canonical),
 # 예측 horizon 만 변경한다. env override: WINDOW_SECS_OVERRIDE / HORIZON_MINS_OVERRIDE
 # 예) WINDOW_SECS_OVERRIDE=600 HORIZON_MINS_OVERRIDE="10 30" bash run.sh
+# ⚠ prefix 채널 토큰 = prepare_data --input-signals "abp icp ecg" 의 mode_str
+#   "abp_icp_ecg". run.py 는 --input-signals 가 없어 prepared 데이터의 모든 채널을
+#   그대로 사용하므로 로드 파일은 이 prefix 로만 결정된다. (구 "icp" 토큰은 ICP-only
+#   시절 잔재 — prepare 산출물(_abp_icp_ecg_)과 불일치해 전부 SKIP 되던 버그를 정정.)
+SIGNALS="${SIGNALS:-abp_icp_ecg}"
 WINDOW_SECS=(${WINDOW_SECS_OVERRIDE:-1200})      # 20min 고정
 HORIZON_MINS=(${HORIZON_MINS_OVERRIDE:-5 15 30})  # 5/15/30분 전 (canonical 30분)
 # 변수명은 전 task 공통 컨벤션: LP_EPOCHS/LORA_EPOCHS, LP_LR/LORA_LR, LP_BATCH/LORA_BATCH
@@ -67,9 +72,9 @@ fi
 for WIN in "${WINDOW_SECS[@]}"; do
     for HORIZON in "${HORIZON_MINS[@]}"; do
         # ⚠ 데이터는 단일 .pt 가 아니라 per-(fold,split)[_chunk] prefix 묶음이다.
-        #   예: intracranial_hypertension_icp_w1200s_h5min_fold0_train_chunk0.pt
+        #   예: intracranial_hypertension_abp_icp_ecg_w1200s_h5min_fold0_train_chunk0.pt
         #   run.py 는 --data-path PREFIX(.pt 없이) + --n-folds/--fold 로 로드.
-        PREFIX="${DATA_DIR}/intracranial_hypertension_icp_w${WIN}s_h${HORIZON}min"
+        PREFIX="${DATA_DIR}/intracranial_hypertension_${SIGNALS}_w${WIN}s_h${HORIZON}min"
 
         if ! ls "${PREFIX}"_fold0_*.pt >/dev/null 2>&1; then
             echo "[SKIP] ${PREFIX}_fold0_*.pt not found (prepare_data 필요)"

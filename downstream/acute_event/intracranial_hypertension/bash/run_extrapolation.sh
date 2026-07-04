@@ -25,6 +25,11 @@ OUT_DIR="${OUT_DIR:-/home/coder/workspace/k-mimic-/bio_fm/result/main/intracrani
 DEVICE="${DEVICE:-cuda}"
 MODEL_VERSION="${MODEL_VERSION:-v2}"
 
+# prefix 채널 토큰 = prepare_data --input-signals "abp icp ecg" → "abp_icp_ecg".
+# (run.py 는 --input-signals 없음: prepared 데이터의 모든 채널 사용 → prefix 로만 결합.
+#  구 "icp" 토큰은 prepare 산출물과 불일치해 전부 SKIP 되던 버그.)
+SIGNALS="${SIGNALS:-abp_icp_ecg}"
+
 # 외삽 sweep: window 여러 개, horizon 고정. (canonical run.sh 는 window 1개)
 WINDOW_SECS=(${WINDOW_SECS_OVERRIDE:-60 300 600 1200 1800})
 HORIZON_MINS=(${HORIZON_MINS_OVERRIDE:-30})
@@ -63,7 +68,7 @@ echo "============================================================"
 for WIN in "${WINDOW_SECS[@]}"; do
     for HORIZON in "${HORIZON_MINS[@]}"; do
         # 데이터는 per-(fold,split)[_chunk] prefix 묶음 (단일 .pt 아님).
-        PREFIX="${DATA_DIR}/intracranial_hypertension_icp_w${WIN}s_h${HORIZON}min"
+        PREFIX="${DATA_DIR}/intracranial_hypertension_${SIGNALS}_w${WIN}s_h${HORIZON}min"
 
         if ! ls "${PREFIX}"_fold0_*.pt >/dev/null 2>&1; then
             echo "[SKIP] ${PREFIX}_fold0_*.pt not found (prepare_data 필요)"
