@@ -331,9 +331,8 @@ def main():
             best_state = copy.deepcopy(_unwrap(model).state_dict())
         else:
             no_imp += 1
-        if (ep + 1) % 5 == 0 or ep == 0:
-            print(f"  ep{ep+1}/{args.epochs} val_auroc={auroc:.4f} "
-                  f"(best={best_auroc:.4f}@{best_ep+1})", flush=True)
+        print(f"  ep{ep+1}/{args.epochs} val_auroc={auroc:.4f} "
+              f"(best={best_auroc:.4f}@{best_ep+1})", flush=True)
         if args.patience > 0 and no_imp >= args.patience:
             print(f"  [early-stop] ep{ep+1}", flush=True); break
 
