@@ -240,9 +240,12 @@ class ResNet1D(nn.Module):
 def _scores(model, loader, device):
     """loader(shuffle=False) 순서대로 sigmoid 확률 반환 (dataset.labels 와 정렬)."""
     model.eval()
+    amp = (device.type == "cuda")
     out = []
     for xb, _ in loader:
-        out.append(torch.sigmoid(model(xb.to(device)).squeeze(-1)).cpu())
+        with torch.cuda.amp.autocast(enabled=amp):
+            logits = model(xb.to(device, non_blocking=True)).squeeze(-1)
+        out.append(torch.sigmoid(logits.float()).cpu())
     return torch.cat(out).numpy() if out else np.array([])
 
 
@@ -267,6 +270,8 @@ def main():
 
     device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
     n_gpus = torch.cuda.device_count() if device.type == "cuda" else 1
+    # 입력 길이가 고정(L)이라 cudnn 이 최적 conv 알고리즘을 캐시 → conv 가속.
+    torch.backends.cudnn.benchmark = True
     out_dir = Path(args.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
 
     train_ds, val_ds, test_ds, keys = _make_datasets(args)
@@ -304,12 +309,18 @@ def main():
     pos_weight = torch.tensor([n_neg / max(n_pos, 1.0)], device=device)
     crit = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
+    amp = (device.type == "cuda")
+    scaler = torch.cuda.amp.GradScaler(enabled=amp)
     best_auroc, best_state, best_ep, no_imp = -1.0, None, -1, 0
     for ep in range(args.epochs):
         model.train()
         for xb, yb in train_dl:
-            loss = crit(model(xb.to(device)).squeeze(-1), yb.to(device))
-            opt.zero_grad(); loss.backward(); opt.step()
+            xb = xb.to(device, non_blocking=True); yb = yb.to(device, non_blocking=True)
+            opt.zero_grad(set_to_none=True)
+            with torch.cuda.amp.autocast(enabled=amp):
+                loss = crit(model(xb).squeeze(-1), yb)
+            scaler.scale(loss).backward()
+            scaler.step(opt); scaler.update()
         va = _scores(model, val_dl, device)
         try:
             auroc = compute_auroc(yva, va)
