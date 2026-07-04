@@ -55,6 +55,7 @@ from torch.utils.data import DataLoader, Dataset
 from downstream._save_utils import iter_prepared_split_chunks
 from downstream._eval_utils import dump_fold_predictions
 from downstream.metrics import (
+    bootstrap_ci,
     compute_auroc,
     compute_auprc,
     compute_f1,
@@ -270,6 +271,7 @@ def add_common_args(p, default_signals):
     p.add_argument("--batch-size", type=int, default=128)
     p.add_argument("--width", type=int, default=64)
     p.add_argument("--patience", type=int, default=0, help=">0 이면 val best 미개선 patience epoch 후 early-stop")
+    p.add_argument("--bootstrap-iters", type=int, default=1000, help="per-fold test CI bootstrap iter (CARMEN 동일)")
     p.add_argument("--num-workers", type=int, default=4, help="DataLoader worker 수 (Linux fork 시 RAM 데이터 COW 공유)")
     p.add_argument("--cache-dir", type=str, default="", help="(deprecated no-op) RAM-resident 방식이라 로컬 캐시 불필요")
     p.add_argument("--keep-cache", action="store_true", help="(deprecated no-op)")
@@ -328,8 +330,12 @@ def run_cnn_baseline(args, task_name, tag, id_fields=("case_ids",)):
     amp = (device.type == "cuda")
     scaler = torch.cuda.amp.GradScaler(enabled=amp)
     best_auroc, best_state, best_ep, no_imp = -1.0, None, -1, 0
+    # CARMEN run.py 와 동일한 학습곡선 저장 (fold JSON 스키마 일치).
+    train_losses: list[float] = []
+    val_aurocs: list[float] = []
     for ep in range(args.epochs):
         model.train()
+        ep_loss, nb = 0.0, 0
         for xb, yb in train_dl:
             xb = xb.to(device, non_blocking=True); yb = yb.to(device, non_blocking=True)
             opt.zero_grad(set_to_none=True)
@@ -337,11 +343,14 @@ def run_cnn_baseline(args, task_name, tag, id_fields=("case_ids",)):
                 loss = crit(model(xb).squeeze(-1), yb)
             scaler.scale(loss).backward()
             scaler.step(opt); scaler.update()
+            ep_loss += float(loss.item()); nb += 1
+        train_losses.append(ep_loss / max(nb, 1))
         va = _scores(model, val_dl, device)
         try:
             auroc = compute_auroc(yva, va)
         except Exception:
             auroc = float("nan")
+        val_aurocs.append(float(auroc))
         if auroc > best_auroc:
             best_auroc, best_ep, no_imp = auroc, ep, 0
             best_state = copy.deepcopy(_unwrap(model).state_dict())
@@ -363,7 +372,16 @@ def run_cnn_baseline(args, task_name, tag, id_fields=("case_ids",)):
     auroc = compute_auroc(yte, ys); auprc = compute_auprc(yte, ys)
     f1 = compute_f1(yte, y_pred, average="macro")
     ss = compute_sensitivity_specificity(yte, y_pred)
-    print(f"\n[{tag}] TEST  AUROC={auroc:.4f}  AUPRC={auprc:.4f}  "
+    # per-fold test CI — CARMEN run.py 와 동일: metrics.bootstrap_ci(window-level,
+    # AUROC/AUPRC=score, F1=Youden-threshold binarized pred), 1000 iter.
+    auroc_ci = bootstrap_ci(compute_auroc, yte, ys, n_iter=args.bootstrap_iters)
+    auprc_ci = bootstrap_ci(compute_auprc, yte, ys, n_iter=args.bootstrap_iters)
+    f1_ci = bootstrap_ci(
+        lambda t, p: compute_f1(t, p, average="macro"),
+        yte, y_pred, n_iter=args.bootstrap_iters,
+    )
+    print(f"\n[{tag}] TEST  AUROC={auroc:.4f} [{auroc_ci[0]:.4f}, {auroc_ci[1]:.4f}]  "
+          f"AUPRC={auprc:.4f} [{auprc_ci[0]:.4f}, {auprc_ci[1]:.4f}]  "
           f"prevalence={yte.mean():.3f} ({yte.sum()}/{len(yte)})", flush=True)
 
     # ── preds .npz (run_eval 집계용, CARMEN run.py 와 동일) ──
@@ -371,7 +389,11 @@ def run_cnn_baseline(args, task_name, tag, id_fields=("case_ids",)):
         out_dir, task=task_name, fold_idx=args.fold,
         n_folds=args.n_folds, y_true=yte, y_score=ys, patient_ids=case_te,
     )
-    # ── fold JSON (CARMEN fold{f}.json 과 동일 스키마 → 같은 방식으로 집계 가능) ──
+    # ── fold JSON — CARMEN hypotension run.py 의 results dict 와 **동일 키·구조** ──
+    #   (auroc/auprc/f1/optimal_threshold/sensitivity/specificity/n_total/n_positive/
+    #    prevalence + y_true/y_score/patient_ids + val_auroc_best/best_epoch +
+    #    auroc_ci/auprc_ci/f1_ci + train_losses/val_aurocs + config). 같은 집계·표
+    #    파이프라인이 CARMEN 결과와 구분 없이 처리한다.
     fold_json = {
         "auroc": float(auroc),
         "auprc": float(auprc),
@@ -387,7 +409,13 @@ def run_cnn_baseline(args, task_name, tag, id_fields=("case_ids",)):
         "patient_ids": [str(c) for c in case_te],
         "val_auroc_best": float(best_auroc),
         "best_epoch": int(best_ep),
+        "auroc_ci": [float(auroc_ci[0]), float(auroc_ci[1])],
+        "auprc_ci": [float(auprc_ci[0]), float(auprc_ci[1])],
+        "f1_ci": [float(f1_ci[0]), float(f1_ci[1])],
+        "train_losses": train_losses,
+        "val_aurocs": val_aurocs,
         "config": {
+            "mode": task_name,
             "model": "resnet1d",
             "width": args.width,
             "input_signals": keys,
@@ -395,11 +423,14 @@ def run_cnn_baseline(args, task_name, tag, id_fields=("case_ids",)):
             "lr": args.lr,
             "batch_size": args.batch_size,
             "patience": args.patience,
+            "bootstrap_iters": args.bootstrap_iters,
+            "val_split_seed": args.val_split_seed,
         },
     }
+    # vault 수집 규칙과 동일한 fold{f}.json (CARMEN 결과도 vault 에선 이 이름).
     json_path = out_dir / f"fold{args.fold}.json"
     with open(json_path, "w") as f:
-        json.dump(fold_json, f)
+        json.dump(fold_json, f, indent=2)
     print(f"  saved preds_fold{args.fold}.npz + fold{args.fold}.json → {out_dir}",
           flush=True)
 
