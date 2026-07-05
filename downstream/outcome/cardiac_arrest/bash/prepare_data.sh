@@ -52,5 +52,5 @@ python -m downstream.outcome.cardiac_arrest.prepare_data_scope \
     --workers $WORKERS
 
 echo -e "\n============================================================"
-echo "  Done! Output prefix: $OUT_DIR/cardiac_arrest_w${WINDOW_SEC}s"
+echo "  Done! Output prefix: $OUT_DIR/scope_${TASK}_w${WINDOW_SEC}s"
 echo "============================================================"

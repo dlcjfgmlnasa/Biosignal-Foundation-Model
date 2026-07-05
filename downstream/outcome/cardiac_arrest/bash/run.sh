@@ -22,6 +22,8 @@ MODEL_VERSION=${MODEL_VERSION:-v2}
 DEVICE=${DEVICE:-cuda}
 NPROC=${NPROC:-4}
 
+# task = arrest(default) | death(=mortality). prepare 저장 prefix scope_{TASK}_w{win}s 와 일치.
+TASK=${TASK:-arrest}
 WINDOW_SEC=${WINDOW_SEC:-300}
 MAX_WINDOWS=${MAX_WINDOWS:-144}
 N_FOLDS=${N_FOLDS:-5}
@@ -39,8 +41,8 @@ else
     LAUNCH="python -m"
 fi
 
-# prepare_data_scope.py 저장 prefix = cardiac_arrest_w{win}s
-PREFIX=$DATA_DIR/cardiac_arrest_w${WINDOW_SEC}s
+# prepare_data_scope.py 저장 prefix = scope_{task}_w{win}s
+PREFIX=$DATA_DIR/scope_${TASK}_w${WINDOW_SEC}s
 
 # maybe_run <out-dir> <fold> <command...>
 maybe_run() {

@@ -592,7 +592,7 @@ def _save_patient_split(
         "split": split_name,
         "data": packed,
         "metadata": {
-            "task": "scope_cardiac_arrest_outcome",
+            "task": f"scope_{task}_outcome",
             "source": "SCOPE (SNUH ICU, KHDP icu-cardiac-arrest)",
             "label": "label",
             "aggregation": "patient_level",
@@ -626,7 +626,7 @@ def _save_patient_split(
     win_int = int(window_sec)
     fold_suffix = f"_fold{fold_idx}" if fold_idx is not None else ""
     filename = (
-        f"cardiac_arrest_w{win_int}s{fold_suffix}_{split_name}_chunk{chunk_idx}.pt"
+        f"scope_{task}_w{win_int}s{fold_suffix}_{split_name}_chunk{chunk_idx}.pt"
     )
     save_path = out_path / filename
     torch.save(save_dict, save_path)
