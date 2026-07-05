@@ -27,19 +27,33 @@ Task 분리 (각자 독립 binary, 서로 안 엮임):
   - ``--task arrest`` : pos=Cardiac Arrest(74) / neg=Discharge(4095) / Death 제외
   - ``--task death``  : pos=Death(348)        / neg=Discharge(4095) / Cardiac Arrest 제외
 
+Negative 구성 (``--neg-mode``, 2026-07-05 추가):
+  - ``cross-patient`` (기본, SCOPE 논문 정합): pos=event 환자·neg=Discharge 환자.
+    "arrest-환자 vs discharge-환자" 구분(who). horizon band 로 lead-time 매칭.
+  - ``within-patient`` (같은 arrest 환자 임박 경보): **arrest 환자만** 사용, 같은 환자
+    안에서 **pos=임박(horizon band, arrest 5~15분 전)·neg=비-임박(tte≥6h)·회색지대 drop**.
+    환자 중증도(who) 대신 arrest 로의 가속(when) 학습. band 를 24h 로 확장(6h+ neg 확보),
+    neg 는 pos×10 로 캡(자연 ~100:1 완화). ⚠ 74 환자뿐 → CI 넓음(환자 단위 bootstrap),
+    SCOPE 논문(cross-patient)과 직접 비교 불가 — 우리 고유 imminence task.
+
 2-pass (네트워크 마운트 스토리지 I/O 최적화):
   - Pass 1: 각 .vital 을 1회만 로딩 → anchor 직전 band 만 전처리 → case 캐시(.pt) 저장.
   - Pass 2: 캐시에서 stratified K-fold × horizon 별 윈도우 추출 → chunk .pt 저장.
 
 사용법:
+    # cross-patient (기본, SCOPE 논문 정합)
     python -m downstream.acute_event.cardiac_arrest.prepare_data_scope \
         --metadata datasets/icu-cardiac-arrest/1.0/metadata_v1.0.xlsx \
         --vital-dir datasets/icu-cardiac-arrest/1.0 \
-        --task arrest \
-        --input-signals ecg ppg \
+        --task arrest --input-signals ecg ppg \
         --window-secs 600 --horizon-mins 5 15 30 \
-        --out-dir datasets/processed/scope_cardiac_arrest \
-        --workers 8
+        --out-dir datasets/processed/scope_cardiac_arrest --workers 8
+
+    # within-patient (같은 arrest 환자 임박 경보)
+    python -m downstream.acute_event.cardiac_arrest.prepare_data_scope \
+        ... --neg-mode within-patient \
+        --within-neg-min-hours 6 --within-neg-band-hours 24 --within-neg-per-pos 10 \
+        --out-dir datasets/processed/scope_cardiac_arrest_within
 """
 
 from __future__ import annotations
@@ -110,13 +124,24 @@ def extract_ca_window_samples(
     valid_ratio_threshold: float = DEFAULT_VALID_RATIO_THRESHOLD,
     gap_stats: GapStats | None = None,
     sample_dtype: str = "float16",
+    neg_mode: str = "cross-patient",
+    within_neg_min_sec: float = 21600.0,
 ) -> list[CAWindowSample]:
     """anchor-relative window-level (input, label) 쌍 추출.
 
     윈도우 종료 절대시각 t_end 의 center 까지 잔여시간 tte = center − t_end.
-    ``horizon_sec ≤ tte ≤ horizon_sec + max_lead_sec`` 인 윈도우만 emit
-    (onset 보다 최소 h, 최대 h+max_lead 앞에서 끝남 → leakage 없음).
-    Gap policy: valid_ratio < threshold → drop, 통과분 NaN→0 + gap_mask 저장.
+
+    neg_mode:
+      - "cross-patient" (기본, SCOPE 논문 정합): ``horizon ≤ tte ≤ horizon+max_lead``
+        윈도우만 emit, **라벨 = 케이스 라벨**(arrest 환자=1, discharge 환자=0). 즉
+        arrest-환자 vs discharge-환자 구분(who).
+      - "within-patient" (같은 arrest 환자 임박 경보): **arrest 환자만**(upstream 필터)
+        에서 tte 로 **window-level 라벨** — ``horizon ≤ tte ≤ horizon+max_lead``=임박
+        (label 1), ``tte ≥ within_neg_min_sec``(기본 6h)=비-임박(label 0), 그 사이
+        회색지대=drop. → 환자 중증도(who) 대신 arrest 로의 가속(when) 학습.
+
+    두 모드 공통: onset 보다 최소 horizon 앞에서 끝남(leakage 없음). Gap policy:
+    valid_ratio < threshold → drop, 통과분 NaN→0 + gap_mask 저장.
     """
     win_samples = int(window_sec * TARGET_SR)
     stride_samples = int(stride_sec * TARGET_SR)
@@ -140,8 +165,20 @@ def extract_ca_window_samples(
                 end = start + win_samples
                 t_end = rec_start + timedelta(seconds=end / TARGET_SR)
                 tte = (center - t_end).total_seconds()
-                if tte < horizon_sec or tte > horizon_sec + max_lead_sec:
-                    continue
+
+                # ── window 라벨 결정 (neg_mode 별) ──
+                if neg_mode == "within-patient":
+                    # arrest 환자만 들어옴(upstream 필터). tte 로 window-level 라벨.
+                    if horizon_sec <= tte <= horizon_sec + max_lead_sec:
+                        win_label = 1                      # 임박(positive)
+                    elif tte >= within_neg_min_sec:
+                        win_label = 0                      # 비-임박(negative, 6h+)
+                    else:
+                        continue                           # 회색지대 → drop
+                else:  # cross-patient (기존): 케이스 라벨, 임박 밴드만
+                    if tte < horizon_sec or tte > horizon_sec + max_lead_sec:
+                        continue
+                    win_label = label
 
                 input_dict = {
                     s: signals[s][start:end] for s in input_signals if s in signals
@@ -170,7 +207,7 @@ def extract_ca_window_samples(
                     CAWindowSample(
                         input_signals=filled_dict,
                         input_gap_masks=gap_mask_dict,
-                        label=label,
+                        label=win_label,
                         label_value=tte / 60.0,
                         case_id=f"{pid}_rec{rec_idx}_w{start}",
                         patient_id=pid,
@@ -568,6 +605,7 @@ def _save_scope_split(
     fold_idx: int | None,
     n_folds: int,
     chunk_idx: int,
+    neg_mode: str = "cross-patient",
 ) -> Path:
     """SCOPE split chunk → .pt (source 메타만 SCOPE 로 다르게)."""
     out_path = Path(out_dir)
@@ -586,7 +624,14 @@ def _save_scope_split(
             "window_sec": window_sec,
             "max_lead_sec": max_lead_sec,
             "sampling_rate": TARGET_SR,
-            "negative_strategy": "anchor-aligned (fixed outcome anchor, lead-time band)",
+            "neg_mode": neg_mode,
+            "negative_strategy": (
+                "within-patient (arrest-only; pos=imminent horizon band, "
+                "neg=non-imminent far band, same patient)"
+                if neg_mode == "within-patient"
+                else "cross-patient (pos=event patient, neg=Discharge patient; "
+                     "fixed outcome anchor, lead-time band)"
+            ),
             "split": split_name,
             "n_samples": n_samples,
             "fold_idx": fold_idx,
@@ -625,12 +670,19 @@ def run_pass2(
     seed: int,
     cases_per_chunk: int = 200,
     train_neg_cap_per_case: int = 0,
+    neg_mode: str = "cross-patient",
+    within_neg_min_sec: float = 21600.0,
+    within_neg_per_pos: int = 10,
 ) -> list[Path]:
     """캐시 메타 → stratified case-level K-fold × (w,h) 윈도우 추출 → 저장.
 
-    train_neg_cap_per_case > 0 이면 **train split 의 음성(Discharge) case 당 window 를
-    최대 이 개수로 무작위 subsample** (극심한 불균형 완화용). val/test 는 손대지 않아
-    자연 유병률 유지 → 평가 selection bias 없음 (train-side rebalancing 만).
+    cross-patient: train_neg_cap_per_case > 0 이면 **train split 의 음성(Discharge)
+      case 당 window 를 무작위 subsample** (val/test 자연분포 유지).
+    within-patient: arrest 환자 안에서 pos(임박)/neg(비-임박) window 라벨. 자연
+      imbalance 가 ~100:1(10min pos vs 수 h neg)로 극심하므로, ``within_neg_per_pos``
+      > 0 이면 **환자별 neg 를 pos 수 × 이 배수로 subsample**(전 split 동일 —
+      within-patient 유병률은 밴드로 설계된 값이라 자연분포 개념이 없음). pos 없는
+      환자는 제외.
     """
     neg_cap_rng = np.random.default_rng(seed + 1)
     case_ids = sorted({m["case_id"] for m in metas})
@@ -679,6 +731,7 @@ def run_pass2(
                         horizon_sec, window_sec, out_dir,
                         max_lead_sec=max_lead_sec, signal_dtype=signal_dtype,
                         fold_idx=cur_fold, n_folds=len(splits), chunk_idx=cidx,
+                        neg_mode=neg_mode,
                     )
                     saved.append(sp)
                     total += n_in
@@ -695,11 +748,25 @@ def run_pass2(
                         [patient], input_signals, window_sec, stride_sec,
                         horizon_sec, max_lead_sec=max_lead_sec,
                         gap_stats=gap_stats, sample_dtype=sample_dtype_str,
+                        neg_mode=neg_mode, within_neg_min_sec=within_neg_min_sec,
                     )
-                    # train 음성 case 만 window 수 캡 (불균형 완화, val/test 불변).
-                    if (split_name == "train" and train_neg_cap_per_case > 0
+                    if neg_mode == "within-patient":
+                        # 환자별 pos(임박)/neg(비-임박). pos 없으면 제외, neg 는
+                        # pos×within_neg_per_pos 로 캡 (전 split 동일 — 설계 유병률).
+                        pos_s = [s for s in samples if s.label == 1]
+                        neg_s = [s for s in samples if s.label == 0]
+                        if not pos_s:
+                            samples = []
+                        else:
+                            cap = within_neg_per_pos * len(pos_s)
+                            if within_neg_per_pos > 0 and len(neg_s) > cap:
+                                keep = neg_cap_rng.permutation(len(neg_s))[:cap]
+                                neg_s = [neg_s[j] for j in sorted(keep.tolist())]
+                            samples = pos_s + neg_s
+                    elif (split_name == "train" and train_neg_cap_per_case > 0
                             and int(m["label"]) == 0
                             and len(samples) > train_neg_cap_per_case):
+                        # cross-patient: train 음성 case 만 캡 (val/test 불변).
                         keep = neg_cap_rng.permutation(len(samples))[:train_neg_cap_per_case]
                         samples = [samples[j] for j in sorted(keep.tolist())]
                     buf.extend(samples)
@@ -750,26 +817,56 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument(
         "--train-neg-cap-per-case", type=int, default=0,
-        help="train split 음성(Discharge) case 당 window 최대 개수(무작위 subsample). "
-        "0=캡 없음. val/test 는 자연분포 유지(평가 편향 없음). 극불균형 완화용.",
+        help="[cross-patient] train split 음성(Discharge) case 당 window 최대 개수"
+        "(무작위 subsample). 0=캡 없음. val/test 자연분포 유지. 극불균형 완화용.",
+    )
+    parser.add_argument(
+        "--neg-mode", type=str, default="cross-patient",
+        choices=["cross-patient", "within-patient"],
+        help="cross-patient(기본, SCOPE 논문 정합): pos=arrest환자·neg=discharge환자. "
+        "within-patient(같은 arrest환자 임박 경보): arrest환자만, pos=임박(horizon밴드)"
+        "·neg=비-임박(6h+)·회색지대 drop.",
+    )
+    parser.add_argument(
+        "--within-neg-min-hours", type=float, default=6.0,
+        help="[within-patient] 비-임박 negative 의 최소 tte(시간). 기본 6h "
+        "(이보다 가까우면 전조 오염 소지 → 회색지대 drop).",
+    )
+    parser.add_argument(
+        "--within-neg-band-hours", type=float, default=24.0,
+        help="[within-patient] band 로딩 범위(시간). 이 범위까지 negative 확보. 기본 24h.",
+    )
+    parser.add_argument(
+        "--within-neg-per-pos", type=int, default=10,
+        help="[within-patient] 환자별 neg 를 pos 수 × 이 배수로 캡(전 split). 0=캡 없음. "
+        "자연 imbalance(~100:1) 완화용. 기본 10.",
     )
     dtype_map = add_signal_dtype_arg(parser)
     args = parser.parse_args()
 
-    # band: 모든 horizon+window+max_lead 를 포괄하는 anchor 직전 구간 + 버퍼
-    band_sec = (
-        max(args.horizon_mins) * 60.0
-        + args.max_lead_sec
-        + max(args.window_secs)
-        + 60.0
-    )
+    within = args.neg_mode == "within-patient"
+    within_neg_min_sec = args.within_neg_min_hours * 3600.0
+    # band: cross-patient=horizon+lead+window 만. within-patient=6h+ negative 확보
+    # 위해 within_neg_band_hours 까지 로딩(+window+버퍼).
+    if within:
+        band_sec = args.within_neg_band_hours * 3600.0 + max(args.window_secs) + 60.0
+    else:
+        band_sec = (
+            max(args.horizon_mins) * 60.0
+            + args.max_lead_sec
+            + max(args.window_secs)
+            + 60.0
+        )
     cache_dir = Path(args.cache_dir) if args.cache_dir else (
         Path(args.out_dir) / "_band_cache" / args.task
     )
 
     print(f"{'=' * 64}")
     print(f"  SCOPE Cardiac Arrest / Mortality — Data Preparation")
-    print(f"  Task:     {args.task}  (pos={TASK_SPEC[args.task][0]}, neg=Discharge)")
+    print(f"  Task:     {args.task}  (pos={TASK_SPEC[args.task][0]})")
+    print(f"  Neg-mode: {args.neg_mode}" + (
+        f"  (arrest-only, neg tte≥{args.within_neg_min_hours:.0f}h, "
+        f"neg≤{args.within_neg_per_pos}×pos)" if within else "  (neg=Discharge)"))
     print(f"  Input:    {' + '.join(s.upper() for s in args.input_signals)}")
     print(f"  Windows:  {args.window_secs}s / Horizons: {args.horizon_mins}min")
     print(f"  Band:     {band_sec / 60:.1f}min (anchor 직전 로딩 구간)")
@@ -779,6 +876,15 @@ def main() -> None:
     if not cohort:
         print("ERROR: 코호트 비어 있음.", file=sys.stderr)
         sys.exit(1)
+
+    if within:
+        # within-patient: arrest(양성) 환자만 — neg 는 같은 환자의 비-임박 구간.
+        n_before = len(cohort)
+        cohort = [c for c in cohort if int(c["label"]) == 1]
+        print(f"  [within-patient] arrest 환자만 유지: {n_before} → {len(cohort)} cases")
+        if not cohort:
+            print("ERROR: within-patient 인데 arrest(양성) case 가 없음.", file=sys.stderr)
+            sys.exit(1)
 
     metas = run_pass1(cohort, args.input_signals, band_sec, cache_dir,
                       workers=args.workers)
@@ -792,6 +898,8 @@ def main() -> None:
         args.max_lead_sec, args.n_folds, args.out_dir,
         dtype_map(args.signal_dtype), args.seed,
         train_neg_cap_per_case=args.train_neg_cap_per_case,
+        neg_mode=args.neg_mode, within_neg_min_sec=within_neg_min_sec,
+        within_neg_per_pos=args.within_neg_per_pos,
     )
 
 
