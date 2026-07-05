@@ -40,7 +40,9 @@ LP_EPOCHS="${LP_EPOCHS:-1000}"
 LORA_EPOCHS="${LORA_EPOCHS:-30}"
 LP_LR="${LP_LR:-1e-3}"
 LORA_LR="${LORA_LR:-1e-4}"
-LP_BATCH="${LP_BATCH:-512}"
+# LP_BATCH 64: 긴 window(최대 1800s→~2700 token) attention O(seq²) OOM 회피.
+#   frozen 추출은 window 독립이라 batch 무관하게 결과 byte-identical (run.sh 와 동일 근거).
+LP_BATCH="${LP_BATCH:-64}"
 LORA_BATCH="${LORA_BATCH:-128}"
 LORA_RANK="${LORA_RANK:-8}"
 N_FOLDS="${N_FOLDS:-5}"

@@ -37,7 +37,11 @@ LP_EPOCHS="${LP_EPOCHS:-1000}"
 LORA_EPOCHS="${LORA_EPOCHS:-30}"
 LP_LR="${LP_LR:-1e-3}"
 LORA_LR="${LORA_LR:-1e-4}"
-LP_BATCH="${LP_BATCH:-512}"
+# LP_BATCH: frozen feature 추출/probe-fit batch. ICH 는 window 가 20min(1200s→3채널 packed
+#   ~1800 token) 로 길어 attention O(seq²) VRAM 이 커진다 — 512 는 단일 ~37GB 할당으로 GPU OOM.
+#   추출 feature 는 window별 독립(BinaryAttentionBias 로 window 경계 attention 차단)이라
+#   batch 를 줄여도 결과 byte-identical → 64 로 낮춰 OOM 회피(짧은 window task 는 512 유지 가능).
+LP_BATCH="${LP_BATCH:-64}"
 LORA_RANK="${LORA_RANK:-8}"
 N_FOLDS="${N_FOLDS:-5}"   # stratified k-fold — fold 별 실행(--n-folds/--fold)
 FORCE="${FORCE:-0}"       # 1 이면 완료 fold(preds_fold{f}.npz)도 재실행
