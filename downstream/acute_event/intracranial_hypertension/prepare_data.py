@@ -558,6 +558,8 @@ def prepare_ich_sweep(
     icp_threshold: float = ICP_THRESHOLD,
     min_sample_gap_sec: float = 1200.0,
     sampling_mode: str = "unbiased",
+    sustained_sec: float = SUSTAINED_SEC,
+    valid_ratio_threshold: float = DEFAULT_VALID_RATIO_THRESHOLD,
 ) -> list[Path]:
     """(window, horizon) 조합 × stratified K-fold CV 데이터셋 생성.
 
@@ -573,7 +575,8 @@ def prepare_ich_sweep(
     print(f"  Input:    {mode_str}")
     print(f"  Windows:  {window_secs}")
     print(f"  Horizons: {horizon_mins}")
-    print(f"  ICP threshold: {icp_threshold} mmHg, sustained: {SUSTAINED_SEC}s")
+    print(f"  ICP threshold: {icp_threshold} mmHg, sustained: {sustained_sec}s, "
+          f"valid_ratio: {valid_ratio_threshold}")
     print(f"{'=' * 60}")
 
     # 1. 데이터 로딩 — required_signals 강제 시 sample 마다 동일 채널 보장
@@ -679,6 +682,8 @@ def prepare_ich_sweep(
                         icp_threshold=icp_threshold,
                         min_sample_gap_sec=min_sample_gap_sec,
                         sampling_mode=sampling_mode,
+                        sustained_sec=sustained_sec,
+                        valid_ratio_threshold=valid_ratio_threshold,
                     )
                     for s in samples:
                         buffer.append(s)
@@ -773,6 +778,17 @@ def main() -> None:
         help="biased 모드 sparse 표본 간격(초). 기본 1200(20분).",
     )
     parser.add_argument(
+        "--sustained-sec", type=float, default=SUSTAINED_SEC,
+        help=f"positive 판정 지속 요건(초): 미래 horizon 내 ICP>임계가 이 시간 이상 "
+             f"연속 지속되어야 ICH. default {SUSTAINED_SEC:.0f}(1분). 낮추면(예: 30) "
+             "짧은 에피소드도 양성으로 포함돼 희소 양성 표본 확보(재파싱 필요).",
+    )
+    parser.add_argument(
+        "--valid-ratio", type=float, default=DEFAULT_VALID_RATIO_THRESHOLD,
+        help=f"input window 유효 샘플 비율 임계. default {DEFAULT_VALID_RATIO_THRESHOLD}. "
+             "낮추면(예: 0.7) gappy window 를 더 포함해 표본 확보(재파싱 필요).",
+    )
+    parser.add_argument(
         "--sampling-mode", type=str, default="unbiased",
         choices=["unbiased", "biased"],
         help="unbiased(현실적·기본: dense·15~20 경계 포함) | "
@@ -797,6 +813,8 @@ def main() -> None:
         icp_threshold=args.icp_threshold,
         min_sample_gap_sec=args.min_sample_gap_sec,
         sampling_mode=args.sampling_mode,
+        sustained_sec=args.sustained_sec,
+        valid_ratio_threshold=args.valid_ratio,
     )
 
 

@@ -31,6 +31,11 @@ STRIDE="${STRIDE:-30}"
 MODE="${MODE:-unbiased}"    # unbiased(현실적·기본) | biased(과대평가·선행비교)
 MIN_GAP="${MIN_GAP:-1200}"  # biased 모드 sparse 간격(초)
 SKIP_DOWNLOAD="${SKIP_DOWNLOAD:-0}"
+# 라벨 완화(재파싱 필요) — 미설정 시 prepare_data.py 기본값 사용(sustained 60s / valid_ratio 기본).
+#   양성 표본이 너무 적을 때: SUSTAINED_SEC=30 (지속요건↓) / VALID_RATIO=0.7 (품질임계↓). ICP 임계는 20 유지.
+LABEL_ARGS=""
+[ -n "$SUSTAINED_SEC" ] && LABEL_ARGS="$LABEL_ARGS --sustained-sec $SUSTAINED_SEC"
+[ -n "$VALID_RATIO" ]   && LABEL_ARGS="$LABEL_ARGS --valid-ratio $VALID_RATIO"
 
 echo "============================================================"
 echo "  Intracranial Hypertension — Data Preparation"
@@ -71,6 +76,7 @@ run_combo() {
         --horizon-mins $HORIZONS \
         --stride-sec $STRIDE \
         --min-sample-gap-sec $MIN_GAP --sampling-mode $MODE \
+        $LABEL_ARGS \
         --out-dir "$OUT_DIR"
 }
 
