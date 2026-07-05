@@ -23,9 +23,9 @@ TRAIN_NEG_CAP=${TRAIN_NEG_CAP:-0}   # [cross-patient] train 음성 case 당 wind
 
 # ── Negative 구성 모드 ──
 #   cross-patient(기본): pos=event환자 / neg=Discharge환자 (SCOPE 논문 정합)
-#   within-patient: arrest환자만, 같은 환자 안 pos=임박·neg=비-임박(6h+)·회색지대 drop
+#   within-patient: arrest환자만, 같은 환자 안 pos=임박·neg=비-임박(12h+)·회색지대 drop
 NEG_MODE=${NEG_MODE:-cross-patient}
-WITHIN_NEG_MIN_HOURS=${WITHIN_NEG_MIN_HOURS:-6}
+WITHIN_NEG_MIN_HOURS=${WITHIN_NEG_MIN_HOURS:-12}
 WITHIN_NEG_BAND_HOURS=${WITHIN_NEG_BAND_HOURS:-24}
 WITHIN_NEG_PER_POS=${WITHIN_NEG_PER_POS:-10}
 # out-dir 은 모드별 분리(덮어쓰기 방지). within 은 _within 접미사.

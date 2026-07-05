@@ -31,8 +31,8 @@ Negative 구성 (``--neg-mode``, 2026-07-05 추가):
   - ``cross-patient`` (기본, SCOPE 논문 정합): pos=event 환자·neg=Discharge 환자.
     "arrest-환자 vs discharge-환자" 구분(who). horizon band 로 lead-time 매칭.
   - ``within-patient`` (같은 arrest 환자 임박 경보): **arrest 환자만** 사용, 같은 환자
-    안에서 **pos=임박(horizon band, arrest 5~15분 전)·neg=비-임박(tte≥6h)·회색지대 drop**.
-    환자 중증도(who) 대신 arrest 로의 가속(when) 학습. band 를 24h 로 확장(6h+ neg 확보),
+    안에서 **pos=임박(horizon band, arrest 5~15분 전)·neg=비-임박(tte≥12h)·회색지대 drop**.
+    환자 중증도(who) 대신 arrest 로의 가속(when) 학습. band 를 24h 로 확장(12h+ neg 확보),
     neg 는 pos×10 로 캡(자연 ~100:1 완화). ⚠ 74 환자뿐 → CI 넓음(환자 단위 bootstrap),
     SCOPE 논문(cross-patient)과 직접 비교 불가 — 우리 고유 imminence task.
 
@@ -52,7 +52,7 @@ Negative 구성 (``--neg-mode``, 2026-07-05 추가):
     # within-patient (같은 arrest 환자 임박 경보)
     python -m downstream.acute_event.cardiac_arrest.prepare_data_scope \
         ... --neg-mode within-patient \
-        --within-neg-min-hours 6 --within-neg-band-hours 24 --within-neg-per-pos 10 \
+        --within-neg-min-hours 12 --within-neg-band-hours 24 --within-neg-per-pos 10 \
         --out-dir datasets/processed/scope_cardiac_arrest_within
 """
 
@@ -125,7 +125,7 @@ def extract_ca_window_samples(
     gap_stats: GapStats | None = None,
     sample_dtype: str = "float16",
     neg_mode: str = "cross-patient",
-    within_neg_min_sec: float = 21600.0,
+    within_neg_min_sec: float = 43200.0,
 ) -> list[CAWindowSample]:
     """anchor-relative window-level (input, label) 쌍 추출.
 
@@ -137,7 +137,7 @@ def extract_ca_window_samples(
         arrest-환자 vs discharge-환자 구분(who).
       - "within-patient" (같은 arrest 환자 임박 경보): **arrest 환자만**(upstream 필터)
         에서 tte 로 **window-level 라벨** — ``horizon ≤ tte ≤ horizon+max_lead``=임박
-        (label 1), ``tte ≥ within_neg_min_sec``(기본 6h)=비-임박(label 0), 그 사이
+        (label 1), ``tte ≥ within_neg_min_sec``(기본 12h)=비-임박(label 0), 그 사이
         회색지대=drop. → 환자 중증도(who) 대신 arrest 로의 가속(when) 학습.
 
     두 모드 공통: onset 보다 최소 horizon 앞에서 끝남(leakage 없음). Gap policy:
@@ -172,7 +172,7 @@ def extract_ca_window_samples(
                     if horizon_sec <= tte <= horizon_sec + max_lead_sec:
                         win_label = 1                      # 임박(positive)
                     elif tte >= within_neg_min_sec:
-                        win_label = 0                      # 비-임박(negative, 6h+)
+                        win_label = 0                      # 비-임박(negative, 12h+)
                     else:
                         continue                           # 회색지대 → drop
                 else:  # cross-patient (기존): 케이스 라벨, 임박 밴드만
@@ -671,7 +671,7 @@ def run_pass2(
     cases_per_chunk: int = 200,
     train_neg_cap_per_case: int = 0,
     neg_mode: str = "cross-patient",
-    within_neg_min_sec: float = 21600.0,
+    within_neg_min_sec: float = 43200.0,
     within_neg_per_pos: int = 10,
 ) -> list[Path]:
     """캐시 메타 → stratified case-level K-fold × (w,h) 윈도우 추출 → 저장.
@@ -825,11 +825,11 @@ def main() -> None:
         choices=["cross-patient", "within-patient"],
         help="cross-patient(기본, SCOPE 논문 정합): pos=arrest환자·neg=discharge환자. "
         "within-patient(같은 arrest환자 임박 경보): arrest환자만, pos=임박(horizon밴드)"
-        "·neg=비-임박(6h+)·회색지대 drop.",
+        "·neg=비-임박(12h+)·회색지대 drop.",
     )
     parser.add_argument(
-        "--within-neg-min-hours", type=float, default=6.0,
-        help="[within-patient] 비-임박 negative 의 최소 tte(시간). 기본 6h "
+        "--within-neg-min-hours", type=float, default=12.0,
+        help="[within-patient] 비-임박 negative 의 최소 tte(시간). 기본 12h "
         "(이보다 가까우면 전조 오염 소지 → 회색지대 drop).",
     )
     parser.add_argument(
@@ -846,7 +846,7 @@ def main() -> None:
 
     within = args.neg_mode == "within-patient"
     within_neg_min_sec = args.within_neg_min_hours * 3600.0
-    # band: cross-patient=horizon+lead+window 만. within-patient=6h+ negative 확보
+    # band: cross-patient=horizon+lead+window 만. within-patient=12h+ negative 확보
     # 위해 within_neg_band_hours 까지 로딩(+window+버퍼).
     if within:
         band_sec = args.within_neg_band_hours * 3600.0 + max(args.window_secs) + 60.0
