@@ -777,10 +777,11 @@ def main() -> None:
         print("ERROR: --checkpoint or --dummy required.", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Mode: {args.mode} | Classes: {CLASS_NAMES}")
-
-    # ── 데이터 로드 ──
+    # ── 데이터 로드 (metadata 에서 CLASS_NAMES/N_CLASSES override) ──
     train_windows, val_windows, test_windows = _load_data(args)
+
+    # CLASS_NAMES 는 _load_data 안에서 prepared metadata 로 갱신되므로 로드 후 출력.
+    print(f"Mode: {args.mode} | Classes: {CLASS_NAMES}")
 
     def _print_dist(name, windows):
         print(f"  {name}: {len(windows)} samples")
