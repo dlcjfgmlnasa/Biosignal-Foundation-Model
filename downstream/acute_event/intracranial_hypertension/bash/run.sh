@@ -58,7 +58,7 @@ else
 fi
 
 echo "============================================================"
-echo "  Intracranial Hypertension Detection (ICP > 22mmHg)"
+echo "  Intracranial Hypertension Detection (ICP > 20mmHg)"
 echo "  Checkpoint: $CHECKPOINT"
 echo "  ModelVer:   $MODEL_VERSION"
 echo "  Data:       $DATA_DIR"

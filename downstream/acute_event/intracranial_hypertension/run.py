@@ -1,5 +1,5 @@
 # -*- coding:utf-8 -*-
-"""Intracranial Hypertension Detection (ICP > 22mmHg).
+"""Intracranial Hypertension Detection (ICP > 20mmHg).
 
 MIMIC-III ICP 기반 두개내 고혈압 탐지 — Foundation model representation 평가.
 
@@ -8,7 +8,7 @@ MIMIC-III ICP 기반 두개내 고혈압 탐지 — Foundation model representat
   - lora:         Frozen encoder + LoRA adapters + LinearProbe
 
 입력: ICP + ECG/ABP/PPG 윈도우 → encoder → mean pool → LinearProbe
-라벨: 미래 구간 ICP > 22mmHg ≥1분 지속 여부
+라벨: 미래 구간 ICP > 20mmHg ≥1분 지속 여부
 
 사용법:
     python -m downstream.acute_event.intracranial_hypertension.run \
@@ -781,7 +781,7 @@ def run_loso(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Intracranial Hypertension Detection (ICP > 22mmHg)"
+        description="Intracranial Hypertension Detection (ICP > 20mmHg)"
     )
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--model-version", type=str, default="v1", choices=["v1", "v2"])

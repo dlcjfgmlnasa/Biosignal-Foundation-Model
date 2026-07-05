@@ -2,16 +2,17 @@
 """Intracranial Hypertension Detection — 데이터 준비 (MIMIC-III).
 
 MIMIC-III Waveform에서 ICP 채널이 있는 레코드를 파싱하여
-ICP > 22mmHg (≥1분 지속) 예측용 (input_window, future_label) 쌍을 생성한다.
-  (임계 22mmHg = BTF 4판 Carney 2017 치료 임계 + ICP crisis ML 문헌 기준.)
+ICP > 20mmHg (≥1분 지속) 예측용 (input_window, future_label) 쌍을 생성한다.
+  (임계 20mmHg = intracranial hypertension 정의 Czosnyka & Pickard 2004, 논문 Table 3
+   기준. BTF Carney 2017 치료 임계 22 보다 낮춰 희소 양성 표본 확보.)
 
-Label 소스: ICP (미래 구간의 평균 ICP > 22mmHg 지속 여부)
+Label 소스: ICP (미래 구간의 평균 ICP > 20mmHg 지속 여부)
 Input 소스: ICP + 동시 기록된 ECG, ABP, PPG 등
-표본 구성 (--sampling-mode, IOH 와 동일 원칙; 공통: 현재-ICH 제외 = 예측 시점 ICP<22 만):
-  - unbiased(기본): dense sliding, 미래 sustained ICP>22 = positive, 나머지(15~22 경계
+표본 구성 (--sampling-mode, IOH 와 동일 원칙; 공통: 현재-ICH 제외 = 예측 시점 ICP<20 만):
+  - unbiased(기본): dense sliding, 미래 sustained ICP>20 = positive, 나머지(15~20 경계
     포함) 전부 negative. sparse/clean-neg 없음 → 실제 forward 평가(현실적).
   - biased(supplementary, 선행 crisis/non-crisis epoch 방식): clean-neg(미래 valid ICP 전부
-    <15, Czosnyka 2004)만 negative + 경계(15~22) 제외 + sparse 20분 → 과대평가.
+    <15, Czosnyka 2004)만 negative + 경계(15~20) 제외 + sparse 20분 → 과대평가.
 
 데이터 소스: MIMIC-III Waveform Matched Subset (PhysioNet)
 
@@ -47,8 +48,9 @@ from downstream._save_utils import consume_gap_masks
 TARGET_SR: float = 100.0
 
 # ICP 임상 기준
-ICP_THRESHOLD: float = 22.0  # mmHg (sustained >1min). BTF 4판(Carney 2017) 치료 임계 +
-#                              ICP crisis ML 문헌(ICP>22) 기준. 정상 ICP 7-15mmHg.
+ICP_THRESHOLD: float = 20.0  # mmHg (sustained >1min). intracranial hypertension 정의
+#                              (Czosnyka & Pickard 2004; 논문 Table 3 기준). 정상 ICP 7-15mmHg.
+#                              (BTF 4판 Carney 2017 치료 임계 22 보다 낮춰 희소 양성 표본 확보.)
 SUSTAINED_SEC: float = 60.0  # 1분 이상 지속
 
 # MIMIC-III 채널명 → signal_type 매핑 (Task #3 ICH: ABP, ECG, PPG, CO2 + ICP for label)
@@ -329,12 +331,12 @@ def extract_forecast_samples(
                 continue
 
             # ── 라벨 결정 ──
-            #   positive: 미래 horizon 내 ≥1분 지속 ICP>22 (신규 두개내압 상승; BTF 4판
-            #     Carney 2017). 현재-ICH 제외는 두 모드 공통(위에서 이미 적용).
-            #   unbiased(기본): dense sliding, positive 외 나머지(15~22 경계 포함) 전부
+            #   positive: 미래 horizon 내 ≥1분 지속 ICP>threshold (신규 두개내압 상승;
+            #     기본 20 = Czosnyka 2004). 현재-ICH 제외는 두 모드 공통(위에서 이미 적용).
+            #   unbiased(기본): dense sliding, positive 외 나머지(15~20 경계 포함) 전부
             #     negative. sparse/clean-neg 없음 → 실제 forward 평가(현실적).
             #   biased(선행 crisis/non-crisis epoch 방식, supplementary): clean-neg(미래 valid
-            #     ICP 전부 <15, Czosnyka 2004)만 negative + 경계(15~22) 제외 + sparse → 과대평가.
+            #     ICP 전부 <15, Czosnyka 2004)만 negative + 경계(15~20) 제외 + sparse → 과대평가.
             is_pos = _has_sustained_ich(future_icps, icp_threshold, min_consecutive)
             if sampling_mode == "unbiased":
                 label = 1 if is_pos else 0
@@ -763,8 +765,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--icp-threshold", type=float, default=ICP_THRESHOLD,
-        help=f"intracranial hypertension 임계 ICP(mmHg). default {ICP_THRESHOLD:.0f}. "
-             "BTF 2016 가이드라인 표준은 22.",
+        help=f"intracranial hypertension 임계 ICP(mmHg). default {ICP_THRESHOLD:.0f} "
+             "(Czosnyka 2004 IH 정의). BTF 2016 치료 임계는 22.",
     )
     parser.add_argument(
         "--min-sample-gap-sec", type=float, default=1200.0,
@@ -773,7 +775,7 @@ def main() -> None:
     parser.add_argument(
         "--sampling-mode", type=str, default="unbiased",
         choices=["unbiased", "biased"],
-        help="unbiased(현실적·기본: dense·15~22 경계 포함) | "
+        help="unbiased(현실적·기본: dense·15~20 경계 포함) | "
         "biased(과대평가·선행 비교용: clean-neg<15+sparse+경계 제외).",
     )
     args = parser.parse_args()
