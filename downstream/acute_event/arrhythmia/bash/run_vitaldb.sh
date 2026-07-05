@@ -30,8 +30,9 @@ NPROC=${NPROC:-1}
 if [ "$NPROC" -gt 1 ]; then LORA_LAUNCH="torchrun --nproc_per_node=$NPROC -m"; else LORA_LAUNCH="python -m"; fi
 
 # canonical 조합만. ablation 추가 시 "ecg" "ppg" 도 prepare 후 여기에 추가.
-SIGNAL_COMBOS=("ecg_ppg")
-MODES=("linear_probe" "lora")
+# env override(공백 구분): SIGNALS_OVERRIDE="ecg ppg" / MODES_OVERRIDE="lora"
+SIGNAL_COMBOS=(${SIGNALS_OVERRIDE:-ecg_ppg})
+MODES=(${MODES_OVERRIDE:-linear_probe lora})
 
 echo "============================================================"
 echo "  Arrhythmia (VitalDB) — 5-class: NSR/AF/SV/VA/BradyCond"
