@@ -45,9 +45,13 @@ from downstream.viz import plot_roc_curve
 from downstream.model_wrapper import LinearProbe
 from downstream.window_task import make_window_batches, iter_window_batches
 from downstream._eval_utils import dump_fold_predictions
-from downstream._save_utils import load_prepared_split_chunked
+from downstream._save_utils import (
+    iter_prepared_split_chunks,
+    load_prepared_split_chunked,
+)
 from downstream._ddp_utils import (
     ddp_enabled,
+    ddp_rank,
     ddp_world_size,
     equalize_shard,
     gather_concat,
@@ -441,6 +445,85 @@ def _load_data(args):
     return train_w, val_w, test_w
 
 
+# ── OOM 하드닝: 스트리밍 + DDP shard 로드 ──────────────────────
+# 기존 _load_data 는 load_prepared_split_chunked(전체 chunk concat) + _to_windows
+# (윈도우별 numpy 복제)로 **rank 마다 전체 split 2벌**을 materialize → 4-GPU × 큰
+# window(1200s) 에서 host-RAM OOM(SIGKILL). 아래는 chunk 를 하나씩 스트리밍하며
+# shard=True(&DDP) 면 이 rank 의 stride(전역 idx % world == rank, shard_for_rank 와
+# 동일 선택)만 materialize → peak = chunk 1개 + 이 rank 몫(1/world).
+
+
+def _stream_load_windows(
+    data_path: str,
+    fold: int | None,
+    split: str,
+    shard: bool,
+) -> tuple[list[dict], list[int]]:
+    """chunk 스트리밍으로 window dict 리스트 생성 (+ 전역 인덱스 gidx).
+
+    shard=True & DDP 면 이 rank 의 stride 만 유지(1/world RAM). 비-DDP/shard=False
+    면 전체를 순서대로 materialize(gidx=range) → 기존 _to_windows 와 동일 순서.
+    val 없는 legacy 산출물이면 빈 리스트 반환(호출측 fallback).
+    """
+    do_shard = shard and ddp_enabled()
+    world = ddp_world_size() if do_shard else 1
+    rank = ddp_rank() if do_shard else 0
+    windows: list[dict] = []
+    gidx: list[int] = []
+    g = 0
+    for payload in iter_prepared_split_chunks(data_path, fold, split):
+        sig = payload.get("signals") if isinstance(payload, dict) else None
+        if not sig:
+            continue
+        labels = payload["labels"]
+        sig_types = list(sig.keys())
+        subj = payload.get("subject_ids")
+        case = payload.get("case_ids")
+        n = len(labels)
+        for i in range(n):
+            if g % world == rank:
+                windows.append({
+                    "signals": {st: sig[st][i].numpy() for st in sig_types},
+                    "label": int(labels[i].item()),
+                    "case_id": case[i] if case is not None else 0,
+                    "subject_id": subj[i] if subj is not None else "unknown",
+                })
+                gidx.append(g)
+            g += 1
+        del sig, payload
+    return windows, gidx
+
+
+@torch.no_grad()
+def _extract_features_presharded(
+    model, windows, gidx, batch_size, patch_size, device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """windows 가 **이미 이 rank 의 shard**(gidx=전역 인덱스)일 때의 feature 추출.
+
+    _extract_features_maybe_sharded 와 동일하되 내부 재-shard 를 하지 않는다
+    (windows 가 로드 시점에 stride 로 들어옴). 비-DDP 면 순서 추출 그대로,
+    DDP 면 각 rank shard 추출 → gather_concat → rank0 가 gidx argsort 로 복원.
+    non-main 은 gather 참여 후 빈 텐서 반환.
+    """
+    feats, labels = _stream_extract_features(
+        model, windows, batch_size, patch_size, device,
+    )
+    if not ddp_enabled():
+        return feats, labels
+    local = [(torch.tensor(gidx, dtype=torch.long), feats, labels)]
+    gathered = gather_concat(local)
+    if not is_main():
+        return torch.empty(0), torch.empty(0)
+    parts = [g for g in gathered if g[0].numel() > 0]
+    if not parts:
+        return torch.empty(0), torch.empty(0)
+    idx_all = torch.cat([g[0] for g in parts])
+    feats_all = torch.cat([g[1] for g in parts], dim=0)
+    labels_all = torch.cat([g[2] for g in parts], dim=0)
+    order = torch.argsort(idx_all)
+    return feats_all[order], labels_all[order]
+
+
 # ── LOSO (Leave-One-Subject-Out) ─────────────────────────────
 
 
@@ -750,17 +833,61 @@ def main() -> None:
     if args.mode == "lora":
         model.inject_lora(rank=args.lora_rank, alpha=args.lora_alpha)
 
-    train_windows, val_windows, test_windows = _load_data(args)
+    # ── 데이터 로드 (스트리밍 + DDP stride shard; OOM 하드닝) ──
+    # 각 rank 가 전체 split 을 materialize 하면 4-GPU × 큰 window(1200s)에서 host-RAM
+    # OOM(SIGKILL). linear_probe(DDP)=각 rank stride 로드→추출→gather 로 rank0 복원,
+    # lora(DDP)=train 만 stride(학습 병렬)·val/test 는 rank0 full, 단일 GPU/LOSO=full.
+    load_fold = int(args.fold) if int(args.n_folds) > 1 else None
+    is_lora = args.mode == "lora"
+    is_loso = args.eval_mode == "loso"
+    tr_gidx = va_gidx = te_gidx = None
+    print(f"\nLoading data: {args.data_path} (fold={load_fold})"
+          f"{'  [DDP stride shard]' if (use_ddp and not is_loso) else '  [stream]'}")
 
+    if use_ddp and not is_loso and not is_lora:
+        # linear_probe DDP: 3 split 모두 stride 샤딩 → 추출 후 gather 로 rank0 복원.
+        train_windows, tr_gidx = _stream_load_windows(args.data_path, load_fold, "train", shard=True)
+        val_windows, va_gidx = _stream_load_windows(args.data_path, load_fold, "val", shard=True)
+        test_windows, te_gidx = _stream_load_windows(args.data_path, load_fold, "test", shard=True)
+        if not val_windows:
+            if is_main():
+                print("ERROR: DDP 는 val 없는 legacy 산출물 미지원 — prepare_data 로 val "
+                      "split 저장하거나 단일 GPU(NPROC=1)로 실행.", file=sys.stderr)
+            import torch.distributed as dist
+            dist.destroy_process_group(); sys.exit(2)
+    elif use_ddp and is_lora:
+        # lora DDP: train 만 stride(데이터 병렬)·val/test 는 rank0 full(평가 전담).
+        train_windows, tr_gidx = _stream_load_windows(args.data_path, load_fold, "train", shard=True)
+        if is_main():
+            val_windows, _ = _stream_load_windows(args.data_path, load_fold, "val", shard=False)
+            test_windows, _ = _stream_load_windows(args.data_path, load_fold, "test", shard=False)
+        else:
+            val_windows, test_windows = [], []
+    else:
+        # 단일 GPU / LOSO: full 스트리밍 로드 (기존 _to_windows 와 동일 순서).
+        train_windows, _ = _stream_load_windows(args.data_path, load_fold, "train", shard=False)
+        val_windows, _ = _stream_load_windows(args.data_path, load_fold, "val", shard=False)
+        test_windows, _ = _stream_load_windows(args.data_path, load_fold, "test", shard=False)
+        if not val_windows:
+            # legacy val-missing fallback (단일 GPU 만) — train 20% 동적 split.
+            seed = getattr(args, "val_split_seed", 42)
+            rng = np.random.default_rng(seed)
+            idx = np.arange(len(train_windows)); rng.shuffle(idx)
+            n_val = max(1, int(len(train_windows) * 0.2))
+            vset = set(idx[:n_val].tolist())
+            val_windows = [w for i, w in enumerate(train_windows) if i in vset]
+            train_windows = [w for i, w in enumerate(train_windows) if i not in vset]
+            print(f"  val split (dynamic, seed={seed}): {len(val_windows)} windows")
+
+    if train_windows:
+        print(f"  Signals: {list(train_windows[0]['signals'].keys())}")
+    _sh = "  [rank shard]" if (use_ddp and not is_loso) else ""
     n_pos_train = sum(1 for w in train_windows if w["label"] == 1)
     n_pos_val = sum(1 for w in val_windows if w["label"] == 1)
     n_pos_test = sum(1 for w in test_windows if w["label"] == 1)
-    print(f"  Train: {len(train_windows)} ({n_pos_train} ICH, "
-          f"{n_pos_train / max(len(train_windows), 1) * 100:.1f}%)")
-    print(f"  Val:   {len(val_windows)} ({n_pos_val} ICH, "
-          f"{n_pos_val / max(len(val_windows), 1) * 100:.1f}%)")
-    print(f"  Test:  {len(test_windows)} ({n_pos_test} ICH, "
-          f"{n_pos_test / max(len(test_windows), 1) * 100:.1f}%)")
+    print(f"  Train: {len(train_windows)} ({n_pos_train} ICH){_sh}")
+    print(f"  Val:   {len(val_windows)} ({n_pos_val} ICH){_sh}")
+    print(f"  Test:  {len(test_windows)} ({n_pos_test} ICH){_sh}")
 
     # ── LOSO 모드 분기 ──
     if args.eval_mode == "loso":
@@ -802,14 +929,15 @@ def main() -> None:
     if not is_lora:
         # frozen encoder feature 1회 추출(train/val/test). DDP 면 rank 별 shard 추출
         # → gather(원본 순서 복원) → rank0 만 probe 학습·평가. 단일 GPU 면 동일 경로.
-        train_features, train_labels = _extract_features_maybe_sharded(
-            model, train_windows, args.batch_size, args.patch_size, device,
+        # windows 는 이미 이 rank 의 stride(DDP)/full(단일). gidx 로 gather 복원.
+        train_features, train_labels = _extract_features_presharded(
+            model, train_windows, tr_gidx, args.batch_size, args.patch_size, device,
         )
-        val_features, val_labels = _extract_features_maybe_sharded(
-            model, val_windows, args.batch_size, args.patch_size, device,
+        val_features, val_labels = _extract_features_presharded(
+            model, val_windows, va_gidx, args.batch_size, args.patch_size, device,
         )
-        test_features, test_labels = _extract_features_maybe_sharded(
-            model, test_windows, args.batch_size, args.patch_size, device,
+        test_features, test_labels = _extract_features_presharded(
+            model, test_windows, te_gidx, args.batch_size, args.patch_size, device,
         )
         if use_ddp and not is_main():
             import torch.distributed as dist
@@ -826,11 +954,13 @@ def main() -> None:
         # ── DDP(B안): train window 를 rank 별 분할 + 전 rank 최소 길이 정렬(step 동기화).
         #   val/test 는 분할하지 않는다(평가는 rank0 가 full set 으로 수행).
         if use_ddp:
-            n_full = len(train_windows)
-            train_windows = equalize_shard(shard_for_rank(train_windows))
+            # train_windows 는 이미 이 rank 의 stride(로드 시 shard=True) → 재-shard 금지.
+            # 전 rank 최소 길이로만 정렬(step 동기화). (val/test 는 rank0 full.)
+            n_shard = len(train_windows)
+            train_windows = equalize_shard(train_windows)
             if is_main():
                 print(
-                    f"  [DDP] train shard: {n_full} → {len(train_windows)}"
+                    f"  [DDP] train shard: {n_shard} → {len(train_windows)}"
                     f"/rank × {ddp_world_size()} ranks"
                 )
             if len(train_windows) == 0:
