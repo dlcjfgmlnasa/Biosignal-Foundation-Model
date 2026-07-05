@@ -220,9 +220,13 @@ class _Block(nn.Module):
 
 
 class ResNet1D(nn.Module):
-    """waveform (B,C,L) → IOH logit. 큰 stride stem 으로 긴 시퀀스 다운샘플."""
+    """waveform (B,C,L) → logit(s). 큰 stride stem 으로 긴 시퀀스 다운샘플.
 
-    def __init__(self, in_ch: int, width: int = 64):
+    n_classes=1(기본): binary logit (기존 IOH/arrest 등, BCEWithLogits). n_classes>1:
+    multiclass logits (arrhythmia 5-class 등, CrossEntropy). 그 외 구조 불변.
+    """
+
+    def __init__(self, in_ch: int, width: int = 64, n_classes: int = 1):
         super().__init__()
         self.stem = nn.Sequential(
             nn.Conv1d(in_ch, width, 15, stride=2, padding=7, bias=False),
@@ -237,9 +241,9 @@ class ResNet1D(nn.Module):
                        _Block(chans[i + 1], chans[i + 1], 1)]
         self.blocks = nn.Sequential(*blocks)
         self.head = nn.Sequential(nn.AdaptiveAvgPool1d(1), nn.Flatten(),
-                                  nn.Linear(chans[-1], 1))
+                                  nn.Linear(chans[-1], n_classes))
 
-    def forward(self, x):  # (B, C, L) → (B, 1)
+    def forward(self, x):  # (B, C, L) → (B, n_classes)
         return self.head(self.blocks(self.stem(x)))
 
 

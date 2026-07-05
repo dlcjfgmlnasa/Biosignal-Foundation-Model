@@ -12,13 +12,14 @@ PhysioNet ``vitaldb-arrhythmia`` (annotation only) + VitalDB Open ``.vital``
 - 환자 단위 분할 키: metadata 의 ``subjectid`` (case_id 아님 — 같은 환자의 다른
   수술이 train/test 로 새는 것 방지).
 
-10종 rhythm_label → 5-class collapse (임상 다중분류, mechanism 기반):
+10종 rhythm_label → 4-class collapse (임상 actionable rhythm, mechanism 기반, 2026-07-05):
     0 NSR       : N                                       (Normal Sinus Rhythm, 기준 클래스)
-    1 AF        : AFIB/AFL                                (단독 유지 — RR 불규칙·P파 소실로 식별 명확, 샘플 충분)
-    2 SV        : SVTA, Patterned Atrial Ectopy, WAP/MAT  (Supraventricular non-AF — 상심실 기원·경계 모호 흡수)
-    3 VA        : VT, Patterned Ventricular Ectopy        (V-arrhythmia — wide QRS 공통, PVC/VT 세분화는 scope 밖)
-    4 BradyCond : AVB, SND                                (Brady/Conduction — AVB↔SND 위계충돌(공존) 해소)
-    (drop): Noise, '', Unclassifiable(리듬 전이구간) + bad_signal_quality 윈도우
+    1 AF        : AFIB/AFL                                (RR 불규칙·P파 소실로 식별 명확)
+    2 VA        : VT, Patterned Ventricular Ectopy        (V-arrhythmia — wide QRS 공통)
+    3 BradyCond : AVB, SND                                (Brady/Conduction — pacing indication, actionable)
+    (drop): SVTA·Patterned Atrial Ectopy·WAP/MAT (SV 상심실 이소성 catch-all — AF 와 구별되는
+             coherent label/actionability 부재, SVTA 17.6%뿐 → hard negative 제거),
+             Noise, '', Unclassifiable(리듬 전이구간), bad_signal_quality 윈도우
 
 신호 전처리는 pretrain 파서(``data/parser/vitaldb.py``)의 cleaning 헬퍼를 그대로
 재사용해 분포 정합을 맞춘다 (range → spike → step/motion → notch → bandpass/lowpass
@@ -74,23 +75,25 @@ from downstream._kfold_utils import (
 
 SEGMENT_SEC: float = 30.0
 
-# 10종 rhythm_label (annotation 실제 문자열) → 5-class collapse
+# 10종 rhythm_label (annotation 실제 문자열) → 4-class collapse (2026-07-05).
+# ⚠ SV(상심실 이소성 catch-all) 드롭: SVTA/Patterned Atrial Ectopy/WAP·MAT 는 AF 와
+#   구별되는 coherent physiological label·단일 actionability 부재. SV-family 중 임상 무게
+#   있는 SVTA 는 17.6%뿐(나머지 82%=ectopy/WAP) → drop 이 정답. AF 와의 hard negative
+#   제거로 인접 지표 소폭 상승 가능 → 논문에 투명 병기. 유지 4범주=clinically actionable rhythm.
 RHYTHM_COLLAPSE: dict[str, int] = {
     "N": 0,                                # NSR
     "AFIB/AFL": 1,                         # AF (fib + flutter)
-    "SVTA": 2,                             # SV (supraventricular non-AF)
-    "Patterned Atrial Ectopy": 2,
-    "WAP/MAT": 2,
-    "VT": 3,                               # VA (ventricular arrhythmia)
-    "Patterned Ventricular Ectopy": 3,
-    "AVB": 4,                              # BradyCond (brady / conduction)
-    "SND": 4,
-    # drop (매핑 없음): "Noise", "", "Unclassifiable"
+    "VT": 2,                               # VA (ventricular arrhythmia)
+    "Patterned Ventricular Ectopy": 2,
+    "AVB": 3,                              # BradyCond (brady / conduction)
+    "SND": 3,
+    # drop (매핑 없음): SVTA, "Patterned Atrial Ectopy", "WAP/MAT" (SV catch-all),
+    #                  "Noise", "", "Unclassifiable"
 }
-CLASS_NAMES = ["NSR", "AF", "SV", "VA", "BradyCond"]
-# 전체명: NSR=Normal Sinus Rhythm / AF=Atrial Fibrillation / SV=Supraventricular(non-AF,
-#   SVTA+Patterned Atrial Ectopy+WAP/MAT) / VA=Ventricular arrhythmia(VT+Patterned Vent Ectopy) /
-#   BradyCond=Bradyarrhythmia·Conduction(AVB+SND). Unclassifiable/Noise = drop.
+CLASS_NAMES = ["NSR", "AF", "VA", "BradyCond"]
+# 전체명: NSR=Normal Sinus Rhythm / AF=Atrial Fibrillation / VA=Ventricular arrhythmia
+#   (VT+Patterned Vent Ectopy) / BradyCond=Bradyarrhythmia·Conduction(AVB+SND, pacing
+#   indication=actionable). SV(상심실 이소성)·Unclassifiable·Noise = drop.
 N_CLASSES = len(CLASS_NAMES)
 
 # input-signals → vital track 우선순위 (TRACK_MAP 키)
