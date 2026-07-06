@@ -27,24 +27,22 @@ BIOFM_ROOT="${BIOFM_ROOT:-/home/coder/workspace/k-mimic-/bio_fm}"
 RECORDS_FILE="${RECORDS_FILE:-${REPO_ROOT}/downstream/outcome/sepsis/RECORDS-waveforms}"
 ICP_RECORDS="${ICP_RECORDS:-downstream/acute_event/intracranial_hypertension/ICP-RECORDS}"
 WAVEFORM_DIR="${WAVEFORM_DIR:-${UPDOWN_ROOT}/raw/mimic3-waveform-ich}"
-# task-mode: detection(aICP식 동시 탐지, 입력=ABP+ECG·ICP=라벨전용, circularity 차단) 기본.
-#   prediction(미래 horizon IH 예측, 현재-ICH 제외)로 바꾸려면 TASK_MODE=prediction.
-TASK_MODE="${TASK_MODE:-detection}"
-# ⚠ 출력 디렉토리를 task_mode 로 완전히 분리한다 → detection/prediction 산출물이
-#   서로 다른 폴더에 저장(파일명 분리에 더해 디렉토리까지 분리). run.sh 도 동일 규칙.
-#   detection  → .../data/downstream/intracranial_hypertension_detection
-#   prediction → .../data/downstream/intracranial_hypertension_prediction
+# ICH 는 prediction 전용 (detection 폐기 — 미래 horizon IH 예측).
+TASK_MODE="prediction"
 OUT_DIR="${OUT_DIR:-${BIOFM_ROOT}/data/downstream/intracranial_hypertension_${TASK_MODE}}"
-WINDOWS="${WINDOWS:-10}"       # 10s 입력 window (aICP npj DM 세그먼트 기준; detection=동시 IH 탐지)
-HORIZONS="${HORIZONS:-5 15 30}"  # (detection 이면 무시·h0min) prediction 모드 시 5/15/30분 전
-STRIDE="${STRIDE:-10}"      # detection: window(10s)와 동일 → 연속 타일링(겹침·건너뜀 없이 전구간 커버)
+WINDOWS="${WINDOWS:-900}"      # 15min(900s) 입력 window (prediction 표준)
+HORIZONS="${HORIZONS:-5 15 30}"  # 5/15/30분 전 예측
+STRIDE="${STRIDE:-60}"      # prediction: 60s stride (15min window 겹침 완화 — 데이터/메모리 폭증 방지)
 MODE="${MODE:-unbiased}"    # unbiased(현실적·기본) | biased(과대평가·선행비교)
+# 저장 dtype: float16 이 기본(디스크·RAM 절반). float32 로 바꾸려면 SIGNAL_DTYPE=float32.
+SIGNAL_DTYPE="${SIGNAL_DTYPE:-float16}"
+# 입력 신호: prediction=ABP+ICP+ECG (미래 horizon 예측이라 현재 ICP 를 입력에 포함).
+INPUT_SIGNALS="${INPUT_SIGNALS:-abp icp ecg}"
 MIN_GAP="${MIN_GAP:-1200}"  # biased 모드 sparse 간격(초)
 SKIP_DOWNLOAD="${SKIP_DOWNLOAD:-0}"
-# detection 10s window 라벨: SUSTAINED_SEC 기본 10 = "이 10s 구간 평균 ICP>임계"(aICP식 동시 탐지).
-#   코드가 sustained 를 label 구간(bucket 수)으로 clamp 하므로 10 이상은 10s window 에선 10 과 동일.
-#   VALID_RATIO 미설정 시 prepare_data.py 기본값 사용. ICP 임계(20)는 유지.
-SUSTAINED_SEC="${SUSTAINED_SEC:-10}"
+# 라벨 지속시간: SUSTAINED_SEC = "horizon 구간 내 ICP>임계 지속(초)". ICP 임계(20)는 유지.
+#   VALID_RATIO 미설정 시 prepare_data.py 기본값 사용.
+SUSTAINED_SEC="${SUSTAINED_SEC:-60}"
 LABEL_ARGS=""
 [ -n "$SUSTAINED_SEC" ] && LABEL_ARGS="$LABEL_ARGS --sustained-sec $SUSTAINED_SEC"
 [ -n "$VALID_RATIO" ]   && LABEL_ARGS="$LABEL_ARGS --valid-ratio $VALID_RATIO"
@@ -54,12 +52,9 @@ echo "  Intracranial Hypertension — Data Preparation"
 echo "  Waveform: $WAVEFORM_DIR"
 echo "  Output:   $OUT_DIR"
 echo "  Task:     $TASK_MODE"
-echo "  Windows:  ${WINDOWS}s"
-if [ "$TASK_MODE" = "detection" ]; then
-    echo "  Horizons: (detection — 동시 라벨, horizon 무시 → h0min)"
-else
-    echo "  Horizons: $HORIZONS"
-fi
+echo "  Input:    $INPUT_SIGNALS  (dtype=$SIGNAL_DTYPE)"
+echo "  Windows:  ${WINDOWS}s (15min prediction)"
+echo "  Horizons: $HORIZONS min"
 echo "  Stride:   ${STRIDE}s"
 echo "============================================================"
 
@@ -81,7 +76,7 @@ else
     echo -e "\n[Step 1-2] SKIP_DOWNLOAD=1 — using existing waveforms at $WAVEFORM_DIR"
 fi
 
-# Step 3: Table 3 #3 canonical 단일 조합 (ABP+ICP+ECG)
+# Step 3: prediction canonical 조합 (ABP+ICP+ECG, 15min window)
 run_combo() {
     local label="$1"
     local sigs="$2"
@@ -92,21 +87,20 @@ run_combo() {
         --window-secs $WINDOWS \
         --horizon-mins $HORIZONS \
         --stride-sec $STRIDE \
+        --signal-dtype $SIGNAL_DTYPE \
         --min-sample-gap-sec $MIN_GAP --sampling-mode $MODE \
         --task-mode $TASK_MODE \
         $LABEL_ARGS \
         --out-dir "$OUT_DIR"
 }
 
-# Table 3 canonical (detection): 입력 ABP+ECG (ICP 는 라벨 전용 — circularity 차단, aICP식).
-#   TASK_MODE=detection 이면 horizon 무시(파일명 h0min). prediction 모드로 쓰려면
-#   TASK_MODE=prediction 로 두고 입력에 icp 를 포함(구 canonical "abp icp ecg").
-run_combo "canonical" "abp ecg"
+# canonical: prediction 입력 ABP+ICP+ECG (INPUT_SIGNALS env 로 override 가능).
+run_combo "canonical" "$INPUT_SIGNALS"
 # S7 modality-subset ablation 필요 시 아래 주석 해제 (+ WINDOWS/HORIZONS sweep env override):
 # run_combo "subset-2ch" "abp icp"
 # run_combo "subset-4ch" "abp icp ecg cvp"
 
 echo -e "\n============================================================"
 echo "  Done! Output: $OUT_DIR"
-echo "  canonical: input ABP+ECG (ICP=label), ${WINDOWS}s window, task=${TASK_MODE}"
+echo "  canonical: input ${INPUT_SIGNALS}, ${WINDOWS}s window, dtype=${SIGNAL_DTYPE}, task=${TASK_MODE}"
 echo "============================================================"

@@ -16,45 +16,38 @@ set -e
 #   CHECKPOINT=... DATA_DIR=... OUT_DIR=... bash run.sh
 # 서버 실제 파일명·경로는 반드시 확인 후 맞추세요(아래 default 는 예시).
 CHECKPOINT="${CHECKPOINT:-/home/coder/workspace/k-mimic-/bio_fm/outputs/main/phase2/kmimic_phase2_k2/checkpoints/checkpoint_phase2_av_epoch049_final.pt}"
-# ⚠ TASK_MODE 로 데이터/결과 디렉토리를 완전히 분리(prepare_data.sh 와 동일 규칙).
-#   detection  → data/downstream/intracranial_hypertension_detection, result/.../intracranial_hypertension_detection
-#   prediction → ..._prediction. prepare_data.sh 의 OUT_DIR 과 반드시 일치해야 로드된다.
-TASK_MODE="${TASK_MODE:-detection}"
+# ICH 는 prediction 전용 (detection 폐기). 데이터/결과 디렉토리는 _prediction 고정.
+#   prepare_data.sh 의 OUT_DIR 과 반드시 일치해야 로드된다.
+TASK_MODE="prediction"
 DATA_DIR="${DATA_DIR:-/home/coder/workspace/k-mimic-/bio_fm/data/downstream/intracranial_hypertension_${TASK_MODE}}"
 OUT_DIR="${OUT_DIR:-/home/coder/workspace/k-mimic-/bio_fm/result/main/intracranial_hypertension_${TASK_MODE}}"
 DEVICE="${DEVICE:-cuda}"
 # v2 필수 (9 modality 단일 embedding — memory project_data_spec_v2). v1 로드 금지.
 MODEL_VERSION="${MODEL_VERSION:-v2}"
 
-# 입력은 ABP+ECG 고정(detection: ICP 는 라벨전용, prepare_data 에서 결정). window 고정(canonical).
-# env override: WINDOW_SECS_OVERRIDE / HORIZON_MINS_OVERRIDE
-# ⚠ prefix 채널 토큰 = prepare_data --input-signals "abp ecg" 의 mode_str "abp_ecg".
-#   run.py 는 --input-signals 가 없어 prepared 데이터의 모든 채널을 그대로 사용하므로
-#   로드 파일은 이 prefix + horizon 으로만 결정된다. detection 은 horizon=0(h0min).
-#   (prediction 모드로 쓰려면 SIGNALS=abp_icp_ecg, HORIZON_MINS_OVERRIDE="5 15 30".)
-# detection(aICP식): 입력 ABP+ECG(ICP=라벨전용) → prefix 토큰 "abp_ecg", horizon=0(h0min).
-#   prepare_data.py 가 detection 시 horizon 을 0 으로 고정 저장하므로 여기도 0 이어야 매칭.
-# ⚠ prepare_data 가 파일명·디렉토리에 task_mode 를 넣으므로(detection/prediction 분리) 위에서 TASK_MODE 정의.
-SIGNALS="${SIGNALS:-abp_ecg}"
-WINDOW_SECS=(${WINDOW_SECS_OVERRIDE:-10})         # 10s 고정 (aICP npj DM 세그먼트 기준)
-HORIZON_MINS=(${HORIZON_MINS_OVERRIDE:-0})        # detection: 동시 라벨(h0min). prediction 시 5/15/30.
+# prediction canonical: 입력 ABP+ICP+ECG(prefix "abp_icp_ecg"), 15min(900s) window, horizon 5/15/30.
+#   run.py 는 --input-signals 가 없어 prepared 데이터의 모든 채널을 그대로 사용 →
+#   로드 파일은 SIGNALS prefix + window + horizon 으로 결정. prepare_data.sh 와 일치해야 함.
+#   env override: SIGNALS / WINDOW_SECS_OVERRIDE / HORIZON_MINS_OVERRIDE
+SIGNALS="${SIGNALS:-abp_icp_ecg}"
+WINDOW_SECS=(${WINDOW_SECS_OVERRIDE:-900})        # 15min(900s) 고정
+HORIZON_MINS=(${HORIZON_MINS_OVERRIDE:-5 15 30})  # 5/15/30분 전 예측
 # 변수명은 전 task 공통 컨벤션: LP_EPOCHS/LORA_EPOCHS, LP_LR/LORA_LR, LP_BATCH/LORA_BATCH
 LP_EPOCHS="${LP_EPOCHS:-1000}"
 LORA_EPOCHS="${LORA_EPOCHS:-30}"
 LP_LR="${LP_LR:-1e-3}"
 LORA_LR="${LORA_LR:-1e-4}"
-# LP_BATCH: frozen feature 추출/probe-fit batch. detection 은 window 가 10s(2채널 packed
-#   ~10 token)로 짧아 attention O(seq²) VRAM 부담이 없다 → 512 로 복원(OOM 무관, 추출 가속).
-LP_BATCH="${LP_BATCH:-512}"
+# LP_BATCH: frozen feature 추출/probe-fit batch. prediction 은 window 가 15min(900s,
+#   3채널 packed ~1350 token)로 길어 attention O(seq²) VRAM 이 크다 → 32 로 보수적 설정
+#   (bf16 autocast 로 추출하지만 batch↑ 시 OOM). 여유되면 LP_BATCH 로 상향.
+LP_BATCH="${LP_BATCH:-32}"
 LORA_RANK="${LORA_RANK:-8}"
 N_FOLDS="${N_FOLDS:-5}"   # stratified k-fold — fold 별 실행(--n-folds/--fold)
 FORCE="${FORCE:-0}"       # 1 이면 완료 fold(preds_fold{f}.npz)도 재실행
-# ── C안: LoRA batch-size 상향 (가속) — ⚠ 결과가 바뀌므로 비교성 주의 ──
-# bf16+frozen encoder 라 VRAM 여유가 커 batch 를 키우면 step 수가 줄어 빨라진다.
-# 단, batch≠32 면 LoRA 최적화 궤적이 달라져 batch=32 시절 결과와 직접 비교 불가
-# (LR 재튜닝 필요). torchrun(B안)에선 effective batch = LORA_BATCH × nproc.
-# 보수적으로 가려면 LORA_BATCH=32 로 override.
-LORA_BATCH="${LORA_BATCH:-128}"
+# LORA_BATCH: LoRA 학습 batch. prediction 15min window(~1350 token)는 grad·activation
+#   메모리가 커 8 로 보수적 설정(서버 OOM 방지). torchrun 에선 effective = LORA_BATCH × nproc.
+#   여유되면 상향하되 batch 변경 시 LR 재튜닝 필요(최적화 궤적 달라짐).
+LORA_BATCH="${LORA_BATCH:-8}"
 
 # ── 한 fold 를 여러 GPU 로 DDP 실행 (fold 순차, 각 fold torchrun 4-GPU) ──
 # 기본 NPROC=4 (cardiac_arrest/hypotension 과 동일). 단일 GPU 는 NPROC=1.
@@ -86,21 +79,19 @@ fi
 
 echo "============================================================"
 [ "$DRY_RUN" = "1" ] && echo "  *** DRY-RUN (fold 0·첫 horizon, 소수 window, 산출물→$OUT_DIR) ***"
-echo "  Intracranial Hypertension Detection (ICP > 20mmHg)"
+echo "  Intracranial Hypertension Prediction (future IH, ICP > 20mmHg)"
 echo "  Checkpoint: $CHECKPOINT"
 echo "  ModelVer:   $MODEL_VERSION"
 echo "  Data:       $DATA_DIR"
 echo "  Output:     $OUT_DIR"
+echo "  Input:      $SIGNALS  Window: ${WINDOW_SECS[*]}s  Horizon: ${HORIZON_MINS[*]}min"
 echo "  LoRA batch: $LORA_BATCH  (NPROC=$NPROC → eff $((LORA_BATCH * NPROC)))"
 echo "============================================================"
-if [ "$LORA_BATCH" != "32" ]; then
-    echo "  ⚠ LoRA batch≠32: 결과가 batch=32 기준선과 비교 불가 — LR 재튜닝 권장"
-fi
 
 for WIN in "${WINDOW_SECS[@]}"; do
     for HORIZON in "${HORIZON_MINS[@]}"; do
         # ⚠ 데이터는 단일 .pt 가 아니라 per-(fold,split)[_chunk] prefix 묶음이다.
-        #   예: intracranial_hypertension_detection_abp_ecg_w10s_h0min_fold0_train_chunk0.pt
+        #   예: intracranial_hypertension_prediction_abp_icp_ecg_w900s_h5min_fold0_train_chunk0.pt
         #   run.py 는 --data-path PREFIX(.pt 없이) + --n-folds/--fold 로 로드.
         PREFIX="${DATA_DIR}/intracranial_hypertension_${TASK_MODE}_${SIGNALS}_w${WIN}s_h${HORIZON}min"
 
