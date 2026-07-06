@@ -1,9 +1,12 @@
 #!/bin/bash
 # Intracranial Hypertension Detection — 데이터 준비
-# Paper Table S7 (Task 3) 정렬: 3 combos × 4 windows × 3 horizons
-#   Combos:   ABP+ICP / ABP+ICP+ECG / ABP+ICP+ECG+CVP
-#   Horizons: 10 / 15 / 30 min ahead
-#   Label:    ICP > 20 mmHg ≥ 1 min (가장 널리 쓰이는 ICH 정의; sustained >1min)
+# Paper Table 3 #3 (detection, aICP식):
+#   Input:    ABP + ECG (두개외 신호만; ICP 는 라벨 전용 → circularity 차단)
+#   Window:   10 s — aICP(npj DM)=1s 세그먼트 기준. CARMEN 차별점 = 사전학습
+#             multimodal FM 표현 전이(frozen/LoRA) + 다-beat/호흡결합 문맥(1s→10s).
+#             (per-window 분류·mean-pool probe. aICP 의 stay-level 빈도 집계와 다름)
+#   Label:    동시(same-window) ICP > 20 mmHg 지속(SUSTAINED_SEC) = IH high/low 이진
+#             (Czosnyka & Pickard 2004 IH 정의; aICP 는 임계 15 사용)
 #
 # Step 1: ICP 레코드 스캔 (헤더만 읽어 ICP 채널 존재 확인)
 # Step 2: ICP 레코드 다운로드
@@ -25,14 +28,19 @@ RECORDS_FILE="${RECORDS_FILE:-${REPO_ROOT}/downstream/outcome/sepsis/RECORDS-wav
 ICP_RECORDS="${ICP_RECORDS:-downstream/acute_event/intracranial_hypertension/ICP-RECORDS}"
 WAVEFORM_DIR="${WAVEFORM_DIR:-${UPDOWN_ROOT}/raw/mimic3-waveform-ich}"
 OUT_DIR="${OUT_DIR:-${BIOFM_ROOT}/data/downstream/intracranial_hypertension}"
-WINDOWS="${WINDOWS:-1200}"     # 1200s=20min 입력 window (ICP 느린 dynamics context)
-HORIZONS="${HORIZONS:-5 15 30}"  # 5/15/30분 전 예측 (파형-only feasible 구간, canonical 30분)
-STRIDE="${STRIDE:-30}"
+WINDOWS="${WINDOWS:-10}"       # 10s 입력 window (aICP npj DM 세그먼트 기준; detection=동시 IH 탐지)
+HORIZONS="${HORIZONS:-5 15 30}"  # (detection 이면 무시·h0min) prediction 모드 시 5/15/30분 전
+STRIDE="${STRIDE:-10}"      # detection: window(10s)와 동일 → 연속 타일링(겹침·건너뜀 없이 전구간 커버)
 MODE="${MODE:-unbiased}"    # unbiased(현실적·기본) | biased(과대평가·선행비교)
 MIN_GAP="${MIN_GAP:-1200}"  # biased 모드 sparse 간격(초)
+# task-mode: detection(aICP식 동시 탐지, 입력=ABP+ECG·ICP=라벨전용, circularity 차단) 기본.
+#   prediction(미래 horizon IH 예측, 현재-ICH 제외)로 바꾸려면 TASK_MODE=prediction.
+TASK_MODE="${TASK_MODE:-detection}"
 SKIP_DOWNLOAD="${SKIP_DOWNLOAD:-0}"
-# 라벨 완화(재파싱 필요) — 미설정 시 prepare_data.py 기본값 사용(sustained 60s / valid_ratio 기본).
-#   양성 표본이 너무 적을 때: SUSTAINED_SEC=30 (지속요건↓) / VALID_RATIO=0.7 (품질임계↓). ICP 임계는 20 유지.
+# detection 10s window 라벨: SUSTAINED_SEC 기본 10 = "이 10s 구간 평균 ICP>임계"(aICP식 동시 탐지).
+#   코드가 sustained 를 label 구간(bucket 수)으로 clamp 하므로 10 이상은 10s window 에선 10 과 동일.
+#   VALID_RATIO 미설정 시 prepare_data.py 기본값 사용. ICP 임계(20)는 유지.
+SUSTAINED_SEC="${SUSTAINED_SEC:-10}"
 LABEL_ARGS=""
 [ -n "$SUSTAINED_SEC" ] && LABEL_ARGS="$LABEL_ARGS --sustained-sec $SUSTAINED_SEC"
 [ -n "$VALID_RATIO" ]   && LABEL_ARGS="$LABEL_ARGS --valid-ratio $VALID_RATIO"
@@ -41,8 +49,13 @@ echo "============================================================"
 echo "  Intracranial Hypertension — Data Preparation"
 echo "  Waveform: $WAVEFORM_DIR"
 echo "  Output:   $OUT_DIR"
-echo "  Windows:  $WINDOWS"
-echo "  Horizons: $HORIZONS"
+echo "  Task:     $TASK_MODE"
+echo "  Windows:  ${WINDOWS}s"
+if [ "$TASK_MODE" = "detection" ]; then
+    echo "  Horizons: (detection — 동시 라벨, horizon 무시 → h0min)"
+else
+    echo "  Horizons: $HORIZONS"
+fi
 echo "  Stride:   ${STRIDE}s"
 echo "============================================================"
 
@@ -76,17 +89,20 @@ run_combo() {
         --horizon-mins $HORIZONS \
         --stride-sec $STRIDE \
         --min-sample-gap-sec $MIN_GAP --sampling-mode $MODE \
+        --task-mode $TASK_MODE \
         $LABEL_ARGS \
         --out-dir "$OUT_DIR"
 }
 
-# Table 3 canonical: ABP+ICP+ECG 만 생성.
-run_combo "canonical" "abp icp ecg"
+# Table 3 canonical (detection): 입력 ABP+ECG (ICP 는 라벨 전용 — circularity 차단, aICP식).
+#   TASK_MODE=detection 이면 horizon 무시(파일명 h0min). prediction 모드로 쓰려면
+#   TASK_MODE=prediction 로 두고 입력에 icp 를 포함(구 canonical "abp icp ecg").
+run_combo "canonical" "abp ecg"
 # S7 modality-subset ablation 필요 시 아래 주석 해제 (+ WINDOWS/HORIZONS sweep env override):
 # run_combo "subset-2ch" "abp icp"
 # run_combo "subset-4ch" "abp icp ecg cvp"
 
 echo -e "\n============================================================"
 echo "  Done! Output: $OUT_DIR"
-echo "  canonical: ABP+ICP+ECG, ${WINDOWS}s window, ${HORIZONS}min horizon"
+echo "  canonical: input ABP+ECG (ICP=label), ${WINDOWS}s window, task=${TASK_MODE}"
 echo "============================================================"

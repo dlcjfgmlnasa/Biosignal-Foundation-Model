@@ -253,8 +253,15 @@ def extract_forecast_samples(
     valid_ratio_threshold: float = DEFAULT_VALID_RATIO_THRESHOLD,
     gap_stats: GapStats | None = None,
     sample_dtype: str = "float16",  # OOM 회피
+    task_mode: str = "prediction",  # prediction(미래 horizon IH) | detection(동시 window IH, aICP식)
 ) -> list[ICHSample]:
     """시간 정렬된 다채널 데이터에서 (input, future_label) 쌍을 추출한다.
+
+    task_mode:
+      "prediction" — 입력 window 끝 이후 horizon 구간의 IH 를 예측. 현재-ICH(입력
+        끝 baseline ICP>임계) 제외 → 신규 발생 예측(기존 canonical).
+      "detection"  — 입력 window 와 동시(same-window)의 IH 를 탐지(aICP식). 현재-ICH
+        제외 없음, horizon 무시. ICP 는 입력에 없고 라벨로만 쓰여 circularity 차단.
 
     Gap policy (project_downstream_gap_window_policy):
       Step 1 — input window 의 multi-channel valid_ratio < threshold → window drop
@@ -263,14 +270,20 @@ def extract_forecast_samples(
     win_samples = int(window_sec * TARGET_SR)
     stride_samples = int(stride_sec * TARGET_SR)
     horizon_samples = int(horizon_sec * TARGET_SR)
+    is_detection = task_mode == "detection"
 
     icp_win_sec = 10.0
     icp_win = int(icp_win_sec * TARGET_SR)
     min_consecutive = max(1, int(sustained_sec / icp_win_sec))
     min_gap_samples = int(min_sample_gap_sec * TARGET_SR)
-    n_future_win = max(1, horizon_samples // icp_win)  # horizon 내 기대 10초-윈도우 수
+    # 라벨 구간 내 기대 10초-윈도우 수 (detection=입력 window, prediction=horizon)
+    label_span = win_samples if is_detection else horizon_samples
+    n_future_win = max(1, label_span // icp_win)
+    # sustained 요건(연속 bucket 수)은 라벨 구간 bucket 수를 넘을 수 없다. 넘으면 영구
+    # 음성이 되므로 clamp — 특히 짧은 window(예: 10s detection = bucket 1개)에서 필수.
+    min_consecutive = min(min_consecutive, n_future_win)
 
-    total_needed = win_samples + horizon_samples
+    total_needed = win_samples if is_detection else win_samples + horizon_samples
     samples: list[ICHSample] = []
 
     for case in cases:
@@ -303,25 +316,28 @@ def extract_forecast_samples(
                     gap_stats.add_drop()
                 continue
 
-            # ── 현재-ICH 제외 (HPI 표준): 예측 시점(T=입력 끝)에 이미 ICP>threshold 면 drop. ──
-            #   진행 중 두개내압 상승의 연속(trivial positive)을 배제, 신규 발생만 예측.
-            #   입력 끝 30초 baseline ICP 평균이 threshold 이상(또는 확인 불가)이면 버린다.
-            base_start = max(start, start + win_samples - 3 * icp_win)
-            baseline_icp = icp[base_start: start + win_samples]
-            base_valid = baseline_icp[~np.isnan(baseline_icp)]
-            if base_valid.size < icp_win or float(np.mean(base_valid)) >= icp_threshold:
-                if gap_stats is not None:
-                    gap_stats.add_drop()
-                continue
+            if is_detection:
+                # ── detection(aICP식): 동시(same-window) ICP 로 라벨. 현재-ICH 제외 없음. ──
+                #   입력 ABP+ECG 만으로 "이 구간에 두개내 고혈압이 있는가"를 탐지.
+                #   ICP 는 입력에 없고 라벨로만 쓰여 circularity 차단.
+                label_icp = icp[start: start + win_samples]
+            else:
+                # ── 현재-ICH 제외 (HPI 표준): 예측 시점(T=입력 끝)에 이미 ICP>threshold 면 drop. ──
+                #   진행 중 두개내압 상승의 연속(trivial positive)을 배제, 신규 발생만 예측.
+                #   입력 끝 30초 baseline ICP 평균이 threshold 이상(또는 확인 불가)이면 버린다.
+                base_start = max(start, start + win_samples - 3 * icp_win)
+                baseline_icp = icp[base_start: start + win_samples]
+                base_valid = baseline_icp[~np.isnan(baseline_icp)]
+                if base_valid.size < icp_win or float(np.mean(base_valid)) >= icp_threshold:
+                    if gap_stats is not None:
+                        gap_stats.add_drop()
+                    continue
+                label_icp = icp[start + win_samples: start + win_samples + horizon_samples]
 
-            # Future ICP (label) — 기존 10s sub-window NaN-free 정책 유지
-            future_start = start + win_samples
-            future_end = future_start + horizon_samples
-            future_icp = icp[future_start:future_end]
-
+            # 10s sub-window NaN-free 평균 (prediction=미래 horizon / detection=동시 window)
             future_icps: list[float] = []
-            for j in range(0, len(future_icp) - icp_win + 1, icp_win):
-                w = future_icp[j: j + icp_win]
+            for j in range(0, len(label_icp) - icp_win + 1, icp_win):
+                w = label_icp[j: j + icp_win]
                 if not np.isnan(w).any():
                     future_icps.append(float(np.mean(w)))
 
@@ -377,7 +393,7 @@ def extract_forecast_samples(
                     case_id=case["case_id"],
                     patient_id=case["patient_id"],
                     win_start_sec=start / TARGET_SR,
-                    horizon_sec=horizon_sec,
+                    horizon_sec=(0.0 if is_detection else horizon_sec),
                 )
             )
 
@@ -400,11 +416,17 @@ def _consume_to_tensors_ich(
         return {"signals": {}, "gap_masks": {},
                 "labels": torch.tensor([], dtype=torch.long),
                 "label_values": torch.tensor([], dtype=torch.float32),
+                "win_start_sec": torch.tensor([], dtype=torch.float32),
                 "case_ids": [], "subject_ids": []}
 
     labels = torch.tensor([s.label for s in samples], dtype=torch.long)
     label_values = torch.tensor(
         [s.label_value for s in samples], dtype=torch.float32
+    )
+    # win_start_sec 보존: (subject_id, win_start_sec, label_value, y_score) 로 환자 내
+    # 시간축 ICP 추적(정적 환자분류 아닌 동적 IH 탐지)을 사후 분석·plot 하기 위함.
+    win_start_sec = torch.tensor(
+        [s.win_start_sec for s in samples], dtype=torch.float32
     )
     case_ids = [s.case_id for s in samples]
     subject_ids = [s.patient_id for s in samples]
@@ -436,6 +458,7 @@ def _consume_to_tensors_ich(
         "gap_masks": gap_tensors,
         "labels": labels,
         "label_values": label_values,
+        "win_start_sec": win_start_sec,
         "case_ids": case_ids,
         "subject_ids": subject_ids,
     }
@@ -452,6 +475,7 @@ def save_split_dataset(
     fold_idx: int | None = None,
     n_folds: int = 1,
     chunk_idx: int | None = None,
+    task_mode: str = "prediction",
 ) -> Path:
     """Single split chunk packed dict → 별도 .pt (OOM 회피 Stage 5)."""
     out_path = Path(out_dir)
@@ -462,7 +486,7 @@ def save_split_dataset(
         "split": split_name,
         "data": split_dict,
         "metadata": {
-            "task": "intracranial_hypertension_detection",
+            "task": f"intracranial_hypertension_{task_mode}",
             "source": "MIMIC-III Waveform",
             "input_signals": input_signals,
             "horizon_sec": horizon_sec,
@@ -560,6 +584,7 @@ def prepare_ich_sweep(
     sampling_mode: str = "unbiased",
     sustained_sec: float = SUSTAINED_SEC,
     valid_ratio_threshold: float = DEFAULT_VALID_RATIO_THRESHOLD,
+    task_mode: str = "prediction",
 ) -> list[Path]:
     """(window, horizon) 조합 × stratified K-fold CV 데이터셋 생성.
 
@@ -568,13 +593,17 @@ def prepare_ich_sweep(
         "loso_export"  : 모든 샘플을 train에 저장(test 비움) — subject_ids로
                          외부에서 LeaveOneSubjectOut CV 수행용.
     """
+    # detection(aICP식 동시 탐지): horizon 무의미 → 단일 0 으로 고정(파일명 h0min).
+    if task_mode == "detection":
+        horizon_mins = [0.0]
+
     mode_str = " + ".join(s.upper() for s in input_signals)
     print(f"\n{'=' * 60}")
-    print(f"  Intracranial Hypertension Detection - MIMIC-III")
+    print(f"  Intracranial Hypertension {task_mode.capitalize()} - MIMIC-III")
     print(f"  Waveform: {waveform_dir}")
-    print(f"  Input:    {mode_str}")
+    print(f"  Input:    {mode_str}  (ICP=label only)")
     print(f"  Windows:  {window_secs}")
-    print(f"  Horizons: {horizon_mins}")
+    print(f"  Horizons: {horizon_mins}" + ("  (detection: 동시 라벨, horizon 무시)" if task_mode == "detection" else ""))
     print(f"  ICP threshold: {icp_threshold} mmHg, sustained: {sustained_sec}s, "
           f"valid_ratio: {valid_ratio_threshold}")
     print(f"{'=' * 60}")
@@ -668,6 +697,7 @@ def prepare_ich_sweep(
                         fold_idx=cur_fold_idx,
                         n_folds=len(splits),
                         chunk_idx=cidx,
+                        task_mode=task_mode,
                     )
                     saved_paths.append(save_path)
                     del packed
@@ -684,6 +714,7 @@ def prepare_ich_sweep(
                         sampling_mode=sampling_mode,
                         sustained_sec=sustained_sec,
                         valid_ratio_threshold=valid_ratio_threshold,
+                        task_mode=task_mode,
                     )
                     for s in samples:
                         buffer.append(s)
@@ -794,7 +825,22 @@ def main() -> None:
         help="unbiased(현실적·기본: dense·15~20 경계 포함) | "
         "biased(과대평가·선행 비교용: clean-neg<15+sparse+경계 제외).",
     )
+    parser.add_argument(
+        "--task-mode", type=str, default="prediction",
+        choices=["prediction", "detection"],
+        help="prediction(미래 horizon IH 예측, 현재-ICH 제외) | "
+             "detection(동시 window IH 탐지, aICP식: 입력 ABP+ECG, ICP=라벨전용, "
+             "현재-ICH 제외 없음, horizon 무시).",
+    )
     args = parser.parse_args()
+
+    # detection 은 ICP 를 라벨 전용으로만 쓴다(circularity 차단). 입력에 icp 가 들어오면
+    # trivial + circular 가 되므로 거부한다.
+    if args.task_mode == "detection" and "icp" in args.input_signals:
+        parser.error(
+            "detection 모드에서는 ICP 를 입력(--input-signals)에 넣을 수 없습니다 "
+            "(ICP=라벨 전용, circularity 차단). --input-signals 에서 icp 를 빼세요.",
+        )
 
     dtype_map = {"float16": torch.float16, "float32": torch.float32}
 
@@ -815,6 +861,7 @@ def main() -> None:
         sampling_mode=args.sampling_mode,
         sustained_sec=args.sustained_sec,
         valid_ratio_threshold=args.valid_ratio,
+        task_mode=args.task_mode,
     )
 
 
