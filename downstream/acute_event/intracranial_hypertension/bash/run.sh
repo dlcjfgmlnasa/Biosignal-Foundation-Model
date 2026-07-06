@@ -65,7 +65,25 @@ else
     LORA_LAUNCH="python -m"
 fi
 
+# DRY_RUN=1: 파이프라인 스모크 테스트. fold 0·첫 horizon 만, 소수 chunk·window·
+#   epoch 로 로드→추출→학습→평가→저장을 빠르게 1회 검증(산출물 무의미, _dryrun 격리).
+#   세부값 env: DRY_CHUNKS(split 당 chunk) DRY_N(클래스당 window) DRY_EPOCHS.
+DRY_RUN=${DRY_RUN:-0}
+DRY_FLAG=""
+FOLD_LIST=$(seq 0 $((N_FOLDS - 1)))
+if [ "$DRY_RUN" = "1" ]; then
+    DRY_FLAG="--dry-run"
+    [ -n "$DRY_CHUNKS" ] && DRY_FLAG="$DRY_FLAG --dry-run-chunks $DRY_CHUNKS"
+    [ -n "$DRY_N" ]      && DRY_FLAG="$DRY_FLAG --dry-run-n $DRY_N"
+    [ -n "$DRY_EPOCHS" ] && DRY_FLAG="$DRY_FLAG --dry-run-epochs $DRY_EPOCHS"
+    FOLD_LIST=0
+    HORIZON_MINS=("${HORIZON_MINS[0]}")   # 첫 horizon 만
+    FORCE=1
+    OUT_DIR="${OUT_DIR}/_dryrun"
+fi
+
 echo "============================================================"
+[ "$DRY_RUN" = "1" ] && echo "  *** DRY-RUN (fold 0·첫 horizon, 소수 window, 산출물→$OUT_DIR) ***"
 echo "  Intracranial Hypertension Detection (ICP > 20mmHg)"
 echo "  Checkpoint: $CHECKPOINT"
 echo "  ModelVer:   $MODEL_VERSION"
@@ -102,7 +120,7 @@ for WIN in "${WINDOW_SECS[@]}"; do
             EXP_DIR="${OUT_DIR}/${EXP_NAME}/${MODE}"
             mkdir -p "$EXP_DIR"
 
-            for f in $(seq 0 $((N_FOLDS - 1))); do
+            for f in $FOLD_LIST; do
                 # resume: 완료 fold(preds_fold{f}.npz)는 건너뜀. FORCE=1 이면 재실행.
                 if [ "$FORCE" != "1" ] && [ -f "${EXP_DIR}/preds_fold${f}.npz" ]; then
                     echo "  [skip] done: ${EXP_DIR} (fold $f)"
@@ -120,7 +138,7 @@ for WIN in "${WINDOW_SECS[@]}"; do
                     --lr "$LR" \
                     --device "$DEVICE" \
                     --out-dir "$EXP_DIR" \
-                    $EXTRA
+                    $EXTRA $DRY_FLAG
             done
         done
     done

@@ -484,12 +484,15 @@ def _stream_load_windows(
     fold: int | None,
     split: str,
     shard: bool,
+    max_chunks: int | None = None,
 ) -> tuple[list[dict], list[int]]:
     """chunk 스트리밍으로 window dict 리스트 생성 (+ 전역 인덱스 gidx).
 
     shard=True & DDP 면 이 rank 의 stride 만 유지(1/world RAM). 비-DDP/shard=False
     면 전체를 순서대로 materialize(gidx=range) → 기존 _to_windows 와 동일 순서.
     val 없는 legacy 산출물이면 빈 리스트 반환(호출측 fallback).
+    max_chunks 가 주어지면 앞쪽 N chunk 만 소비한다(dry-run 스모크 테스트 — 긴
+    window 전체 추출을 피해 파이프라인만 빠르게 검증).
     """
     do_shard = shard and ddp_enabled()
     world = ddp_world_size() if do_shard else 1
@@ -497,7 +500,11 @@ def _stream_load_windows(
     windows: list[dict] = []
     gidx: list[int] = []
     g = 0
+    n_chunk = 0
     for payload in iter_prepared_split_chunks(data_path, fold, split):
+        if max_chunks is not None and n_chunk >= max_chunks:
+            break
+        n_chunk += 1
         sig = payload.get("signals") if isinstance(payload, dict) else None
         if not sig:
             continue
@@ -518,6 +525,35 @@ def _stream_load_windows(
             g += 1
         del sig, payload
     return windows, gidx
+
+
+def _subsample_windows_dry_run(
+    windows: list[dict],
+    gidx: list[int] | None,
+    n_per_class: int,
+    seed: int,
+) -> tuple[list[dict], list[int] | None]:
+    """dry-run: 클래스별로 최대 n_per_class window 만 남긴다 (양/음성 모두 확보).
+
+    gidx(DDP gather 용 전역 인덱스)가 있으면 동일 인덱스로 함께 잘라 window↔gidx
+    짝을 보존한다(gather/argsort 정합 유지). 소수 표본이라도 양·음성 최소 1건씩
+    남겨 feature 추출→학습→평가 파이프라인이 degenerate 없이 돈다.
+    """
+    if not windows:
+        return windows, gidx
+    rng = np.random.default_rng(seed)
+    pos = [i for i, w in enumerate(windows) if w["label"] == 1]
+    neg = [i for i, w in enumerate(windows) if w["label"] == 0]
+
+    def _take(pool: list[int], n: int) -> list[int]:
+        if len(pool) <= n:
+            return list(pool)
+        return [int(x) for x in rng.choice(pool, size=n, replace=False)]
+
+    keep = sorted(_take(pos, n_per_class) + _take(neg, n_per_class))
+    w2 = [windows[i] for i in keep]
+    g2 = [gidx[i] for i in keep] if gidx is not None else None
+    return w2, g2
 
 
 @torch.no_grad()
@@ -830,6 +866,15 @@ def main() -> None:
     parser.add_argument("--eval-mode", type=str, default="standard",
                         choices=["standard", "loso"],
                         help="standard: train/test split; loso: leave-one-subject-out CV")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="파이프라인 스모크 테스트: 소수 chunk·window 만 로드→추출→"
+                             "학습→평가→저장 하여 크래시 여부만 빠르게 확인 (결과 무의미).")
+    parser.add_argument("--dry-run-chunks", type=int, default=1,
+                        help="dry-run 시 split 당 스트리밍할 chunk 수 (기본 1)")
+    parser.add_argument("--dry-run-n", type=int, default=32,
+                        help="dry-run 시 split·클래스당 window 수 상한 (기본 32)")
+    parser.add_argument("--dry-run-epochs", type=int, default=2,
+                        help="dry-run 시 epoch 상한 (기본 2)")
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -870,11 +915,14 @@ def main() -> None:
     print(f"\nLoading data: {args.data_path} (fold={load_fold})"
           f"{'  [DDP stride shard]' if (use_ddp and not is_loso) else '  [stream]'}")
 
+    # dry-run: split 당 앞쪽 few chunk 만 스트리밍(긴 window 전체 추출 회피).
+    dc = args.dry_run_chunks if args.dry_run else None
+
     if use_ddp and not is_loso and not is_lora:
         # linear_probe DDP: 3 split 모두 stride 샤딩 → 추출 후 gather 로 rank0 복원.
-        train_windows, tr_gidx = _stream_load_windows(args.data_path, load_fold, "train", shard=True)
-        val_windows, va_gidx = _stream_load_windows(args.data_path, load_fold, "val", shard=True)
-        test_windows, te_gidx = _stream_load_windows(args.data_path, load_fold, "test", shard=True)
+        train_windows, tr_gidx = _stream_load_windows(args.data_path, load_fold, "train", shard=True, max_chunks=dc)
+        val_windows, va_gidx = _stream_load_windows(args.data_path, load_fold, "val", shard=True, max_chunks=dc)
+        test_windows, te_gidx = _stream_load_windows(args.data_path, load_fold, "test", shard=True, max_chunks=dc)
         if not val_windows:
             if is_main():
                 print("ERROR: DDP 는 val 없는 legacy 산출물 미지원 — prepare_data 로 val "
@@ -883,17 +931,17 @@ def main() -> None:
             dist.destroy_process_group(); sys.exit(2)
     elif use_ddp and is_lora:
         # lora DDP: train 만 stride(데이터 병렬)·val/test 는 rank0 full(평가 전담).
-        train_windows, tr_gidx = _stream_load_windows(args.data_path, load_fold, "train", shard=True)
+        train_windows, tr_gidx = _stream_load_windows(args.data_path, load_fold, "train", shard=True, max_chunks=dc)
         if is_main():
-            val_windows, _ = _stream_load_windows(args.data_path, load_fold, "val", shard=False)
-            test_windows, _ = _stream_load_windows(args.data_path, load_fold, "test", shard=False)
+            val_windows, _ = _stream_load_windows(args.data_path, load_fold, "val", shard=False, max_chunks=dc)
+            test_windows, _ = _stream_load_windows(args.data_path, load_fold, "test", shard=False, max_chunks=dc)
         else:
             val_windows, test_windows = [], []
     else:
         # 단일 GPU / LOSO: full 스트리밍 로드 (기존 _to_windows 와 동일 순서).
-        train_windows, _ = _stream_load_windows(args.data_path, load_fold, "train", shard=False)
-        val_windows, _ = _stream_load_windows(args.data_path, load_fold, "val", shard=False)
-        test_windows, _ = _stream_load_windows(args.data_path, load_fold, "test", shard=False)
+        train_windows, _ = _stream_load_windows(args.data_path, load_fold, "train", shard=False, max_chunks=dc)
+        val_windows, _ = _stream_load_windows(args.data_path, load_fold, "val", shard=False, max_chunks=dc)
+        test_windows, _ = _stream_load_windows(args.data_path, load_fold, "test", shard=False, max_chunks=dc)
         if not val_windows:
             # legacy val-missing fallback (단일 GPU 만) — train 20% 동적 split.
             seed = getattr(args, "val_split_seed", 42)
@@ -904,6 +952,21 @@ def main() -> None:
             val_windows = [w for i, w in enumerate(train_windows) if i in vset]
             train_windows = [w for i, w in enumerate(train_windows) if i not in vset]
             print(f"  val split (dynamic, seed={seed}): {len(val_windows)} windows")
+
+    # ── dry-run: 로드된 window 를 클래스별 소수로 줄이고 epoch 상한을 낮춘다.
+    #   (chunk 제한으로 이미 소수만 로드됨 → 여기서 추출량을 추가로 캡.) gidx 는
+    #   window 와 짝으로 잘려 DDP gather 정합이 유지된다. ──
+    if args.dry_run:
+        train_windows, tr_gidx = _subsample_windows_dry_run(train_windows, tr_gidx, args.dry_run_n, 0)
+        val_windows, va_gidx = _subsample_windows_dry_run(val_windows, va_gidx, args.dry_run_n, 1)
+        test_windows, te_gidx = _subsample_windows_dry_run(test_windows, te_gidx, args.dry_run_n, 2)
+        args.epochs = min(args.epochs, args.dry_run_epochs)
+        if is_main():
+            print("\n" + "!" * 60)
+            print("  DRY-RUN — 파이프라인 스모크 테스트 (결과 무의미, 저장물 폐기)")
+            print(f"    train={len(train_windows)} / val={len(val_windows)} / "
+                  f"test={len(test_windows)} windows | epochs={args.epochs}")
+            print("!" * 60)
 
     if train_windows:
         print(f"  Signals: {list(train_windows[0]['signals'].keys())}")
