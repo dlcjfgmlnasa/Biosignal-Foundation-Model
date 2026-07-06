@@ -31,6 +31,19 @@ import numpy as np
 import torch
 from torch import nn
 
+try:
+    from tqdm import tqdm
+except ImportError:  # tqdm 미설치 시 no-op 폴백(set_postfix/write 안전)
+    class tqdm:  # type: ignore[no-redef]
+        def __init__(self, it=None, **_kw):
+            self._it = it if it is not None else []
+        def __iter__(self):
+            return iter(self._it)
+        def set_postfix(self, *a, **k):
+            pass
+        def write(self, *a, **k):
+            print(*a)
+
 from data.collate import PackedBatch
 from data.dataset import BiosignalSample
 from data.spatial_map import SIGNAL_KEY_TO_TYPE, get_global_spatial_id
@@ -311,6 +324,10 @@ def train_lora(
         {"params": probe.parameters(), "lr": lr},
     ], weight_decay=0.01)
     criterion = nn.BCEWithLogitsLoss()
+    # bf16 autocast: 인코더가 bf16 사전학습이라 학습도 bf16 forward 가 자연스럽고
+    # 긴 window forward/backward 가 ~2x 빠르고 VRAM 절감. bf16 은 dynamic range 가
+    # 넓어 GradScaler 불필요(backward 는 autocast 밖에서 fp32 grad 로 수행).
+    use_amp = (torch.device(device).type == "cuda")
     losses = []
     for epoch in range(epochs):
         if ddp_module is not None:
@@ -318,15 +335,16 @@ def train_lora(
         epoch_loss, n = 0.0, 0
         for batch, labels in train_batches:
             batch = model.batch_to_device(batch)
-            if ddp_module is not None:
-                # DDP: forward 가 LoRATrainModule(encode→pool→probe)를 타야
-                # grad all-reduce 가 등록된다(probe 가 모듈 안에 포함됨).
-                logits = ddp_module(batch)
-            else:
-                out = model.model(batch, task="masked")
-                features = _mean_pool(out["encoded"], out["patch_mask"])
-                logits = probe(features)
-            loss = criterion(logits, labels.to(device).unsqueeze(-1))
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+                if ddp_module is not None:
+                    # DDP: forward 가 LoRATrainModule(encode→pool→probe)를 타야
+                    # grad all-reduce 가 등록된다(probe 가 모듈 안에 포함됨).
+                    logits = ddp_module(batch)
+                else:
+                    out = model.model(batch, task="masked")
+                    features = _mean_pool(out["encoded"], out["patch_mask"])
+                    logits = probe(features)
+                loss = criterion(logits, labels.to(device).unsqueeze(-1))
             optimizer.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(
@@ -348,11 +366,13 @@ def evaluate_lora(model, probe, test_batches, device):
     model.model.eval()
     probe.to(device).eval()
     all_labels, all_scores = [], []
+    use_amp = (torch.device(device).type == "cuda")
     for batch, labels in test_batches:
         batch = model.batch_to_device(batch)
-        out = model.model(batch, task="masked")
-        features = _mean_pool(out["encoded"], out["patch_mask"])
-        logits = probe(features)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+            out = model.model(batch, task="masked")
+            features = _mean_pool(out["encoded"], out["patch_mask"])
+            logits = probe(features)
         probs = torch.sigmoid(logits).squeeze(-1).cpu().numpy()
         all_labels.append(labels.numpy())
         all_scores.append(probs)
@@ -1015,7 +1035,9 @@ def main() -> None:
     best_probe_state: dict | None = None
     best_model_state: dict | None = None  # lora 에서만
 
-    for epoch in range(args.epochs):
+    _pbar = tqdm(range(args.epochs), desc=f"{args.mode} fold{args.fold}",
+                 unit="ep", disable=not is_main())
+    for epoch in _pbar:
         probe.train()
         if is_lora:
             model.model.train()
@@ -1072,8 +1094,10 @@ def main() -> None:
                 best_probe_state = copy.deepcopy(probe.state_dict())
                 if is_lora:
                     best_model_state = copy.deepcopy(model.model.state_dict())
-            if (epoch + 1) % 1 == 0 or epoch == 0 or epoch == args.epochs - 1:
-                print(
+            _pbar.set_postfix(loss=f"{avg:.4f}", val_auroc=f"{val_auroc:.4f}",
+                              best=f"{best_val_auroc:.4f}@{best_epoch + 1}")
+            if (epoch + 1) % 10 == 0 or epoch == 0 or epoch == args.epochs - 1:
+                _pbar.write(
                     f"  Epoch {epoch + 1}/{args.epochs}  loss={avg:.4f}  "
                     f"val_auroc={val_auroc:.4f}  "
                     f"(best={best_val_auroc:.4f}@ep{best_epoch + 1})"
