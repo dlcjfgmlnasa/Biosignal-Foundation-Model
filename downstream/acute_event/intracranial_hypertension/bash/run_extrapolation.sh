@@ -19,7 +19,10 @@ set -e
 
 # canonical 경로 (k-mimic-/bio_fm). 모두 env override 가능.
 CHECKPOINT="${CHECKPOINT:-/home/coder/workspace/k-mimic-/bio_fm/outputs/main/phase2/kmimic_phase2_k2/checkpoints/checkpoint_phase2_av_epoch049_final.pt}"
-DATA_DIR="${DATA_DIR:-/home/coder/workspace/k-mimic-/bio_fm/data/downstream/intracranial_hypertension}"
+# 외삽 sweep 은 prediction(미래 horizon 예측). DATA_DIR 은 task_mode 로 분리된
+# prediction 데이터 디렉토리(prepare_data.sh TASK_MODE=prediction 산출물)를 가리킨다.
+TASK_MODE="${TASK_MODE:-prediction}"
+DATA_DIR="${DATA_DIR:-/home/coder/workspace/k-mimic-/bio_fm/data/downstream/intracranial_hypertension_${TASK_MODE}}"
 # 외삽 결과는 canonical 결과와 섞이지 않게 별도 디렉토리에 저장.
 OUT_DIR="${OUT_DIR:-/home/coder/workspace/k-mimic-/bio_fm/result/main/intracranial_hypertension_extrapolation}"
 DEVICE="${DEVICE:-cuda}"
@@ -28,9 +31,7 @@ MODEL_VERSION="${MODEL_VERSION:-v2}"
 # prefix 채널 토큰 = prepare_data --input-signals "abp icp ecg" → "abp_icp_ecg".
 # (run.py 는 --input-signals 없음: prepared 데이터의 모든 채널 사용 → prefix 로만 결합.
 #  구 "icp" 토큰은 prepare 산출물과 불일치해 전부 SKIP 되던 버그.)
-# prepare_data 가 파일명에 task_mode 를 넣으므로(detection/prediction 분리) 일치 필요.
-# 외삽 sweep 은 prediction(미래 horizon 예측) 이므로 기본 prediction.
-TASK_MODE="${TASK_MODE:-prediction}"
+# prepare_data 가 파일명·디렉토리에 task_mode 를 넣으므로(detection/prediction 분리) 위에서 TASK_MODE 정의.
 SIGNALS="${SIGNALS:-abp_icp_ecg}"
 
 # 외삽 sweep: window 여러 개, horizon 고정. (canonical run.sh 는 window 1개)

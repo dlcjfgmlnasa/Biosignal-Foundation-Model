@@ -16,8 +16,12 @@ set -e
 #   CHECKPOINT=... DATA_DIR=... OUT_DIR=... bash run.sh
 # 서버 실제 파일명·경로는 반드시 확인 후 맞추세요(아래 default 는 예시).
 CHECKPOINT="${CHECKPOINT:-/home/coder/workspace/k-mimic-/bio_fm/outputs/main/phase2/kmimic_phase2_k2/checkpoints/checkpoint_phase2_av_epoch049_final.pt}"
-DATA_DIR="${DATA_DIR:-/home/coder/workspace/k-mimic-/bio_fm/data/downstream/intracranial_hypertension}"
-OUT_DIR="${OUT_DIR:-/home/coder/workspace/k-mimic-/bio_fm/result/main/intracranial_hypertension}"
+# ⚠ TASK_MODE 로 데이터/결과 디렉토리를 완전히 분리(prepare_data.sh 와 동일 규칙).
+#   detection  → data/downstream/intracranial_hypertension_detection, result/.../intracranial_hypertension_detection
+#   prediction → ..._prediction. prepare_data.sh 의 OUT_DIR 과 반드시 일치해야 로드된다.
+TASK_MODE="${TASK_MODE:-detection}"
+DATA_DIR="${DATA_DIR:-/home/coder/workspace/k-mimic-/bio_fm/data/downstream/intracranial_hypertension_${TASK_MODE}}"
+OUT_DIR="${OUT_DIR:-/home/coder/workspace/k-mimic-/bio_fm/result/main/intracranial_hypertension_${TASK_MODE}}"
 DEVICE="${DEVICE:-cuda}"
 # v2 필수 (9 modality 단일 embedding — memory project_data_spec_v2). v1 로드 금지.
 MODEL_VERSION="${MODEL_VERSION:-v2}"
@@ -30,8 +34,7 @@ MODEL_VERSION="${MODEL_VERSION:-v2}"
 #   (prediction 모드로 쓰려면 SIGNALS=abp_icp_ecg, HORIZON_MINS_OVERRIDE="5 15 30".)
 # detection(aICP식): 입력 ABP+ECG(ICP=라벨전용) → prefix 토큰 "abp_ecg", horizon=0(h0min).
 #   prepare_data.py 가 detection 시 horizon 을 0 으로 고정 저장하므로 여기도 0 이어야 매칭.
-# ⚠ prepare_data 가 파일명에 task_mode 를 넣으므로(detection/prediction 산출물 분리) 여기도 일치해야.
-TASK_MODE="${TASK_MODE:-detection}"
+# ⚠ prepare_data 가 파일명·디렉토리에 task_mode 를 넣으므로(detection/prediction 분리) 위에서 TASK_MODE 정의.
 SIGNALS="${SIGNALS:-abp_ecg}"
 WINDOW_SECS=(${WINDOW_SECS_OVERRIDE:-10})         # 10s 고정 (aICP npj DM 세그먼트 기준)
 HORIZON_MINS=(${HORIZON_MINS_OVERRIDE:-0})        # detection: 동시 라벨(h0min). prediction 시 5/15/30.

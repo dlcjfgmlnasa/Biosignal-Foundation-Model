@@ -27,15 +27,19 @@ BIOFM_ROOT="${BIOFM_ROOT:-/home/coder/workspace/k-mimic-/bio_fm}"
 RECORDS_FILE="${RECORDS_FILE:-${REPO_ROOT}/downstream/outcome/sepsis/RECORDS-waveforms}"
 ICP_RECORDS="${ICP_RECORDS:-downstream/acute_event/intracranial_hypertension/ICP-RECORDS}"
 WAVEFORM_DIR="${WAVEFORM_DIR:-${UPDOWN_ROOT}/raw/mimic3-waveform-ich}"
-OUT_DIR="${OUT_DIR:-${BIOFM_ROOT}/data/downstream/intracranial_hypertension}"
+# task-mode: detection(aICP식 동시 탐지, 입력=ABP+ECG·ICP=라벨전용, circularity 차단) 기본.
+#   prediction(미래 horizon IH 예측, 현재-ICH 제외)로 바꾸려면 TASK_MODE=prediction.
+TASK_MODE="${TASK_MODE:-detection}"
+# ⚠ 출력 디렉토리를 task_mode 로 완전히 분리한다 → detection/prediction 산출물이
+#   서로 다른 폴더에 저장(파일명 분리에 더해 디렉토리까지 분리). run.sh 도 동일 규칙.
+#   detection  → .../data/downstream/intracranial_hypertension_detection
+#   prediction → .../data/downstream/intracranial_hypertension_prediction
+OUT_DIR="${OUT_DIR:-${BIOFM_ROOT}/data/downstream/intracranial_hypertension_${TASK_MODE}}"
 WINDOWS="${WINDOWS:-10}"       # 10s 입력 window (aICP npj DM 세그먼트 기준; detection=동시 IH 탐지)
 HORIZONS="${HORIZONS:-5 15 30}"  # (detection 이면 무시·h0min) prediction 모드 시 5/15/30분 전
 STRIDE="${STRIDE:-10}"      # detection: window(10s)와 동일 → 연속 타일링(겹침·건너뜀 없이 전구간 커버)
 MODE="${MODE:-unbiased}"    # unbiased(현실적·기본) | biased(과대평가·선행비교)
 MIN_GAP="${MIN_GAP:-1200}"  # biased 모드 sparse 간격(초)
-# task-mode: detection(aICP식 동시 탐지, 입력=ABP+ECG·ICP=라벨전용, circularity 차단) 기본.
-#   prediction(미래 horizon IH 예측, 현재-ICH 제외)로 바꾸려면 TASK_MODE=prediction.
-TASK_MODE="${TASK_MODE:-detection}"
 SKIP_DOWNLOAD="${SKIP_DOWNLOAD:-0}"
 # detection 10s window 라벨: SUSTAINED_SEC 기본 10 = "이 10s 구간 평균 ICP>임계"(aICP식 동시 탐지).
 #   코드가 sustained 를 label 구간(bucket 수)으로 clamp 하므로 10 이상은 10s window 에선 10 과 동일.
