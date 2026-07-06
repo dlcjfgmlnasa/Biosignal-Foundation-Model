@@ -144,12 +144,18 @@ def _stream_extract_features(
     """
     feats: list[torch.Tensor] = []
     labs: list[torch.Tensor] = []
+    # bf16 autocast: 인코더가 bf16 로 사전학습됐으므로 추론도 bf16 로 하면
+    # 긴 window(20min→~1800 token, attention O(seq²)) forward 가 ~2x 빠르고 VRAM 절반.
+    # frozen 추출이라 결과는 bf16 정밀도 내에서 사실상 동일(수치 영향 미미).
+    use_amp = (torch.device(device).type == "cuda")
     for batch, labels in iter_window_batches(
         windows, batch_size, patch_size,
         to_samples=lambda w, idx: _make_samples(w["signals"], idx),
         get_label=lambda w: w["label"],
     ):
-        f = model.extract_features(batch, pool="mean").detach().cpu()
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+            f = model.extract_features(batch, pool="mean")
+        f = f.float().detach().cpu()
         feats.append(f)
         labs.append(labels)
     if not feats:
