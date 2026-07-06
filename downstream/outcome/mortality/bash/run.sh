@@ -54,9 +54,20 @@ else
     LAUNCH="python -m"
 fi
 
+# DRY_RUN=1: 파이프라인 스모크 테스트. 소수 환자·소수 윈도우·적은 epoch 로
+#   추출→학습→평가→저장을 빠르게 1회 돌려 크래시 여부만 확인(산출물 무의미).
+#   산출물은 _dryrun 하위로 격리해 실 결과를 덮어쓰지 않는다.
+DRY_RUN=${DRY_RUN:-0}
+DRY_FLAG=""
+if [ "$DRY_RUN" = "1" ]; then
+    DRY_FLAG="--dry-run"
+    OUT_DIR="$OUT_DIR/_dryrun"
+fi
+
 DATA_PATH="${DATA_DIR}/mortality_w${WINDOW_SEC}s.pt"
 
 echo "============================================================"
+[ "$DRY_RUN" = "1" ] && echo "  *** DRY-RUN (소수 환자, 산출물→$OUT_DIR) ***"
 echo "  ICU Mortality Prediction (Transformer Aggregator)"
 echo "  Checkpoint:  $CHECKPOINT"
 echo "  ModelVer:    $MODEL_VERSION"
@@ -84,7 +95,7 @@ $LAUNCH downstream.outcome.mortality.run \
     --batch-size "$LP_BATCH" \
     --max-windows "$MAX_WINDOWS" \
     --device "$DEVICE" \
-    --out-dir "$EXP_DIR"
+    --out-dir "$EXP_DIR" $DRY_FLAG
 
 # ── LoRA (NPROC>1 이면 torchrun DDP) ──
 EXP_DIR="${OUT_DIR}/lora"
@@ -103,7 +114,7 @@ $LAUNCH downstream.outcome.mortality.run \
     --batch-size "$LORA_BATCH" \
     --max-windows "$MAX_WINDOWS" \
     --device "$DEVICE" \
-    --out-dir "$EXP_DIR"
+    --out-dir "$EXP_DIR" $DRY_FLAG
 
 echo -e "\n============================================================"
 echo "  Done! Results: $OUT_DIR"
