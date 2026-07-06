@@ -103,7 +103,10 @@ for SIGNALS in "${SIGNAL_COMBOS[@]}"; do
                     fi
                     loge "\n[${COUNT}/${TOTAL}] ${MODE} | ${SIGNALS} | w=${W}s h=${H}min | fold ${f}"
 
-                    CMD="EARLY_STOP_PATIENCE=$PAT $LAUNCH downstream.acute_event.desaturation.run \
+                    # ⚠ env-var 접두어는 `env` 명령으로 감싼다: 직접 eval(셸)뿐 아니라
+                    #   run_sharded(shlex.split+Popen, 셸 미경유)에서도 실행되게 하기 위함.
+                    #   (그냥 'VAR=0 python' 이면 run_sharded 가 'VAR=0' 을 실행파일로 오인해 실패)
+                    CMD="env EARLY_STOP_PATIENCE=$PAT $LAUNCH downstream.acute_event.desaturation.run \
                         --checkpoint $CHECKPOINT \
                         --model-version $MODEL_VERSION \
                         --mode $MODE \
