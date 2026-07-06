@@ -57,10 +57,16 @@ fi
 # DRY_RUN=1: 파이프라인 스모크 테스트. 소수 환자·소수 윈도우·적은 epoch 로
 #   추출→학습→평가→저장을 빠르게 1회 돌려 크래시 여부만 확인(산출물 무의미).
 #   산출물은 _dryrun 하위로 격리해 실 결과를 덮어쓰지 않는다.
+#   세부값은 env 로 조절: DRY_N(클래스당 환자) DRY_WINDOWS(환자당 윈도우)
+#   DRY_EPOCHS(epoch 상한) DRY_CHUNKS(split 당 chunk). 미지정 시 run.py 기본값.
 DRY_RUN=${DRY_RUN:-0}
 DRY_FLAG=""
 if [ "$DRY_RUN" = "1" ]; then
     DRY_FLAG="--dry-run"
+    [ -n "$DRY_N" ]       && DRY_FLAG="$DRY_FLAG --dry-run-n $DRY_N"
+    [ -n "$DRY_WINDOWS" ] && DRY_FLAG="$DRY_FLAG --dry-run-windows $DRY_WINDOWS"
+    [ -n "$DRY_EPOCHS" ]  && DRY_FLAG="$DRY_FLAG --dry-run-epochs $DRY_EPOCHS"
+    [ -n "$DRY_CHUNKS" ]  && DRY_FLAG="$DRY_FLAG --dry-run-chunks $DRY_CHUNKS"
     OUT_DIR="$OUT_DIR/_dryrun"
 fi
 
