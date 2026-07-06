@@ -40,9 +40,9 @@ SIGNAL_DTYPE="${SIGNAL_DTYPE:-float16}"
 INPUT_SIGNALS="${INPUT_SIGNALS:-abp icp ecg}"
 MIN_GAP="${MIN_GAP:-1200}"  # biased 모드 sparse 간격(초)
 SKIP_DOWNLOAD="${SKIP_DOWNLOAD:-0}"
-# 라벨 지속시간: SUSTAINED_SEC = "horizon 구간 내 ICP>임계 지속(초)". ICP 임계(20)는 유지.
-#   VALID_RATIO 미설정 시 prepare_data.py 기본값 사용.
-SUSTAINED_SEC="${SUSTAINED_SEC:-60}"
+# 라벨 지속시간: SUSTAINED_SEC = "horizon 구간 내 ICP>임계 연속 지속(초)". 길수록 pos 희소.
+#   30s = 60s(너무 빡빡·pos 부족)와 절충. ICP 임계(20)는 유지. VALID_RATIO 미설정 시 py 기본.
+SUSTAINED_SEC="${SUSTAINED_SEC:-30}"
 LABEL_ARGS=""
 [ -n "$SUSTAINED_SEC" ] && LABEL_ARGS="$LABEL_ARGS --sustained-sec $SUSTAINED_SEC"
 [ -n "$VALID_RATIO" ]   && LABEL_ARGS="$LABEL_ARGS --valid-ratio $VALID_RATIO"
