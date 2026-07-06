@@ -30,6 +30,8 @@ MODEL_VERSION="${MODEL_VERSION:-v2}"
 #   (prediction 모드로 쓰려면 SIGNALS=abp_icp_ecg, HORIZON_MINS_OVERRIDE="5 15 30".)
 # detection(aICP식): 입력 ABP+ECG(ICP=라벨전용) → prefix 토큰 "abp_ecg", horizon=0(h0min).
 #   prepare_data.py 가 detection 시 horizon 을 0 으로 고정 저장하므로 여기도 0 이어야 매칭.
+# ⚠ prepare_data 가 파일명에 task_mode 를 넣으므로(detection/prediction 산출물 분리) 여기도 일치해야.
+TASK_MODE="${TASK_MODE:-detection}"
 SIGNALS="${SIGNALS:-abp_ecg}"
 WINDOW_SECS=(${WINDOW_SECS_OVERRIDE:-10})         # 10s 고정 (aICP npj DM 세그먼트 기준)
 HORIZON_MINS=(${HORIZON_MINS_OVERRIDE:-0})        # detection: 동시 라벨(h0min). prediction 시 5/15/30.
@@ -75,9 +77,9 @@ fi
 for WIN in "${WINDOW_SECS[@]}"; do
     for HORIZON in "${HORIZON_MINS[@]}"; do
         # ⚠ 데이터는 단일 .pt 가 아니라 per-(fold,split)[_chunk] prefix 묶음이다.
-        #   예: intracranial_hypertension_abp_icp_ecg_w1200s_h5min_fold0_train_chunk0.pt
+        #   예: intracranial_hypertension_detection_abp_ecg_w10s_h0min_fold0_train_chunk0.pt
         #   run.py 는 --data-path PREFIX(.pt 없이) + --n-folds/--fold 로 로드.
-        PREFIX="${DATA_DIR}/intracranial_hypertension_${SIGNALS}_w${WIN}s_h${HORIZON}min"
+        PREFIX="${DATA_DIR}/intracranial_hypertension_${TASK_MODE}_${SIGNALS}_w${WIN}s_h${HORIZON}min"
 
         if ! ls "${PREFIX}"_fold0_*.pt >/dev/null 2>&1; then
             echo "[SKIP] ${PREFIX}_fold0_*.pt not found (prepare_data 필요)"

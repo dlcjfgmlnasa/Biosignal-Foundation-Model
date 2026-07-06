@@ -28,6 +28,9 @@ MODEL_VERSION="${MODEL_VERSION:-v2}"
 # prefix 채널 토큰 = prepare_data --input-signals "abp icp ecg" → "abp_icp_ecg".
 # (run.py 는 --input-signals 없음: prepared 데이터의 모든 채널 사용 → prefix 로만 결합.
 #  구 "icp" 토큰은 prepare 산출물과 불일치해 전부 SKIP 되던 버그.)
+# prepare_data 가 파일명에 task_mode 를 넣으므로(detection/prediction 분리) 일치 필요.
+# 외삽 sweep 은 prediction(미래 horizon 예측) 이므로 기본 prediction.
+TASK_MODE="${TASK_MODE:-prediction}"
 SIGNALS="${SIGNALS:-abp_icp_ecg}"
 
 # 외삽 sweep: window 여러 개, horizon 고정. (canonical run.sh 는 window 1개)
@@ -70,7 +73,7 @@ echo "============================================================"
 for WIN in "${WINDOW_SECS[@]}"; do
     for HORIZON in "${HORIZON_MINS[@]}"; do
         # 데이터는 per-(fold,split)[_chunk] prefix 묶음 (단일 .pt 아님).
-        PREFIX="${DATA_DIR}/intracranial_hypertension_${SIGNALS}_w${WIN}s_h${HORIZON}min"
+        PREFIX="${DATA_DIR}/intracranial_hypertension_${TASK_MODE}_${SIGNALS}_w${WIN}s_h${HORIZON}min"
 
         if ! ls "${PREFIX}"_fold0_*.pt >/dev/null 2>&1; then
             echo "[SKIP] ${PREFIX}_fold0_*.pt not found (prepare_data 필요)"

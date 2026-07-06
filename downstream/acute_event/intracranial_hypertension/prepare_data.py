@@ -509,8 +509,12 @@ def save_split_dataset(
     win_int = int(window_sec)
     fold_suffix = f"_fold{fold_idx}" if fold_idx is not None else ""
     chunk_suffix = f"_chunk{chunk_idx}" if chunk_idx is not None else ""
+    # task_mode 를 파일명에 넣어 detection 산출물이 prediction 산출물과 섞이지 않게 한다
+    # (같은 OUT_DIR 공유 시 이름 충돌 방지). 예:
+    #   intracranial_hypertension_detection_abp_ecg_w10s_h0min_fold0_train_chunk0.pt
+    #   intracranial_hypertension_prediction_abp_icp_ecg_w1200s_h30min_fold0_train.pt
     filename = (
-        f"intracranial_hypertension_{mode_str}_w{win_int}s_h{horizon_min}min"
+        f"intracranial_hypertension_{task_mode}_{mode_str}_w{win_int}s_h{horizon_min}min"
         f"{fold_suffix}_{split_name}{chunk_suffix}.pt"
     )
     save_path = out_path / filename
