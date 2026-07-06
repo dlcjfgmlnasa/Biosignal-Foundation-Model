@@ -1,11 +1,11 @@
 #!/bin/bash
 # Desaturation Prediction (SNUH) — 실행 스크립트
-# 입력 ECG+PPG+CO2+AWP+RESP_Flow 고정, window/horizon 고정 (canonical). horizon 만 override.
+# 입력 CO2+AWP+RESP_Flow(호흡 신호만) 고정, window 고정. horizon 5/10/15 sweep.
 # 기본: 1 combo × window 1개 × horizon 1개 × modes(linear_probe,lora) × 5 fold.
 # env override: SIGNALS_OVERRIDE / WINDOWS_OVERRIDE / HORIZONS_OVERRIDE / MODES_OVERRIDE
 #
 # 사전 조건: prepare_data.sh 로 .pt 데이터셋 생성돼 있어야 함
-#   (파일명: desaturation_ecg_ppg_co2_awp_resp_flow_w300s_h10min_fold{f}_{train,val,test}.pt)
+#   (파일명: desaturation_co2_awp_resp_flow_w300s_h{5,10,15}min_fold{f}_{train,val,test}.pt)
 #
 # 사용법:
 #   # (1) 직렬 실행 (단일 GPU)
@@ -49,9 +49,9 @@ NPROC=${NPROC:-4}
 if [ "$NPROC" -gt 1 ]; then LORA_LAUNCH="torchrun --nproc_per_node=$NPROC -m"; else LORA_LAUNCH="python -m"; fi
 
 # ── 실험 조합 (canonical: 입력·window·horizon 고정) ──
-SIGNAL_COMBOS=(${SIGNALS_OVERRIDE:-ecg_ppg_co2_awp_resp_flow})
+SIGNAL_COMBOS=(${SIGNALS_OVERRIDE:-co2_awp_resp_flow})   # 호흡 신호만
 WINDOWS=(${WINDOWS_OVERRIDE:-300})
-HORIZONS=(${HORIZONS_OVERRIDE:-10})
+HORIZONS=(${HORIZONS_OVERRIDE:-5 10 15})
 MODES=(${MODES_OVERRIDE:-linear_probe lora})
 N_FOLDS=${N_FOLDS:-5}
 FORCE=${FORCE:-0}

@@ -5,7 +5,7 @@
 (input_window, future_label) 쌍 생성.
 
 Task 성격: Acute Event — respiratory desaturation *prediction* (detection 아님).
-  - 입력 = desat *이전* 정상 파형 (ECG/PPG/CO2/AWP/RESP_Flow)
+  - 입력 = desat *이전* 정상 파형 (CO2/AWP/RESP_Flow — 호흡 신호만, PPG=leakage·ECG 제외)
   - 라벨 = 이후 horizon 구간에 (게이트 통과한) SpO2<92% 가 **한 번이라도** 발생하면 1
 
 라벨 정의 = "any point" + 아티팩트 게이트 — 소아논문(PLOS One 2023) 프로토콜 재현:
@@ -26,9 +26,9 @@ Task 성격: Acute Event — respiratory desaturation *prediction* (detection �
     python -m downstream.acute_event.desaturation.prepare_data \\
         --vital-dir C:/Projects/ventilation_eventcases/data/vital_files \\
         --meta-xlsx C:/Projects/ventilation_eventcases/ventilation_cases.xlsx \\
-        --input-signals ecg ppg co2 awp resp_flow \\
-        --required-signals ecg co2 awp \\
-        --window-secs 300 --horizon-mins 10 --n-folds 5 \\
+        --input-signals co2 awp resp_flow \\
+        --required-signals co2 awp \\
+        --window-secs 300 --horizon-mins 5 10 15 --n-folds 5 \\
         --out-dir outputs/downstream/desaturation
 
 외부검증(external-test) 모드: --external-test → fold 분할 없이 188 전부 test-only 저장.
@@ -408,22 +408,24 @@ def extract_forecast_samples(
 
 
 def pack_samples_to_dict(samples: list[ForecastSample]) -> dict:
+    # ⚠ 키 이름은 run.py(hypoxemia 계열)가 기대하는 "signals"/"gap_masks" 여야 함.
+    #   run.py --data-path 분기가 train_data["signals"] 로 읽으므로 다르면 KeyError.
     if not samples:
-        return {"input_signals": {}, "input_gap_masks": {},
+        return {"signals": {}, "gap_masks": {},
                 "labels": torch.tensor([]), "label_values": torch.tensor([]),
                 "case_ids": [], "win_starts": []}
     stypes = list(samples[0].input_signals.keys())
-    input_signals = {
+    signals = {
         st: torch.from_numpy(np.stack([s.input_signals[st] for s in samples]))
         for st in stypes
     }
-    input_gap_masks = {
+    gap_masks = {
         st: torch.from_numpy(np.stack([s.input_gap_masks[st] for s in samples]))
         for st in stypes
     }
     return {
-        "input_signals": input_signals,
-        "input_gap_masks": input_gap_masks,
+        "signals": signals,
+        "gap_masks": gap_masks,
         "labels": torch.tensor([s.label for s in samples], dtype=torch.long),
         "label_values": torch.tensor([s.label_value for s in samples], dtype=torch.float32),
         "case_ids": [s.case_id for s in samples],
@@ -515,11 +517,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="SNUH desaturation prediction 데이터 준비")
     parser.add_argument("--vital-dir", required=True, help="SNUH .vital 디렉토리 (188개)")
     parser.add_argument("--meta-xlsx", default=None, help="ventilation_cases.xlsx (case_id→환자ID)")
+    # 호흡 신호만 (co2·awp·resp_flow): PPG(=SpO2 센서 leakage)·ECG 제외. 순수 환기신호로
+    # 산소화 예측 → 깨끗한 cross-modal. all 5 나 +ecg 원하면 --input-signals 로 override.
     parser.add_argument("--input-signals", nargs="+",
-                        default=["ecg", "ppg", "co2", "awp", "resp_flow"])
-    parser.add_argument("--required-signals", nargs="+", default=["ecg", "co2", "awp"])
+                        default=["co2", "awp", "resp_flow"])
+    parser.add_argument("--required-signals", nargs="+", default=["co2", "awp"])
     parser.add_argument("--window-secs", nargs="+", type=float, default=[300.0])
-    parser.add_argument("--horizon-mins", nargs="+", type=float, default=[10.0])
+    parser.add_argument("--horizon-mins", nargs="+", type=float, default=[5.0, 10.0, 15.0])
     parser.add_argument("--stride-sec", type=float, default=30.0)
     parser.add_argument("--spo2-threshold", type=float, default=92.0,
                         help="SpO2 임계 (%%). 92=Prescience/WHO perioperative 관행(기본), "

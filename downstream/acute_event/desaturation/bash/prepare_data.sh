@@ -4,7 +4,7 @@
 # Label: future horizon 내 SpO2 < 92% "at any point" + 아티팩트 게이트 (category 텍스트 미사용)
 #        = 소아논문(PLOS One 2023) 프로토콜: any-point 는 반드시 품질게이트와 세트.
 #        게이트 = SpO2∈[50,100] · |pulseHR-ecgHR|≤20% · PI≥0.3. threshold 92=Prescience/WHO.
-# Input: ECG + PPG + CO2 + AWP + RESP_Flow  (SNUH 고유: FLOW_WAV → RESP_Flow 최초 투입)
+# Input: CO2 + AWP + RESP_Flow (호흡 신호만 — PPG=SpO2센서 leakage·ECG 제외). RESP_Flow SNUH 고유.
 # Source: 188 raw .vital (Intellivue 파형 125~250Hz → 100Hz 다운샘플)
 #
 # N: 게이트 후 재측정 필요. dwell variant 는 SUSTAINED=10/30. 게이트 끄기: NO_GATE=1.
@@ -25,8 +25,8 @@ VITAL_DIR="${VITAL_DIR:-${UPDOWN_ROOT}/datasets/ventilation_eventcases/data/vita
 META_XLSX="${META_XLSX:-${UPDOWN_ROOT}/datasets/ventilation_eventcases/ventilation_cases.xlsx}"
 OUT_DIR="${OUT_DIR:-${BIOFM_ROOT}/data/downstream/desaturation}"
 
-WINDOWS="${WINDOWS:-300}"            # canonical: 5 min input window
-HORIZONS="${HORIZONS:-10}"           # canonical: 10 min ahead
+WINDOWS="${WINDOWS:-300}"            # 5 min input window
+HORIZONS="${HORIZONS:-5 10 15}"      # 5/10/15 min ahead 예측 (sweep)
 STRIDE="${STRIDE:-30}"
 THRESHOLD="${THRESHOLD:-92}"         # SpO2 < 92% (Prescience/WHO perioperative). conservative=90
 SUSTAINED="${SUSTAINED:-1}"          # 1='any point'(게이트와 세트, 기본). dwell variant: 10/30
@@ -34,8 +34,8 @@ SUSTAINED="${SUSTAINED:-1}"          # 1='any point'(게이트와 세트, 기본
 GATE_ARGS=""
 if [ "${NO_GATE:-0}" = "1" ]; then GATE_ARGS="--no-artifact-gate"; fi
 N_FOLDS="${N_FOLDS:-5}"
-INPUT="${INPUT:-ecg ppg co2 awp resp_flow}"
-REQUIRED="${REQUIRED:-ecg co2 awp}"
+INPUT="${INPUT:-co2 awp resp_flow}"   # 호흡 신호만 (PPG=leakage·ECG 제외). override 가능
+REQUIRED="${REQUIRED:-co2 awp}"
 
 EXTRA=""
 if [ "${EXTERNAL_TEST:-0}" = "1" ]; then EXTRA="--external-test"; fi
