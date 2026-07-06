@@ -42,6 +42,8 @@ from data.dataset import BiosignalSample
 from data.spatial_map import SIGNAL_KEY_TO_TYPE as SIGNAL_TYPES
 from downstream._save_utils import load_prepared_chunked
 
+# 실제 patch_size 는 checkpoint config(=200)에서 읽는다(main() 참조).
+# 이 상수는 model 이 patch_size 속성을 노출하지 않을 때의 fallback 일 뿐.
 PATCH_SIZE = 100
 TARGET_SR = 100.0
 
@@ -339,6 +341,14 @@ def evaluate_multi_input_forecasting(
 
 
 def main() -> None:
+    # Windows cp949 콘솔에서 유니코드(—·화살표 등) print 시 UnicodeEncodeError 로
+    # sweep 요약/결과 저장 전에 크래시하는 것을 방지 (Linux/UTF-8 에선 no-op).
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+
     parser = argparse.ArgumentParser(description="Vital Sign Forecasting Evaluation")
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--model-version", type=str, default="v1")
@@ -391,6 +401,13 @@ def main() -> None:
     else:
         print("ERROR: --checkpoint or --dummy required.", file=sys.stderr)
         sys.exit(1)
+
+    # patch_size 는 반드시 모델(config)에서 가져온다. 모듈 상수 100 을 그대로 쓰면
+    # 실제 checkpoint(config.patch_size=200)와 어긋나, PackCollate 가 만드는 patch-grid
+    # id 개수(2×)가 모델 PatchEmbedding 의 실제 패치 수와 불일치 → forward 파손.
+    # cross_modal(build_multivariate_batch)·aki·cardiac_arrest 등과 동일한 규약.
+    patch_size = int(getattr(model, "patch_size", PATCH_SIZE))
+    print(f"  patch_size = {patch_size} (from model config)")
 
     # Data
     is_multi_input = False
@@ -467,7 +484,7 @@ def main() -> None:
         n_samples = int(round(tgt_sec * TARGET_SR))
         n_samples = min(n_samples, max_target_samples)
         targets_trunc = targets[:, :n_samples]
-        n_target_patches = n_samples // PATCH_SIZE
+        n_target_patches = n_samples // patch_size
 
         collect_raw = (not args.no_dump_preds) and (tgt_sec == primary_tgt_sec)
 
@@ -478,7 +495,7 @@ def main() -> None:
                 targets_trunc,
                 context_signal_types=context_signal_types,
                 target_signal_type=signal_type,
-                patch_size=PATCH_SIZE,
+                patch_size=patch_size,
                 device=device,
                 patient_ids=patient_ids,
                 collect_raw=collect_raw,
@@ -490,7 +507,7 @@ def main() -> None:
                 contexts,
                 targets_trunc,
                 signal_type,
-                patch_size=PATCH_SIZE,
+                patch_size=patch_size,
                 device=device,
                 patient_ids=patient_ids,
                 collect_raw=collect_raw,

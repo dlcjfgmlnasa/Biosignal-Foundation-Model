@@ -49,6 +49,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from tqdm import tqdm
 
 from data.parser._common import resample_to_target
 from data.parser.vitaldb import (
@@ -338,14 +339,14 @@ def run_pass1(
     print(f"\n[Pass 1] band 캐시 생성: {len(cohort)} cases "
           f"(band={band_sec / 3600:.1f}h, workers={workers}) → {cache_dir}")
     metas: list[dict] = []
-    done = 0
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futs = {
             ex.submit(load_and_cache_case, c, input_signals, band_sec, cache_dir): c
             for c in cohort
         }
-        for fut in as_completed(futs):
-            done += 1
+        pbar = tqdm(as_completed(futs), total=len(cohort),
+                    desc="[Pass1] caching", unit="case")
+        for fut in pbar:
             try:
                 m = fut.result()
             except Exception as exc:
@@ -353,8 +354,7 @@ def run_pass1(
                 m = None
             if m is not None:
                 metas.append(m)
-            if done % 200 == 0:
-                print(f"    {done}/{len(cohort)} 처리 (cached={len(metas)})")
+            pbar.set_postfix(cached=len(metas))
     n_pos = sum(m["label"] for m in metas)
     print(f"  Pass 1 완료: {len(metas)}/{len(cohort)} cached "
           f"(pos={n_pos}, neg={len(metas) - n_pos})")
@@ -502,7 +502,7 @@ def _survey_cohort(
     n_cap_hit: dict[int, int] = {0: 0, 1: 0}
     qualified: dict[str, int] = {}
 
-    for i, m in enumerate(metas):
+    for i, m in enumerate(tqdm(metas, desc="[Survey] scanning", unit="case")):
         label = int(m["label"])
         patient = _meta_to_patient(m, input_signals)
         if patient is None:
@@ -713,7 +713,9 @@ def run_pass2(
                 gc.collect()
                 return cidx + 1
 
-            for c in sorted(split_cases):
+            pbar = tqdm(sorted(split_cases), total=len(split_cases),
+                        desc=f"[Pass2] fold{fold_idx}/{split_name}", unit="case")
+            for c in pbar:
                 m = meta_by_case.get(c)
                 if m is None:
                     continue
@@ -733,6 +735,7 @@ def run_pass2(
                 if len(buf) >= patients_per_chunk:
                     chunk_idx = _flush(buf, chunk_idx)
                     buf = []
+                pbar.set_postfix(kept=total_pat + len(buf), chunks=chunk_idx)
             chunk_idx = _flush(buf, chunk_idx)
             buf = []
             print(f"    [fold{fold_idx}/{split_name}] {chunk_idx} chunk(s), "

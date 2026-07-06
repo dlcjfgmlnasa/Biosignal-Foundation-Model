@@ -34,6 +34,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch import nn
+from tqdm import tqdm
 
 from downstream.metrics import (
     compute_auroc,
@@ -112,14 +113,17 @@ def train_model(
             cached_reprs = cached_reprs_override
         else:
             cached_reprs = []
-            for p in train_patients:
+            for p in tqdm(train_patients, desc="[LP] encode train",
+                          unit="pt", disable=not is_main()):
                 reprs = encode_patient_windows(
                     model, p, patch_size, max_windows,
                     use_lora=False, session_prefix="ca_out",
                 )
                 cached_reprs.append(reprs.detach().cpu())
 
-    for epoch in range(epochs):
+    epoch_bar = tqdm(range(epochs), desc="[train] epoch",
+                     unit="ep", disable=not is_main())
+    for epoch in epoch_bar:
         # 환자 셔플
         rng = np.random.default_rng(epoch)
         order = rng.permutation(len(train_patients))
@@ -179,8 +183,7 @@ def train_model(
 
         avg = epoch_loss / max(n_batches, 1)
         losses.append(avg)
-        if (epoch + 1) % 5 == 0 or epoch == 0:
-            print(f"  Epoch {epoch + 1}/{epochs}  loss={avg:.4f}")
+        epoch_bar.set_postfix(loss=f"{avg:.4f}")
 
     return losses
 
@@ -208,7 +211,8 @@ def evaluate_model(
 
     # precomputed_reprs: DDP sharded 추출 경로에서 rank0 가 gather 한 test reprs
     # (test_patients 와 co-index). 단일 GPU 면 None → 기존처럼 즉시 인코딩(불변).
-    for i, p in enumerate(test_patients):
+    for i, p in enumerate(tqdm(test_patients, desc="[eval] encode test",
+                               unit="pt", disable=not is_main())):
         if precomputed_reprs is not None:
             reprs = precomputed_reprs[i]
         else:
@@ -400,7 +404,8 @@ def main() -> None:
             # idxs 와 sharded patients 는 동일 stride(shard_for_rank)라 정렬된다.
             idxs = shard_for_rank(list(range(len(patients))))
             out = []
-            for gi in idxs:
+            for gi in tqdm(idxs, desc="[extract] shard", unit="pt",
+                           disable=not is_main()):
                 p = patients[gi]
                 reprs = encode_patient_windows(
                     model, p, patch_size, args.max_windows,
