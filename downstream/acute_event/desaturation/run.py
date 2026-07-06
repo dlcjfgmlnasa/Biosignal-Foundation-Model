@@ -65,6 +65,9 @@ from downstream._ddp_utils import (
 DEFAULT_PATCH_SIZE = 100
 DEFAULT_SR = 100.0
 
+# v2 signal_type (prepare_data 소문자 채널명 → v2 modality). RESP_Flow=8 (disk SIGNAL_TYPES 미포함).
+_V2_SIGNAL_TYPE = {"ecg": 0, "abp": 1, "ppg": 2, "cvp": 3, "co2": 4, "awp": 5, "resp_flow": 8}
+
 
 # ── 배치 생성 ─────────────────────────────────────────────────
 
@@ -83,9 +86,10 @@ def _multi_window_to_samples(mw: MultiSignalWindow, idx: int) -> list[BiosignalS
     """MultiSignalWindow → 신호별 BiosignalSample 리스트."""
     samples = []
     for ch, (sig_type, signal) in enumerate(mw.signals.items()):
-        # sig_type 은 문자열. SIGNAL_TYPES 로 int 인덱스 변환 후
-        # get_global_spatial_id 도 int 인덱스로 호출해야 한다 (Patch C).
-        stype_int = SIGNAL_TYPES.get(sig_type, 1)
+        # sig_type 은 문자열 → v2 signal_type(int) 변환.
+        # ⚠ data.parser.vitaldb.SIGNAL_TYPES(disk spec)엔 resp_flow 가 없어 .get(...,1)
+        #   이 조용히 abp(1)로 빠뜨린다 → v2(RESP_Flow=8) 매핑을 명시적으로 우선.
+        stype_int = _V2_SIGNAL_TYPE.get(sig_type, SIGNAL_TYPES.get(sig_type, 1))
         spatial_id = get_global_spatial_id(stype_int, 0)
         samples.append(
             BiosignalSample(
@@ -747,9 +751,9 @@ def main() -> None:
     parser.add_argument(
         "--input-signals",
         nargs="+",
-        default=["ppg", "ecg", "abp", "co2"],
-        choices=["abp", "ecg", "ppg", "co2"],
-        help="Input signal types (Task #6: PPG, ECG, ABP, CO2; label from SpO2 numerics)",
+        default=["co2", "awp", "resp_flow"],
+        choices=["abp", "ecg", "ppg", "co2", "awp", "resp_flow", "cvp"],
+        help="Input signal types (desaturation: 호흡 신호 CO2/AWP/RESP_Flow; label from SpO2 numerics)",
     )
     parser.add_argument(
         "--val-split-seed",
