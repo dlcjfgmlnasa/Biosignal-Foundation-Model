@@ -190,7 +190,7 @@ def train_linear_probe(
             nb += 1
         avg = epoch_loss / max(nb, 1)
         losses.append(avg)
-        if (epoch + 1) % 5 == 0 or epoch == 0:
+        if (epoch + 1) % 1 == 0 or epoch == 0:
             print(f"  Epoch {epoch + 1}/{epochs}  loss={avg:.4f}")
     return losses
 
@@ -270,7 +270,7 @@ def _fit_probe_cached(probe, features, labels, batch_size, epochs, lr, device):
             nb += 1
         avg = epoch_loss / max(nb, 1)
         losses.append(avg)
-        if (epoch + 1) % 5 == 0 or epoch == 0:
+        if (epoch + 1) % 1 == 0 or epoch == 0:
             print(f"  Epoch {epoch + 1}/{epochs}  loss={avg:.4f}")
     return losses
 
@@ -331,7 +331,7 @@ def train_lora(
             n += 1
         avg = epoch_loss / max(n, 1)
         losses.append(avg)
-        if (epoch + 1) % 5 == 0 or epoch == 0:
+        if (epoch + 1) % 1 == 0 or epoch == 0:
             if is_main():  # DDP: rank0 만 출력(비-DDP 면 항상 True → 불변)
                 print(f"  Epoch {epoch + 1}/{epochs}  loss={avg:.4f}")
     return losses
@@ -1066,7 +1066,7 @@ def main() -> None:
                 best_probe_state = copy.deepcopy(probe.state_dict())
                 if is_lora:
                     best_model_state = copy.deepcopy(model.model.state_dict())
-            if (epoch + 1) % 5 == 0 or epoch == 0 or epoch == args.epochs - 1:
+            if (epoch + 1) % 1 == 0 or epoch == 0 or epoch == args.epochs - 1:
                 print(
                     f"  Epoch {epoch + 1}/{args.epochs}  loss={avg:.4f}  "
                     f"val_auroc={val_auroc:.4f}  "
