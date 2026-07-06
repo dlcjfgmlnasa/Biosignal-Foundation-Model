@@ -80,6 +80,8 @@ if [ "$DRY_RUN" = "1" ]; then
     HORIZON_MINS=("${HORIZON_MINS[0]}")   # 첫 horizon 만
     FORCE=1
     OUT_DIR="${OUT_DIR}/_dryrun"
+    NPROC=1                    # dry-run 은 단일 GPU 전용(train 재사용, DDP gather 없음)
+    LORA_LAUNCH="python -m"    # torchrun 경합 제거 → 네트워크 read 4× 완화
 fi
 
 echo "============================================================"

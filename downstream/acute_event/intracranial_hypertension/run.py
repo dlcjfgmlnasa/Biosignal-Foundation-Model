@@ -918,7 +918,32 @@ def main() -> None:
     # dry-run: split 당 앞쪽 few chunk 만 스트리밍(긴 window 전체 추출 회피).
     dc = args.dry_run_chunks if args.dry_run else None
 
-    if use_ddp and not is_loso and not is_lora:
+    # dry-run 은 단일 GPU 전용(gidx/DDP gather 없이 train 재사용). torchrun 이면 차단.
+    if args.dry_run and use_ddp:
+        if is_main():
+            print("ERROR: --dry-run 은 단일 GPU 전용입니다. NPROC=1 로 실행하세요.",
+                  file=sys.stderr)
+        import torch.distributed as dist
+        dist.destroy_process_group()
+        sys.exit(2)
+
+    if args.dry_run:
+        # 스모크 최적화: train chunk 1개만 로드(네트워크 I/O 최소) → subsample →
+        # val/test 는 같은 표본 재사용. 결과가 무의미하므로 분리 로드 불필요(I/O 3배 절감).
+        train_windows, _ = _stream_load_windows(
+            args.data_path, load_fold, "train", shard=False, max_chunks=dc)
+        train_windows, _ = _subsample_windows_dry_run(
+            train_windows, None, args.dry_run_n, 0)
+        val_windows = list(train_windows)
+        test_windows = list(train_windows)
+        args.epochs = min(args.epochs, args.dry_run_epochs)
+        if is_main():
+            print("\n" + "!" * 60)
+            print("  DRY-RUN — 스모크(train 1 chunk 재사용, 결과 무의미)")
+            print(f"    train=val=test={len(train_windows)} windows | "
+                  f"epochs={args.epochs}")
+            print("!" * 60)
+    elif use_ddp and not is_loso and not is_lora:
         # linear_probe DDP: 3 split 모두 stride 샤딩 → 추출 후 gather 로 rank0 복원.
         train_windows, tr_gidx = _stream_load_windows(args.data_path, load_fold, "train", shard=True, max_chunks=dc)
         val_windows, va_gidx = _stream_load_windows(args.data_path, load_fold, "val", shard=True, max_chunks=dc)
@@ -952,21 +977,6 @@ def main() -> None:
             val_windows = [w for i, w in enumerate(train_windows) if i in vset]
             train_windows = [w for i, w in enumerate(train_windows) if i not in vset]
             print(f"  val split (dynamic, seed={seed}): {len(val_windows)} windows")
-
-    # ── dry-run: 로드된 window 를 클래스별 소수로 줄이고 epoch 상한을 낮춘다.
-    #   (chunk 제한으로 이미 소수만 로드됨 → 여기서 추출량을 추가로 캡.) gidx 는
-    #   window 와 짝으로 잘려 DDP gather 정합이 유지된다. ──
-    if args.dry_run:
-        train_windows, tr_gidx = _subsample_windows_dry_run(train_windows, tr_gidx, args.dry_run_n, 0)
-        val_windows, va_gidx = _subsample_windows_dry_run(val_windows, va_gidx, args.dry_run_n, 1)
-        test_windows, te_gidx = _subsample_windows_dry_run(test_windows, te_gidx, args.dry_run_n, 2)
-        args.epochs = min(args.epochs, args.dry_run_epochs)
-        if is_main():
-            print("\n" + "!" * 60)
-            print("  DRY-RUN — 파이프라인 스모크 테스트 (결과 무의미, 저장물 폐기)")
-            print(f"    train={len(train_windows)} / val={len(val_windows)} / "
-                  f"test={len(test_windows)} windows | epochs={args.epochs}")
-            print("!" * 60)
 
     if train_windows:
         print(f"  Signals: {list(train_windows[0]['signals'].keys())}")
