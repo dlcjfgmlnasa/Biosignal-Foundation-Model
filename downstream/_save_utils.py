@@ -360,6 +360,7 @@ def load_prepared_split_chunked(
     data_path: str | Path,
     fold: int | None = None,
     splits: Iterable[str] = ("train", "val", "test"),
+    max_chunks: int | None = None,
 ) -> dict:
     """분류 prepare_data 의 per-(fold,split)[_chunk] 산출물을 통일 dict 로 로드.
 
@@ -389,6 +390,10 @@ def load_prepared_split_chunked(
         int K → fold glob ``<base>_fold{K}_<split>*.pt`` 만 로드 (K-fold CV).
     splits : Iterable[str]
         탐색할 split 이름들. 존재하지 않는 split (예: val 없는 legacy) 은 건너뛴다.
+    max_chunks : int | None
+        None → split 의 모든 chunk 로드(기본). int N → split 당 앞쪽 N chunk 만
+        로드(정렬된 파일 순서 기준). dry-run 스모크 테스트용 — 수십 GB 전체를 읽지
+        않고 소수 chunk 만 읽어 로딩 시간을 줄인다. 단일파일 back-compat 경로는 무시.
     """
     p = Path(data_path)
 
@@ -419,6 +424,8 @@ def load_prepared_split_chunked(
         files = sorted(parent.glob(f"{prefix}_{split_name}*.pt"))
         if not files:
             continue
+        if max_chunks is not None and max_chunks > 0:
+            files = files[:max_chunks]
         # 순서는 files 인덱스로 복원 → 순차 로드와 동일한 payload 순서 보존(재현성).
         # peak RAM 은 순차와 동일(어차피 concat 전 전체 chunk 를 보유).
         n_w = min(n_load_workers, len(files))

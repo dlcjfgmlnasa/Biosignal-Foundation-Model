@@ -35,6 +35,19 @@ LORA_BATCH=${LORA_BATCH:-8};  LORA_LR=${LORA_LR:-2e-4}; LORA_EPOCHS=${LORA_EPOCH
 LORA_RANK=${LORA_RANK:-8};    LORA_ALPHA=${LORA_ALPHA:-16}
 FORCE=${FORCE:-0}
 
+# DRY_RUN=1: 파이프라인 스모크 테스트. fold 0 만, 소수 환자·소수 윈도우·적은 epoch 로
+#   추출→학습→평가→저장을 빠르게 1회 돌려 크래시 여부만 확인한다(산출물 무의미).
+#   --n-folds 는 5 를 유지해야 per-fold chunk 가 올바로 로드된다(루프만 fold 0 로 제한).
+DRY_RUN=${DRY_RUN:-0}
+DRY_FLAG=""
+FOLD_LIST=$(seq 0 $((N_FOLDS-1)))
+if [ "$DRY_RUN" = "1" ]; then
+    DRY_FLAG="--dry-run"
+    FOLD_LIST=0
+    FORCE=1                    # dryrun 산출물은 매번 새로 쓴다
+    OUT_DIR="$OUT_DIR/_dryrun" # 실 결과 디렉토리를 덮어쓰지 않도록 격리
+fi
+
 if [ "$NPROC" -gt 1 ]; then
     LAUNCH="torchrun --nproc_per_node=$NPROC -m"
 else
@@ -56,6 +69,7 @@ maybe_run() {
 }
 
 echo "============================================================"
+[ "$DRY_RUN" = "1" ] && echo "  *** DRY-RUN (fold 0 only, 소수 환자, 산출물→$OUT_DIR) ***"
 echo "  Cardiac Arrest Outcome (patient-level) | NPROC=$NPROC | FORCE=$FORCE"
 echo "  Checkpoint: $CHECKPOINT | ModelVer: $MODEL_VERSION"
 echo "  Data:       $PREFIX (${N_FOLDS}-fold)"
@@ -65,14 +79,14 @@ echo "  LoRA: batch=$LORA_BATCH (eff $((LORA_BATCH*NPROC))) lr=$LORA_LR epochs=$
 echo "  OUT_DIR: $OUT_DIR"
 echo "============================================================"
 
-for f in $(seq 0 $((N_FOLDS-1))); do
+for f in $FOLD_LIST; do
   LP_OUT=$OUT_DIR/linear_probe
   maybe_run "$LP_OUT" "$f" \
     $LAUNCH downstream.outcome.cardiac_arrest.run \
       --checkpoint "$CHECKPOINT" --model-version "$MODEL_VERSION" \
       --data-path "$PREFIX" --mode linear_probe --n-folds "$N_FOLDS" --fold "$f" \
       --epochs "$LP_EPOCHS" --lr "$LP_LR" --batch-size "$LP_BATCH" \
-      --max-windows "$MAX_WINDOWS" --device "$DEVICE" --out-dir "$LP_OUT"
+      --max-windows "$MAX_WINDOWS" --device "$DEVICE" --out-dir "$LP_OUT" $DRY_FLAG
 
   LORA_OUT=$OUT_DIR/lora
   maybe_run "$LORA_OUT" "$f" \
@@ -81,7 +95,7 @@ for f in $(seq 0 $((N_FOLDS-1))); do
       --data-path "$PREFIX" --mode lora --lora-rank "$LORA_RANK" --lora-alpha "$LORA_ALPHA" \
       --n-folds "$N_FOLDS" --fold "$f" \
       --epochs "$LORA_EPOCHS" --lr "$LORA_LR" --batch-size "$LORA_BATCH" \
-      --max-windows "$MAX_WINDOWS" --device "$DEVICE" --out-dir "$LORA_OUT"
+      --max-windows "$MAX_WINDOWS" --device "$DEVICE" --out-dir "$LORA_OUT" $DRY_FLAG
 done
 
 echo "============================================================"

@@ -267,16 +267,20 @@ def _compute_metrics(y_true, y_score):
 
 def _load_data(
     data_path: str, fold: int = 0, n_folds: int = 1,
+    max_chunks: int | None = None,
 ) -> tuple[list[dict], list[dict], dict]:
     """환자 단위로 그룹핑된 .pt 를 로드한다.
 
     단일 통합 .pt (back-compat) 또는 per-(fold,split)[_chunk] prefix 묶음
     (ablation runner) 양쪽을 처리한다. n_folds>1 이면 해당 fold 의 chunk 만 로드.
     chunk 들의 ``data`` (patient dict 리스트) 는 split 별로 extend concat 된다.
+    max_chunks 가 주어지면 split 당 앞쪽 N chunk 만 로드한다(dry-run 가속).
     """
     load_fold = int(fold) if int(n_folds) > 1 else None
-    print(f"\nLoading data: {data_path} (fold={load_fold})")
-    data = load_prepared_split_chunked(data_path, fold=load_fold)
+    print(f"\nLoading data: {data_path} (fold={load_fold}, max_chunks={max_chunks})")
+    data = load_prepared_split_chunked(
+        data_path, fold=load_fold, max_chunks=max_chunks,
+    )
     meta = data.get("metadata", {})
     print(f"  Task: {meta.get('task', '?')}")
     print(f"  Signals: {meta.get('input_signals', '?')}")
@@ -284,6 +288,27 @@ def _load_data(
     print(f"  Aggregation: {meta.get('aggregation', 'window_level')}")
 
     return data["train"], data["test"], meta
+
+
+def _subsample_dry_run(
+    patients: list[dict], n_per_class: int, seed: int,
+) -> list[dict]:
+    """dry-run: 클래스별로 최대 n_per_class 명만 남긴다 (양/음성 모두 확보).
+
+    양성이 희소하므로 random 이 아니라 클래스별 stratified 로 뽑아, 소수 표본이라도
+    AUROC/AUPRC 가 계산 가능하도록(양·음성 최소 1건 이상) 보장한다.
+    """
+    rng = np.random.default_rng(seed)
+    pos = [p for p in patients if p["label"] == 1]
+    neg = [p for p in patients if p["label"] == 0]
+
+    def _take(pool: list[dict], n: int) -> list[dict]:
+        if len(pool) <= n:
+            return list(pool)
+        idx = rng.choice(len(pool), size=n, replace=False)
+        return [pool[int(i)] for i in idx]
+
+    return _take(pos, n_per_class) + _take(neg, n_per_class)
 
 
 # ── CLI ──────────────────────────────────────────────────────
@@ -315,6 +340,17 @@ def main() -> None:
                         help="현재 fold 인덱스 (run_eval OOF 집계용 .npz 라벨)")
     parser.add_argument("--n-folds", type=int, default=1, help="전체 fold 수")
     parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="파이프라인 스모크 테스트: 소수 환자만 추출→학습→평가→저장 "
+                             "하여 크래시 여부만 빠르게 확인 (결과는 무의미).")
+    parser.add_argument("--dry-run-n", type=int, default=4,
+                        help="dry-run 시 split·클래스당 표본 환자 수 (기본 4)")
+    parser.add_argument("--dry-run-windows", type=int, default=8,
+                        help="dry-run 시 환자당 max_windows 상한 (기본 8, 추출 가속)")
+    parser.add_argument("--dry-run-epochs", type=int, default=2,
+                        help="dry-run 시 epoch 상한 (기본 2)")
+    parser.add_argument("--dry-run-chunks", type=int, default=2,
+                        help="dry-run 시 split 당 로드할 chunk 수 (기본 2, 로딩 가속)")
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -352,9 +388,27 @@ def main() -> None:
         model.inject_lora(rank=args.lora_rank, alpha=args.lora_alpha)
 
     # ── 데이터 로드 ──
+    #   dry-run 이면 split 당 앞쪽 few chunk 만 읽어 수십 GB 전체 로딩을 피한다
+    #   (chunk0 에 양성이 포함돼 있어 스모크 테스트에 충분).
+    load_max_chunks = args.dry_run_chunks if args.dry_run else None
     train_patients, test_patients, meta = _load_data(
-        args.data_path, args.fold, args.n_folds,
+        args.data_path, args.fold, args.n_folds, max_chunks=load_max_chunks,
     )
+
+    # ── dry-run: 추출 전에 환자를 소수로 줄이고 윈도우·epoch 상한을 낮춘다.
+    #   feature 추출 비용 ∝ (환자 수 × 환자당 윈도우 수) 이므로 둘 다 줄여야 빨라진다.
+    #   DDP 샤딩(아래)보다 먼저 적용해야 각 rank 가 축소된 리스트를 샤딩한다. ──
+    if args.dry_run:
+        train_patients = _subsample_dry_run(train_patients, args.dry_run_n, seed=0)
+        test_patients = _subsample_dry_run(test_patients, args.dry_run_n, seed=1)
+        args.max_windows = min(args.max_windows, args.dry_run_windows)
+        args.epochs = min(args.epochs, args.dry_run_epochs)
+        if is_main():
+            print("\n" + "!" * 60)
+            print("  DRY-RUN — 파이프라인 스모크 테스트 (결과 무의미, 저장물 폐기)")
+            print(f"    train={len(train_patients)} / test={len(test_patients)} patients "
+                  f"| max_windows={args.max_windows} | epochs={args.epochs}")
+            print("!" * 60)
 
     n_pos_train = sum(1 for p in train_patients if p["label"] == 1)
     n_pos_test = sum(1 for p in test_patients if p["label"] == 1)
