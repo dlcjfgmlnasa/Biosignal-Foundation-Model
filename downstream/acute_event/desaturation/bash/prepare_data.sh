@@ -26,7 +26,7 @@ META_XLSX="${META_XLSX:-${UPDOWN_ROOT}/datasets/ventilation_eventcases/ventilati
 OUT_DIR="${OUT_DIR:-${BIOFM_ROOT}/data/downstream/desaturation}"
 
 WINDOWS="${WINDOWS:-300}"            # 5 min input window
-HORIZONS="${HORIZONS:-1 3 5 15}"     # 1/3/5min 임상정렬 + 15min stress-test(예측 지평선)
+HORIZONS="${HORIZONS:-1 3 5}"        # 1/3/5min 임상정렬. 15min stress-test 는 HORIZONS="1 3 5 15"
 STRIDE="${STRIDE:-30}"
 THRESHOLD="${THRESHOLD:-92}"         # SpO2 < 92% (Prescience/WHO perioperative). conservative=90
 SUSTAINED="${SUSTAINED:-1}"          # 1='any point'(게이트와 세트, 기본). dwell variant: 10/30

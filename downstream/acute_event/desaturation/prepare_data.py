@@ -28,7 +28,7 @@ Task 성격: Acute Event — respiratory desaturation *prediction* (detection �
         --meta-xlsx C:/Projects/ventilation_eventcases/ventilation_cases.xlsx \\
         --input-signals co2 awp resp_flow \\
         --required-signals co2 awp \\
-        --window-secs 300 --horizon-mins 1 3 5 15 --n-folds 5 \\
+        --window-secs 300 --horizon-mins 1 3 5 --n-folds 5 \\
         --out-dir outputs/downstream/desaturation
 
 외부검증(external-test) 모드: --external-test → fold 분할 없이 188 전부 test-only 저장.
@@ -528,7 +528,7 @@ def main() -> None:
     # horizon 1/3/5min = 임상·선행연구(IOH/hypoxemia 예측) 정렬. 15min = stress test
     # (예측 지평선 한계 측정 — AUPRC 붕괴는 실패가 아니라 "호흡역학→desat 예측의
     #  생리학적 지평선"을 실증하는 곡선으로 해석).
-    parser.add_argument("--horizon-mins", nargs="+", type=float, default=[1.0, 3.0, 5.0, 15.0])
+    parser.add_argument("--horizon-mins", nargs="+", type=float, default=[1.0, 3.0, 5.0])
     parser.add_argument("--stride-sec", type=float, default=30.0)
     parser.add_argument("--spo2-threshold", type=float, default=92.0,
                         help="SpO2 임계 (%%). 92=Prescience/WHO perioperative 관행(기본), "

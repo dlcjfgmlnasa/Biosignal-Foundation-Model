@@ -1,6 +1,6 @@
 #!/bin/bash
 # Desaturation Prediction (SNUH) — 실행 스크립트
-# 입력 CO2+AWP+RESP_Flow(호흡 신호만) 고정. horizon 1/3/5min(임상) + 15min(stress-test).
+# 입력 CO2+AWP+RESP_Flow(호흡 신호만) 고정. horizon 1/3/5min(임상). 15min stress-test 는 HORIZONS override.
 # 기본: 1 combo × window 1개 × horizon 1개 × modes(linear_probe,lora) × 5 fold.
 # env override: SIGNALS_OVERRIDE / WINDOWS_OVERRIDE / HORIZONS_OVERRIDE / MODES_OVERRIDE
 #
@@ -51,7 +51,7 @@ if [ "$NPROC" -gt 1 ]; then LORA_LAUNCH="torchrun --nproc_per_node=$NPROC -m"; e
 # ── 실험 조합 (canonical: 입력·window·horizon 고정) ──
 SIGNAL_COMBOS=(${SIGNALS_OVERRIDE:-co2_awp_resp_flow})   # 호흡 신호만
 WINDOWS=(${WINDOWS_OVERRIDE:-300})
-HORIZONS=(${HORIZONS_OVERRIDE:-1 3 5 15})
+HORIZONS=(${HORIZONS_OVERRIDE:-1 3 5})
 MODES=(${MODES_OVERRIDE:-linear_probe lora})
 N_FOLDS=${N_FOLDS:-5}
 FORCE=${FORCE:-0}
