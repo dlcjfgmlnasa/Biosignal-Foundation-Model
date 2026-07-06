@@ -415,8 +415,10 @@ def pack_samples_to_dict(samples: list[ForecastSample]) -> dict:
                 "labels": torch.tensor([]), "label_values": torch.tensor([]),
                 "case_ids": [], "win_starts": []}
     stypes = list(samples[0].input_signals.keys())
+    # bfloat16 저장 (모델 학습 dtype 과 정합). numpy 는 bf16 미지원이라 torch 로 캐스팅.
+    #   → run.py 로드시 .float().numpy() 로 되돌림 (numpy bf16 불가라 .numpy() 직접 호출 금지).
     signals = {
-        st: torch.from_numpy(np.stack([s.input_signals[st] for s in samples]))
+        st: torch.from_numpy(np.stack([s.input_signals[st] for s in samples])).to(torch.bfloat16)
         for st in stypes
     }
     gap_masks = {
@@ -442,7 +444,7 @@ def save_split_dataset(
     out_dir: str,
     spo2_threshold: float,
     sustained_sec: float,
-    signal_dtype: str = "float16",
+    signal_dtype: str = "bfloat16",
     fold_idx: int | None = None,
     n_folds: int = 1,
 ) -> Path:

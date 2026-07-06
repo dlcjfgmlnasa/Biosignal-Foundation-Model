@@ -580,8 +580,9 @@ def _load_data(
             label_values_t = split_data["label_values"]
             n = len(labels_t)
             for i in range(n):
+                # .float() 먼저: 저장이 bfloat16 이면 numpy 가 bf16 미지원이라 .numpy() 직접 호출 불가.
                 signals = {
-                    k: split_data["signals"][k][i].numpy()
+                    k: split_data["signals"][k][i].float().numpy()
                     for k in input_keys
                     if k in split_data["signals"]
                 }
