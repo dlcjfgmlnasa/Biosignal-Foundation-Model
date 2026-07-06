@@ -11,8 +11,10 @@ contiguous 출력 두 벌을 잡아 600s × N-channel windows 에서 ~70 GB 피�
 from __future__ import annotations
 
 import gc
+import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -403,21 +405,39 @@ def load_prepared_split_chunked(
     parent = p.parent if str(p.parent) else Path(".")
     prefix = base if fold is None else f"{base}_fold{int(fold)}"
 
+    # 네트워크 마운트 chunk torch.load 는 I/O-bound → ThreadPool 병렬 로드로 가속
+    # (torch.load 가 read 중 GIL 해제 → 실질 병렬; feedback_network_mounted_storage).
+    # 워커 수는 PREP_LOAD_WORKERS 로 조절 (DDP 다중 rank 동시 로드 시 낮춰 마운트 경합 완화).
+    try:
+        n_load_workers = max(1, int(os.environ.get("PREP_LOAD_WORKERS", "8")))
+    except ValueError:
+        n_load_workers = 8
+
     out: dict[str, Any] = {}
     metadata: dict[str, Any] | None = None
     for split_name in splits:
         files = sorted(parent.glob(f"{prefix}_{split_name}*.pt"))
         if not files:
             continue
+        # 순서는 files 인덱스로 복원 → 순차 로드와 동일한 payload 순서 보존(재현성).
+        # peak RAM 은 순차와 동일(어차피 concat 전 전체 chunk 를 보유).
+        n_w = min(n_load_workers, len(files))
+        loaded: list[Any] = [None] * len(files)
+        with ThreadPoolExecutor(max_workers=n_w) as ex:
+            futs = {
+                ex.submit(_robust_torch_load, f, weights_only=False): i
+                for i, f in enumerate(files)
+            }
+            for fut in tqdm(
+                as_completed(futs),
+                total=len(files),
+                desc=f"load {split_name} (fold={fold}, x{n_w})",
+                unit="chunk",
+                mininterval=0.5,
+            ):
+                loaded[futs[fut]] = fut.result()
         payloads: list[Any] = []
-        # 네트워크 마운트에서 chunk 순차 torch.load 는 분 단위 — 진행률 표시.
-        for f in tqdm(
-            files,
-            desc=f"load {split_name} (fold={fold})",
-            unit="chunk",
-            mininterval=0.5,
-        ):
-            ck = _robust_torch_load(f, weights_only=False)
+        for ck in loaded:
             if metadata is None and isinstance(ck.get("metadata"), dict):
                 metadata = dict(ck["metadata"])
             # split payload 는 "data" 로 wrap 됨. 누락 시 chunk 전체에서 추출.
