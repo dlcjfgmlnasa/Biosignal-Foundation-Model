@@ -136,8 +136,9 @@ def build_scope_cohort(
     df["outcome"] = df["outcome"].astype(str).str.strip()
     vdir = Path(vital_dir)
 
-    cohort: list[dict] = []
-    n_excl = n_missing_file = 0
+    # 1) 라벨 결정 + 경로 구성 (I/O 없음, 빠름).
+    candidates: list[dict] = []
+    n_excl = 0
     for _, row in df.iterrows():
         outcome = row["outcome"]
         if outcome == pos_outcome:
@@ -153,17 +154,21 @@ def build_scope_cohort(
             cid = str(int(raw))
         except (ValueError, TypeError):
             cid = str(raw).strip()
-        vpath = vdir / f"{cid}.vital"
-        if not vpath.is_file():
-            n_missing_file += 1
-            continue
-
-        cohort.append({
+        candidates.append({
             "case_id": cid,
             "patient_id": cid,  # patient-stay 연결 ID 부재 → case_id 단위 split
             "label": label,
-            "vital_path": vpath,
+            "vital_path": vdir / f"{cid}.vital",
         })
+
+    # 2) 파일 존재 확인은 네트워크 마운트 stat → 수천 건 직렬 시 수 분 소요.
+    #    ThreadPool 로 병렬화 (startup 가속).
+    def _exists(c: dict) -> dict | None:
+        return c if c["vital_path"].is_file() else None
+
+    with ThreadPoolExecutor(max_workers=32) as ex:
+        cohort = [c for c in ex.map(_exists, candidates) if c is not None]
+    n_missing_file = len(candidates) - len(cohort)
 
     n_pos = sum(c["label"] for c in cohort)
     print(f"  Cohort [{task}]: {len(cohort)} cases "
@@ -235,6 +240,7 @@ def load_and_cache_case(
     input_signals: list[str],
     band_sec: float,
     cache_dir: Path,
+    cutoff_sec: float = 0.0,
 ) -> dict | None:
     """단일 .vital → anchor 직전 band 전처리 → case 캐시(.pt) 저장.
 
@@ -266,8 +272,8 @@ def load_and_cache_case(
         return None
     dtstart = float(vf.dtstart)
 
-    t0 = OUTCOME_ANCHOR_TS - band_sec  # band 시작 절대시각
-    t1 = OUTCOME_ANCHOR_TS             # anchor (post-anchor tail 배제)
+    t0 = OUTCOME_ANCHOR_TS - band_sec       # band 시작 절대시각
+    t1 = OUTCOME_ANCHOR_TS - cutoff_sec     # cutoff(=lead) 이후는 안 씀 → 로딩 생략(I/O↓)
 
     sigs: dict[str, np.ndarray] = {}
     band_start_ts_target: float | None = None
@@ -334,6 +340,7 @@ def run_pass1(
     band_sec: float,
     cache_dir: Path,
     workers: int = 8,
+    cutoff_sec: float = 0.0,
 ) -> list[dict]:
     """모든 case 의 band 캐시 생성 (ThreadPool 병렬, 네트워크 I/O 최적화)."""
     print(f"\n[Pass 1] band 캐시 생성: {len(cohort)} cases "
@@ -341,7 +348,8 @@ def run_pass1(
     metas: list[dict] = []
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futs = {
-            ex.submit(load_and_cache_case, c, input_signals, band_sec, cache_dir): c
+            ex.submit(load_and_cache_case, c, input_signals, band_sec, cache_dir,
+                      cutoff_sec): c
             for c in cohort
         }
         pbar = tqdm(as_completed(futs), total=len(cohort),
@@ -788,7 +796,13 @@ def main() -> None:
     dtype_map = add_signal_dtype_arg(parser)
     args = parser.parse_args()
 
-    band_sec = args.band_hours * 3600.0
+    # 관측 = [anchor−(lead+history), anchor−lead] 뿐 → anchor 직전 lead 구간은 로딩 안 함
+    # (cutoff=lead). band 는 관측 시작을 담도록 lead+history 이상 보장 (I/O 절감).
+    cutoff_sec = args.lead_sec
+    band_sec = max(
+        args.band_hours * 3600.0,
+        args.lead_sec + args.history_sec + args.window_sec + 60.0,
+    )
     cache_dir = Path(args.cache_dir) if args.cache_dir else (
         Path(args.out_dir) / "_band_cache" / args.task
     )
@@ -803,7 +817,8 @@ def main() -> None:
     print(f"  Lead:     {args.lead_sec / 3600:.1f}h  History band: "
           f"[anchor−{(args.lead_sec + args.history_sec) / 3600:.0f}h, "
           f"anchor−{args.lead_sec / 3600:.0f}h] (fixed)")
-    print(f"  Cache band: {band_sec / 3600:.1f}h (anchor 직전)")
+    print(f"  Cache load: [anchor−{band_sec / 3600:.1f}h, anchor−"
+          f"{cutoff_sec / 3600:.1f}h] (lead 구간 로딩 생략, I/O↓)")
     print(f"{'=' * 64}")
 
     cohort = build_scope_cohort(args.metadata, args.vital_dir, args.task)
@@ -812,7 +827,7 @@ def main() -> None:
         sys.exit(1)
 
     metas = run_pass1(cohort, args.input_signals, band_sec, cache_dir,
-                      workers=args.workers)
+                      workers=args.workers, cutoff_sec=cutoff_sec)
     if not metas:
         print("ERROR: 캐시된 case 없음.", file=sys.stderr)
         sys.exit(1)
