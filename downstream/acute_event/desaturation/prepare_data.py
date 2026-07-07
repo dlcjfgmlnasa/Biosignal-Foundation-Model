@@ -306,13 +306,18 @@ def extract_forecast_samples(
     sustained_sec: float = 60.0,
     valid_ratio_threshold: float = DEFAULT_VALID_RATIO_THRESHOLD,
     exclude_already_low: bool = True,
+    task_mode: str = "prediction",
     gap_stats: GapStats | None = None,
     sample_dtype: str = "float16",
 ) -> list[ForecastSample]:
-    """SpO2 trend + waveform window 정렬해서 (input, future_label) 쌍 추출.
+    """SpO2 trend + waveform window 정렬해서 (input, label) 쌍 추출.
 
     wave(100Hz) index/100 == spo2(1Hz) index(초). 둘 다 같은 .vital dtstart 기준이라 정렬됨.
-    exclude_already_low: window 끝 시점에 이미 SpO2<threshold 면 drop (예측 아님 → leakage 방지).
+    task_mode:
+      - "prediction": 라벨 = 미래 [win_end, win_end+horizon] 의 desat (조기예측).
+        exclude_already_low 로 window 끝에 이미 desat 이면 drop(leakage 방지).
+      - "detection": 라벨 = 입력 window 자체 [win_start, win_end] 의 concurrent desat.
+        exclude_already_low 무시(진행중 desat 이 곧 positive).
     """
     win_samples = int(window_sec * TARGET_SR)
     stride_samples = int(stride_sec * TARGET_SR)
@@ -344,34 +349,38 @@ def extract_forecast_samples(
                     gap_stats.add_drop()
                 continue
 
-            future_start_sec = (start + win_samples) / TARGET_SR
-            f_start = int(future_start_sec)
-            f_end = int(future_start_sec + horizon_sec)
-            if f_end > len(spo2):
-                if gap_stats is not None:
-                    gap_stats.add_drop()
-                continue
-
-            # 이미 desat 중인 window 제외 (window 끝 직전 5초 SpO2 기준)
-            if exclude_already_low:
-                pre = spo2[max(0, f_start - 5):f_start]
-                pre = pre[(pre >= 50.0) & (pre <= 100.0)]
-                if len(pre) and float(np.min(pre)) < spo2_threshold:
+            win_end_sec = (start + win_samples) / TARGET_SR
+            if task_mode == "detection":
+                # 라벨 window = 입력 window 자체 (concurrent). exclude_already_low 무시.
+                l_start = int(start / TARGET_SR)
+                l_end = int(win_end_sec)
+            else:  # prediction: 미래 horizon
+                l_start = int(win_end_sec)
+                l_end = int(win_end_sec + horizon_sec)
+                if l_end > len(spo2):
                     if gap_stats is not None:
                         gap_stats.add_drop()
                     continue
+                # 이미 desat 중인 window 제외 (window 끝 직전 5초 SpO2 기준)
+                if exclude_already_low:
+                    pre = spo2[max(0, l_start - 5):l_start]
+                    pre = pre[(pre >= 50.0) & (pre <= 100.0)]
+                    if len(pre) and float(np.min(pre)) < spo2_threshold:
+                        if gap_stats is not None:
+                            gap_stats.add_drop()
+                        continue
 
-            future_spo2 = spo2[f_start:f_end]
-            future_spo2 = future_spo2[np.isfinite(future_spo2)]
-            future_spo2 = future_spo2[(future_spo2 >= 50.0) & (future_spo2 <= 100.0)]
-            if len(future_spo2) < max(1, min_consecutive // 2):
+            lbl_spo2 = spo2[l_start:l_end]
+            lbl_spo2 = lbl_spo2[np.isfinite(lbl_spo2)]
+            lbl_spo2 = lbl_spo2[(lbl_spo2 >= 50.0) & (lbl_spo2 <= 100.0)]
+            if len(lbl_spo2) < max(1, min_consecutive // 2):
                 if gap_stats is not None:
                     gap_stats.add_drop()
                 continue
 
             label = 1 if _has_sustained_desat(
-                future_spo2.tolist(), spo2_threshold, min_consecutive) else 0
-            min_future_spo2 = float(future_spo2.min())
+                lbl_spo2.tolist(), spo2_threshold, min_consecutive) else 0
+            min_future_spo2 = float(lbl_spo2.min())
 
             filled_dict, gap_mask_dict = apply_gap_mask_multichannel(
                 input_dict, output_dtype=sample_dtype)
@@ -548,8 +557,15 @@ def main() -> None:
     parser.add_argument("--max-cases", type=int, default=None, help="디버그: 앞 N개만")
     parser.add_argument("--external-test", action="store_true",
                         help="fold 분할 없이 전체를 test-only 로 저장 (외부검증)")
+    parser.add_argument("--task-mode", choices=["prediction", "detection"], default="prediction",
+                        help="prediction=미래 horizon desat 예측(기본). "
+                             "detection=입력 window 내 concurrent desat 분류(horizon 무시, h0).")
     parser.add_argument("--out-dir", default="outputs/downstream/desaturation")
     args = parser.parse_args()
+
+    # detection 은 horizon 개념이 없음 → 단일 pass(h0)로 강제. 파일명 _h0min 로 prediction 과 구분.
+    if args.task_mode == "detection":
+        args.horizon_mins = [0.0]
 
     vital_dir = Path(args.vital_dir)
     files = sorted(vital_dir.glob("*.vital"))
@@ -601,14 +617,16 @@ def main() -> None:
     combos = [(w, h * 60.0) for w in args.window_secs for h in args.horizon_mins]
 
     for window_sec, horizon_sec in combos:
-        print(f"\n[2/4] window={window_sec:.0f}s horizon={horizon_sec/60:.0f}min "
-              f"| label: SpO2<{args.spo2_threshold:.0f}% ≥{args.sustained_sec:.0f}s")
+        _lbl = ("concurrent(입력 window 내)" if args.task_mode == "detection"
+                else f"미래 {horizon_sec/60:.0f}min 내")
+        print(f"\n[2/4] window={window_sec:.0f}s [{args.task_mode}] "
+              f"| label: {_lbl} SpO2<{args.spo2_threshold:.0f}%")
 
         if args.external_test:
             gap = GapStats()
             samples = extract_forecast_samples(
                 cases, args.input_signals, window_sec, args.stride_sec, horizon_sec,
-                args.spo2_threshold, args.sustained_sec, gap_stats=gap)
+                args.spo2_threshold, args.sustained_sec, task_mode=args.task_mode, gap_stats=gap)
             print_stats("external_test", samples)
             save_split_dataset(
                 pack_samples_to_dict(samples), "test", args.input_signals,
@@ -629,7 +647,7 @@ def main() -> None:
                 gap = GapStats()
                 samples = extract_forecast_samples(
                     sub, args.input_signals, window_sec, args.stride_sec, horizon_sec,
-                    args.spo2_threshold, args.sustained_sec, gap_stats=gap)
+                    args.spo2_threshold, args.sustained_sec, task_mode=args.task_mode, gap_stats=gap)
                 print_stats(split_name, samples)
                 save_split_dataset(
                     pack_samples_to_dict(samples), split_name, args.input_signals,

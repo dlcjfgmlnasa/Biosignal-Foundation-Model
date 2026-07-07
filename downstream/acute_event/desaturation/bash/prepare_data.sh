@@ -36,6 +36,9 @@ if [ "${NO_GATE:-0}" = "1" ]; then GATE_ARGS="--no-artifact-gate"; fi
 N_FOLDS="${N_FOLDS:-5}"
 INPUT="${INPUT:-co2 awp resp_flow ppg}"   # CO2·AWP·RESP_Flow·PPG (ECG 제외). override 가능
 REQUIRED="${REQUIRED:-co2 awp}"
+# prediction=미래 desat 예측(기본) / detection=입력 window 내 concurrent desat 분류(h0)
+# detection 권장: TASK_MODE=detection INPUT="co2 awp resp_flow" (PPG 빼야 non-trivial)
+TASK_MODE="${TASK_MODE:-prediction}"
 
 EXTRA=""
 if [ "${EXTERNAL_TEST:-0}" = "1" ]; then EXTRA="--external-test"; fi
@@ -62,6 +65,7 @@ python -m downstream.acute_event.desaturation.prepare_data \
     --stride-sec $STRIDE \
     --spo2-threshold $THRESHOLD \
     --sustained-sec $SUSTAINED \
+    --task-mode $TASK_MODE \
     --n-folds $N_FOLDS \
     --out-dir "$OUT_DIR" \
     $GATE_ARGS \
