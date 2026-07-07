@@ -1,17 +1,17 @@
 # -*- coding:utf-8 -*-
 """Intraoperative Desaturation Prediction — 데이터 준비 (SNUH ventilation_eventcases, self-contained).
 
-미래 horizon 구간 SpO2 < 92% "at any point" (아티팩트 게이트 후) 예측을 위한
+미래 horizon 구간 SpO2 < 95% "at any point" (아티팩트 게이트 후) 예측을 위한
 (input_window, future_label) 쌍 생성.
 
 Task 성격: Acute Event — respiratory desaturation *prediction* (detection 아님).
-  - 입력 = desat *이전* 정상 파형 (CO2/AWP/RESP_Flow — 호흡 신호만, PPG=leakage·ECG 제외)
-  - 라벨 = 이후 horizon 구간에 (게이트 통과한) SpO2<92% 가 **한 번이라도** 발생하면 1
+  - 입력 = desat *이전* 정상 파형 (CO2/AWP/RESP_Flow/PPG — ECG 제외). PPG 포함=competitive(문헌 관행)
+  - 라벨 = 이후 horizon 구간에 (게이트 통과한) SpO2<95% 가 **한 번이라도** 발생하면 1
 
 라벨 정의 = "any point" + 아티팩트 게이트 — 소아논문(PLOS One 2023) 프로토콜 재현:
   any-point 를 쓰려면 반드시 품질 게이트가 세트여야 함 (motion/dropout label noise 차단).
   게이트 = ① SpO2∈[50,100] ② |pulseHR-ecgHR|/ecgHR ≤ 0.20 ③ PI ≥ 0.3.
-  threshold 92% = Prescience(Nat BME 2018)/WHO perioperative 관행. 90=conservative variant.
+  threshold 95% = SNUH 소아(PLOS One 2023) 관행. 92=Prescience/WHO, 90=conservative.
   dwell(≥10/30s)은 `--sustained-sec` sensitivity variant.
 
 데이터 소스: SNUH 2024 마취 이상사례(ventilation) 코호트 — raw `.vital` 188개.
@@ -26,7 +26,7 @@ Task 성격: Acute Event — respiratory desaturation *prediction* (detection �
     python -m downstream.acute_event.desaturation.prepare_data \\
         --vital-dir C:/Projects/ventilation_eventcases/data/vital_files \\
         --meta-xlsx C:/Projects/ventilation_eventcases/ventilation_cases.xlsx \\
-        --input-signals co2 awp resp_flow \\
+        --input-signals co2 awp resp_flow ppg \\
         --required-signals co2 awp \\
         --window-secs 300 --horizon-mins 1 3 5 --n-folds 5 \\
         --out-dir outputs/downstream/desaturation
@@ -519,10 +519,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="SNUH desaturation prediction 데이터 준비")
     parser.add_argument("--vital-dir", required=True, help="SNUH .vital 디렉토리 (188개)")
     parser.add_argument("--meta-xlsx", default=None, help="ventilation_cases.xlsx (case_id→환자ID)")
-    # 호흡 신호만 (co2·awp·resp_flow): PPG(=SpO2 센서 leakage)·ECG 제외. 순수 환기신호로
-    # 산소화 예측 → 깨끗한 cross-modal. all 5 나 +ecg 원하면 --input-signals 로 override.
+    # CO2·AWP·RESP_Flow·PPG (호흡 + PPG). PPG 는 SpO2 와 같은 센서라 예측력↑(문헌 관행,
+    # PLOS One 2023 은 SpO2 자체를 입력) — competitive 버전. ECG 제외. respiratory-only
+    # (co2 awp resp_flow) 로 leakage-clean ablation 하려면 --input-signals override.
     parser.add_argument("--input-signals", nargs="+",
-                        default=["co2", "awp", "resp_flow"])
+                        default=["co2", "awp", "resp_flow", "ppg"])
     parser.add_argument("--required-signals", nargs="+", default=["co2", "awp"])
     parser.add_argument("--window-secs", nargs="+", type=float, default=[300.0])
     # horizon 1/3/5min = 임상·선행연구(IOH/hypoxemia 예측) 정렬. 15min = stress test
@@ -530,9 +531,9 @@ def main() -> None:
     #  생리학적 지평선"을 실증하는 곡선으로 해석).
     parser.add_argument("--horizon-mins", nargs="+", type=float, default=[1.0, 3.0, 5.0])
     parser.add_argument("--stride-sec", type=float, default=30.0)
-    parser.add_argument("--spo2-threshold", type=float, default=92.0,
-                        help="SpO2 임계 (%%). 92=Prescience/WHO perioperative 관행(기본), "
-                             "90=conservative variant, 95=SNUH 소아.")
+    parser.add_argument("--spo2-threshold", type=float, default=95.0,
+                        help="SpO2 임계 (%%). 95=SNUH 소아(PLOS One 2023) 관행(기본), "
+                             "92=Prescience/WHO, 90=conservative.")
     parser.add_argument("--sustained-sec", type=float, default=1.0,
                         help="임계 아래 최소 연속 초. 1='any point'(소아논문+게이트 관행, 기본). "
                              "10/30 은 dwell sensitivity variant.")
