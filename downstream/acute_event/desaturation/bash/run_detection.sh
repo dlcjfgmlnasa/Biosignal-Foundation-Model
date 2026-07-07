@@ -17,6 +17,7 @@
 set -e
 
 export HORIZONS_OVERRIDE=0                      # detection = h0 (concurrent, 파일명 _h0min)
+export WINDOWS_OVERRIDE=30                      # 30s window (sweep 최적점). 파일명 w30s
 export SIGNALS_OVERRIDE=co2_awp_resp_flow      # 환기 파형 3종 (파일명·--input-signals 일치)
 # detection 결과는 prediction 과 분리된 폴더로 (미지정 시 기본)
 export OUT_DIR="${OUT_DIR:-/home/coder/workspace/k-mimic-/bio_fm/result/main/desaturation_detection}"

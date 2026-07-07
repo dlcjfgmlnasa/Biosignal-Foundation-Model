@@ -17,6 +17,10 @@ set -e
 export TASK_MODE=detection
 export INPUT="${INPUT:-co2 awp resp_flow}"     # 환기 파형만 (SpO2/PPG 제외)
 export THRESHOLD="${THRESHOLD:-90}"            # concurrent desat 임계 (CNN 검증값)
+# window=30s: CNN window sweep(10/30/60/300s) 최적점. AUROC 0.87/lift 12× (뒤집힌 U,
+#   300s=희석·과적합 0.76, 10s=morphology 부족 0.81, 30~60s sweet spot). stride=window.
+export WINDOWS="${WINDOWS:-30}"
+export STRIDE="${STRIDE:-30}"
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 echo ">>> DETECTION 모드로 prepare_data 실행 (TASK_MODE=$TASK_MODE, INPUT='$INPUT', THRESHOLD=$THRESHOLD)" >&2
