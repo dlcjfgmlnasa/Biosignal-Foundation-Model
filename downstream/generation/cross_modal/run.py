@@ -50,6 +50,7 @@ from data.collate import PackCollate, PackedBatch
 from data.dataset import BiosignalSample
 from data.spatial_map import SIGNAL_KEY_TO_TYPE
 from downstream._save_utils import load_prepared_chunked
+from loss.masked_mse_loss import compute_patch_loss
 
 # signal_type_key -> signal_type_id : data.spatial_map 의 SSOT(v2) 사용.
 # (9 signal_type, spatial_id 폐지, resp_impedance=7 / resp_flow=8, PAP 제거.)
@@ -608,6 +609,28 @@ def _pool_by_time(
 # ── LoRA training ────────────────────────────────────────────
 
 
+def _waveform_loss(
+    pred: torch.Tensor,  # (B, N, P)
+    target: torch.Tensor,  # (B, N, P)
+    peak_alpha: float,
+    lambda_spec: float,
+) -> torch.Tensor:
+    """Peak-Weighted MSE + Multi-Resolution STFT 복합 파형 손실.
+
+    encoder 사전학습과 동일한 ``compute_patch_loss`` (loss/masked_mse_loss)를 재사용해
+    파형 형태·주파수 구조 복원력을 높인다. ``peak_alpha=0, lambda_spec=0`` 이면
+    일반 MSE 와 수치적으로 동일하다(하위 호환). pretrain(K-MIMIC) 기본값은
+    ``peak_alpha=1.0, lambda_spec=0.2``.
+    """
+    p = pred.shape[-1]
+    return compute_patch_loss(
+        pred.reshape(-1, p),
+        target.reshape(-1, p),
+        peak_alpha=peak_alpha,
+        lambda_spec=lambda_spec,
+    )["total"]
+
+
 def train_lora_regression(
     model,  # DownstreamModelWrapper (with LoRA injected)
     head: WaveformRegressionHead,
@@ -616,6 +639,8 @@ def train_lora_regression(
     lr: float,
     device: torch.device,
     gradient_clip: float = 1.0,
+    peak_alpha: float = 0.0,
+    lambda_spec: float = 0.0,
 ) -> list[float]:
     """Train LoRA adapters + WaveformRegressionHead.
 
@@ -672,7 +697,7 @@ def train_lora_regression(
             predicted = predicted[:, :n_out]
             target = target_patches[:, :n_out]
 
-            loss = F.mse_loss(predicted, target)
+            loss = _waveform_loss(predicted, target, peak_alpha, lambda_spec)
 
             optimizer.zero_grad()
             loss.backward()
@@ -1281,6 +1306,8 @@ def train_generate_lora(
     lr: float,
     device: torch.device,
     gradient_clip: float = 1.0,
+    peak_alpha: float = 0.0,
+    lambda_spec: float = 0.0,
 ) -> list[float]:
     """모델 본연 cross_pred pathway 를 LoRA 로 fine-tune (source->target 생성).
 
@@ -1306,7 +1333,9 @@ def train_generate_lora(
             pred = cpp[:, :, target_type_id, :]  # (B, N, P)
 
             n_out = min(pred.shape[1], target.shape[1])
-            loss = F.mse_loss(pred[:, :n_out], target[:, :n_out])
+            loss = _waveform_loss(
+                pred[:, :n_out], target[:, :n_out], peak_alpha, lambda_spec
+            )
 
             optimizer.zero_grad()
             loss.backward()
@@ -1338,6 +1367,8 @@ def run_cross_modal_generate_lora(
     fold: int | None = None,
     n_folds: int = 1,
     dump_preds: bool = True,
+    peak_alpha: float = 0.0,
+    lambda_spec: float = 0.0,
 ) -> dict:
     """generate + LoRA companion — native cross_pred 를 LoRA fine-tune 후 평가.
 
@@ -1377,6 +1408,7 @@ def run_cross_modal_generate_lora(
     print("\nTraining (LoRA fine-tune of cross_pred)...")
     train_losses = train_generate_lora(
         wrapper, train_batches, target_type_id, epochs, lr, device,
+        peak_alpha=peak_alpha, lambda_spec=lambda_spec,
     )
 
     # ── Eval: generate_cross_modal per-window (LoRA-adapted model) ──
@@ -1645,6 +1677,8 @@ def run_lora_regression(
     fold: int | None = None,
     n_folds: int = 1,
     dump_preds: bool = True,
+    peak_alpha: float = 0.0,
+    lambda_spec: float = 0.0,
 ) -> dict:
     """Run LoRA regression training and evaluation for a single scenario.
 
@@ -1728,7 +1762,8 @@ def run_lora_regression(
     # Train
     print(f"\nTraining...")
     train_losses = train_lora_regression(
-        wrapper, head, train_batches, epochs, lr, device
+        wrapper, head, train_batches, epochs, lr, device,
+        peak_alpha=peak_alpha, lambda_spec=lambda_spec,
     )
 
     # Evaluate (raw 수집은 preds dump 시에만)
@@ -1823,6 +1858,8 @@ def train_linear_probe_regression(
     lr: float,
     device: torch.device,
     gradient_clip: float = 1.0,
+    peak_alpha: float = 0.0,
+    lambda_spec: float = 0.0,
 ) -> list[float]:
     """Train only WaveformRegressionHead on top of a frozen encoder.
 
@@ -1868,7 +1905,7 @@ def train_linear_probe_regression(
             target = target_c.to(device)  # (B, N_out, patch_size)
 
             predicted = head(pooled)  # (B, N_out, patch_size)
-            loss = F.mse_loss(predicted, target)
+            loss = _waveform_loss(predicted, target, peak_alpha, lambda_spec)
 
             optimizer.zero_grad()
             loss.backward()
@@ -1899,6 +1936,8 @@ def run_linear_probe_regression(
     fold: int | None = None,
     n_folds: int = 1,
     dump_preds: bool = True,
+    peak_alpha: float = 0.0,
+    lambda_spec: float = 0.0,
 ) -> dict:
     """Frozen linear-probe regression for a single cross-modal scenario.
 
@@ -1949,7 +1988,8 @@ def run_linear_probe_regression(
 
     print(f"\nTraining...")
     train_losses = train_linear_probe_regression(
-        wrapper, head, train_batches, epochs, lr, device
+        wrapper, head, train_batches, epochs, lr, device,
+        peak_alpha=peak_alpha, lambda_spec=lambda_spec,
     )
 
     print(f"\nEvaluating on test set...")
@@ -2152,6 +2192,16 @@ def main() -> None:
         "--no-dump-preds", action="store_true",
         help="preds_fold{idx}.npz raw waveform dump 생략 (lora 모드 기본은 dump).",
     )
+    parser.add_argument(
+        "--peak-alpha", type=float, default=1.0,
+        help="파형 head 학습의 Peak-Weighted MSE 강도. pretrain(K-MIMIC) 기본 1.0, "
+             "0=일반 MSE (lora/generate_lora/linear_probe 학습 모드에만 적용).",
+    )
+    parser.add_argument(
+        "--lambda-spec", type=float, default=0.2,
+        help="파형 head 학습의 Multi-Resolution STFT loss 가중치. pretrain 기본 0.2, "
+             "0=비활성 (lora/generate_lora/linear_probe 학습 모드에만 적용).",
+    )
     args = parser.parse_args()
 
     # n_folds>1 이면 해당 fold chunk 만 로드, 1 이면 비-fold/단일 (None).
@@ -2244,6 +2294,8 @@ def main() -> None:
             fold=load_fold,
             n_folds=args.n_folds,
             dump_preds=not args.no_dump_preds,
+            peak_alpha=args.peak_alpha,
+            lambda_spec=args.lambda_spec,
         )
 
     elif args.mode == "linear_probe":
@@ -2269,6 +2321,8 @@ def main() -> None:
             fold=load_fold,
             n_folds=args.n_folds,
             dump_preds=not args.no_dump_preds,
+            peak_alpha=args.peak_alpha,
+            lambda_spec=args.lambda_spec,
         )
 
     elif args.mode == "lora":
@@ -2296,6 +2350,8 @@ def main() -> None:
             fold=load_fold,
             n_folds=args.n_folds,
             dump_preds=not args.no_dump_preds,
+            peak_alpha=args.peak_alpha,
+            lambda_spec=args.lambda_spec,
         )
 
 
