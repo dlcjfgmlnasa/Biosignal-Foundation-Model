@@ -126,6 +126,10 @@ def extract_ca_window_samples(
     sample_dtype: str = "float16",
     neg_mode: str = "cross-patient",
     within_neg_min_sec: float = 43200.0,
+    pos_gap_sec: float = 300.0,
+    pos_horizon_sec: float = 86400.0,
+    neg_min_sec: float = 86400.0,
+    neg_max_sec: float = 172800.0,
 ) -> list[CAWindowSample]:
     """anchor-relative window-level (input, label) 쌍 추출.
 
@@ -167,7 +171,23 @@ def extract_ca_window_samples(
                 tte = (center - t_end).total_seconds()
 
                 # ── window 라벨 결정 (neg_mode 별) ──
-                if neg_mode == "within-patient":
+                if neg_mode == "scope":
+                    # SCOPE 논문 정합 비대칭 band.
+                    #   양성(arrest): arrest 직전 [pos_gap, pos_gap+pos_horizon]
+                    #     (논문 "last 24h before arrest" + leakage 회피 gap).
+                    #   음성(discharge): 퇴실 [neg_min, neg_max] 전 (방어적 default
+                    #     24–48h = 48h 창의 이른 부분, 논문 "first 24h of admission" 의도).
+                    if label == 1:
+                        if pos_gap_sec <= tte <= pos_gap_sec + pos_horizon_sec:
+                            win_label = 1
+                        else:
+                            continue
+                    else:
+                        if neg_min_sec <= tte <= neg_max_sec:
+                            win_label = 0
+                        else:
+                            continue
+                elif neg_mode == "within-patient":
                     # arrest 환자만 들어옴(upstream 필터). tte 로 window-level 라벨.
                     if horizon_sec <= tte <= horizon_sec + max_lead_sec:
                         win_label = 1                      # 임박(positive)
@@ -299,10 +319,26 @@ TASK_SPEC: dict[str, tuple[str, str]] = {
 # ── 코호트 구성 (metadata xlsx) ──────────────────────────────
 
 
+def _flag_true(v) -> bool:
+    """metadata flag 컬럼(문자열/숫자 혼재) → bool. '1'/'Y'/'True'/1/1.0 등을 참."""
+    import math
+
+    if v is None:
+        return False
+    if isinstance(v, (int, float)):
+        try:
+            return not math.isnan(float(v)) and int(v) != 0
+        except (ValueError, TypeError):
+            return False
+    return str(v).strip().lower() in {"1", "y", "yes", "true", "t"}
+
+
 def build_scope_cohort(
     metadata_path: str,
     vital_dir: str,
     task: str,
+    exclude_death_post: bool = False,
+    exclude_arrest_pre: bool = False,
 ) -> list[dict]:
     """metadata_v1.0.xlsx → task 별 코호트 case 리스트.
 
@@ -332,7 +368,7 @@ def build_scope_cohort(
     vdir = Path(vital_dir)
 
     cohort: list[dict] = []
-    n_excl = n_missing_file = 0
+    n_excl = n_missing_file = n_flag_excl = 0
     for _, row in df.iterrows():
         outcome = row["outcome"]
         if outcome == pos_outcome:
@@ -341,6 +377,15 @@ def build_scope_cohort(
             label = 0
         else:
             n_excl += 1  # 제외 그룹 (다른 outcome)
+            continue
+
+        # 컬럼 기반 제외 (rigorous arm). death_post: 퇴실 24h내 사망 → "건강한 대조군"
+        # 아님(음성 오염). arrest_pre: 입원 24h전 arrest → 생리 이미 손상.
+        if exclude_death_post and _flag_true(row.get("death_post")):
+            n_flag_excl += 1
+            continue
+        if exclude_arrest_pre and _flag_true(row.get("arrest_pre")):
+            n_flag_excl += 1
             continue
 
         # case_id → 파일명. 9자리 정수(예: 100008162) → "{case_id}.vital".
@@ -359,12 +404,16 @@ def build_scope_cohort(
             "patient_id": cid,  # patient-stay 연결 ID 부재 → case_id 단위 split
             "label": label,
             "vital_path": vpath,
+            # ECMO/VAD 는 파형 크게 변형 → shortcut 위험. stratify/보고용 태그.
+            "circ_support": _flag_true(row.get("circulatory_support")),
         })
 
     n_pos = sum(c["label"] for c in cohort)
+    n_circ = sum(1 for c in cohort if c.get("circ_support"))
     print(f"  Cohort [{task}]: {len(cohort)} cases "
           f"(pos={n_pos}, neg={len(cohort) - n_pos}); "
-          f"excluded({excl_outcome})={n_excl}, missing_file={n_missing_file}")
+          f"excluded({excl_outcome})={n_excl}, missing_file={n_missing_file}, "
+          f"flag_excluded={n_flag_excl}, circ_support={n_circ}")
     return cohort
 
 
@@ -629,6 +678,9 @@ def _save_scope_split(
                 "within-patient (arrest-only; pos=imminent horizon band, "
                 "neg=non-imminent far band, same patient)"
                 if neg_mode == "within-patient"
+                else "scope-repro (SCOPE Lee et al. 정합; pos=event patient pre-event "
+                     "horizon, neg=Discharge patient earlier band; asymmetric)"
+                if neg_mode == "scope"
                 else "cross-patient (pos=event patient, neg=Discharge patient; "
                      "fixed outcome anchor, lead-time band)"
             ),
@@ -673,6 +725,10 @@ def run_pass2(
     neg_mode: str = "cross-patient",
     within_neg_min_sec: float = 43200.0,
     within_neg_per_pos: int = 10,
+    pos_gap_sec: float = 300.0,
+    pos_horizon_sec: float = 86400.0,
+    neg_min_sec: float = 86400.0,
+    neg_max_sec: float = 172800.0,
 ) -> list[Path]:
     """캐시 메타 → stratified case-level K-fold × (w,h) 윈도우 추출 → 저장.
 
@@ -749,6 +805,8 @@ def run_pass2(
                         horizon_sec, max_lead_sec=max_lead_sec,
                         gap_stats=gap_stats, sample_dtype=sample_dtype_str,
                         neg_mode=neg_mode, within_neg_min_sec=within_neg_min_sec,
+                        pos_gap_sec=pos_gap_sec, pos_horizon_sec=pos_horizon_sec,
+                        neg_min_sec=neg_min_sec, neg_max_sec=neg_max_sec,
                     )
                     if neg_mode == "within-patient":
                         # 환자별 pos(임박)/neg(비-임박). pos 없으면 제외, neg 는
@@ -822,10 +880,41 @@ def main() -> None:
     )
     parser.add_argument(
         "--neg-mode", type=str, default="cross-patient",
-        choices=["cross-patient", "within-patient"],
-        help="cross-patient(기본, SCOPE 논문 정합): pos=arrest환자·neg=discharge환자. "
-        "within-patient(같은 arrest환자 임박 경보): arrest환자만, pos=임박(horizon밴드)"
-        "·neg=비-임박(12h+)·회색지대 drop.",
+        choices=["cross-patient", "within-patient", "scope"],
+        help="cross-patient(기본): pos=arrest환자·neg=discharge환자 (같은 lead-time band). "
+        "within-patient(같은 arrest환자 임박): arrest환자만, pos=임박·neg=비-임박(12h+). "
+        "scope(논문 Lee et al. 정합, 비대칭 band): pos=arrest 직전 pos_horizon, "
+        "neg=discharge 퇴실 neg_tte_min~max 전(방어적 24–48h).",
+    )
+    # ── scope mode (SCOPE 논문 정합 재현) 전용 ──
+    parser.add_argument(
+        "--pos-gap-min", type=float, default=5.0,
+        help="[scope] 양성(arrest) lead-time gap(분). window 끝~arrest 최소 간격 "
+        "(leakage 회피). 기본 5min.",
+    )
+    parser.add_argument(
+        "--pos-horizon-h", type=float, default=24.0,
+        help="[scope] 양성 horizon(시간). arrest 직전 이 시간 내 window = 양성. "
+        "논문 = 24h. 파일명 h{분}min 에 반영.",
+    )
+    parser.add_argument(
+        "--neg-tte-min-h", type=float, default=24.0,
+        help="[scope] 음성(discharge) tte 하한(시간). 방어적 default 24h "
+        "(퇴실 직전 안정구간 shortcut 회피).",
+    )
+    parser.add_argument(
+        "--neg-tte-max-h", type=float, default=48.0,
+        help="[scope] 음성 tte 상한(시간). 기본 48h (48h 창의 이른 24h = 논문 "
+        "'first 24h of admission' 의도).",
+    )
+    parser.add_argument(
+        "--exclude-death-post", action="store_true",
+        help="[rigorous] 퇴실 24h내 사망(death_post) discharge 를 음성에서 제외 "
+        "(대조군 오염 제거). 기본 off(논문 정합).",
+    )
+    parser.add_argument(
+        "--exclude-arrest-pre", action="store_true",
+        help="[rigorous] 입원 24h전 arrest(arrest_pre) case 제외. 기본 off.",
     )
     parser.add_argument(
         "--within-neg-min-hours", type=float, default=12.0,
@@ -845,11 +934,28 @@ def main() -> None:
     args = parser.parse_args()
 
     within = args.neg_mode == "within-patient"
+    scope = args.neg_mode == "scope"
     within_neg_min_sec = args.within_neg_min_hours * 3600.0
-    # band: cross-patient=horizon+lead+window 만. within-patient=12h+ negative 확보
-    # 위해 within_neg_band_hours 까지 로딩(+window+버퍼).
+    # scope 비대칭 band 파라미터
+    pos_gap_sec = args.pos_gap_min * 60.0
+    pos_horizon_sec = args.pos_horizon_h * 3600.0
+    neg_min_sec = args.neg_tte_min_h * 3600.0
+    neg_max_sec = args.neg_tte_max_h * 3600.0
+    # scope 는 horizon_mins 대신 pos_horizon 을 쓴다 → 파일명/루프용 단일값으로 대체.
+    horizon_mins = args.horizon_mins
+    if scope:
+        horizon_mins = [args.pos_horizon_h * 60.0]  # 파일명 h{1440}min = 24h
+
+    # band: cross-patient=horizon+lead+window. within-patient=within_neg_band_hours.
+    # scope=양성 pos_horizon 과 음성 neg_max 중 더 먼 것 + window 커버.
     if within:
         band_sec = args.within_neg_band_hours * 3600.0 + max(args.window_secs) + 60.0
+    elif scope:
+        band_sec = (
+            max(pos_gap_sec + pos_horizon_sec, neg_max_sec)
+            + max(args.window_secs)
+            + 60.0
+        )
     else:
         band_sec = (
             max(args.horizon_mins) * 60.0
@@ -864,15 +970,27 @@ def main() -> None:
     print(f"{'=' * 64}")
     print(f"  SCOPE Cardiac Arrest / Mortality — Data Preparation")
     print(f"  Task:     {args.task}  (pos={TASK_SPEC[args.task][0]})")
-    print(f"  Neg-mode: {args.neg_mode}" + (
-        f"  (arrest-only, neg tte≥{args.within_neg_min_hours:.0f}h, "
-        f"neg≤{args.within_neg_per_pos}×pos)" if within else "  (neg=Discharge)"))
+    if within:
+        nm_desc = (f"  (arrest-only, neg tte≥{args.within_neg_min_hours:.0f}h, "
+                   f"neg≤{args.within_neg_per_pos}×pos)")
+    elif scope:
+        nm_desc = (f"  (SCOPE-repro: pos=arrest {args.pos_gap_min:.0f}min–"
+                   f"{args.pos_horizon_h:.0f}h, neg=discharge {args.neg_tte_min_h:.0f}–"
+                   f"{args.neg_tte_max_h:.0f}h; excl death_post={args.exclude_death_post} "
+                   f"arrest_pre={args.exclude_arrest_pre})")
+    else:
+        nm_desc = "  (neg=Discharge)"
+    print(f"  Neg-mode: {args.neg_mode}{nm_desc}")
     print(f"  Input:    {' + '.join(s.upper() for s in args.input_signals)}")
     print(f"  Windows:  {args.window_secs}s / Horizons: {args.horizon_mins}min")
     print(f"  Band:     {band_sec / 60:.1f}min (anchor 직전 로딩 구간)")
     print(f"{'=' * 64}")
 
-    cohort = build_scope_cohort(args.metadata, args.vital_dir, args.task)
+    cohort = build_scope_cohort(
+        args.metadata, args.vital_dir, args.task,
+        exclude_death_post=args.exclude_death_post,
+        exclude_arrest_pre=args.exclude_arrest_pre,
+    )
     if not cohort:
         print("ERROR: 코호트 비어 있음.", file=sys.stderr)
         sys.exit(1)
@@ -894,12 +1012,14 @@ def main() -> None:
 
     run_pass2(
         metas, args.task, args.input_signals,
-        args.window_secs, args.horizon_mins, args.stride_sec,
+        args.window_secs, horizon_mins, args.stride_sec,
         args.max_lead_sec, args.n_folds, args.out_dir,
         dtype_map(args.signal_dtype), args.seed,
         train_neg_cap_per_case=args.train_neg_cap_per_case,
         neg_mode=args.neg_mode, within_neg_min_sec=within_neg_min_sec,
         within_neg_per_pos=args.within_neg_per_pos,
+        pos_gap_sec=pos_gap_sec, pos_horizon_sec=pos_horizon_sec,
+        neg_min_sec=neg_min_sec, neg_max_sec=neg_max_sec,
     )
 
 
