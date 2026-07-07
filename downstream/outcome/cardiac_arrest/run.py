@@ -48,6 +48,7 @@ from downstream._eval_utils import dump_fold_predictions
 from downstream._save_utils import load_prepared_split_chunked
 from downstream.aggregator import (
     SIGNAL_TYPE_INT,
+    MeanAggregator,
     TransformerAggregator,
     collate_patients,
     encode_patient_windows,
@@ -335,6 +336,11 @@ def main() -> None:
     parser.add_argument("--agg-layers", type=int, default=2,
                         help="Transformer Aggregator 레이어 수")
     parser.add_argument("--agg-heads", type=int, default=4)
+    parser.add_argument("--aggregator", type=str, default="transformer",
+                        choices=["transformer", "mean"],
+                        help="환자-수준 집약 방식. transformer(기본): 학습 가능 "
+                             "aggregator. mean: 파라미터 없는 masked mean "
+                             "(소규모 코호트 aggregator 과적합 방지, cardiac arrest 등).")
     parser.add_argument("--out-dir", type=str, default=".")
     parser.add_argument("--fold", type=int, default=0,
                         help="현재 fold 인덱스 (run_eval OOF 집계용 .npz 라벨)")
@@ -493,12 +499,15 @@ def main() -> None:
         test_precomputed = [r for (_gi, r, _lbl, _cid) in g_test]
 
     # ── Aggregator + Probe ──
-    aggregator = TransformerAggregator(
-        d_model=d_model,
-        n_heads=args.agg_heads,
-        n_layers=args.agg_layers,
-        max_windows=args.max_windows,
-    )
+    if args.aggregator == "mean":
+        aggregator = MeanAggregator(d_model=d_model)
+    else:
+        aggregator = TransformerAggregator(
+            d_model=d_model,
+            n_heads=args.agg_heads,
+            n_layers=args.agg_layers,
+            max_windows=args.max_windows,
+        )
     probe = LinearProbe(d_model, n_classes=1)
 
     n_agg = sum(p.numel() for p in aggregator.parameters())

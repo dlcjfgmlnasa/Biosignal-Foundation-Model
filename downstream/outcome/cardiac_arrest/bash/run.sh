@@ -27,6 +27,9 @@ TASK=${TASK:-arrest}
 WINDOW_SEC=${WINDOW_SEC:-300}
 MAX_WINDOWS=${MAX_WINDOWS:-144}
 N_FOLDS=${N_FOLDS:-5}
+# 환자-수준 집약: transformer(기본, 학습 aggregator) | mean(파라미터 없는 masked mean,
+# 소규모 코호트 과적합 방지). run.py --aggregator 로 전달.
+AGG=${AGG:-transformer}
 
 # Linear Probe (frozen feature 캐싱 — batch 는 probe SGD 미니배치에만 영향).
 LP_BATCH=${LP_BATCH:-512};    LP_LR=${LP_LR:-1e-3};    LP_EPOCHS=${LP_EPOCHS:-1000}
@@ -79,7 +82,7 @@ echo "============================================================"
 echo "  Cardiac Arrest Outcome (patient-level) | NPROC=$NPROC | FORCE=$FORCE"
 echo "  Checkpoint: $CHECKPOINT | ModelVer: $MODEL_VERSION"
 echo "  Data:       $PREFIX (${N_FOLDS}-fold)"
-echo "  Window=${WINDOW_SEC}s max_windows=$MAX_WINDOWS"
+echo "  Window=${WINDOW_SEC}s max_windows=$MAX_WINDOWS aggregator=$AGG"
 echo "  LP: batch=$LP_BATCH lr=$LP_LR epochs=$LP_EPOCHS"
 echo "  LoRA: batch=$LORA_BATCH (eff $((LORA_BATCH*NPROC))) lr=$LORA_LR epochs=$LORA_EPOCHS rank=$LORA_RANK"
 echo "  OUT_DIR: $OUT_DIR"
@@ -92,6 +95,7 @@ for f in $FOLD_LIST; do
       --checkpoint "$CHECKPOINT" --model-version "$MODEL_VERSION" \
       --data-path "$PREFIX" --mode linear_probe --n-folds "$N_FOLDS" --fold "$f" \
       --epochs "$LP_EPOCHS" --lr "$LP_LR" --batch-size "$LP_BATCH" \
+      --aggregator "$AGG" \
       --max-windows "$MAX_WINDOWS" --device "$DEVICE" --out-dir "$LP_OUT" $DRY_FLAG
 
   LORA_OUT=$OUT_DIR/lora
@@ -101,6 +105,7 @@ for f in $FOLD_LIST; do
       --data-path "$PREFIX" --mode lora --lora-rank "$LORA_RANK" --lora-alpha "$LORA_ALPHA" \
       --n-folds "$N_FOLDS" --fold "$f" \
       --epochs "$LORA_EPOCHS" --lr "$LORA_LR" --batch-size "$LORA_BATCH" \
+      --aggregator "$AGG" \
       --max-windows "$MAX_WINDOWS" --device "$DEVICE" --out-dir "$LORA_OUT" $DRY_FLAG
 done
 

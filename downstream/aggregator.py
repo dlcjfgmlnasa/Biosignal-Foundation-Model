@@ -143,6 +143,33 @@ class TransformerAggregator(nn.Module):
         return out[:, 0, :]  # CLS token → (B, d_model)
 
 
+class MeanAggregator(nn.Module):
+    """파라미터 없는 masked mean 기반 환자 표현 생성기.
+
+    :class:`TransformerAggregator` 의 drop-in 대체 (동일 forward 시그니처).
+    K개 윈도우 representation 을 mask 기준 평균해 (B, d_model) 을 낸다. 학습 가능한
+    aggregation 파라미터가 없어 소규모 코호트(예: cardiac arrest ~74명)에서 aggregator
+    자체의 과적합을 구조적으로 배제한다. 윈도우 순서/시간은 무시하므로 ``time_secs`` 는
+    받되 사용하지 않는다. ``n_heads``/``n_layers``/``max_windows``/``pos_mode`` 등
+    TransformerAggregator 전용 인자는 ``**kwargs`` 로 흡수해 무시한다(교체 호환).
+    """
+
+    def __init__(self, d_model: int, **kwargs) -> None:
+        super().__init__()
+        self.d_model = d_model
+
+    def forward(
+        self,
+        chunk_reprs: torch.Tensor,  # (B, K, d_model)
+        mask: torch.Tensor | None = None,  # (B, K) bool, True=valid
+        time_secs: torch.Tensor | None = None,  # 무시 (순서 무관)
+    ) -> torch.Tensor:  # (B, d_model)
+        if mask is None:
+            return chunk_reprs.mean(dim=1)
+        m = mask.unsqueeze(-1).to(chunk_reprs.dtype)  # (B, K, 1)
+        return (chunk_reprs * m).sum(dim=1) / m.sum(dim=1).clamp(min=1.0)
+
+
 def mean_pool(
     encoded: torch.Tensor,  # (B, N, d_model)
     patch_mask: torch.Tensor,  # (B, N)
