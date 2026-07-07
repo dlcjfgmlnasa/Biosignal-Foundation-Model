@@ -500,8 +500,10 @@ def load_and_cache_case(
         except Exception:
             pass  # 손상 캐시 → 재생성
 
+    # 필요한 track(ECG_II·PLETH)만 로딩 → 모니터 덤프의 수십 개 track 파싱 생략(속도↑).
+    want_tracks = [trk for trk, s in SCOPE_TRACK_MAP.items() if s in input_signals]
     try:
-        vf = vitaldb.VitalFile(str(case["vital_path"]))
+        vf = vitaldb.VitalFile(str(case["vital_path"]), track_names=want_tracks)
     except Exception as exc:
         print(f"    [WARN] {cid}: load 실패 {exc}", file=sys.stderr)
         return None
