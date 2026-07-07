@@ -982,7 +982,8 @@ def main() -> None:
         nm_desc = "  (neg=Discharge)"
     print(f"  Neg-mode: {args.neg_mode}{nm_desc}")
     print(f"  Input:    {' + '.join(s.upper() for s in args.input_signals)}")
-    print(f"  Windows:  {args.window_secs}s / Horizons: {args.horizon_mins}min")
+    print(f"  Windows:  {args.window_secs}s / Horizons: {horizon_mins}min "
+          f"({'scope: pos_horizon=' + str(args.pos_horizon_h) + 'h' if scope else 'band'})")
     print(f"  Band:     {band_sec / 60:.1f}min (anchor 직전 로딩 구간)")
     print(f"{'=' * 64}")
 
