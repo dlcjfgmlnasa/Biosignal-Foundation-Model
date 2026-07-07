@@ -35,7 +35,7 @@ GATE_ARGS=""
 if [ "${NO_GATE:-0}" = "1" ]; then GATE_ARGS="--no-artifact-gate"; fi
 N_FOLDS="${N_FOLDS:-5}"
 INPUT="${INPUT:-co2 awp resp_flow ppg}"   # CO2·AWP·RESP_Flow·PPG (ECG 제외). override 가능
-REQUIRED="${REQUIRED:-co2 awp}"
+REQUIRED="${REQUIRED:-$INPUT}"   # 신호 고정: 입력 채널 전부 필수(없는 케이스 drop, 패딩 없음)
 # prediction=미래 desat 예측(기본) / detection=입력 window 내 concurrent desat 분류(h0)
 # detection 권장: TASK_MODE=detection INPUT="co2 awp resp_flow" (PPG 빼야 non-trivial)
 TASK_MODE="${TASK_MODE:-prediction}"

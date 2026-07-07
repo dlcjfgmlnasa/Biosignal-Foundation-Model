@@ -533,7 +533,9 @@ def main() -> None:
     # (co2 awp resp_flow) 로 leakage-clean ablation 하려면 --input-signals override.
     parser.add_argument("--input-signals", nargs="+",
                         default=["co2", "awp", "resp_flow", "ppg"])
-    parser.add_argument("--required-signals", nargs="+", default=["co2", "awp"])
+    # 기본 None → input-signals 전부 필수(신호 고정: 모든 케이스가 입력 채널을 실제로 다 보유,
+    # 패딩 없음). 일부만 필수로 완화하려면 명시적으로 지정(없는 채널은 all-gap 패딩).
+    parser.add_argument("--required-signals", nargs="+", default=None)
     parser.add_argument("--window-secs", nargs="+", type=float, default=[300.0])
     # horizon 1/3/5min = 임상·선행연구(IOH/hypoxemia 예측) 정렬. 15min = stress test
     # (예측 지평선 한계 측정 — AUPRC 붕괴는 실패가 아니라 "호흡역학→desat 예측의
@@ -566,6 +568,10 @@ def main() -> None:
     # detection 은 horizon 개념이 없음 → 단일 pass(h0)로 강제. 파일명 _h0min 로 prediction 과 구분.
     if args.task_mode == "detection":
         args.horizon_mins = [0.0]
+
+    # 신호 고정: required 미지정 시 input 전부 필수 → 모든 케이스가 입력 채널을 실제 보유(패딩 없음).
+    if args.required_signals is None:
+        args.required_signals = list(args.input_signals)
 
     vital_dir = Path(args.vital_dir)
     files = sorted(vital_dir.glob("*.vital"))
