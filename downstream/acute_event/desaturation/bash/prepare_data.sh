@@ -43,13 +43,14 @@ TASK_MODE="${TASK_MODE:-prediction}"
 EXTRA=""
 if [ "${EXTERNAL_TEST:-0}" = "1" ]; then EXTRA="--external-test"; fi
 
+if [ "$TASK_MODE" = "detection" ]; then HZ_DISP="h0 (concurrent)"; else HZ_DISP="${HORIZONS}min"; fi
 echo "============================================================"
-echo "  Intraop Desaturation Prediction — SNUH (${N_FOLDS}-fold CV)"
+echo "  Intraop Desaturation [${TASK_MODE}] — SNUH (${N_FOLDS}-fold CV)"
 echo "  Vital:     $VITAL_DIR"
 echo "  Meta:      $META_XLSX"
 echo "  Output:    $OUT_DIR"
-echo "  Window/Horizon: ${WINDOWS}s / ${HORIZONS}min   Stride: ${STRIDE}s"
-echo "  Label:     SpO2 < ${THRESHOLD}% sustained >= ${SUSTAINED}s"
+echo "  Window/Horizon: ${WINDOWS}s / ${HZ_DISP}   Stride: ${STRIDE}s"
+echo "  Label:     SpO2 < ${THRESHOLD}% (${TASK_MODE})"
 echo "  Input:     $INPUT   (required: $REQUIRED)"
 echo "  Mode:      ${EXTRA:-kfold}"
 echo "============================================================"

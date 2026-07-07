@@ -168,8 +168,9 @@ def gate_spo2_artifacts(
         m = min(n, len(pulse_hr), len(ecg_hr))
         ph, eh = pulse_hr[:m], ecg_hr[:m]
         ok = np.isfinite(ph) & np.isfinite(eh) & (eh > 20.0)  # eh 유효할 때만 판정
+        safe_eh = np.where(eh > 20.0, eh, np.nan)  # eh=0 divide-by-zero 회피(무효 샘플은 nan→False)
         discord = np.zeros(n, dtype=bool)
-        discord[:m] = ok & (np.abs(ph - eh) / eh > hr_tol)
+        discord[:m] = ok & (np.abs(ph - eh) / safe_eh > hr_tol)
         n_hr = int((discord & ~invalid).sum())
         invalid |= discord
 
