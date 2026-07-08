@@ -52,13 +52,20 @@ EVENT_CONSEC: int = 5     # 5블록 연속(=5분) > threshold = crisis 확정
 # ── ICP-only 빠른 로딩 (1분 median 블록) ────────────────────
 
 
-def read_icp_blocks(record_dir: Path, record_name: str) -> np.ndarray | None:
+def read_icp_blocks(
+    record_dir: Path, record_name: str,
+) -> tuple[np.ndarray | None, str]:
     """WFDB 레코드에서 ICP 채널만 읽어 1분-median 블록 timeline 을 반환한다.
+
+    ⚠️ MIMIC waveform 은 multi-segment 라 master .hea 엔 sig_name 이 없고 신호는
+    _layout/세그먼트에 정의된다. 따라서 rdheader 게이트로 채널을 확인하면 전부
+    걸러진다 → 게이트 없이 rdrecord(channel_names=["ICP"]) 로 직접 조립한다
+    (ICP-RECORDS 는 이미 ICP 보유 레코드만 추린 목록).
 
     Returns
     -------
-    np.ndarray (n_blocks,) — 각 원소는 1분 구간 median ICP(mmHg), 전부 NaN 인
-    구간은 NaN. ICP 채널이 없으면 None.
+    (blocks, reason) — 성공 시 (ndarray(n_blocks,), "ok"), 실패 시 (None, reason).
+    reason ∈ {no_hea, read_fail, empty, short}.
     """
     try:
         import wfdb
@@ -68,23 +75,15 @@ def read_icp_blocks(record_dir: Path, record_name: str) -> np.ndarray | None:
 
     hea_path = record_dir / f"{record_name}.hea"
     if not hea_path.exists():
-        return None
-
-    # 헤더만 먼저 읽어 ICP 채널 존재 확인 (없으면 무거운 rdrecord 스킵)
-    try:
-        hdr = wfdb.rdheader(str(record_dir / record_name), rd_segments=False)
-    except Exception:
-        return None
-    if "ICP" not in (hdr.sig_name or []):
-        return None
+        return None, "no_hea"
 
     try:
         rec = wfdb.rdrecord(str(record_dir / record_name), channel_names=["ICP"])
     except Exception:
-        return None
+        return None, "read_fail"  # ICP 채널 없음 / .dat 누락 / 파싱 오류 포함
 
-    if rec.p_signal is None or rec.sig_len == 0:
-        return None
+    if rec.p_signal is None or rec.sig_len == 0 or rec.p_signal.shape[1] == 0:
+        return None, "empty"
 
     fs = float(rec.fs)
     icp = rec.p_signal[:, 0].astype(np.float64)  # (N,)
@@ -92,13 +91,13 @@ def read_icp_blocks(record_dir: Path, record_name: str) -> np.ndarray | None:
     block_samps = max(1, int(round(BLOCK_SEC * fs)))
     n_blocks = len(icp) // block_samps
     if n_blocks == 0:
-        return None
+        return None, "short"
 
     trimmed = icp[: n_blocks * block_samps].reshape(n_blocks, block_samps)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", category=RuntimeWarning)  # all-NaN 블록
         block_med = np.nanmedian(trimmed, axis=1)  # (n_blocks,)
-    return block_med.astype(np.float32)
+    return block_med.astype(np.float32), "ok"
 
 
 # ── 레코드 목록 (load_patient_signals 와 동일 규칙) ──────────
@@ -288,25 +287,27 @@ def process_record(
     stride_sec: float,
     threshold: float,
     event_consec: int,
-) -> tuple[str, str, int, dict[float, HorizonStat]] | None:
+) -> tuple[str, str, str, int, dict[float, HorizonStat] | None]:
     """레코드 1개를 읽어 onset + horizon 별 window 통계를 독립 계산(스레드 안전).
 
     read_icp_blocks(느린 마운트 I/O) 를 worker 스레드로 겹치고, 순수 계산
     (find_onsets/scan_record) 결과를 per-record 로 반환 → 메인이 병합.
-    ICP 없으면 None.
+
+    Returns (reason, rec_id, pid, n_onsets, local). 실패 시 local=None,
+    reason ∈ {no_hea, read_fail, empty, short}.
     """
     pid, rec_dir, rec_name = item
-    blocks = read_icp_blocks(rec_dir, rec_name)
-    if blocks is None:
-        return None
     rec_id = f"{pid}_{rec_name}"
+    blocks, reason = read_icp_blocks(rec_dir, rec_name)
+    if blocks is None:
+        return reason, rec_id, pid, 0, None
     onsets = find_onsets(blocks, threshold, event_consec)
     local: dict[float, HorizonStat] = {h: HorizonStat() for h in horizon_secs}
     scan_record(
         blocks, pid, rec_id, onsets,
         window_sec, horizon_secs, stride_sec, threshold, local,
     )
-    return rec_id, pid, len(onsets), local
+    return "ok", rec_id, pid, len(onsets), local
 
 
 def _merge(dst: HorizonStat, src: HorizonStat) -> None:
@@ -394,15 +395,16 @@ def main() -> None:
             args.icp_threshold, args.event_consec,
         )
 
+    reason_counts: dict[str, int] = defaultdict(int)
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
         futures = {_submit(ex, item): item for item in records}
         pbar = tqdm(as_completed(futures), total=len(futures),
                     desc="Scanning ICP", unit="rec")
         for fut in pbar:
-            result = fut.result()
-            if result is None:
+            reason, rec_id, pid, n_onsets, local = fut.result()
+            reason_counts[reason] += 1
+            if reason != "ok":
                 continue
-            rec_id, pid, n_onsets, local = result
 
             icp_records.add(rec_id)
             icp_patients.add(pid)
@@ -420,6 +422,11 @@ def main() -> None:
                 onset=total_onsets,
                 onset_pt=len(onset_patients),
             )
+
+    # 로딩 사유 요약 (0 이 나올 때 원인 파악용: no_hea=경로/레이아웃 불일치 등)
+    print("  load reasons: " + "  ".join(
+        f"{k}={reason_counts[k]}" for k in sorted(reason_counts)
+    ), flush=True)
 
     print_report(
         stats, args.window_secs, args.icp_threshold, args.stride_sec,
