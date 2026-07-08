@@ -1131,7 +1131,11 @@ def main() -> None:
                 epoch_loss += loss.item()
                 n_steps += 1
         else:
-            for batch, labels in train_batches:
+            _bbar = tqdm(
+                train_batches, desc=f"  ep{epoch + 1}/{args.epochs}",
+                unit="batch", leave=False, disable=not is_main(),
+            )
+            for batch, labels in _bbar:
                 batch = model.batch_to_device(batch)
                 if ddp_module is not None:
                     logits = ddp_module(batch)
@@ -1148,6 +1152,8 @@ def main() -> None:
                 optimizer.step()
                 epoch_loss += loss.item()
                 n_steps += 1
+                if is_main():
+                    _bbar.set_postfix(loss=f"{epoch_loss / max(n_steps, 1):.4f}")
 
         avg = epoch_loss / max(n_steps, 1)
         train_losses.append(avg)
