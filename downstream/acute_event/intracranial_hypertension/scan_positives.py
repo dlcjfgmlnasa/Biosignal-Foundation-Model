@@ -219,12 +219,12 @@ def find_onsets(blocks: np.ndarray, threshold: float, consec: int) -> list[int]:
 
 @dataclass
 class HorizonStat:
-    n_windows: int = 0
     n_pos: int = 0
-    n_neg: int = 0
     n_dropped_baseline: int = 0  # 현재-ICH 제외 or baseline 무효로 drop
     pos_records: set = field(default_factory=set)
     pos_patients: set = field(default_factory=set)
+    # 음성은 stride 별로 따로 집계 (한 번 읽고 여러 stride 비율을 비교하는 sweep).
+    n_neg_by_stride: dict = field(default_factory=dict)  # stride_sec -> neg count
 
 
 def _baseline_ok(blocks: np.ndarray, win_end: int, threshold: float) -> bool:
@@ -244,7 +244,7 @@ def scan_record(
     threshold: float,
     stats: dict[float, HorizonStat],
     sampling: str = "dense",
-    neg_stride_sec: float = 300.0,
+    neg_stride_secs: tuple[float, ...] = (300.0,),
 ) -> None:
     """1분-median 블록 timeline 에서 horizon 별 양/음성 window 를 센다.
 
@@ -253,12 +253,25 @@ def scan_record(
                    나머지 전부 negative(현실 유병률 그대로, 중복·불균형 큼).
       "anchored" — 양성은 onset 마다 목표 lead(horizon) 에서 끝나는 window 1개로
                    고정(중복 제거, onset 보존). 음성은 crisis 없는 구간에서
-                   neg_stride_sec 균일 stride 로만 추출(경계 15~20 도 음성 유지 →
-                   정직). biased 모드(clean-<15 필터·cherry-pick)와 다름.
+                   neg_stride_secs 각 균일 stride 로 추출(경계 15~20 도 음성 유지 →
+                   정직). 여러 stride 를 한 번에 세어 자연 비율을 비교한다.
     """
     win_b = max(1, int(round(window_sec / BLOCK_SEC)))
     L = len(blocks)
     onset_list = sorted(onsets)
+
+    def _count_neg(hor_b: int, total_needed: int, neg_stride_b: int) -> int:
+        cnt = 0
+        for start in range(0, L - total_needed + 1, neg_stride_b):
+            win_end = start + win_b
+            if not _baseline_ok(blocks, win_end, threshold):
+                continue
+            if any(win_end <= o < win_end + hor_b for o in onset_list):
+                continue                        # horizon 에 onset → 음성 아님
+            if np.isnan(blocks[win_end: win_end + hor_b]).all():
+                continue                        # 미래 데이터 전무 → skip
+            cnt += 1
+        return cnt
 
     for horizon_sec in horizon_secs:
         hor_b = max(1, int(round(horizon_sec / BLOCK_SEC)))
@@ -280,35 +293,32 @@ def scan_record(
                 st.n_pos += 1
                 st.pos_records.add(record_id)
                 st.pos_patients.add(patient_id)
-            # ── 음성: crisis 없는 구간, 균일 stride, 경계 유지(정직) ──
-            neg_stride_b = max(1, int(round(neg_stride_sec / BLOCK_SEC)))
-            for start in range(0, L - total_needed + 1, neg_stride_b):
-                win_end = start + win_b
-                if not _baseline_ok(blocks, win_end, threshold):
-                    continue
-                if any(win_end <= o < win_end + hor_b for o in onset_list):
-                    continue                    # horizon 에 onset → 음성 아님
-                horizon = blocks[win_end: win_end + hor_b]
-                if np.isnan(horizon).all():
-                    continue                    # 미래 데이터 전무 → skip
-                st.n_neg += 1
+            # ── 음성: 각 stride 별로 crisis-free 균일 추출 ──
+            for s in neg_stride_secs:
+                nsb = max(1, int(round(s / BLOCK_SEC)))
+                st.n_neg_by_stride[s] = (
+                    st.n_neg_by_stride.get(s, 0)
+                    + _count_neg(hor_b, total_needed, nsb)
+                )
             continue
 
-        # ── dense (기본) ──
+        # ── dense (기본): stride_sec 단일, positive=band ──
         stride_b = max(1, int(round(stride_sec / BLOCK_SEC)))
+        neg = 0
         for start in range(0, L - total_needed + 1, stride_b):
             win_end = start + win_b
             if not _baseline_ok(blocks, win_end, threshold):
                 st.n_dropped_baseline += 1
                 continue
-            st.n_windows += 1
-            is_pos = any(win_end <= o < win_end + hor_b for o in onset_list)
-            if is_pos:
+            if any(win_end <= o < win_end + hor_b for o in onset_list):
                 st.n_pos += 1
                 st.pos_records.add(record_id)
                 st.pos_patients.add(patient_id)
             else:
-                st.n_neg += 1
+                neg += 1
+        st.n_neg_by_stride[stride_sec] = (
+            st.n_neg_by_stride.get(stride_sec, 0) + neg
+        )
 
 
 # ── 리포트 ───────────────────────────────────────────────────
@@ -326,15 +336,15 @@ def print_report(
     onset_records: int,
     onset_patients: int,
     sampling: str = "dense",
-    neg_stride_sec: float = 300.0,
+    neg_stride_secs: tuple[float, ...] = (300.0,),
     neg_ratio: float | None = None,
 ) -> None:
     print(f"\n{'=' * 78}")
     print("  ICH Prediction — 양성 희소성 스캔 (Güiza식, ICP-only 상한)")
     print(f"{'=' * 78}")
     smp = (f"sampling={sampling}"
-           + (f"(neg stride={neg_stride_sec:.0f}s)" if sampling == "anchored"
-              else f"(dense stride={stride_sec:.0f}s)"))
+           + (f"(neg strides={[int(s) for s in neg_stride_secs]}s)"
+              if sampling == "anchored" else f"(dense stride={stride_sec:.0f}s)"))
     cap = f"  neg-ratio cap=1:{neg_ratio:.0f}" if neg_ratio else ""
     print(f"  Window={window_sec:.0f}s ({window_sec / 60:.0f}min)  "
           f"event=5×1min median >{threshold:.0f}mmHg  {smp}{cap}")
@@ -345,30 +355,31 @@ def print_report(
     print(f"  [이벤트 확정]  총 crisis onset={total_onsets}  "
           f"onset 보유 레코드={onset_records}  onset 보유 환자={onset_patients}")
     print(f"{'-' * 78}")
-    # [2단] horizon 별 양/음성 (NEG(pool)=전체 crisis-free 풀, NEG(kept)=cap 적용 후)
-    print(f"  {'horizon':>8} | {'POS':>7} | {'NEG pool':>9} | {'NEG kept':>9} | "
+    # [2단] horizon × neg-stride 별 양/음성 (넓힐수록 음성↓·비율↓ — sweep 비교)
+    print(f"  {'horizon':>7} | {'negStride':>9} | {'POS':>6} | {'NEG':>8} | "
           f"{'ratio':>8} | {'pos pt':>6}")
-    print(f"  {'-' * 8} | {'-' * 7} | {'-' * 9} | {'-' * 9} | "
+    print(f"  {'-' * 7} | {'-' * 9} | {'-' * 6} | {'-' * 8} | "
           f"{'-' * 8} | {'-' * 6}")
     for horizon_sec in sorted(stats):
         st = stats[horizon_sec]
-        # cap: 양성당 최대 neg_ratio 개 (전역 균일 서브샘플의 결과 개수)
-        if neg_ratio and st.n_pos:
-            kept = min(st.n_neg, int(round(neg_ratio * st.n_pos)))
-        else:
-            kept = st.n_neg
-        ratio = (kept / st.n_pos) if st.n_pos else float("inf")
-        ratio_s = f"1:{ratio:.1f}" if st.n_pos else "1:inf"
-        print(f"  {horizon_sec / 60:6.0f}min | {st.n_pos:7d} | {st.n_neg:9d} | "
-              f"{kept:9d} | {ratio_s:>8} | {len(st.pos_patients):6d}")
+        for s in sorted(st.n_neg_by_stride):
+            neg = st.n_neg_by_stride[s]
+            # neg_ratio cap 은 선택적 상한(넓힌 stride 위에 추가로 씌울 수 있음)
+            if neg_ratio and st.n_pos:
+                neg = min(neg, int(round(neg_ratio * st.n_pos)))
+            ratio = (neg / st.n_pos) if st.n_pos else float("inf")
+            ratio_s = f"1:{ratio:.1f}" if st.n_pos else "1:inf"
+            stride_lbl = (f"{s / 60:.0f}min" if sampling == "anchored"
+                          else f"{s:.0f}s")
+            print(f"  {horizon_sec / 60:5.0f}min | {stride_lbl:>9} | "
+                  f"{st.n_pos:6d} | {neg:8d} | {ratio_s:>8} | "
+                  f"{len(st.pos_patients):6d}")
     print(f"{'-' * 78}")
     print("  주: POS 는 ICP 유효성만 반영한 상한. 실제 prepare_data 는 입력 채널")
     print("      (ABP) valid_ratio 도 요구 → 실제 양성 ≤ 위 값.")
     if sampling == "anchored":
-        print("  anchored: POS=onset 당 1개(중복 제거), NEG pool=crisis-free 균일 stride.")
-    if neg_ratio:
-        print(f"  NEG kept = min(pool, {neg_ratio:.0f}×POS) — prepare_data 가 풀에서 "
-              "전역 균일 서브샘플해 이 개수만 저장(정직: 경계 15~20 도 후보 포함).")
+        print("  anchored: POS=onset 당 1개(중복 제거). NEG=crisis-free 를 negStride")
+        print("      간격으로 균일 추출(경계 15~20 유지 → 정직). stride 넓힐수록 비율↓.")
     print("  판단 가이드: 5-fold stratified CV 안정성엔 'onset 보유 환자' ≳ 15~20 권장.")
     print(f"{'=' * 78}")
 
@@ -384,7 +395,7 @@ def process_record(
     threshold: float,
     event_consec: int,
     sampling: str = "dense",
-    neg_stride_sec: float = 300.0,
+    neg_stride_secs: tuple[float, ...] = (300.0,),
 ) -> tuple[str, str, str, int, dict[float, HorizonStat] | None]:
     """레코드 1개를 읽어 onset + horizon 별 window 통계를 독립 계산(스레드 안전).
 
@@ -404,18 +415,18 @@ def process_record(
     scan_record(
         blocks, pid, rec_id, onsets,
         window_sec, horizon_secs, stride_sec, threshold, local,
-        sampling=sampling, neg_stride_sec=neg_stride_sec,
+        sampling=sampling, neg_stride_secs=neg_stride_secs,
     )
     return "ok", rec_id, pid, len(onsets), local
 
 
 def _merge(dst: HorizonStat, src: HorizonStat) -> None:
-    dst.n_windows += src.n_windows
     dst.n_pos += src.n_pos
-    dst.n_neg += src.n_neg
     dst.n_dropped_baseline += src.n_dropped_baseline
     dst.pos_records |= src.pos_records
     dst.pos_patients |= src.pos_patients
+    for s, c in src.n_neg_by_stride.items():
+        dst.n_neg_by_stride[s] = dst.n_neg_by_stride.get(s, 0) + c
 
 
 # ── CLI ──────────────────────────────────────────────────────
@@ -439,11 +450,14 @@ def main() -> None:
                         choices=["dense", "anchored"],
                         help="dense(현실 유병률·중복 큼) | anchored(onset 당 양성 1개 "
                              "+ crisis-free 균일 stride 음성; 제안 설계).")
-    parser.add_argument("--neg-stride-sec", type=float, default=300.0,
-                        help="anchored 모드 음성 균일 stride(초). 기본 300(5min).")
+    parser.add_argument("--neg-stride-secs", nargs="+", type=float,
+                        default=[300.0],
+                        help="anchored 음성 균일 stride(초) — 여러 개 주면 한 번 읽고 "
+                             "각 stride 자연 비율을 한 표에서 비교(sweep). 기본 300. "
+                             "넓힐수록(예: 1800 3600 6000) 음성↓·비율↓.")
     parser.add_argument("--neg-ratio", type=float, default=None,
-                        help="양성당 음성 캡(예: 10 → 1:10). prepare_data 가 풀에서 "
-                             "전역 균일 서브샘플해 저장할 최종 개수. 미지정 시 풀 전체.")
+                        help="(선택) 넓힌 stride 위에 추가로 씌우는 양성당 음성 상한. "
+                             "보통은 stride 로만 맞추고 미지정.")
     parser.add_argument("--icp-threshold", type=float, default=ICP_THRESHOLD)
     parser.add_argument("--event-consec", type=int, default=EVENT_CONSEC,
                         help="crisis 확정 연속 1분블록 수. 기본 5(=5min). "
@@ -509,7 +523,7 @@ def main() -> None:
             process_record, item,
             args.window_secs, horizon_secs, args.stride_sec,
             args.icp_threshold, args.event_consec,
-            args.sampling, args.neg_stride_sec,
+            args.sampling, tuple(args.neg_stride_secs),
         )
 
     reason_counts: dict[str, int] = defaultdict(int)
@@ -549,7 +563,7 @@ def main() -> None:
         stats, args.window_secs, args.icp_threshold, args.stride_sec,
         len(records), len(icp_records), len(icp_patients),
         total_onsets, len(onset_records), len(onset_patients),
-        sampling=args.sampling, neg_stride_sec=args.neg_stride_sec,
+        sampling=args.sampling, neg_stride_secs=tuple(args.neg_stride_secs),
         neg_ratio=args.neg_ratio,
     )
 
