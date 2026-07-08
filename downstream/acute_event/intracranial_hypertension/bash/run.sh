@@ -25,26 +25,26 @@ DEVICE="${DEVICE:-cuda}"
 # v2 필수 (9 modality 단일 embedding — memory project_data_spec_v2). v1 로드 금지.
 MODEL_VERSION="${MODEL_VERSION:-v2}"
 
-# prediction canonical: 입력 ABP+ICP+ECG(prefix "abp_icp_ecg"), 15min(900s) window, horizon 5/15/30.
+# anchored canonical: 입력 ABP+ICP(prefix "abp_icp"), 20min(1200s) window, horizon 5/10/15.
 #   run.py 는 --input-signals 가 없어 prepared 데이터의 모든 채널을 그대로 사용 →
 #   로드 파일은 SIGNALS prefix + window + horizon 으로 결정. prepare_data.sh 와 일치해야 함.
 #   env override: SIGNALS / WINDOW_SECS_OVERRIDE / HORIZON_MINS_OVERRIDE
-SIGNALS="${SIGNALS:-abp_icp_ecg}"
-WINDOW_SECS=(${WINDOW_SECS_OVERRIDE:-900})        # 15min(900s) 고정
-HORIZON_MINS=(${HORIZON_MINS_OVERRIDE:-5 15 30})  # 5/15/30분 전 예측
+SIGNALS="${SIGNALS:-abp_icp}"
+WINDOW_SECS=(${WINDOW_SECS_OVERRIDE:-1200})        # 20min(1200s) 고정
+HORIZON_MINS=(${HORIZON_MINS_OVERRIDE:-5 10 15})   # 5/10/15분 전 예측
 # 변수명은 전 task 공통 컨벤션: LP_EPOCHS/LORA_EPOCHS, LP_LR/LORA_LR, LP_BATCH/LORA_BATCH
 LP_EPOCHS="${LP_EPOCHS:-1000}"
 LORA_EPOCHS="${LORA_EPOCHS:-30}"
 LP_LR="${LP_LR:-1e-3}"
 LORA_LR="${LORA_LR:-1e-4}"
-# LP_BATCH: frozen feature 추출/probe-fit batch. prediction 은 window 가 15min(900s,
-#   3채널 packed ~1350 token)로 길어 attention O(seq²) VRAM 이 크다 → 32 로 보수적 설정
-#   (bf16 autocast 로 추출하지만 batch↑ 시 OOM). 여유되면 LP_BATCH 로 상향.
+# LP_BATCH: frozen feature 추출/probe-fit batch. anchored prediction 은 window 가
+#   20min(1200s, 2채널 abp+icp packed ~1200 token)로 길어 attention O(seq²) VRAM 이
+#   크다 → 32 로 보수적 설정(bf16 autocast 추출, batch↑ 시 OOM). 여유되면 상향.
 LP_BATCH="${LP_BATCH:-32}"
 LORA_RANK="${LORA_RANK:-8}"
 N_FOLDS="${N_FOLDS:-5}"   # stratified k-fold — fold 별 실행(--n-folds/--fold)
 FORCE="${FORCE:-0}"       # 1 이면 완료 fold(preds_fold{f}.npz)도 재실행
-# LORA_BATCH: LoRA 학습 batch. prediction 15min window(~1350 token)는 grad·activation
+# LORA_BATCH: LoRA 학습 batch. anchored 20min window(~1200 token)는 grad·activation
 #   메모리가 커 8 로 보수적 설정(서버 OOM 방지). torchrun 에선 effective = LORA_BATCH × nproc.
 #   여유되면 상향하되 batch 변경 시 LR 재튜닝 필요(최적화 궤적 달라짐).
 LORA_BATCH="${LORA_BATCH:-8}"
