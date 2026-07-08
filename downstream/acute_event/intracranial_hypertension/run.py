@@ -221,7 +221,7 @@ def evaluate_linear_probe(model, probe, test_windows, batch_size, patch_size, de
         model, test_windows, batch_size, patch_size, device,
     )
     logits = probe(features.to(device))
-    scores = torch.sigmoid(logits).squeeze(-1).cpu().numpy()
+    scores = torch.sigmoid(logits).squeeze(-1).float().cpu().numpy()
     return _compute_metrics(labels.numpy().astype(int), scores)
 
 
@@ -299,7 +299,7 @@ def _eval_probe_cached(probe, features, labels, device):
     """미리 추출된 cached feature 로 probe 평가 (evaluate_linear_probe 와 동일 산출)."""
     probe.to(device).eval()
     logits = probe(features.to(device))
-    scores = torch.sigmoid(logits).squeeze(-1).cpu().numpy()
+    scores = torch.sigmoid(logits).squeeze(-1).float().cpu().numpy()
     return _compute_metrics(labels.numpy().astype(int), scores)
 
 
@@ -373,7 +373,7 @@ def evaluate_lora(model, probe, test_batches, device):
             out = model.model(batch, task="masked")
             features = _mean_pool(out["encoded"], out["patch_mask"])
             logits = probe(features)
-        probs = torch.sigmoid(logits).squeeze(-1).cpu().numpy()
+        probs = torch.sigmoid(logits).squeeze(-1).float().cpu().numpy()
         all_labels.append(labels.numpy())
         all_scores.append(probs)
     return _compute_metrics(np.concatenate(all_labels), np.concatenate(all_scores))
@@ -643,7 +643,7 @@ def _predict_on_features(
 ) -> np.ndarray:
     probe.eval()
     logits = probe(features.to(device))
-    return torch.sigmoid(logits).squeeze(-1).cpu().numpy()
+    return torch.sigmoid(logits).squeeze(-1).float().cpu().numpy()
 
 
 def _bootstrap_auroc_ci(
