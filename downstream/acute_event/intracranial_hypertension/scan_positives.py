@@ -111,6 +111,45 @@ def _patient_id_from_parts(parts: tuple[str, ...], rec_name: str) -> str:
     return rec_name.split("-", 1)[0]
 
 
+_SEG_RE = re.compile(r"_\d{4}$")           # 세그먼트 헤더 접미(_0001)
+_MASTER_NUM_RE = re.compile(r"^\d+$")       # 일반 mimic3wdb 숫자 레코드(3008477)
+_MASTER_MATCHED_RE = re.compile(            # matched subset 레코드(p000907-2163-...)
+    r"^p\d{6}-\d{4}-\d{2}-\d{2}-\d{2}-\d{2}$"
+)
+
+
+def list_records_scandir(waveform_dir: Path) -> list[tuple[str, Path, str]]:
+    """waveform_dir **최상위 한 단계**를 scandir(재귀·stat 없음)해 마스터 헤더 열거.
+
+    ICP-RECORDS(matched 경로)와 실제 디스크 레이아웃이 다를 때 사용 — 특히 flat
+    numeric(3008477.hea/_0001.dat, 일반 mimic3wdb) 레이아웃. matched(pXXXXXX-...)
+    도 함께 인식한다. _layout / _NNNN 세그먼트 헤더는 제외.
+
+    patient_id: matched 는 pXXXXXX 추출, numeric 은 subject 링크가 없어 record
+    stem 을 그대로 pseudo-patient 로 둔다(스캔 feasibility 용 — CV 그룹핑엔 부적합).
+    """
+    import os
+
+    out: list[tuple[str, Path, str]] = []
+    with os.scandir(waveform_dir) as it:
+        for entry in it:
+            name = entry.name
+            if not name.endswith(".hea"):
+                continue
+            stem = name[:-4]
+            if stem.endswith("_layout") or _SEG_RE.search(stem):
+                continue
+            m = _MASTER_MATCHED_RE.match(stem)
+            if m:
+                pid = stem.split("-", 1)[0]  # pXXXXXX
+            elif _MASTER_NUM_RE.match(stem):
+                pid = stem                    # 숫자 레코드 → 자기 자신이 group
+            else:
+                continue
+            out.append((pid, waveform_dir, stem))
+    return sorted(out)
+
+
 def list_records_from_file(
     waveform_dir: Path, records_file: Path,
 ) -> list[tuple[str, Path, str]]:
@@ -352,6 +391,10 @@ def main() -> None:
     )
     parser.add_argument("--rglob", action="store_true",
                         help="records-file 대신 waveform-dir 를 rglob 스캔(느림).")
+    parser.add_argument("--scan-dir", action="store_true",
+                        help="waveform-dir 최상위를 scandir 로 마스터 헤더 직접 열거"
+                             "(재귀 없음). flat numeric(3008477) 등 ICP-RECORDS 경로와"
+                             " 레이아웃이 다를 때 사용.")
     args = parser.parse_args()
 
     waveform_dir = Path(args.waveform_dir)
@@ -361,7 +404,10 @@ def main() -> None:
 
     horizon_secs = [m * 60.0 for m in args.horizon_mins]
     records_file = Path(args.records_file)
-    if not args.rglob and records_file.is_file():
+    if args.scan_dir:
+        print(f"  scandir 마스터 헤더 열거: {waveform_dir} (재귀 없음)...", flush=True)
+        records = list_records_scandir(waveform_dir)
+    elif not args.rglob and records_file.is_file():
         print(f"  Reading record list from {records_file} (rglob 회피, 즉시 시작)",
               flush=True)
         records = list_records_from_file(waveform_dir, records_file)
