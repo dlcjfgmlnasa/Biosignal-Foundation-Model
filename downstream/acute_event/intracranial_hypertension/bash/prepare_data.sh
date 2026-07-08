@@ -27,56 +27,48 @@ BIOFM_ROOT="${BIOFM_ROOT:-/home/coder/workspace/k-mimic-/bio_fm}"
 RECORDS_FILE="${RECORDS_FILE:-${REPO_ROOT}/downstream/outcome/sepsis/RECORDS-waveforms}"
 ICP_RECORDS="${ICP_RECORDS:-downstream/acute_event/intracranial_hypertension/ICP-RECORDS}"
 WAVEFORM_DIR="${WAVEFORM_DIR:-${UPDOWN_ROOT}/raw/mimic3-waveform-ich}"
-# ICH 는 prediction 전용 (detection 폐기 — 미래 horizon IH 예측).
+# ICH 는 prediction 전용 (미래 horizon IH 예측). anchored 산출물도 prediction 이름.
 TASK_MODE="prediction"
 OUT_DIR="${OUT_DIR:-${BIOFM_ROOT}/data/downstream/intracranial_hypertension_${TASK_MODE}}"
-WINDOWS="${WINDOWS:-900}"      # 15min(900s) 입력 window (prediction 표준)
-HORIZONS="${HORIZONS:-5 15 30}"  # 5/15/30분 전 예측
-STRIDE="${STRIDE:-60}"      # prediction: 60s stride (15min window; 30s 는 용량 ~1TB 폭증으로 복귀)
-MODE="${MODE:-unbiased}"    # unbiased(현실적·기본) | biased(과대평가·선행비교)
-# 저장 dtype: float16 이 기본(디스크·RAM 절반). float32 로 바꾸려면 SIGNAL_DTYPE=float32.
+# ── 확정 스펙 (Güiza anchored, 2026-07-08) ──
+WINDOWS="${WINDOWS:-1200}"        # 20min(1200s) 입력 window
+HORIZONS="${HORIZONS:-5 10 15}"   # 5/10/15분 전 예측
+MODE="${MODE:-anchored}"          # anchored(onset-anchor 양성 + 균일 stride 음성)
+NEG_STRIDE="${NEG_STRIDE:-1800}"  # 음성 균일 stride 30min → prevalence ~3.5%
+EVENT_CONSEC="${EVENT_CONSEC:-5}" # 5×1min median>20mmHg = crisis (Güiza)
+# 입력 신호: ABP + ICP (prediction 이라 현재 ICP 를 입력에 포함). label 은 항상 ICP.
+INPUT_SIGNALS="${INPUT_SIGNALS:-abp icp}"
+# 저장 dtype: float16 이 기본(디스크·RAM 절반).
 SIGNAL_DTYPE="${SIGNAL_DTYPE:-float16}"
-# 입력 신호: prediction=ABP+ICP+ECG (미래 horizon 예측이라 현재 ICP 를 입력에 포함).
-INPUT_SIGNALS="${INPUT_SIGNALS:-abp icp ecg}"
-MIN_GAP="${MIN_GAP:-1200}"  # biased 모드 sparse 간격(초)
-SKIP_DOWNLOAD="${SKIP_DOWNLOAD:-0}"
-# 라벨 지속시간: SUSTAINED_SEC = "horizon 구간 내 ICP>임계 연속 지속(초)". 길수록 pos 희소.
-#   30s = 60s(너무 빡빡·pos 부족)와 절충. ICP 임계(20)는 유지. VALID_RATIO 미설정 시 py 기본.
-SUSTAINED_SEC="${SUSTAINED_SEC:-30}"
+# 데이터는 이미 flat-numeric(3008477.hea/_0001.dat)로 받아져 있음 → 기본 스킵.
+#   (구 matched ICP-RECORDS 다운로드 경로는 이 데이터와 레이아웃 불일치라 미사용.)
+SKIP_DOWNLOAD="${SKIP_DOWNLOAD:-1}"
 LABEL_ARGS=""
-[ -n "$SUSTAINED_SEC" ] && LABEL_ARGS="$LABEL_ARGS --sustained-sec $SUSTAINED_SEC"
-[ -n "$VALID_RATIO" ]   && LABEL_ARGS="$LABEL_ARGS --valid-ratio $VALID_RATIO"
+[ -n "$VALID_RATIO" ] && LABEL_ARGS="$LABEL_ARGS --valid-ratio $VALID_RATIO"
 
 echo "============================================================"
-echo "  Intracranial Hypertension — Data Preparation"
+echo "  Intracranial Hypertension — Data Preparation (Güiza anchored)"
 echo "  Waveform: $WAVEFORM_DIR"
 echo "  Output:   $OUT_DIR"
-echo "  Task:     $TASK_MODE"
 echo "  Input:    $INPUT_SIGNALS  (dtype=$SIGNAL_DTYPE)"
-echo "  Windows:  ${WINDOWS}s (15min prediction)"
-echo "  Horizons: $HORIZONS min"
-echo "  Stride:   ${STRIDE}s"
+echo "  Window:   ${WINDOWS}s (20min)   Horizons: $HORIZONS min"
+echo "  Sampling: $MODE  neg-stride=${NEG_STRIDE}s  event-consec=${EVENT_CONSEC}"
 echo "============================================================"
 
 if [ "$SKIP_DOWNLOAD" != "1" ]; then
-    # Step 1: ICP 레코드 스캔
+    # (선택) matched subset ICP-RECORDS 스캔+다운로드. 현 데이터는 flat-numeric 이라
+    # 기본 스킵. matched 데이터를 새로 받을 때만 SKIP_DOWNLOAD=0.
     echo -e "\n[Step 1] Scanning for ICP records..."
     python -m downstream.acute_event.intracranial_hypertension.download_waveforms \
-        scan \
-        --records-file "$RECORDS_FILE" \
-        --out-file "$ICP_RECORDS"
-
-    # Step 2: 다운로드
+        scan --records-file "$RECORDS_FILE" --out-file "$ICP_RECORDS"
     echo -e "\n[Step 2] Downloading ICP waveforms..."
     python -m downstream.acute_event.intracranial_hypertension.download_waveforms \
-        download \
-        --icp-records-file "$ICP_RECORDS" \
-        --out-dir "$WAVEFORM_DIR"
+        download --icp-records-file "$ICP_RECORDS" --out-dir "$WAVEFORM_DIR"
 else
     echo -e "\n[Step 1-2] SKIP_DOWNLOAD=1 — using existing waveforms at $WAVEFORM_DIR"
 fi
 
-# Step 3: prediction canonical 조합 (ABP+ICP+ECG, 15min window)
+# Step 3: anchored canonical (ABP+ICP, 20min window, --scan-dir flat-numeric)
 run_combo() {
     local label="$1"
     local sigs="$2"
@@ -86,19 +78,18 @@ run_combo() {
         --input-signals $sigs \
         --window-secs $WINDOWS \
         --horizon-mins $HORIZONS \
-        --stride-sec $STRIDE \
+        --sampling-mode $MODE \
+        --neg-stride-sec $NEG_STRIDE \
+        --event-consec $EVENT_CONSEC \
+        --scan-dir \
         --signal-dtype $SIGNAL_DTYPE \
-        --min-sample-gap-sec $MIN_GAP --sampling-mode $MODE \
         --task-mode $TASK_MODE \
         $LABEL_ARGS \
         --out-dir "$OUT_DIR"
 }
 
-# canonical: prediction 입력 ABP+ICP+ECG (INPUT_SIGNALS env 로 override 가능).
+# canonical: anchored 입력 ABP+ICP (INPUT_SIGNALS env 로 override 가능).
 run_combo "canonical" "$INPUT_SIGNALS"
-# S7 modality-subset ablation 필요 시 아래 주석 해제 (+ WINDOWS/HORIZONS sweep env override):
-# run_combo "subset-2ch" "abp icp"
-# run_combo "subset-4ch" "abp icp ecg cvp"
 
 echo -e "\n============================================================"
 echo "  Done! Output: $OUT_DIR"

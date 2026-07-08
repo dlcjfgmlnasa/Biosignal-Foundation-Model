@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,7 +35,15 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from data.parser._common import resample_to_target
 from data.parser.mimic3_waveform import _apply_pipeline
+from data.parser.vitaldb import (
+    SIGNAL_CONFIGS,
+    _apply_filter,
+    _apply_median_filter,
+    _apply_range_check,
+    _detect_electrocautery,
+)
 from downstream._gap_mask import (
     DEFAULT_VALID_RATIO_THRESHOLD,
     GapStats,
@@ -51,7 +60,13 @@ TARGET_SR: float = 100.0
 ICP_THRESHOLD: float = 20.0  # mmHg (sustained >1min). intracranial hypertension 정의
 #                              (Czosnyka & Pickard 2004; 논문 Table 3 기준). 정상 ICP 7-15mmHg.
 #                              (BTF 4판 Carney 2017 치료 임계 22 보다 낮춰 희소 양성 표본 확보.)
-SUSTAINED_SEC: float = 60.0  # 1분 이상 지속
+SUSTAINED_SEC: float = 60.0  # 1분 이상 지속 (구 10s-평균 sustained 모드 잔존 인자)
+
+# ── Güiza 식 이벤트 정의 (anchored 샘플링용) ──────────────────
+#   ICP 를 1분 median 블록으로 요약(아티팩트 견고) → 5블록 연속(=5분) median > 20
+#   이면 ICP crisis 로 확정. run 첫 블록 = onset. (Güiza et al. Crit Care Med 2013)
+BLOCK_SEC: float = 60.0     # 1분 median 블록
+EVENT_CONSEC: int = 5       # 5블록 연속(=5분) > threshold = crisis 확정
 
 # MIMIC-III 채널명 → signal_type 매핑 (Task #3 ICH: ABP, ECG, PPG, CO2 + ICP for label)
 # ICP는 라벨 산출 전용 (input 신호로는 사용하지 않음, --input-signals 로 별도 제어)
@@ -136,6 +151,152 @@ def parse_waveform_record(
     return signals
 
 
+# ── 정렬(aligned) 파싱: ABP+ICP 를 공통 시간축에서 세그먼트 단위로 ──────
+#   parse_waveform_record 는 채널별로 각자의 최장 NaN-free 세그먼트를 뽑아
+#   (offset 폐기) 채널 간 시간축이 어긋날 수 있다(multi-modal 정렬 버그). anchored
+#   prediction 은 ICP 라벨과 ABP 입력이 같은 시각이어야 하므로, 채널 공통 valid 구간
+#   을 교집합해 세그먼트별로 정렬 처리한다(불연속 concat 금지 — 세그먼트 분리).
+
+
+def _contiguous_runs(valid: np.ndarray, min_samples: int) -> list[tuple[int, int]]:
+    """valid(bool) 에서 연속 True 구간 [s, e) 중 길이 ≥ min_samples 인 것."""
+    diff = np.diff(valid.astype(np.int8), prepend=0, append=0)
+    starts = np.where(diff == 1)[0]
+    ends = np.where(diff == -1)[0]
+    return [(int(s), int(e)) for s, e in zip(starts, ends) if e - s >= min_samples]
+
+
+def _process_channel_segment(
+    raw_seg: np.ndarray, stype: str, native_sr: float,
+) -> np.ndarray | None:
+    """NaN-free 원시 세그먼트에 median→filter→resample 적용 (정렬·길이 보존).
+
+    _apply_pipeline 의 Step 4-5 와 동일하나 NaN-free 세그먼트 추출은 이미 공통
+    교집합에서 끝났으므로 생략 → 채널 간 정렬 유지.
+    """
+    cfg = SIGNAL_CONFIGS.get(stype)
+    if cfg is None:
+        return None
+    seg = raw_seg
+    if cfg.median_kernel > 0:
+        seg = _apply_median_filter(seg, kernel_size=cfg.median_kernel)
+    seg = _apply_filter(seg, cfg, native_sr)
+    if native_sr != TARGET_SR:
+        seg = resample_to_target(seg, orig_sr=native_sr, target_sr=TARGET_SR)
+    return seg.astype(np.float32)
+
+
+def parse_aligned_segments(
+    record_dir: Path,
+    record_name: str,
+    input_signals: list[str],
+    min_seg_sec: float,
+) -> list[dict[str, np.ndarray]]:
+    """레코드에서 input_signals(+icp) 를 정렬된 연속 세그먼트로 반환한다.
+
+    반환 각 원소: {stype: ndarray(TARGET_SR)} — 모든 채널이 **동일 길이·동일 시각**.
+    ICP 는 라벨 산출용으로 항상 포함. 공통 valid 구간이 min_seg_sec 미만이면 제외.
+    """
+    try:
+        import wfdb
+    except ImportError:
+        print("ERROR: wfdb 패키지 필요. pip install wfdb", file=sys.stderr)
+        sys.exit(1)
+
+    hea_path = record_dir / f"{record_name}.hea"
+    if not hea_path.exists():
+        return []
+    try:
+        rec = wfdb.rdrecord(str(record_dir / record_name))
+    except Exception:
+        return []
+    if rec.p_signal is None or rec.sig_len == 0:
+        return []
+
+    fs = float(rec.fs)
+    needed = set(input_signals) | {"icp"}
+
+    # 원시 채널 수집 (같은 record → 모든 채널 동일 fs·동일 길이 = 정렬됨)
+    raw: dict[str, np.ndarray] = {}
+    for ch_idx, sname in enumerate(rec.sig_name):
+        st = MIMIC_SIGNAL_MAP.get(sname)
+        if st is None or st not in needed or st in raw:
+            continue
+        raw[st] = rec.p_signal[:, ch_idx].astype(np.float64)
+    if not needed.issubset(raw):
+        return []
+
+    # range check + spike → NaN (채널별, 길이 보존)
+    clean: dict[str, np.ndarray] = {}
+    for st, arr in raw.items():
+        cfg = SIGNAL_CONFIGS.get(st)
+        a = arr
+        if cfg is not None and cfg.valid_range is not None:
+            a, _ = _apply_range_check(a, cfg.valid_range)
+        if cfg is not None and cfg.spike_detection:
+            a, _ = _detect_electrocautery(a, fs, threshold_std=cfg.spike_threshold_std)
+        clean[st] = a
+
+    # 공통 valid 마스크 (모든 채널이 동시에 유효한 구간만)
+    n = min(len(a) for a in clean.values())
+    common_valid = np.ones(n, dtype=bool)
+    for a in clean.values():
+        common_valid &= ~np.isnan(a[:n])
+
+    min_samples_native = int(min_seg_sec * fs)
+    segments: list[dict[str, np.ndarray]] = []
+    for s, e in _contiguous_runs(common_valid, min_samples_native):
+        seg: dict[str, np.ndarray] = {}
+        ok = True
+        for st, a in clean.items():
+            proc = _process_channel_segment(a[s:e], st, fs)
+            if proc is None or proc.size == 0:
+                ok = False
+                break
+            seg[st] = proc
+        if not ok:
+            continue
+        # resample 반올림 차이 방어 — 채널 공통 최소 길이로 절단 (정렬 유지)
+        L = min(len(v) for v in seg.values())
+        segments.append({st: v[:L] for st, v in seg.items()})
+    return segments
+
+
+# ── Güiza 라벨 엔진 (1분 median onset) ───────────────────────
+
+
+def _icp_median_blocks(icp: np.ndarray) -> np.ndarray:
+    """100Hz ICP → 1분 median 블록 timeline (Güiza). 세그먼트는 NaN-free 전제."""
+    block_samps = max(1, int(round(BLOCK_SEC * TARGET_SR)))  # 6000
+    n_blocks = len(icp) // block_samps
+    if n_blocks == 0:
+        return np.empty(0, dtype=np.float32)
+    trimmed = icp[: n_blocks * block_samps].reshape(n_blocks, block_samps)
+    return np.median(trimmed, axis=1).astype(np.float32)
+
+
+def _find_onsets(blocks: np.ndarray, threshold: float, consec: int) -> list[int]:
+    """5블록 연속 median>threshold 인 crisis run 의 onset(첫 블록) index 목록.
+
+    run 이 consec 에 도달하는 순간 run_start 를 onset 으로 확정(ICP 가 처음 임계를
+    넘은 시점). 한 run 은 onset 하나만 → 진행 중 위기 중복 계수 차단.
+    (scan_positives.find_onsets 와 동일 정의; 순환 import 회피 위해 복제.)
+    """
+    onsets: list[int] = []
+    run = 0
+    run_start = 0
+    for i, v in enumerate(blocks):
+        if not np.isnan(v) and v > threshold:
+            if run == 0:
+                run_start = i
+            run += 1
+            if run == consec:
+                onsets.append(run_start)
+        else:
+            run = 0
+    return onsets
+
+
 # ── 환자별 레코드 탐색 ───────────────────────────────────────
 
 
@@ -216,6 +377,97 @@ def load_patient_signals(
     return cases
 
 
+# ── 레코드 열거 (scandir flat-numeric / rglob matched) ───────
+
+_SEG_RE = re.compile(r"_\d{4}$")
+_MASTER_NUM_RE = re.compile(r"^\d+$")
+_MASTER_MATCHED_RE = re.compile(r"^p\d{6}-\d{4}-\d{2}-\d{2}-\d{2}-\d{2}$")
+
+
+def _patient_id_of(stem: str, parts: tuple[str, ...]) -> str:
+    """matched(pXXXXXX) 는 subject dir/prefix, numeric 은 record stem 을 pid 로."""
+    for part in parts:
+        if part.startswith("p") and len(part) == 7 and part[1:].isdigit():
+            return part
+    m = _MASTER_MATCHED_RE.match(stem)
+    if m:
+        return stem.split("-", 1)[0]
+    return stem  # numeric general mimic3wdb: record = group
+
+
+def list_records_meta(
+    waveform_dir: Path, scan_dir: bool,
+) -> list[tuple[str, Path, str]]:
+    """(patient_id, record_dir, record_name) 목록.
+
+    scan_dir=True: waveform_dir 최상위를 scandir(재귀·stat 없음)해 마스터 헤더 직접
+      열거 — flat numeric(3008477.hea/_0001.dat, 일반 mimic3wdb) 레이아웃 대응.
+    scan_dir=False: rglob 로 matched(pXXXXXX-...) 마스터 열거(네트워크 마운트 느림).
+    """
+    import os
+
+    out: list[tuple[str, Path, str]] = []
+    if scan_dir:
+        with os.scandir(waveform_dir) as it:
+            for entry in it:
+                if not entry.name.endswith(".hea"):
+                    continue
+                stem = entry.name[:-4]
+                if stem.endswith("_layout") or _SEG_RE.search(stem):
+                    continue
+                if _MASTER_MATCHED_RE.match(stem) or _MASTER_NUM_RE.match(stem):
+                    out.append((_patient_id_of(stem, ()), waveform_dir, stem))
+    else:
+        for hea in waveform_dir.rglob("*.hea"):
+            if not _MASTER_MATCHED_RE.match(hea.stem):
+                continue
+            out.append((_patient_id_of(hea.stem, hea.parts), hea.parent, hea.stem))
+    return sorted(out)
+
+
+def load_aligned_cases(
+    waveform_dir: Path,
+    input_signals: list[str],
+    min_seg_sec: float,
+    scan_dir: bool = True,
+) -> list[dict]:
+    """정렬 세그먼트 단위 case 리스트.
+
+    각 case = 한 연속 세그먼트 {case_id, patient_id, signals{stype: ndarray100}} —
+    모든 채널 동일 길이·동일 시각. 한 레코드가 여러 세그먼트면 같은 patient_id 로
+    복수 case 생성(case_id 에 _segK 접미).
+    """
+    records = list_records_meta(waveform_dir, scan_dir=scan_dir)
+    print(f"  Found {len(records)} master records "
+          f"({'scandir' if scan_dir else 'rglob'})")
+    print(f"  Input signals (aligned, +icp label): {sorted(set(input_signals) | {'icp'})}")
+
+    cases: list[dict] = []
+    n_no_sig = 0
+    n_seg = 0
+    for i, (pid, rec_dir, rec_name) in enumerate(records):
+        segs = parse_aligned_segments(rec_dir, rec_name, input_signals, min_seg_sec)
+        if not segs:
+            n_no_sig += 1
+            continue
+        for k, seg in enumerate(segs):
+            n_seg += 1
+            cases.append({
+                "case_id": f"{pid}_{rec_name}_seg{k}",
+                "patient_id": pid,
+                "signals": seg,
+            })
+        if (i + 1) % 50 == 0 or i == 0:
+            dur = sum(len(s["icp"]) for s in segs) / TARGET_SR
+            print(f"    [{i + 1}/{len(records)}] {pid}/{rec_name} "
+                  f"segs={len(segs)} dur={dur:.0f}s")
+
+    print(f"  Aligned cases (segments): {n_seg} from "
+          f"{len(records) - n_no_sig} records "
+          f"(skipped no-abp/icp/short: {n_no_sig})")
+    return cases
+
+
 # ── 라벨링 ───────────────────────────────────────────────────
 
 
@@ -236,7 +488,119 @@ def _has_sustained_ich(
     return False
 
 
-# ── 윈도우 추출 ──────────────────────────────────────────────
+# ── 윈도우 추출 (anchored: Güiza onset + 균일 stride 음성) ────
+
+
+def extract_anchored_samples(
+    cases: list[dict],
+    input_signals: list[str],
+    window_sec: float = 1200.0,
+    horizon_sec: float = 300.0,
+    neg_stride_sec: float = 1800.0,
+    icp_threshold: float = ICP_THRESHOLD,
+    event_consec: int = EVENT_CONSEC,
+    valid_ratio_threshold: float = DEFAULT_VALID_RATIO_THRESHOLD,
+    gap_stats: GapStats | None = None,
+    sample_dtype: str = "float16",
+) -> list[ICHSample]:
+    """정렬 세그먼트 case 들에서 anchored (input, label) 쌍을 추출한다.
+
+    양성: crisis onset(5×1min median>threshold 첫 블록) 마다, 정확히 horizon 만큼
+      앞에서 끝나는 window 1개 (중복 제거·onset 보존). 예측 시점(입력 끝) baseline
+      median ≤ threshold 여야 함(현재-ICH 제외).
+    음성: crisis 없는 구간을 neg_stride_sec 균일 간격으로 추출(경계 15~20 유지 →
+      정직). horizon 에 onset 이 없고 baseline ≤ threshold 인 window.
+
+    ICP 라벨 판정은 1분 median 블록 그리드에서, 입력 window 추출은 그 블록 경계에
+    정렬된 100Hz 구간에서 이뤄진다(block b → sample [b*6000, ...)).
+    """
+    block_samps = max(1, int(round(BLOCK_SEC * TARGET_SR)))  # 6000
+    win_b = max(1, int(round(window_sec / BLOCK_SEC)))
+    hor_b = max(1, int(round(horizon_sec / BLOCK_SEC)))
+    neg_b = max(1, int(round(neg_stride_sec / BLOCK_SEC)))
+    win_samples = int(window_sec * TARGET_SR)
+    total_needed_b = win_b + hor_b
+
+    samples: list[ICHSample] = []
+
+    for case in cases:
+        signals = case["signals"]
+        if "icp" not in signals:
+            continue
+        icp = signals["icp"]
+        blocks = _icp_median_blocks(icp)
+        L = len(blocks)
+        if L < total_needed_b:
+            continue
+        onsets = _find_onsets(blocks, icp_threshold, event_consec)
+        onset_set = set(onsets)
+
+        def _emit(start_block: int, label: int) -> None:
+            start = start_block * block_samps
+            input_dict: dict[str, np.ndarray] = {}
+            for st in input_signals:
+                arr = signals.get(st)
+                if arr is None or start + win_samples > len(arr):
+                    return  # 채널 길이 부족 → window 불가
+                input_dict[st] = arr[start: start + win_samples]
+            if not input_dict:
+                return
+            valid_ratio = compute_valid_ratio(list(input_dict.values()))
+            if valid_ratio < valid_ratio_threshold:
+                if gap_stats is not None:
+                    gap_stats.add_drop()
+                return
+            win_end_b = start_block + win_b
+            fut = blocks[win_end_b: win_end_b + hor_b]
+            fut = fut[~np.isnan(fut)]
+            label_value = float(fut.max()) if fut.size else float("nan")
+            filled_dict, gap_mask_dict = apply_gap_mask_multichannel(
+                input_dict, output_dtype=sample_dtype,
+            )
+            if gap_stats is not None:
+                n_total_s = sum(a.size for a in filled_dict.values())
+                n_gap_s = sum(int(m.sum()) for m in gap_mask_dict.values())
+                gap_stats.add_window(n_total_s, n_gap_s)
+            samples.append(
+                ICHSample(
+                    input_signals=filled_dict,
+                    input_gap_masks=gap_mask_dict,
+                    label=label,
+                    label_value=label_value,
+                    case_id=case["case_id"],
+                    patient_id=case["patient_id"],
+                    win_start_sec=start_block * BLOCK_SEC,
+                    horizon_sec=horizon_sec,
+                )
+            )
+
+        # ── 양성: onset 당 1개 (horizon 끝 블록 == onset) ──
+        for o in onsets:
+            win_end_b = o - hor_b + 1
+            start_block = win_end_b - win_b
+            if start_block < 0:
+                continue
+            base = blocks[win_end_b - 1]              # 예측 시점 baseline
+            if np.isnan(base) or float(base) > icp_threshold:
+                if gap_stats is not None:
+                    gap_stats.add_drop()             # 현재-ICH → 제외
+                continue
+            _emit(start_block, 1)
+
+        # ── 음성: crisis-free 균일 stride ──
+        for start_block in range(0, L - total_needed_b + 1, neg_b):
+            win_end_b = start_block + win_b
+            base = blocks[win_end_b - 1]
+            if np.isnan(base) or float(base) > icp_threshold:
+                continue
+            if any(win_end_b <= o < win_end_b + hor_b for o in onset_set):
+                continue                              # horizon 에 onset → 음성 아님
+            _emit(start_block, 0)
+
+    return samples
+
+
+# ── 윈도우 추출 (구 dense/biased 10s-평균 모드) ───────────────
 
 
 def extract_forecast_samples(
@@ -571,6 +935,29 @@ def _patient_level_ich_labels(
     return patient_to_labels
 
 
+def _patient_level_onset_labels(
+    cases: list[dict],
+    icp_threshold: float = ICP_THRESHOLD,
+    event_consec: int = EVENT_CONSEC,
+) -> dict[str, list[int]]:
+    """환자별 case 레벨 crisis-onset 유무 (anchored stratification 용).
+
+    각 세그먼트 case 의 1분 median 블록에 확정 onset(5×1min>threshold)이 하나라도
+    있으면 1. anchored 양성 정의와 일치하는 stratification.
+    """
+    patient_to_labels: dict[str, list[int]] = {}
+    for case in cases:
+        pid = case["patient_id"]
+        icp = case.get("signals", {}).get("icp")
+        has_onset = 0
+        if icp is not None and len(icp):
+            blocks = _icp_median_blocks(icp)
+            if _find_onsets(blocks, icp_threshold, event_consec):
+                has_onset = 1
+        patient_to_labels.setdefault(pid, []).append(has_onset)
+    return patient_to_labels
+
+
 def prepare_ich_sweep(
     waveform_dir: str,
     input_signals: list[str],
@@ -589,6 +976,9 @@ def prepare_ich_sweep(
     sustained_sec: float = SUSTAINED_SEC,
     valid_ratio_threshold: float = DEFAULT_VALID_RATIO_THRESHOLD,
     task_mode: str = "prediction",
+    scan_dir: bool = True,
+    neg_stride_sec: float = 1800.0,
+    event_consec: int = EVENT_CONSEC,
 ) -> list[Path]:
     """(window, horizon) 조합 × stratified K-fold CV 데이터셋 생성.
 
@@ -596,7 +986,12 @@ def prepare_ich_sweep(
         "kfold"        : Stratified patient-level K-fold CV (default, n_folds=5).
         "loso_export"  : 모든 샘플을 train에 저장(test 비움) — subject_ids로
                          외부에서 LeaveOneSubjectOut CV 수행용.
+
+    sampling_mode == "anchored": Güiza onset-anchor 양성 + crisis-free 균일 stride
+        음성. 정렬(aligned) 세그먼트 로더(load_aligned_cases) 사용, ABP·ICP 시간축
+        일치 보장. (unbiased/biased 는 구 10s-평균 dense 모드.)
     """
+    is_anchored = sampling_mode == "anchored"
     # detection(aICP식 동시 탐지): horizon 무의미 → 단일 0 으로 고정(파일명 h0min).
     if task_mode == "detection":
         horizon_mins = [0.0]
@@ -612,13 +1007,23 @@ def prepare_ich_sweep(
           f"valid_ratio: {valid_ratio_threshold}")
     print(f"{'=' * 60}")
 
-    # 1. 데이터 로딩 — required_signals 강제 시 sample 마다 동일 채널 보장
+    # 1. 데이터 로딩
     print("\n[1/3] Loading ICP waveform records...")
-    # default: input_signals 전체를 강제 (모든 sample 이 동일 채널)
-    effective_required = (
-        required_signals if required_signals is not None else input_signals
-    )
-    cases = load_patient_signals(Path(waveform_dir), required_signals=effective_required)
+    if is_anchored:
+        # 정렬 세그먼트 로더 (ABP·ICP 시간축 일치). min_seg = window + 최소 horizon.
+        min_seg_sec = min(window_secs) + min(h * 60.0 for h in horizon_mins)
+        cases = load_aligned_cases(
+            Path(waveform_dir), input_signals,
+            min_seg_sec=min_seg_sec, scan_dir=scan_dir,
+        )
+    else:
+        # default: input_signals 전체를 강제 (모든 sample 이 동일 채널)
+        effective_required = (
+            required_signals if required_signals is not None else input_signals
+        )
+        cases = load_patient_signals(
+            Path(waveform_dir), required_signals=effective_required,
+        )
     if not cases:
         print("ERROR: No ICP records found.", file=sys.stderr)
         sys.exit(1)
@@ -631,12 +1036,18 @@ def prepare_ich_sweep(
         splits = [(set(patient_ids), set(), set())]
     else:
         print(f"\n[2/3] Stratified {n_folds}-fold patient-level CV...")
-        patient_to_labels = _patient_level_ich_labels(
-            cases, icp_threshold=icp_threshold,
-        )
+        if is_anchored:
+            patient_to_labels = _patient_level_onset_labels(
+                cases, icp_threshold=icp_threshold, event_consec=event_consec,
+            )
+        else:
+            patient_to_labels = _patient_level_ich_labels(
+                cases, icp_threshold=icp_threshold,
+            )
         pos_pts = sum(1 for pid in patient_ids if any(patient_to_labels.get(pid, [])))
+        crit = ("any crisis onset" if is_anchored else f"any ICP>{icp_threshold}")
         print(
-            f"  Patient-level positive (any ICP>{icp_threshold}): "
+            f"  Patient-level positive ({crit}): "
             f"{pos_pts}/{len(patient_ids)} "
             f"({100.0 * pos_pts / max(1, len(patient_ids)):.1f}%)"
         )
@@ -709,17 +1120,29 @@ def prepare_ich_sweep(
                     return n_in_chunk
 
                 for case in split_cases:
-                    samples = extract_forecast_samples(
-                        [case], input_signals, window_sec, stride_sec, horizon_sec,
-                        gap_stats=gap_stats,
-                        sample_dtype=sample_dtype_str,
-                        icp_threshold=icp_threshold,
-                        min_sample_gap_sec=min_sample_gap_sec,
-                        sampling_mode=sampling_mode,
-                        sustained_sec=sustained_sec,
-                        valid_ratio_threshold=valid_ratio_threshold,
-                        task_mode=task_mode,
-                    )
+                    if is_anchored:
+                        samples = extract_anchored_samples(
+                            [case], input_signals,
+                            window_sec=window_sec, horizon_sec=horizon_sec,
+                            neg_stride_sec=neg_stride_sec,
+                            icp_threshold=icp_threshold,
+                            event_consec=event_consec,
+                            valid_ratio_threshold=valid_ratio_threshold,
+                            gap_stats=gap_stats,
+                            sample_dtype=sample_dtype_str,
+                        )
+                    else:
+                        samples = extract_forecast_samples(
+                            [case], input_signals, window_sec, stride_sec, horizon_sec,
+                            gap_stats=gap_stats,
+                            sample_dtype=sample_dtype_str,
+                            icp_threshold=icp_threshold,
+                            min_sample_gap_sec=min_sample_gap_sec,
+                            sampling_mode=sampling_mode,
+                            sustained_sec=sustained_sec,
+                            valid_ratio_threshold=valid_ratio_threshold,
+                            task_mode=task_mode,
+                        )
                     for s in samples:
                         buffer.append(s)
                         buf_bytes += sum(a.nbytes for a in s.input_signals.values())
@@ -761,18 +1184,19 @@ def main() -> None:
     )
     parser.add_argument(
         "--input-signals", nargs="+",
-        default=["abp", "ecg", "ppg", "co2"],
+        default=["abp", "icp"],
         choices=["icp", "ecg", "abp", "ppg", "co2"],
-        help="Input signal types (label always from ICP). "
-             "Default: ICP + ABP + ECG + PPG (4ch).",
+        help="Input signal types. anchored 기본: ABP + ICP (2ch, prediction 이라 "
+             "현재 ICP 를 입력에 포함). label 은 항상 ICP.",
     )
     parser.add_argument(
-        "--horizon-mins", nargs="+", type=float, default=[10.0],
+        "--horizon-mins", nargs="+", type=float, default=[5.0, 10.0, 15.0],
     )
     parser.add_argument(
-        "--window-secs", nargs="+", type=float, default=[30.0],
+        "--window-secs", nargs="+", type=float, default=[1200.0],
     )
-    parser.add_argument("--stride-sec", type=float, default=30.0)
+    parser.add_argument("--stride-sec", type=float, default=30.0,
+                        help="구 dense 모드 sliding stride(초). anchored 는 미사용.")
     parser.add_argument(
         "--n-folds", type=int, default=5,
         help="Stratified patient-level K-fold CV (default 5).",
@@ -824,10 +1248,23 @@ def main() -> None:
              "낮추면(예: 0.7) gappy window 를 더 포함해 표본 확보(재파싱 필요).",
     )
     parser.add_argument(
-        "--sampling-mode", type=str, default="unbiased",
-        choices=["unbiased", "biased"],
-        help="unbiased(현실적·기본: dense·15~20 경계 포함) | "
-        "biased(과대평가·선행 비교용: clean-neg<15+sparse+경계 제외).",
+        "--sampling-mode", type=str, default="anchored",
+        choices=["anchored", "unbiased", "biased"],
+        help="anchored(기본: Güiza onset-anchor 양성 + crisis-free 균일 stride 음성, "
+             "정렬 세그먼트) | unbiased/biased(구 10s-평균 dense 모드).",
+    )
+    parser.add_argument(
+        "--neg-stride-sec", type=float, default=1800.0,
+        help="anchored 음성 균일 stride(초). 기본 1800(30min), prevalence 약 3.5 퍼센트.",
+    )
+    parser.add_argument(
+        "--event-consec", type=int, default=EVENT_CONSEC,
+        help=f"crisis 확정 연속 1분블록 수. 기본 {EVENT_CONSEC}(=5min, Güiza).",
+    )
+    parser.add_argument(
+        "--scan-dir", action=argparse.BooleanOptionalAction, default=True,
+        help="anchored 로더가 waveform-dir 최상위를 scandir 로 마스터 직접 열거"
+             "(flat numeric 대응, 기본 True). --no-scan-dir 이면 rglob(matched).",
     )
     parser.add_argument(
         "--task-mode", type=str, default="prediction",
@@ -866,6 +1303,9 @@ def main() -> None:
         sustained_sec=args.sustained_sec,
         valid_ratio_threshold=args.valid_ratio,
         task_mode=args.task_mode,
+        scan_dir=args.scan_dir,
+        neg_stride_sec=args.neg_stride_sec,
+        event_consec=args.event_consec,
     )
 
 
