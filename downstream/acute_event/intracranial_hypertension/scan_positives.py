@@ -104,8 +104,40 @@ def read_icp_blocks(record_dir: Path, record_name: str) -> np.ndarray | None:
 # ── 레코드 목록 (load_patient_signals 와 동일 규칙) ──────────
 
 
+def _patient_id_from_parts(parts: tuple[str, ...], rec_name: str) -> str:
+    """경로 조각에서 7자리 pXXXXXX subject dir 를 찾는다(없으면 rec_name prefix)."""
+    for part in parts:
+        if part.startswith("p") and len(part) == 7 and part[1:].isdigit():
+            return part
+    return rec_name.split("-", 1)[0]
+
+
+def list_records_from_file(
+    waveform_dir: Path, records_file: Path,
+) -> list[tuple[str, Path, str]]:
+    """RECORDS 파일(각 줄=`p00/p000907/p000907-2163-...`)에서 목록 구성.
+
+    네트워크 마운트 전체 트리를 rglob 하지 않아 **즉시 시작**한다(rglob 은 마운트
+    에서 재귀 디렉토리 스캔이 수 분 걸려 "멈춘 것처럼" 보이는 주범).
+    """
+    out: list[tuple[str, Path, str]] = []
+    for line in records_file.read_text(encoding="utf-8").splitlines():
+        rec_path = line.strip()
+        if not rec_path:
+            continue
+        rel = Path(rec_path)
+        rec_name = rel.name
+        rec_dir = waveform_dir / rel.parent
+        patient_id = _patient_id_from_parts(rel.parts, rec_name)
+        out.append((patient_id, rec_dir, rec_name))
+    return out
+
+
 def list_records(waveform_dir: Path) -> list[tuple[str, Path, str]]:
-    """(patient_id, record_dir, record_name) 목록. master .hea 만 선별."""
+    """(patient_id, record_dir, record_name) 목록. master .hea 만 선별 (rglob).
+
+    ⚠️ 네트워크 마운트에서 느림 — 가능하면 list_records_from_file 을 쓸 것.
+    """
     master_re = re.compile(r"^p\d{6}-\d{4}-\d{2}-\d{2}-\d{2}-\d{2}$")
     all_hea = sorted(
         h for h in waveform_dir.rglob("*.hea") if master_re.match(h.stem)
@@ -113,13 +145,7 @@ def list_records(waveform_dir: Path) -> list[tuple[str, Path, str]]:
     out: list[tuple[str, Path, str]] = []
     for hea in all_hea:
         rec_name = hea.stem
-        patient_id = "unknown"
-        for part in hea.parts:
-            if part.startswith("p") and len(part) == 7 and part[1:].isdigit():
-                patient_id = part
-                break
-        if patient_id == "unknown":
-            patient_id = rec_name.split("-", 1)[0]
+        patient_id = _patient_id_from_parts(hea.parts, rec_name)
         out.append((patient_id, hea.parent, rec_name))
     return out
 
@@ -317,6 +343,14 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=8,
                         help="병렬 읽기 스레드 수(네트워크 마운트 I/O 겹치기). "
                              "기본 8. 마운트가 느리면 16~32 로 올려도 됨.")
+    parser.add_argument(
+        "--records-file", type=str,
+        default=str(Path(__file__).parent / "ICP-RECORDS"),
+        help="레코드 경로 목록 파일(각 줄 p00/p000907/p000907-...). 기본=번들 "
+             "ICP-RECORDS. 마운트 전체 rglob 을 회피해 즉시 시작(권장).",
+    )
+    parser.add_argument("--rglob", action="store_true",
+                        help="records-file 대신 waveform-dir 를 rglob 스캔(느림).")
     args = parser.parse_args()
 
     waveform_dir = Path(args.waveform_dir)
@@ -325,10 +359,21 @@ def main() -> None:
         sys.exit(1)
 
     horizon_secs = [m * 60.0 for m in args.horizon_mins]
-    records = list_records(waveform_dir)
+    records_file = Path(args.records_file)
+    if not args.rglob and records_file.is_file():
+        print(f"  Reading record list from {records_file} (rglob 회피, 즉시 시작)",
+              flush=True)
+        records = list_records_from_file(waveform_dir, records_file)
+    else:
+        if not args.rglob:
+            print(f"  WARN: records-file 없음({records_file}) → rglob 폴백",
+                  file=sys.stderr, flush=True)
+        print(f"  rglob scanning {waveform_dir} (마운트에서 수 분 걸릴 수 있음)...",
+              flush=True)
+        records = list_records(waveform_dir)
     if args.max_records is not None:
         records = records[: args.max_records]
-    print(f"  Found {len(records)} master records under {waveform_dir}")
+    print(f"  {len(records)} records to scan (workers={args.workers})", flush=True)
 
     stats: dict[float, HorizonStat] = {h: HorizonStat() for h in horizon_secs}
     icp_records: set[str] = set()
