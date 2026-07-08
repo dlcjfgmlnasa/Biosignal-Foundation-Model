@@ -252,6 +252,46 @@ def print_report(
     print(f"{'=' * 70}")
 
 
+# ── 병렬 워커 (네트워크 마운트 I/O 겹치기) ──────────────────
+
+
+def process_record(
+    item: tuple[str, Path, str],
+    window_sec: float,
+    horizon_secs: list[float],
+    stride_sec: float,
+    threshold: float,
+    event_consec: int,
+) -> tuple[str, str, int, dict[float, HorizonStat]] | None:
+    """레코드 1개를 읽어 onset + horizon 별 window 통계를 독립 계산(스레드 안전).
+
+    read_icp_blocks(느린 마운트 I/O) 를 worker 스레드로 겹치고, 순수 계산
+    (find_onsets/scan_record) 결과를 per-record 로 반환 → 메인이 병합.
+    ICP 없으면 None.
+    """
+    pid, rec_dir, rec_name = item
+    blocks = read_icp_blocks(rec_dir, rec_name)
+    if blocks is None:
+        return None
+    rec_id = f"{pid}_{rec_name}"
+    onsets = find_onsets(blocks, threshold, event_consec)
+    local: dict[float, HorizonStat] = {h: HorizonStat() for h in horizon_secs}
+    scan_record(
+        blocks, pid, rec_id, onsets,
+        window_sec, horizon_secs, stride_sec, threshold, local,
+    )
+    return rec_id, pid, len(onsets), local
+
+
+def _merge(dst: HorizonStat, src: HorizonStat) -> None:
+    dst.n_windows += src.n_windows
+    dst.n_pos += src.n_pos
+    dst.n_neg += src.n_neg
+    dst.n_dropped_baseline += src.n_dropped_baseline
+    dst.pos_records |= src.pos_records
+    dst.pos_patients |= src.pos_patients
+
+
 # ── CLI ──────────────────────────────────────────────────────
 
 
@@ -274,7 +314,9 @@ def main() -> None:
                              "완화 시(예: 3=3min) 양성 확보.")
     parser.add_argument("--max-records", type=int, default=None,
                         help="앞 N개 레코드만 스캔(초고속 첫 확인).")
-    parser.add_argument("--progress-every", type=int, default=25)
+    parser.add_argument("--workers", type=int, default=8,
+                        help="병렬 읽기 스레드 수(네트워크 마운트 I/O 겹치기). "
+                             "기본 8. 마운트가 느리면 16~32 로 올려도 됨.")
     args = parser.parse_args()
 
     waveform_dir = Path(args.waveform_dir)
@@ -296,35 +338,43 @@ def main() -> None:
     onset_patients: set[str] = set()
     per_patient_onsets: dict[str, int] = defaultdict(int)
 
-    for i, (pid, rec_dir, rec_name) in enumerate(records):
-        blocks = read_icp_blocks(rec_dir, rec_name)
-        if blocks is None:
-            if (i + 1) % args.progress_every == 0:
-                print(f"    [{i + 1}/{len(records)}] {pid}/{rec_name}  (no ICP)")
-            continue
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        rec_id = f"{pid}_{rec_name}"
-        icp_records.add(rec_id)
-        icp_patients.add(pid)
+    from tqdm import tqdm
 
-        onsets = find_onsets(blocks, args.icp_threshold, args.event_consec)
-        if onsets:
-            total_onsets += len(onsets)
-            onset_records.add(rec_id)
-            onset_patients.add(pid)
-            per_patient_onsets[pid] += len(onsets)
-
-        scan_record(
-            blocks, pid, rec_id, onsets,
+    def _submit(ex: ThreadPoolExecutor, item: tuple[str, Path, str]):
+        return ex.submit(
+            process_record, item,
             args.window_secs, horizon_secs, args.stride_sec,
-            args.icp_threshold, stats,
+            args.icp_threshold, args.event_consec,
         )
 
-        if (i + 1) % args.progress_every == 0:
-            dur_min = len(blocks) * BLOCK_SEC / 60.0
-            print(f"    [{i + 1}/{len(records)}] {pid}/{rec_name}  "
-                  f"dur={dur_min:.0f}min  onsets={len(onsets)}  "
-                  f"cohort onsets so far={total_onsets}")
+    with ThreadPoolExecutor(max_workers=args.workers) as ex:
+        futures = {_submit(ex, item): item for item in records}
+        pbar = tqdm(as_completed(futures), total=len(futures),
+                    desc="Scanning ICP", unit="rec")
+        for fut in pbar:
+            result = fut.result()
+            if result is None:
+                continue
+            rec_id, pid, n_onsets, local = result
+
+            icp_records.add(rec_id)
+            icp_patients.add(pid)
+            if n_onsets:
+                total_onsets += n_onsets
+                onset_records.add(rec_id)
+                onset_patients.add(pid)
+                per_patient_onsets[pid] += n_onsets
+            for h in horizon_secs:
+                _merge(stats[h], local[h])
+
+            # 진행 중 누적 지표를 progress bar 오른쪽에 표시
+            pbar.set_postfix(
+                icp=len(icp_records),
+                onset=total_onsets,
+                onset_pt=len(onset_patients),
+            )
 
     print_report(
         stats, args.window_secs, args.icp_threshold, args.stride_sec,
