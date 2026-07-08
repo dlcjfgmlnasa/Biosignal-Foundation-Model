@@ -390,6 +390,116 @@ class WaveformConvDecoder(nn.Module):
         return self.proj(x)     # (B, N, patch_size)
 
 
+class WaveformUpsampleDecoder(nn.Module):
+    """토큰 feature 시퀀스 → target 파형 패치 (context mix + upsample synthesis).
+
+    ``WaveformConvDecoder`` 의 마지막 ``Linear(hidden→patch_size)`` 는 토큰 1개에서
+    patch_size 샘플을 서로 독립적인 회귀로 뽑아 patch 내부 시간 구조에 대한
+    inductive bias 가 없다(→ MSE 하 조건부 평균 수렴, dicrotic notch 등 날카로운
+    형태 소실). 본 decoder 는
+
+      (1) 토큰 축 dilated-TCN context mixer 로 인접·원거리 패치 맥락을 섞고,
+      (2) 각 토큰을 저해상도 latent(seed) 로 시드한 뒤 ConvTranspose1d 로
+          patch_size 까지 점진 업샘플링해 파형을 **합성**한다.
+
+    출력은 per-window z-score space 이므로 마지막은 무제약 linear(Conv1d) 로 둔다
+    (sigmoid/tanh 금지 — upstroke/notch clip 방지). 입출력 시그니처는
+    ``WaveformConvDecoder`` 와 동일한 ``(B, N, d_model) → (B, N, patch_size)`` 라
+    ``train_lora_regression`` / ``_waveform_loss`` 경로에 drop-in 된다.
+    capacity 는 ~0.41M (d_model=384, patch_size=200 기준) 로 moderate —
+    ablation 판별력 보존 (기존 WaveformConvDecoder ~1.55M 대비 경량).
+
+    Parameters
+    ----------
+    d_model : 인코더 hidden dim.
+    patch_size : 패치당 샘플 수 (출력 길이).
+    d_ctx : context mixer 내부 차원.
+    n_ctx_layers : dilated conv 층 수 (dilation 1,2,4,... 자동).
+    base_ch : 업샘플러 conv 채널.
+    kernel : context/synthesis conv kernel.
+    min_seed : seed 최소 길이 (업샘플 stage 수 자동 결정 하한).
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        patch_size: int,
+        d_ctx: int = 128,
+        n_ctx_layers: int = 3,
+        base_ch: int = 32,
+        kernel: int = 5,
+        min_seed: int = 16,
+    ) -> None:
+        super().__init__()
+        # kernel 은 홀수여야 context/out conv 가 'same' length 를 보존한다(정확 복원 불변식).
+        assert kernel % 2 == 1, f"kernel must be odd for length-preserving conv, got {kernel}"
+        # seed_len * 2^n_up == patch_size 가 되도록 stride-2 stage 수를 자동 결정.
+        # (patch_size=200 → seed 25, n_up 3 / 100 → seed 25, n_up 2). 항상 정확 복원.
+        seed_len, n_up = patch_size, 0
+        while seed_len % 2 == 0 and seed_len // 2 >= min_seed and n_up < 4:
+            seed_len //= 2
+            n_up += 1
+        self.seed_len, self.n_up, self.base_ch = seed_len, n_up, base_ch
+
+        self.norm = nn.LayerNorm(d_model)
+        self.in_proj = nn.Linear(d_model, d_ctx)
+
+        # (1) 토큰 축 dilated-TCN context mixer ('same' length, 양방향).
+        ctx: list[nn.Module] = []
+        for i in range(n_ctx_layers):
+            dilation = 2 ** i
+            ctx.append(
+                nn.Conv1d(
+                    d_ctx, d_ctx, kernel,
+                    padding=dilation * (kernel - 1) // 2, dilation=dilation,
+                )
+            )
+            ctx.append(nn.GELU())
+        self.ctx = nn.Sequential(*ctx)
+
+        # (2) patch 내부 합성기: 토큰 → (base_ch, seed_len) → ConvTranspose ×n_up.
+        self.seed = nn.Linear(d_ctx, base_ch * seed_len)
+        up: list[nn.Module] = []
+        for _ in range(n_up):
+            up.append(nn.ConvTranspose1d(base_ch, base_ch, 4, stride=2, padding=1))
+            up.append(nn.GELU())
+        self.up = nn.Sequential(*up)
+        self.out = nn.Conv1d(base_ch, 1, kernel, padding=kernel // 2)  # linear 출력
+
+    def forward(
+        self,
+        encoded: torch.Tensor,  # (B, N, d_model)
+    ) -> torch.Tensor:  # (B, N, patch_size)
+        B, N, _ = encoded.shape
+        x = self.in_proj(self.norm(encoded))   # (B, N, d_ctx)
+        x = x.transpose(1, 2)                   # (B, d_ctx, N)
+        x = self.ctx(x)                         # (B, d_ctx, N)
+        x = x.transpose(1, 2)                   # (B, N, d_ctx)
+        s = self.seed(x).reshape(B * N, self.base_ch, self.seed_len)  # (B*N, C, seed_len)
+        s = self.up(s)                          # (B*N, C, patch_size)
+        y = self.out(s).squeeze(1)              # (B*N, patch_size)
+        return y.reshape(B, N, -1)              # (B, N, patch_size)
+
+
+def build_waveform_decoder(
+    decoder_type: str, d_model: int, patch_size: int
+) -> nn.Module:
+    """``--decoder`` 선택에 따라 파형 decoder head 를 생성.
+
+    - ``"conv"``:     WaveformConvDecoder (1D conv over token + Linear readout) — 기존 default.
+    - ``"upsample"``: WaveformUpsampleDecoder (dilated-TCN context + ConvTranspose 합성).
+
+    두 decoder 모두 I/O 가 ``(B, N, d_model) → (B, N, patch_size)`` 로 동일하다.
+    """
+    if decoder_type == "conv":
+        return WaveformConvDecoder(d_model, patch_size)
+    if decoder_type == "upsample":
+        return WaveformUpsampleDecoder(d_model, patch_size)
+    raise ValueError(
+        f"Unknown decoder_type: {decoder_type!r} (choices: conv, upsample)"
+    )
+
+
 # ── LoRA data utilities ─────────────────────────────────────
 
 
@@ -1679,6 +1789,7 @@ def run_lora_regression(
     dump_preds: bool = True,
     peak_alpha: float = 0.0,
     lambda_spec: float = 0.0,
+    decoder_type: str = "conv",
 ) -> dict:
     """Run LoRA regression training and evaluation for a single scenario.
 
@@ -1752,8 +1863,9 @@ def run_lora_regression(
         print("ERROR: No train batches.", file=sys.stderr)
         sys.exit(1)
 
-    # Create regression head
-    head = WaveformConvDecoder(wrapper.d_model, patch_size)
+    # Create regression head (--decoder 선택: conv | upsample)
+    head = build_waveform_decoder(decoder_type, wrapper.d_model, patch_size)
+    print(f"  Decoder: {decoder_type} ({type(head).__name__})")
 
     n_lora = sum(p.numel() for p in wrapper.lora_parameters())
     n_head = sum(p.numel() for p in head.parameters())
@@ -1938,6 +2050,7 @@ def run_linear_probe_regression(
     dump_preds: bool = True,
     peak_alpha: float = 0.0,
     lambda_spec: float = 0.0,
+    decoder_type: str = "conv",
 ) -> dict:
     """Frozen linear-probe regression for a single cross-modal scenario.
 
@@ -1982,8 +2095,9 @@ def run_linear_probe_regression(
         print("ERROR: No train batches.", file=sys.stderr)
         sys.exit(1)
 
-    head = WaveformConvDecoder(wrapper.d_model, patch_size)
+    head = build_waveform_decoder(decoder_type, wrapper.d_model, patch_size)
     n_head = sum(p.numel() for p in head.parameters())
+    print(f"  Decoder: {decoder_type} ({type(head).__name__})")
     print(f"\nTrainable params: Head={n_head:,} (encoder frozen)")
 
     print(f"\nTraining...")
@@ -2202,6 +2316,12 @@ def main() -> None:
         help="파형 head 학습의 Multi-Resolution STFT loss 가중치. pretrain 기본 0.2, "
              "0=비활성 (lora/generate_lora/linear_probe 학습 모드에만 적용).",
     )
+    parser.add_argument(
+        "--decoder", type=str, default="conv", choices=["conv", "upsample"],
+        help="파형 decoder head 종류 (lora/linear_probe 모드). "
+             "conv=WaveformConvDecoder(기존 default), "
+             "upsample=WaveformUpsampleDecoder(dilated-TCN + ConvTranspose 합성).",
+    )
     args = parser.parse_args()
 
     # n_folds>1 이면 해당 fold chunk 만 로드, 1 이면 비-fold/단일 (None).
@@ -2323,6 +2443,7 @@ def main() -> None:
             dump_preds=not args.no_dump_preds,
             peak_alpha=args.peak_alpha,
             lambda_spec=args.lambda_spec,
+            decoder_type=args.decoder,
         )
 
     elif args.mode == "lora":
@@ -2352,6 +2473,7 @@ def main() -> None:
             dump_preds=not args.no_dump_preds,
             peak_alpha=args.peak_alpha,
             lambda_spec=args.lambda_spec,
+            decoder_type=args.decoder,
         )
 
 
