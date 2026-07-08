@@ -327,44 +327,50 @@ def print_report(
     onset_patients: int,
     sampling: str = "dense",
     neg_stride_sec: float = 300.0,
+    neg_ratio: float | None = None,
 ) -> None:
-    print(f"\n{'=' * 74}")
+    print(f"\n{'=' * 78}")
     print("  ICH Prediction — 양성 희소성 스캔 (Güiza식, ICP-only 상한)")
-    print(f"{'=' * 74}")
+    print(f"{'=' * 78}")
     smp = (f"sampling={sampling}"
            + (f"(neg stride={neg_stride_sec:.0f}s)" if sampling == "anchored"
               else f"(dense stride={stride_sec:.0f}s)"))
+    cap = f"  neg-ratio cap=1:{neg_ratio:.0f}" if neg_ratio else ""
     print(f"  Window={window_sec:.0f}s ({window_sec / 60:.0f}min)  "
-          f"event=5×1min median >{threshold:.0f}mmHg  {smp}")
+          f"event=5×1min median >{threshold:.0f}mmHg  {smp}{cap}")
     print(f"  Records scanned={n_records_scanned}  with ICP={n_records_with_icp}  "
           f"patients with ICP={n_patients_with_icp}")
-    print(f"{'-' * 74}")
+    print(f"{'-' * 78}")
     # [1단] 확정 이벤트 = 양성의 진짜 천장
     print(f"  [이벤트 확정]  총 crisis onset={total_onsets}  "
           f"onset 보유 레코드={onset_records}  onset 보유 환자={onset_patients}")
-    print(f"{'-' * 74}")
-    # [2단] horizon 별 양/음성
-    print(f"  {'horizon':>8} | {'POS':>7} | {'NEG':>9} | {'pos%':>6} | "
-          f"{'ratio':>8} | {'pos rec':>7} | {'pos pt':>6}")
-    print(f"  {'-' * 8} | {'-' * 7} | {'-' * 9} | {'-' * 6} | "
-          f"{'-' * 8} | {'-' * 7} | {'-' * 6}")
+    print(f"{'-' * 78}")
+    # [2단] horizon 별 양/음성 (NEG(pool)=전체 crisis-free 풀, NEG(kept)=cap 적용 후)
+    print(f"  {'horizon':>8} | {'POS':>7} | {'NEG pool':>9} | {'NEG kept':>9} | "
+          f"{'ratio':>8} | {'pos pt':>6}")
+    print(f"  {'-' * 8} | {'-' * 7} | {'-' * 9} | {'-' * 9} | "
+          f"{'-' * 8} | {'-' * 6}")
     for horizon_sec in sorted(stats):
         st = stats[horizon_sec]
-        total = st.n_pos + st.n_neg
-        pos_rate = (100.0 * st.n_pos / total) if total else 0.0
-        ratio = (st.n_neg / st.n_pos) if st.n_pos else float("inf")
+        # cap: 양성당 최대 neg_ratio 개 (전역 균일 서브샘플의 결과 개수)
+        if neg_ratio and st.n_pos:
+            kept = min(st.n_neg, int(round(neg_ratio * st.n_pos)))
+        else:
+            kept = st.n_neg
+        ratio = (kept / st.n_pos) if st.n_pos else float("inf")
         ratio_s = f"1:{ratio:.1f}" if st.n_pos else "1:inf"
         print(f"  {horizon_sec / 60:6.0f}min | {st.n_pos:7d} | {st.n_neg:9d} | "
-              f"{pos_rate:5.2f}% | {ratio_s:>8} | "
-              f"{len(st.pos_records):7d} | {len(st.pos_patients):6d}")
-    print(f"{'-' * 74}")
+              f"{kept:9d} | {ratio_s:>8} | {len(st.pos_patients):6d}")
+    print(f"{'-' * 78}")
     print("  주: POS 는 ICP 유효성만 반영한 상한. 실제 prepare_data 는 입력 채널")
     print("      (ABP) valid_ratio 도 요구 → 실제 양성 ≤ 위 값.")
     if sampling == "anchored":
-        print("  anchored: POS=onset 당 1개(중복 제거), NEG=crisis-free 균일 stride.")
-        print("      학습은 여기서 1:5~1:10 로 NEG 서브샘플. ratio 가 목표보다 크면 여유.")
+        print("  anchored: POS=onset 당 1개(중복 제거), NEG pool=crisis-free 균일 stride.")
+    if neg_ratio:
+        print(f"  NEG kept = min(pool, {neg_ratio:.0f}×POS) — prepare_data 가 풀에서 "
+              "전역 균일 서브샘플해 이 개수만 저장(정직: 경계 15~20 도 후보 포함).")
     print("  판단 가이드: 5-fold stratified CV 안정성엔 'onset 보유 환자' ≳ 15~20 권장.")
-    print(f"{'=' * 74}")
+    print(f"{'=' * 78}")
 
 
 # ── 병렬 워커 (네트워크 마운트 I/O 겹치기) ──────────────────
@@ -435,6 +441,9 @@ def main() -> None:
                              "+ crisis-free 균일 stride 음성; 제안 설계).")
     parser.add_argument("--neg-stride-sec", type=float, default=300.0,
                         help="anchored 모드 음성 균일 stride(초). 기본 300(5min).")
+    parser.add_argument("--neg-ratio", type=float, default=None,
+                        help="양성당 음성 캡(예: 10 → 1:10). prepare_data 가 풀에서 "
+                             "전역 균일 서브샘플해 저장할 최종 개수. 미지정 시 풀 전체.")
     parser.add_argument("--icp-threshold", type=float, default=ICP_THRESHOLD)
     parser.add_argument("--event-consec", type=int, default=EVENT_CONSEC,
                         help="crisis 확정 연속 1분블록 수. 기본 5(=5min). "
@@ -541,6 +550,7 @@ def main() -> None:
         len(records), len(icp_records), len(icp_patients),
         total_onsets, len(onset_records), len(onset_patients),
         sampling=args.sampling, neg_stride_sec=args.neg_stride_sec,
+        neg_ratio=args.neg_ratio,
     )
 
 
