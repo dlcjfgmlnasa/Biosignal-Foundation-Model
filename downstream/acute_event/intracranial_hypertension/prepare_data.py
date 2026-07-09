@@ -886,9 +886,6 @@ def save_split_dataset(
             "chunk_idx": chunk_idx,
             "signal_dtype": str(signal_dtype).replace("torch.", ""),
             "valid_ratio_threshold": DEFAULT_VALID_RATIO_THRESHOLD,
-            "pos_mode": pos_mode,
-            "pos_stride_sec": pos_stride_sec,
-            "neg_stride_sec": neg_stride_sec,
         },
     }
 
