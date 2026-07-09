@@ -33,7 +33,9 @@ N_FOLDS=${N_FOLDS:-5}
 #   arrest/death 코호트는 양성이 극소수(예: 38 arrest/2314)라 3.6M transformer
 #   aggregator 는 과적합 → 순수 frozen linear-probe 취지에 맞는 mean 을 기본으로.
 #   양성 수백+ 코호트에서만 transformer 가 의미. run.py --aggregator 로 전달.
+#   lastk: 관측 후반부(event 근접) 마지막 LAST_K개 window 만 평균 (mean 희석 회피, 0-param).
 AGG=${AGG:-mean}
+LAST_K=${LAST_K:-36}    # [AGG=lastk] 5min window 기준 36=마지막 3h
 
 # Linear Probe (frozen feature 캐싱 — batch 는 probe SGD 미니배치에만 영향).
 LP_BATCH=${LP_BATCH:-512};    LP_LR=${LP_LR:-1e-3};    LP_EPOCHS=${LP_EPOCHS:-1000}
@@ -104,7 +106,7 @@ for f in $FOLD_LIST; do
         --checkpoint "$CHECKPOINT" --model-version "$MODEL_VERSION" \
         --data-path "$PREFIX" --mode linear_probe --n-folds "$N_FOLDS" --fold "$f" \
         --epochs "$LP_EPOCHS" --lr "$LP_LR" --batch-size "$LP_BATCH" \
-        --aggregator "$AGG" \
+        --aggregator "$AGG" --last-k "$LAST_K" \
         --max-windows "$MAX_WINDOWS" --device "$DEVICE" --out-dir "$LP_OUT" $DRY_FLAG
   fi
 
@@ -116,7 +118,7 @@ for f in $FOLD_LIST; do
         --data-path "$PREFIX" --mode lora --lora-rank "$LORA_RANK" --lora-alpha "$LORA_ALPHA" \
         --n-folds "$N_FOLDS" --fold "$f" \
         --epochs "$LORA_EPOCHS" --lr "$LORA_LR" --batch-size "$LORA_BATCH" \
-        --aggregator "$AGG" \
+        --aggregator "$AGG" --last-k "$LAST_K" \
         --max-windows "$MAX_WINDOWS" --device "$DEVICE" --out-dir "$LORA_OUT" $DRY_FLAG
   fi
 done

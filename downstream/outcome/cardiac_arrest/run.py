@@ -52,6 +52,7 @@ from downstream._save_utils import (
 )
 from downstream.aggregator import (
     SIGNAL_TYPE_INT,
+    LastKAggregator,
     MeanAggregator,
     TransformerAggregator,
     collate_patients,
@@ -379,8 +380,11 @@ def main() -> None:
     parser.add_argument("--agg-layers", type=int, default=2,
                         help="Transformer Aggregator 레이어 수")
     parser.add_argument("--agg-heads", type=int, default=4)
+    parser.add_argument("--last-k", type=int, default=36,
+                        help="[aggregator=lastk] 관측 후반부 마지막 K개 valid window 만 "
+                             "평균 (5min window 기준 36=마지막 3h). event 직전 구간 집중.")
     parser.add_argument("--aggregator", type=str, default="mean",
-                        choices=["transformer", "mean"],
+                        choices=["transformer", "mean", "lastk"],
                         help="환자-수준 집약 방식. transformer(기본): 학습 가능 "
                              "aggregator. mean: 파라미터 없는 masked mean "
                              "(소규모 코호트 aggregator 과적합 방지, cardiac arrest 등).")
@@ -580,6 +584,8 @@ def main() -> None:
     # ── Aggregator + Probe ──
     if args.aggregator == "mean":
         aggregator = MeanAggregator(d_model=d_model)
+    elif args.aggregator == "lastk":
+        aggregator = LastKAggregator(d_model=d_model, last_k=args.last_k)
     else:
         aggregator = TransformerAggregator(
             d_model=d_model,
@@ -591,11 +597,13 @@ def main() -> None:
 
     n_agg = sum(p.numel() for p in aggregator.parameters())
     n_probe = sum(p.numel() for p in probe.parameters())
-    if args.aggregator == "mean":
-        print(f"\n  Aggregator: mean (non-parametric, {n_agg:,} params)")
-    else:
+    if args.aggregator == "transformer":
         print(f"\n  Aggregator: transformer ({n_agg:,} params, "
               f"{args.agg_layers} layers, {args.agg_heads} heads)")
+    elif args.aggregator == "lastk":
+        print(f"\n  Aggregator: lastk (non-parametric, last_k={args.last_k})")
+    else:
+        print(f"\n  Aggregator: mean (non-parametric, {n_agg:,} params)")
     print(f"  Probe: {n_probe:,} params")
     if use_lora:
         n_lora = sum(p.numel() for p in model.lora_parameters())

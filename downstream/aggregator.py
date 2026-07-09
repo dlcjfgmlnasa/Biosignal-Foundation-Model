@@ -170,6 +170,42 @@ class MeanAggregator(nn.Module):
         return (chunk_reprs * m).sum(dim=1) / m.sum(dim=1).clamp(min=1.0)
 
 
+class LastKAggregator(nn.Module):
+    """관측 후반부(event 에 가장 가까운) 마지막 K개 valid window 만 masked-mean.
+
+    :class:`TransformerAggregator` drop-in (동일 forward 시그니처), **파라미터 없음**.
+    window 는 시간 순(index 0=가장 이른 관측, 마지막 valid=event 에 가장 가까움)으로
+    쌓이므로, "마지막 K개 valid window"는 event 직전 구간에 해당한다. 악화 신호가
+    관측 후반에 몰릴 때 전체 mean 의 희석을 피한다. ``last_k <= 0`` 이면 전체 mean 과 동일.
+    ``time_secs``·transformer 전용 인자는 무시(교체 호환).
+    """
+
+    def __init__(self, d_model: int, last_k: int = 36, **kwargs) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.last_k = last_k
+
+    def forward(
+        self,
+        chunk_reprs: torch.Tensor,  # (B, K, d_model)
+        mask: torch.Tensor | None = None,  # (B, K) bool, True=valid
+        time_secs: torch.Tensor | None = None,  # 무시
+    ) -> torch.Tensor:  # (B, d_model)
+        b, k, _ = chunk_reprs.shape
+        if mask is None:
+            mask = torch.ones(b, k, dtype=torch.bool, device=chunk_reprs.device)
+        if self.last_k is not None and self.last_k > 0:
+            # rev_cum[i] = 위치 i 포함 오른쪽(더 늦은) valid window 개수.
+            # 뒤에서부터 last_k 번째까지(=rev_cum<=last_k)만 선택.
+            valid_f = mask.to(chunk_reprs.dtype)
+            rev_cum = torch.cumsum(valid_f.flip(dims=[1]), dim=1).flip(dims=[1])
+            sel = mask & (rev_cum <= self.last_k)
+        else:
+            sel = mask
+        m = sel.unsqueeze(-1).to(chunk_reprs.dtype)
+        return (chunk_reprs * m).sum(dim=1) / m.sum(dim=1).clamp(min=1.0)
+
+
 def mean_pool(
     encoded: torch.Tensor,  # (B, N, d_model)
     patch_mask: torch.Tensor,  # (B, N)
