@@ -29,9 +29,11 @@ TASK=${TASK:-arrest}
 WINDOW_SEC=${WINDOW_SEC:-300}
 MAX_WINDOWS=${MAX_WINDOWS:-144}
 N_FOLDS=${N_FOLDS:-5}
-# 환자-수준 집약: transformer(기본, 학습 aggregator) | mean(파라미터 없는 masked mean,
-# 소규모 코호트 과적합 방지). run.py --aggregator 로 전달.
-AGG=${AGG:-transformer}
+# 환자-수준 집약: mean(기본, 파라미터 없는 masked mean) | transformer(학습 aggregator).
+#   arrest/death 코호트는 양성이 극소수(예: 38 arrest/2314)라 3.6M transformer
+#   aggregator 는 과적합 → 순수 frozen linear-probe 취지에 맞는 mean 을 기본으로.
+#   양성 수백+ 코호트에서만 transformer 가 의미. run.py --aggregator 로 전달.
+AGG=${AGG:-mean}
 
 # Linear Probe (frozen feature 캐싱 — batch 는 probe SGD 미니배치에만 영향).
 LP_BATCH=${LP_BATCH:-512};    LP_LR=${LP_LR:-1e-3};    LP_EPOCHS=${LP_EPOCHS:-1000}
