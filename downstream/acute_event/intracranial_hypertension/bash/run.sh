@@ -102,7 +102,8 @@ for WIN in "${WINDOW_SECS[@]}"; do
 
         EXP_NAME="w${WIN}s_h${HORIZON}min"
 
-        for MODE in linear_probe lora; do
+        # MODES env 로 실행할 모드 선택 (기본 둘 다). LP 만: MODES=linear_probe
+        for MODE in ${MODES:-linear_probe lora}; do
             if [ "$MODE" = "linear_probe" ]; then
                 EPOCHS="$LP_EPOCHS"; LR="$LP_LR"
                 EXTRA="--batch-size $LP_BATCH"
