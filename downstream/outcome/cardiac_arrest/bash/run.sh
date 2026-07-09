@@ -15,8 +15,10 @@
 
 # ── canonical 경로 (k-mimic-/bio_fm — memory project_kmimic_bio_fm_paths). ──
 CHECKPOINT=${CHECKPOINT:-/home/coder/workspace/k-mimic-/bio_fm/outputs/main/phase2/kmimic_phase2_k2/checkpoints/checkpoint_phase2_av_epoch049_final.pt}
-DATA_DIR=${DATA_DIR:-/home/coder/workspace/k-mimic-/bio_fm/data/downstream/cardiac_arrest_outcome}
-OUT_DIR=${OUT_DIR:-/home/coder/workspace/k-mimic-/bio_fm/result/main/cardiac_arrest_outcome}
+# 실제 준비 데이터는 task 별로 분리 디렉토리: scope_outcome_{arrest,death}
+#   (prepare_data_scope 저장 위치). TASK 에 따라 자동 선택.
+DATA_DIR=${DATA_DIR:-/home/coder/workspace/k-mimic-/bio_fm/data/downstream/scope_outcome_${TASK:-arrest}}
+OUT_DIR=${OUT_DIR:-/home/coder/workspace/k-mimic-/bio_fm/result/main/scope_outcome_${TASK:-arrest}}
 # v2 필수 (9 modality 단일 embedding). v1 로드 금지.
 MODEL_VERSION=${MODEL_VERSION:-v2}
 DEVICE=${DEVICE:-cuda}
