@@ -27,6 +27,7 @@ Transformer Aggregator 로 시간 순서를 반영하여 환자 수준 표현을
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import sys
 from pathlib import Path
@@ -45,7 +46,10 @@ from downstream.metrics import (
 from downstream.viz import plot_roc_curve
 from downstream.model_wrapper import LinearProbe
 from downstream._eval_utils import dump_fold_predictions
-from downstream._save_utils import load_prepared_split_chunked
+from downstream._save_utils import (
+    iter_prepared_split_chunks,
+    load_prepared_split_chunked,
+)
 from downstream.aggregator import (
     SIGNAL_TYPE_INT,
     MeanAggregator,
@@ -54,6 +58,7 @@ from downstream.aggregator import (
     encode_patient_windows,
 )
 from downstream._ddp_utils import (
+    ddp_rank,
     ddp_world_size,
     equalize_shard,
     gather_concat,
@@ -312,6 +317,44 @@ def _subsample_dry_run(
     return _take(pos, n_per_class) + _take(neg, n_per_class)
 
 
+def _stream_extract_lp_shard(
+    data_path: str,
+    load_fold: int | None,
+    split: str,
+    model,
+    patch_size: int,
+    max_windows: int,
+    use_ddp: bool,
+) -> list[tuple[int, torch.Tensor, int, str]]:
+    """LP frozen-feature 를 chunk 스트리밍으로 추출 — 전체 raw window 상주 회피.
+
+    chunk 를 하나씩 로드 → 환자별 encode → (gi, repr_cpu, label, subject_id) 저장 →
+    chunk 폐기. peak RAM = chunk 1개 + 누적 reprs(환자당 ~KB). DDP 면 각 rank 가
+    자기 shard(gi%world==rank, shard_for_rank 와 동일 stride)만 추출 → gather+gi
+    정렬 후 단일 GPU 와 byte-identical. reprs 는 encode_patient_windows 가 결정적.
+    """
+    world = ddp_world_size() if use_ddp else 1
+    rank = ddp_rank() if use_ddp else 0
+    out: list[tuple[int, torch.Tensor, int, str]] = []
+    gi = 0
+    for payload in iter_prepared_split_chunks(data_path, load_fold, split):
+        patients = payload if isinstance(payload, list) else payload.get("data", [])
+        for p in patients:
+            if gi % world == rank:
+                reprs = encode_patient_windows(
+                    model, p, patch_size, max_windows,
+                    use_lora=False, session_prefix="ca_out",
+                )
+                out.append(
+                    (gi, reprs.detach().cpu(), int(p["label"]), str(p["subject_id"]))
+                )
+            gi += 1
+        del payload
+        patients = None
+        gc.collect()
+    return out
+
+
 # ── CLI ──────────────────────────────────────────────────────
 
 
@@ -393,48 +436,83 @@ def main() -> None:
     if use_lora:
         model.inject_lora(rank=args.lora_rank, alpha=args.lora_alpha)
 
-    # ── 데이터 로드 ──
-    #   dry-run 이면 split 당 앞쪽 few chunk 만 읽어 수십 GB 전체 로딩을 피한다
-    #   (chunk0 에 양성이 포함돼 있어 스모크 테스트에 충분).
-    load_max_chunks = args.dry_run_chunks if args.dry_run else None
-    train_patients, test_patients, meta = _load_data(
-        args.data_path, args.fold, args.n_folds, max_chunks=load_max_chunks,
-    )
+    # ── 데이터 로드 / 특징 추출 ──
+    # LP 실측 run 은 chunk 스트리밍 추출로 전체 raw window 상주를 피한다(RAM OOM 회피
+    #   — SCOPE 24-48h ICU × DDP rank 별 중복 로드가 수백 GB). dry-run 은 max_chunks 로
+    #   이미 소량이라 기존 경로 유지. lora 는 매 epoch encoder 재인코딩이 필요해 raw
+    #   window 를 들고 있어야 하므로 기존 경로 유지.
+    stream_lp = (not use_lora) and (not args.dry_run)
+    cached_train_override: list[torch.Tensor] | None = None
+    test_precomputed: list[torch.Tensor] | None = None
+    meta: dict = {}
 
-    # ── dry-run: 추출 전에 환자를 소수로 줄이고 윈도우·epoch 상한을 낮춘다.
-    #   feature 추출 비용 ∝ (환자 수 × 환자당 윈도우 수) 이므로 둘 다 줄여야 빨라진다.
-    #   DDP 샤딩(아래)보다 먼저 적용해야 각 rank 가 축소된 리스트를 샤딩한다. ──
-    if args.dry_run:
-        train_patients = _subsample_dry_run(train_patients, args.dry_run_n, seed=0)
-        test_patients = _subsample_dry_run(test_patients, args.dry_run_n, seed=1)
-        args.max_windows = min(args.max_windows, args.dry_run_windows)
-        args.epochs = min(args.epochs, args.dry_run_epochs)
+    if stream_lp:
+        load_fold = int(args.fold) if int(args.n_folds) > 1 else None
         if is_main():
-            print("\n" + "!" * 60)
-            print("  DRY-RUN — 파이프라인 스모크 테스트 (결과 무의미, 저장물 폐기)")
-            print(f"    train={len(train_patients)} / test={len(test_patients)} patients "
-                  f"| max_windows={args.max_windows} | epochs={args.epochs}")
-            print("!" * 60)
+            print("\n[streaming LP] chunk 별 frozen-feature 추출 (peak RAM=chunk 1개)")
+        g_train = _stream_extract_lp_shard(
+            args.data_path, load_fold, "train", model, patch_size,
+            args.max_windows, use_ddp,
+        )
+        g_test = _stream_extract_lp_shard(
+            args.data_path, load_fold, "test", model, patch_size,
+            args.max_windows, use_ddp,
+        )
+        if use_ddp:
+            g_train = gather_concat(g_train)
+            g_test = gather_concat(g_test)
+            if not is_main():
+                import torch.distributed as dist
+                dist.destroy_process_group()
+                return
+        # gi 정렬 → 단일 GPU 와 동일 순서(재현성; window군과 동일 기법).
+        g_train.sort(key=lambda t: t[0])
+        g_test.sort(key=lambda t: t[0])
+        train_patients = [
+            {"label": lbl, "subject_id": cid, "n_windows": r.shape[0]}
+            for (_gi, r, lbl, cid) in g_train
+        ]
+        cached_train_override = [r for (_gi, r, _l, _c) in g_train]
+        test_patients = [
+            {"label": lbl, "subject_id": cid, "n_windows": r.shape[0]}
+            for (_gi, r, lbl, cid) in g_test
+        ]
+        test_precomputed = [r for (_gi, r, _l, _c) in g_test]
+    else:
+        #   dry-run 이면 split 당 앞쪽 few chunk 만 읽어 수십 GB 전체 로딩을 피한다
+        #   (chunk0 에 양성이 포함돼 있어 스모크 테스트에 충분).
+        load_max_chunks = args.dry_run_chunks if args.dry_run else None
+        train_patients, test_patients, meta = _load_data(
+            args.data_path, args.fold, args.n_folds, max_chunks=load_max_chunks,
+        )
+        # ── dry-run: 추출 전에 환자를 소수로 줄이고 윈도우·epoch 상한을 낮춘다. ──
+        if args.dry_run:
+            train_patients = _subsample_dry_run(train_patients, args.dry_run_n, seed=0)
+            test_patients = _subsample_dry_run(test_patients, args.dry_run_n, seed=1)
+            args.max_windows = min(args.max_windows, args.dry_run_windows)
+            args.epochs = min(args.epochs, args.dry_run_epochs)
+            if is_main():
+                print("\n" + "!" * 60)
+                print("  DRY-RUN — 파이프라인 스모크 테스트 (결과 무의미, 저장물 폐기)")
+                print(f"    train={len(train_patients)} / test={len(test_patients)} patients "
+                      f"| max_windows={args.max_windows} | epochs={args.epochs}")
+                print("!" * 60)
 
     n_pos_train = sum(1 for p in train_patients if p["label"] == 1)
     n_pos_test = sum(1 for p in test_patients if p["label"] == 1)
-    avg_win_train = np.mean([p["n_windows"] for p in train_patients])
-    avg_win_test = np.mean([p["n_windows"] for p in test_patients])
+    avg_win_train = np.mean([p["n_windows"] for p in train_patients]) if train_patients else 0.0
+    avg_win_test = np.mean([p["n_windows"] for p in test_patients]) if test_patients else 0.0
     print(f"  Train: {len(train_patients)} patients "
           f"({n_pos_train} arrest, avg {avg_win_train:.1f} windows)")
     print(f"  Test:  {len(test_patients)} patients "
           f"({n_pos_test} arrest, avg {avg_win_test:.1f} windows)")
     print(f"  Max windows per patient: {args.max_windows}")
 
-    # ── DDP 분기 ──
+    # ── DDP 분기 (lora / dry-run-LP). stream_lp 는 위에서 추출 완료 → skip. ──
     # lora: train 환자 리스트를 rank 별 분할(+equalize)해 aggregator DDP 로 학습.
-    # linear_probe: 각 rank 가 환자 shard 만 frozen encoder 로 인코딩 → reprs 를
-    #   (reprs_cpu, label, case_id) 한 튜플로 묶어 gather_concat(정렬 co-index 보존)
-    #   → rank0 가 모은 reprs 로 aggregator+probe 단독 학습/평가/저장.
+    # dry-run-LP: 각 rank 가 환자 shard 만 인코딩 → gather → rank0 단독 학습.
     # 단일 GPU(use_ddp=False)면 두 분기 모두 skip → 기존 경로 그대로(불변).
-    cached_train_override: list[torch.Tensor] | None = None
-    test_precomputed: list[torch.Tensor] | None = None
-    if use_ddp and use_lora:
+    if not stream_lp and use_ddp and use_lora:
         n_full = len(train_patients)
         train_patients = equalize_shard(shard_for_rank(train_patients))
         if is_main():
@@ -454,7 +532,8 @@ def main() -> None:
             import torch.distributed as dist
             dist.destroy_process_group()
             sys.exit(2)
-    elif use_ddp and not use_lora:
+    elif not stream_lp and use_ddp and not use_lora:
+        # (dry-run-LP 전용 경로 — 실측 LP 는 위 stream_lp 에서 처리)
         # sharded frozen-feature 추출 + gather. global index(gi)를 튜플에 포함해
         # gather 후 gi 로 정렬(argsort)해 **원순서를 복원** → 단일 GPU 와 동일한
         # train_patients 순서가 되어 epoch seed permutation 이 동일 minibatch 를
