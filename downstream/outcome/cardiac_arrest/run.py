@@ -591,8 +591,11 @@ def main() -> None:
 
     n_agg = sum(p.numel() for p in aggregator.parameters())
     n_probe = sum(p.numel() for p in probe.parameters())
-    print(f"\n  Aggregator: {n_agg:,} params ({args.agg_layers} layers, "
-          f"{args.agg_heads} heads)")
+    if args.aggregator == "mean":
+        print(f"\n  Aggregator: mean (non-parametric, {n_agg:,} params)")
+    else:
+        print(f"\n  Aggregator: transformer ({n_agg:,} params, "
+              f"{args.agg_layers} layers, {args.agg_heads} heads)")
     print(f"  Probe: {n_probe:,} params")
     if use_lora:
         n_lora = sum(p.numel() for p in model.lora_parameters())
@@ -643,7 +646,7 @@ def main() -> None:
     patient_ids = [str(p["subject_id"]) for p in test_patients]
 
     print(f"\n{'=' * 60}")
-    print(f"  Cardiac Arrest Outcome — {args.mode} (Transformer Aggregator)")
+    print(f"  Cardiac Arrest Outcome — {args.mode} ({args.aggregator} aggregator)")
     print(f"{'=' * 60}")
     print(f"  AUROC:       {metrics['auroc']:.4f}")
     print(f"  AUPRC:       {metrics['auprc']:.4f}")
