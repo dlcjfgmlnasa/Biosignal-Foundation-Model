@@ -33,8 +33,11 @@ OUT_DIR="${OUT_DIR:-${BIOFM_ROOT}/data/downstream/intracranial_hypertension_${TA
 # ── 확정 스펙 (Güiza anchored, 2026-07-08) ──
 WINDOWS="${WINDOWS:-1200}"        # 20min(1200s) 입력 window
 HORIZONS="${HORIZONS:-5 10 15}"   # 5/10/15분 전 예측
-MODE="${MODE:-anchored}"          # anchored(onset-anchor 양성 + 균일 stride 음성)
-NEG_STRIDE="${NEG_STRIDE:-1800}"  # 음성 균일 stride 30min → prevalence ~3.5%
+MODE="${MODE:-anchored}"          # aligned 세그먼트 경로(unbiased/biased=구 10s-avg)
+POS_MODE="${POS_MODE:-dense}"     # dense(기본): 예측구간 안 onset=양성 dense sliding
+#                                   → horizon 따라 prevalence↑. anchored=onset당 1개(flat).
+NEG_STRIDE="${NEG_STRIDE:-600}"   # 음성 균일 stride 10min → dense 양성 기준 prev≈IOH
+#                                   (3.9/7/9.7% @ h5/10/15). 300=2/3.6/5.1, 1800=10/18/24.
 EVENT_CONSEC="${EVENT_CONSEC:-5}" # 5×1min median>20mmHg = crisis (Güiza)
 # 입력 신호: ABP + ICP (prediction 이라 현재 ICP 를 입력에 포함). label 은 항상 ICP.
 INPUT_SIGNALS="${INPUT_SIGNALS:-abp icp}"
@@ -52,7 +55,7 @@ echo "  Waveform: $WAVEFORM_DIR"
 echo "  Output:   $OUT_DIR"
 echo "  Input:    $INPUT_SIGNALS  (dtype=$SIGNAL_DTYPE)"
 echo "  Window:   ${WINDOWS}s (20min)   Horizons: $HORIZONS min"
-echo "  Sampling: $MODE  neg-stride=${NEG_STRIDE}s  event-consec=${EVENT_CONSEC}"
+echo "  Sampling: $MODE  pos-mode=$POS_MODE  neg-stride=${NEG_STRIDE}s  event-consec=${EVENT_CONSEC}"
 echo "============================================================"
 
 if [ "$SKIP_DOWNLOAD" != "1" ]; then
@@ -79,6 +82,7 @@ run_combo() {
         --window-secs $WINDOWS \
         --horizon-mins $HORIZONS \
         --sampling-mode $MODE \
+        --pos-mode $POS_MODE \
         --neg-stride-sec $NEG_STRIDE \
         --event-consec $EVENT_CONSEC \
         --scan-dir \
