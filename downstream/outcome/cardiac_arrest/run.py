@@ -379,7 +379,7 @@ def main() -> None:
     parser.add_argument("--agg-layers", type=int, default=2,
                         help="Transformer Aggregator 레이어 수")
     parser.add_argument("--agg-heads", type=int, default=4)
-    parser.add_argument("--aggregator", type=str, default="transformer",
+    parser.add_argument("--aggregator", type=str, default="mean",
                         choices=["transformer", "mean"],
                         help="환자-수준 집약 방식. transformer(기본): 학습 가능 "
                              "aggregator. mean: 파라미터 없는 masked mean "
