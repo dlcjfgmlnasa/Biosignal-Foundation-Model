@@ -496,20 +496,29 @@ def extract_anchored_samples(
     input_signals: list[str],
     window_sec: float = 1200.0,
     horizon_sec: float = 300.0,
-    neg_stride_sec: float = 1800.0,
+    neg_stride_sec: float = 600.0,
     icp_threshold: float = ICP_THRESHOLD,
     event_consec: int = EVENT_CONSEC,
     valid_ratio_threshold: float = DEFAULT_VALID_RATIO_THRESHOLD,
     gap_stats: GapStats | None = None,
     sample_dtype: str = "float16",
+    pos_mode: str = "dense",
+    pos_stride_sec: float = 60.0,
 ) -> list[ICHSample]:
-    """정렬 세그먼트 case 들에서 anchored (input, label) 쌍을 추출한다.
+    """정렬 세그먼트 case 들에서 (input, label) 쌍을 추출한다.
 
-    양성: crisis onset(5×1min median>threshold 첫 블록) 마다, 정확히 horizon 만큼
-      앞에서 끝나는 window 1개 (중복 제거·onset 보존). 예측 시점(입력 끝) baseline
-      median ≤ threshold 여야 함(현재-ICH 제외).
-    음성: crisis 없는 구간을 neg_stride_sec 균일 간격으로 추출(경계 15~20 유지 →
-      정직). horizon 에 onset 이 없고 baseline ≤ threshold 인 window.
+    ``pos_mode`` (양성 sampling):
+      "dense" (기본): pos_stride 간격 dense sliding — 예측구간 [win_end, win_end+H)
+        안에 crisis onset 이 있으면 양성. horizon 이 길수록 양성 window 가 늘어 →
+        prevalence 가 horizon 따라 증가(IOH 정합, scan dense 모드와 동일 정의).
+      "anchored" (레거시): crisis onset 마다 정확히 horizon 앞에서 끝나는 window
+        1개(중복 제거·onset 보존). onset 수와 무관하게 horizon 무관 flat prevalence.
+    두 모드 공통: 예측 시점(입력 끝) baseline median ≤ threshold 여야 함(현재-ICH 제외).
+
+    음성: crisis 없는 구간을 neg_stride_sec 균일 stride 로 추출(경계 15~20 유지 →
+      정직). horizon 에 onset 이 없고 baseline ≤ threshold 인 window. dense 양성 +
+      strided 음성이라 음성 수는 ~horizon 무관 → prevalence 가 양성(horizon 의존)으로
+      결정된다. neg_stride 는 prevalence 다이얼(600s ≈ IOH 스케일 3.9/7/9.7%).
 
     ICP 라벨 판정은 1분 median 블록 그리드에서, 입력 window 추출은 그 블록 경계에
     정렬된 100Hz 구간에서 이뤄진다(block b → sample [b*6000, ...)).
@@ -518,6 +527,7 @@ def extract_anchored_samples(
     win_b = max(1, int(round(window_sec / BLOCK_SEC)))
     hor_b = max(1, int(round(horizon_sec / BLOCK_SEC)))
     neg_b = max(1, int(round(neg_stride_sec / BLOCK_SEC)))
+    pos_b = max(1, int(round(pos_stride_sec / BLOCK_SEC)))
     win_samples = int(window_sec * TARGET_SR)
     total_needed_b = win_b + hor_b
 
@@ -574,18 +584,29 @@ def extract_anchored_samples(
                 )
             )
 
-        # ── 양성: onset 당 1개 (horizon 끝 블록 == onset) ──
-        for o in onsets:
-            win_end_b = o - hor_b + 1
-            start_block = win_end_b - win_b
-            if start_block < 0:
-                continue
-            base = blocks[win_end_b - 1]              # 예측 시점 baseline
-            if np.isnan(base) or float(base) > icp_threshold:
-                if gap_stats is not None:
-                    gap_stats.add_drop()             # 현재-ICH → 제외
-                continue
-            _emit(start_block, 1)
+        # ── 양성 ──
+        if pos_mode == "dense":
+            # dense sliding(pos_stride): 예측구간 안에 onset 이 있고 현재-ICH 아니면 양성.
+            # horizon 길수록 band 가 커져 양성 window ↑ → prevalence ↑.
+            for start_block in range(0, L - total_needed_b + 1, pos_b):
+                win_end_b = start_block + win_b
+                base = blocks[win_end_b - 1]           # 예측 시점 baseline
+                if np.isnan(base) or float(base) > icp_threshold:
+                    continue                            # 현재-ICH/무효 → 제외
+                if any(win_end_b <= o < win_end_b + hor_b for o in onset_set):
+                    _emit(start_block, 1)
+        else:  # anchored (레거시): onset 당 1개, horizon 끝 블록 == onset
+            for o in onsets:
+                win_end_b = o - hor_b + 1
+                start_block = win_end_b - win_b
+                if start_block < 0:
+                    continue
+                base = blocks[win_end_b - 1]          # 예측 시점 baseline
+                if np.isnan(base) or float(base) > icp_threshold:
+                    if gap_stats is not None:
+                        gap_stats.add_drop()         # 현재-ICH → 제외
+                    continue
+                _emit(start_block, 1)
 
         # ── 음성: crisis-free 균일 stride ──
         for start_block in range(0, L - total_needed_b + 1, neg_b):
@@ -865,6 +886,9 @@ def save_split_dataset(
             "chunk_idx": chunk_idx,
             "signal_dtype": str(signal_dtype).replace("torch.", ""),
             "valid_ratio_threshold": DEFAULT_VALID_RATIO_THRESHOLD,
+            "pos_mode": pos_mode,
+            "pos_stride_sec": pos_stride_sec,
+            "neg_stride_sec": neg_stride_sec,
         },
     }
 
@@ -977,8 +1001,10 @@ def prepare_ich_sweep(
     valid_ratio_threshold: float = DEFAULT_VALID_RATIO_THRESHOLD,
     task_mode: str = "prediction",
     scan_dir: bool = True,
-    neg_stride_sec: float = 1800.0,
+    neg_stride_sec: float = 600.0,
     event_consec: int = EVENT_CONSEC,
+    pos_mode: str = "dense",
+    pos_stride_sec: float = 60.0,
 ) -> list[Path]:
     """(window, horizon) 조합 × stratified K-fold CV 데이터셋 생성.
 
@@ -1130,6 +1156,8 @@ def prepare_ich_sweep(
                             valid_ratio_threshold=valid_ratio_threshold,
                             gap_stats=gap_stats,
                             sample_dtype=sample_dtype_str,
+                            pos_mode=pos_mode,
+                            pos_stride_sec=pos_stride_sec,
                         )
                     else:
                         samples = extract_forecast_samples(
@@ -1254,8 +1282,18 @@ def main() -> None:
              "정렬 세그먼트) | unbiased/biased(구 10s-평균 dense 모드).",
     )
     parser.add_argument(
-        "--neg-stride-sec", type=float, default=1800.0,
-        help="anchored 음성 균일 stride(초). 기본 1800(30min), prevalence 약 3.5 퍼센트.",
+        "--neg-stride-sec", type=float, default=600.0,
+        help="음성 균일 stride(초). prevalence 다이얼(dense 양성 기준): 600(10min)"
+             "≈IOH 스케일 3.9/7/9.7%, 300≈2/3.6/5.1%, 1800≈10/18/24%.",
+    )
+    parser.add_argument(
+        "--pos-mode", type=str, default="dense", choices=["dense", "anchored"],
+        help="양성 sampling. dense(기본): 예측구간 안 onset=양성 dense sliding → "
+             "horizon 따라 prevalence↑(IOH 정합). anchored(레거시): onset 당 1개 → flat.",
+    )
+    parser.add_argument(
+        "--pos-stride-sec", type=float, default=60.0,
+        help="dense 양성 sliding stride(초). 기본 60(=1분 median 블록).",
     )
     parser.add_argument(
         "--event-consec", type=int, default=EVENT_CONSEC,
@@ -1306,6 +1344,8 @@ def main() -> None:
         scan_dir=args.scan_dir,
         neg_stride_sec=args.neg_stride_sec,
         event_consec=args.event_consec,
+        pos_mode=args.pos_mode,
+        pos_stride_sec=args.pos_stride_sec,
     )
 
 
