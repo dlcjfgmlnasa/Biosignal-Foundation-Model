@@ -90,25 +90,33 @@ echo "  LoRA: batch=$LORA_BATCH (eff $((LORA_BATCH*NPROC))) lr=$LORA_LR epochs=$
 echo "  OUT_DIR: $OUT_DIR"
 echo "============================================================"
 
-for f in $FOLD_LIST; do
-  LP_OUT=$OUT_DIR/linear_probe
-  maybe_run "$LP_OUT" "$f" \
-    $LAUNCH downstream.outcome.cardiac_arrest.run \
-      --checkpoint "$CHECKPOINT" --model-version "$MODEL_VERSION" \
-      --data-path "$PREFIX" --mode linear_probe --n-folds "$N_FOLDS" --fold "$f" \
-      --epochs "$LP_EPOCHS" --lr "$LP_LR" --batch-size "$LP_BATCH" \
-      --aggregator "$AGG" \
-      --max-windows "$MAX_WINDOWS" --device "$DEVICE" --out-dir "$LP_OUT" $DRY_FLAG
+# 실행할 모드 선택 (기본 둘 다). LP 만: MODES=linear_probe / LoRA 만: MODES=lora
+MODES="${MODES:-linear_probe lora}"
+has_mode() { case " $MODES " in *" $1 "*) return 0;; *) return 1;; esac; }
 
-  LORA_OUT=$OUT_DIR/lora
-  maybe_run "$LORA_OUT" "$f" \
-    $LAUNCH downstream.outcome.cardiac_arrest.run \
-      --checkpoint "$CHECKPOINT" --model-version "$MODEL_VERSION" \
-      --data-path "$PREFIX" --mode lora --lora-rank "$LORA_RANK" --lora-alpha "$LORA_ALPHA" \
-      --n-folds "$N_FOLDS" --fold "$f" \
-      --epochs "$LORA_EPOCHS" --lr "$LORA_LR" --batch-size "$LORA_BATCH" \
-      --aggregator "$AGG" \
-      --max-windows "$MAX_WINDOWS" --device "$DEVICE" --out-dir "$LORA_OUT" $DRY_FLAG
+for f in $FOLD_LIST; do
+  if has_mode linear_probe; then
+    LP_OUT=$OUT_DIR/linear_probe
+    maybe_run "$LP_OUT" "$f" \
+      $LAUNCH downstream.outcome.cardiac_arrest.run \
+        --checkpoint "$CHECKPOINT" --model-version "$MODEL_VERSION" \
+        --data-path "$PREFIX" --mode linear_probe --n-folds "$N_FOLDS" --fold "$f" \
+        --epochs "$LP_EPOCHS" --lr "$LP_LR" --batch-size "$LP_BATCH" \
+        --aggregator "$AGG" \
+        --max-windows "$MAX_WINDOWS" --device "$DEVICE" --out-dir "$LP_OUT" $DRY_FLAG
+  fi
+
+  if has_mode lora; then
+    LORA_OUT=$OUT_DIR/lora
+    maybe_run "$LORA_OUT" "$f" \
+      $LAUNCH downstream.outcome.cardiac_arrest.run \
+        --checkpoint "$CHECKPOINT" --model-version "$MODEL_VERSION" \
+        --data-path "$PREFIX" --mode lora --lora-rank "$LORA_RANK" --lora-alpha "$LORA_ALPHA" \
+        --n-folds "$N_FOLDS" --fold "$f" \
+        --epochs "$LORA_EPOCHS" --lr "$LORA_LR" --batch-size "$LORA_BATCH" \
+        --aggregator "$AGG" \
+        --max-windows "$MAX_WINDOWS" --device "$DEVICE" --out-dir "$LORA_OUT" $DRY_FLAG
+  fi
 done
 
 echo "============================================================"
