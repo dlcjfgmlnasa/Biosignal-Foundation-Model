@@ -33,8 +33,7 @@ from torch import nn
 
 from data.collate import PackedBatch
 from data.dataset import BiosignalSample
-from data.spatial_map import get_global_spatial_id
-from data.parser.vitaldb import SIGNAL_TYPES
+from data.spatial_map import SIGNAL_KEY_TO_TYPE, get_global_spatial_id
 
 from downstream.metrics import (
     bootstrap_ci,
@@ -83,9 +82,15 @@ def _multi_window_to_samples(mw: MultiSignalWindow, idx: int) -> list[BiosignalS
     """MultiSignalWindow → 신호별 BiosignalSample 리스트."""
     samples = []
     for ch, (sig_type, signal) in enumerate(mw.signals.items()):
-        # sig_type 은 문자열. SIGNAL_TYPES 로 int 인덱스 변환 후
-        # get_global_spatial_id 도 int 인덱스로 호출해야 한다 (Patch C).
-        stype_int = SIGNAL_TYPES.get(sig_type, 1)
+        # sig_type 은 문자열 → SSOT(data.spatial_map) 로 int 인덱스 변환.
+        # 구 코드는 parser 의 disk-spec 표를 쓰며 미등록 키를 조용히 ABP(1) 로
+        # 폴백했다 (memory: project_signal_type_ssot_split). 미등록은 즉시 에러.
+        if sig_type not in SIGNAL_KEY_TO_TYPE:
+            raise KeyError(
+                f"unknown signal key '{sig_type}' — data.spatial_map.SIGNAL_KEY_TO_TYPE "
+                f"에 없음 (허용: {sorted(SIGNAL_KEY_TO_TYPE)})"
+            )
+        stype_int = SIGNAL_KEY_TO_TYPE[sig_type]
         spatial_id = get_global_spatial_id(stype_int, 0)
         samples.append(
             BiosignalSample(
@@ -626,91 +631,20 @@ def _load_data(
 
         return train_windows, val_windows, test_windows
 
-    elif args.data_dir and Path(args.data_dir).is_dir():
-        from downstream.acute_event.hypoxemia.prepare_data import (
-            _load_local_pt_aligned_signals,
-            extract_forecast_samples,
-        )
-
-        print(f"\nLoading from local .pt directory: {args.data_dir}")
-        input_sigs = args.input_signals
-        horizon_sec = 300.0
-        min_dur = args.window_sec + horizon_sec + args.stride_sec
-
-        cases = _load_local_pt_aligned_signals(
-            args.data_dir, input_sigs, min_dur, max_subjects=args.n_cases,
-        )
-        if not cases:
-            print("No valid cases loaded.", file=sys.stderr)
-            sys.exit(1)
-
-        rng = np.random.default_rng(42)
-        patient_ids = list({c["patient_id"] for c in cases})
-        rng.shuffle(patient_ids)
-        n_train_p = max(1, int(len(patient_ids) * args.train_ratio))
-        # Patch A: train/val/test 3-way patient-level split.
-        # 남은(test+val) 환자를 절반씩 val/test 로 분할 — val 0 명 방지.
-        remaining = patient_ids[n_train_p:]
-        n_val_p = max(1, len(remaining) // 2) if len(remaining) >= 2 else 0
-        train_pats = set(patient_ids[:n_train_p])
-        val_pats = set(remaining[:n_val_p])
-        test_pats = set(remaining[n_val_p:])
-
-        train_cases = [c for c in cases if c["patient_id"] in train_pats]
-        val_cases = [c for c in cases if c["patient_id"] in val_pats]
-        test_cases = [c for c in cases if c["patient_id"] in test_pats]
+    elif args.data_dir:
+        # 구 on-the-fly 경로 제거 (2026-07-10). 이 경로는 SpO2 trend 를 로드하지 않아
+        # extract_forecast_samples 를 잘못된 시그니처로 호출했고(라벨 없음), fold 분할도
+        # 무작위였다. 라벨 정렬은 prepare_data.py 가 manifest start_sample 로 수행한다.
         print(
-            f"Split: {len(train_cases)} train, {len(val_cases)} val, "
-            f"{len(test_cases)} test cases"
+            "ERROR: --data-dir on-the-fly 경로는 폐지되었습니다.\n"
+            "  prepare_data.py 로 .pt 를 만든 뒤 --data-path <prefix> 로 실행하세요.\n"
+            "  예) bash downstream/acute_event/hypoxemia/bash/prepare_data.sh",
+            file=sys.stderr,
         )
-
-        train_samples = extract_forecast_samples(
-            train_cases, input_sigs, args.window_sec, args.stride_sec, horizon_sec,
-        )
-        val_samples = extract_forecast_samples(
-            val_cases, input_sigs, args.window_sec, args.stride_sec, horizon_sec,
-        ) if val_cases else []
-        test_samples = extract_forecast_samples(
-            test_cases, input_sigs, args.window_sec, args.stride_sec, horizon_sec,
-        )
-
-        def _forecast_to_windows(samples):
-            windows = []
-            for s in samples:
-                windows.append(
-                    MultiSignalWindow(
-                        signals=s.input_signals,
-                        label=s.label,
-                        label_value=s.label_value,
-                        case_id=s.case_id,
-                    )
-                )
-            return windows
-
-        train_windows = _forecast_to_windows(train_samples)
-        val_windows = _forecast_to_windows(val_samples)
-        test_windows = _forecast_to_windows(test_samples)
-
-        # data_dir 경로에서도 val 이 비면 train 에서 20% 동적 split (backward-compat).
-        if not val_windows:
-            warnings.warn(
-                "No val cases produced from --data-dir split; falling back to a "
-                "20% dynamic split of train.",
-                stacklevel=2,
-            )
-            rng2 = np.random.default_rng(args.val_split_seed)
-            idx = np.arange(len(train_windows))
-            rng2.shuffle(idx)
-            n_val = max(1, int(len(train_windows) * 0.2))
-            val_idx = set(idx[:n_val].tolist())
-            new_train = [w for i, w in enumerate(train_windows) if i not in val_idx]
-            val_windows = [w for i, w in enumerate(train_windows) if i in val_idx]
-            train_windows = new_train
-
-        return train_windows, val_windows, test_windows
+        sys.exit(1)
 
     else:
-        print("ERROR: --data-path or --data-dir required.", file=sys.stderr)
+        print("ERROR: --data-path required.", file=sys.stderr)
         sys.exit(1)
 
 
@@ -746,9 +680,10 @@ def main() -> None:
     parser.add_argument(
         "--input-signals",
         nargs="+",
-        default=["ppg", "ecg", "abp", "co2"],
-        choices=["abp", "ecg", "ppg", "co2"],
-        help="Input signal types (Task #6: PPG, ECG, ABP, CO2; label from SpO2 numerics)",
+        default=["ecg", "ppg", "co2", "awp"],
+        choices=["abp", "ecg", "ppg", "co2", "awp"],
+        help="Input signal types. prepare_data.py 와 동일한 순서·조합이어야 한다 "
+             "(라벨은 SpO2 numeric 에서 별도로 온다).",
     )
     parser.add_argument(
         "--val-split-seed",

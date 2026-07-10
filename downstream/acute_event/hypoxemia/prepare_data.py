@@ -5,17 +5,28 @@
 SpO2 임계 92%: BTF/WHO 중재 수준이자 수술중 hypoxemia 예측 표준(Lundberg 2018, ≤92).
 
 Label 소스: SpO2 trend (raw .vital → vitaldb library 로 PLETH_SPO2 1Hz 추출)
-Input 소스: parsed .pt 디렉토리의 wave (ECG/ABP/PPG)
+Input 소스: parsed .pt 디렉토리의 wave (ECG/PPG/CO2/AWP/ABP)
 
 Hypotension prepare_data.py 와 같은 sweep 구조 (window×horizon×signal-combo, paired comparison).
+
+시간축 정렬 (2026-07-10 수정):
+    parser 는 `.vital` 을 dtstart 부터 100Hz 로 리샘플한 뒤 NaN-free segment 로 쪼개고,
+    각 recording 의 `start_sample`(=dtstart 로부터의 100Hz 절대 인덱스)을 manifest 에
+    기록한다. SpO2 trend 도 `to_numpy(track, 1.0)` 로 **같은 dtstart 원점**의 1Hz 격자다.
+    따라서 case-내 offset `start` 의 절대 시각(초) = (start_sample + start) / 100.
+    구 코드는 segment 가 raw t=0 에서 시작한다고 가정해 라벨이 통째로 어긋났다.
+
+Baseline 누수 가드:
+    예측 시점에 이미 SpO2 < threshold 인 윈도우는 기본 제외(`--exclude-already-low`).
+    포함하면 "이미 저산소 → 계속 저산소" 지속성만으로 양성이 맞아 성능이 부풀려진다
+    (IOH 의 '현재-저혈압 제외' 와 같은 계열, Yang et al. BJA 2025).
 
 사용법:
     python -m downstream.acute_event.hypoxemia.prepare_data \\
         --data-dir <parsed .pt 디렉토리> \\
         --raw-dir <raw vitaldb .vital 디렉토리> \\
-        --input-signals ppg ecg \\
-        --required-signals ecg ppg abp \\
-        --window-secs 60 180 300 600 --horizon-mins 5 10 15 \\
+        --input-signals ecg ppg co2 awp \\
+        --window-secs 300 --horizon-mins 5 10 15 \\
         --out-dir outputs/downstream/hypoxemia
 """
 
@@ -23,8 +34,8 @@ from __future__ import annotations
 
 import argparse
 import gc
-import re
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -65,101 +76,19 @@ class ForecastSample:
     horizon_sec: float
 
 
-# ---- 로컬 .pt 로더 (hypotension 과 동일) ----
-
-
-def _parse_pt_filename(name: str) -> dict | None:
-    m = re.match(
-        r"^(.+?)_S(\d+)_([a-z0-9]+)_(\d+)_seg(\d+)_(\d+)\.pt$",
-        name,
-    )
-    if m is None:
-        return None
-    return {
-        "subject_id": m.group(1),
-        "session_id": int(m.group(2)),
-        "signal_type": m.group(3),
-        "spatial_id": int(m.group(4)),
-        "seg_i": int(m.group(5)),
-        "seg_j": int(m.group(6)),
-    }
-
-
-def _load_local_pt_aligned_signals(
-    data_dir: str,
-    input_signals: list[str],
-    min_duration_sec: float,
-    max_subjects: int | None,
-    required_signals: list[str] | None,
-) -> list[dict]:
-    """parsed .pt 디렉토리에서 시간 정렬된 다채널 segment 로드 (hypotension 동일)."""
-    root = Path(data_dir)
-    if not root.is_dir():
-        print(f"  ERROR: Data directory not found: {root}", file=sys.stderr)
-        return []
-
-    if required_signals is not None:
-        required_types = set(required_signals) | set(input_signals)
-    else:
-        required_types = set(input_signals)
-
-    subject_dirs = sorted([d for d in root.iterdir() if d.is_dir()])
-    if max_subjects is not None:
-        subject_dirs = subject_dirs[:max_subjects]
-
-    print(f"  Scanning {len(subject_dirs)} subjects in {root}...")
-    cases: list[dict] = []
-
-    for subj_dir in subject_dirs:
-        subject_id = subj_dir.name
-
-        file_map: dict[tuple[int, int, int], dict[str, Path]] = {}
-        for pt_file in subj_dir.glob("*.pt"):
-            meta = _parse_pt_filename(pt_file.name)
-            if meta is None:
-                continue
-            seg_key = (meta["session_id"], meta["seg_i"], meta["seg_j"])
-            file_map.setdefault(seg_key, {})[meta["signal_type"]] = pt_file
-
-        for seg_key, type_paths in file_map.items():
-            if not required_types.issubset(set(type_paths.keys())):
-                continue
-
-            signals: dict[str, np.ndarray] = {}
-            for stype_str in required_types:
-                t = torch.load(type_paths[stype_str], weights_only=True)
-                signals[stype_str] = t.squeeze(0).numpy()
-
-            min_len = min(len(s) for s in signals.values())
-            if min_len < int(min_duration_sec * TARGET_SR):
-                continue
-
-            signals = {k: v[:min_len] for k, v in signals.items()}
-            session_id, seg_i, seg_j = seg_key
-
-            cases.append({
-                "case_id": f"{subject_id}_s{session_id}_seg{seg_i}_{seg_j}",
-                "patient_id": subject_id,
-                "session_id": session_id,
-                "seg_i": seg_i,
-                "seg_j": seg_j,
-                "signals": signals,
-            })
-
-    print(f"  Loaded {len(cases)} aligned segments with {required_types}")
-    return cases
+# NOTE: 구 filename-seg_key 로더(_parse_pt_filename / _load_local_pt_aligned_signals)는
+#   제거했다. manifest 의 start_sample 을 싣지 않아 SpO2 라벨 정렬이 불가능하고,
+#   sweep 은 downstream._seg_intersect.load_aligned_signals_intersection 만 쓴다.
 
 
 # ---- SpO2 trend 추출 (raw .vital 사용) ----
 
 
-def _load_spo2_trend(
-    raw_vital_path: Path,
-    target_duration_sec: float,
-) -> np.ndarray | None:
-    """raw .vital 에서 SpO2 1Hz trend 추출.
+def _load_spo2_trend(raw_vital_path: Path) -> np.ndarray | None:
+    """raw .vital 에서 SpO2 1Hz trend 추출 (dtstart 원점).
 
-    여러 SpO2 track 후보를 순차 시도하고 첫 발견 사용.
+    SpO2 track 만 지정해 로드한다 — 전체 track 파싱은 네트워크 마운트에서 수십 배
+    느리다. 여러 track 후보를 순차 시도하고 첫 발견 사용.
     Returns: (T,) 1Hz SpO2 array 또는 None.
     """
     try:
@@ -171,15 +100,16 @@ def _load_spo2_trend(
     if not raw_vital_path.is_file():
         return None
     try:
-        vf = vitaldb.VitalFile(str(raw_vital_path))
-        avail = vf.get_track_names()
+        vf = vitaldb.VitalFile(str(raw_vital_path), track_names=SPO2_TRACKS)
+        avail = set(vf.get_track_names())
     except Exception:
         return None
 
     for track in SPO2_TRACKS:
         if track in avail:
             try:
-                arr = vf.to_numpy([track], 1.0)  # 1Hz
+                # interval=1.0 → dtstart 기준 1Hz 격자. parser 의 start_sample 과 동일 원점.
+                arr = vf.to_numpy([track], 1.0)
                 if arr is not None and arr.size > 0:
                     return arr.flatten().astype(np.float32)
             except Exception:
@@ -187,32 +117,27 @@ def _load_spo2_trend(
     return None
 
 
-def _resolve_raw_vital_path(raw_dir: Path, subject_id: str) -> Path | None:
-    """parsed subject_id 에서 raw .vital 파일 경로 추론.
+def build_raw_vital_index(raw_dir: Path) -> dict[int, Path]:
+    """raw .vital 트리를 **한 번만** 순회해 {case 번호: 경로} 인덱스 구성.
 
-    VitalDB OR: VDB_0001 → 0001.vital 또는 vitaldb_open/0001.vital
+    구 코드는 subject 마다 `raw_dir.glob("**/*.vital")` 를 다시 돌아, 네트워크 마운트
+    에서 O(N_subject × N_file) 디렉토리 순회가 발생했다.
     """
+    index: dict[int, Path] = {}
+    for p in raw_dir.glob("**/*.vital"):
+        digits = "".join(c for c in p.stem if c.isdigit())
+        if not digits:
+            continue
+        index.setdefault(int(digits), p)
+    return index
+
+
+def _resolve_raw_vital_path(index: dict[int, Path], subject_id: str) -> Path | None:
+    """parsed subject_id(VDB_0001) → raw .vital 경로 (사전 구축 인덱스 조회)."""
     digits = "".join(c for c in subject_id if c.isdigit())
     if not digits:
         return None
-
-    # 다양한 naming convention 시도
-    candidates = [
-        raw_dir / f"{int(digits):04d}.vital",
-        raw_dir / f"{int(digits)}.vital",
-        raw_dir / f"{subject_id}.vital",
-    ]
-    # 1.0.0 같은 nested
-    for sub in raw_dir.glob("**/*.vital"):
-        # filename digit match
-        stem_digits = "".join(c for c in sub.stem if c.isdigit())
-        if stem_digits and int(stem_digits) == int(digits):
-            return sub
-
-    for c in candidates:
-        if c.is_file():
-            return c
-    return None
+    return index.get(int(digits))
 
 
 # ---- 라벨링 ----
@@ -247,19 +172,35 @@ def extract_forecast_samples(
     valid_ratio_threshold: float = DEFAULT_VALID_RATIO_THRESHOLD,
     gap_stats: GapStats | None = None,
     sample_dtype: str = "float16",  # OOM 회피
+    exclude_already_low: bool = True,
+    baseline_sec: float = 30.0,
+    drop_counts: dict[str, int] | None = None,
+    allow_tail_windows: bool = False,
 ) -> list[ForecastSample]:
     """SpO2 trend + waveform window 정렬해서 (input, future_label) 쌍 추출.
 
-    SpO2 trend 는 1Hz라 sliding window 의 future 시작 ~ +horizon 구간을
-    초 단위로 인덱싱.
+    시간 정렬: case["start_sample"] 은 dtstart 로부터의 100Hz 절대 인덱스이고 SpO2
+    trend 도 dtstart 원점 1Hz 이므로, 윈도우 끝의 절대 초 =
+    (start_sample + start + win_samples) / TARGET_SR 로 직접 인덱싱한다.
+
+    exclude_already_low: 예측 시점 baseline SpO2 (윈도우 끝 직전 baseline_sec 의
+    중앙값)가 이미 threshold 미만이면 그 윈도우를 버린다. 지속성만으로 양성이
+    맞아떨어지는 누수를 막는다.
     """
     win_samples = int(window_sec * TARGET_SR)
     stride_samples = int(stride_sec * TARGET_SR)
     horizon_samples_target = int(horizon_sec * TARGET_SR)
-    total_needed = win_samples + horizon_samples_target
+    # 라벨은 SpO2 trend(전체 recording)에서 오므로 파형이 horizon 만큼 더 있을 필요는
+    # 없다. 기본값은 보수적으로 파형까지 요구(구 동작 유지). allow_tail_windows=True 면
+    # case 말미 windows 를 회복한다 — 라벨은 trend 범위 가드(out_of_trend)가 지킨다.
+    total_needed = win_samples if allow_tail_windows else win_samples + horizon_samples_target
 
     min_consecutive = max(1, int(sustained_sec))  # 1Hz 라 1초당 1 sample
     samples: list[ForecastSample] = []
+
+    def _bump(key: str) -> None:
+        if drop_counts is not None:
+            drop_counts[key] = drop_counts.get(key, 0) + 1
 
     for case in cases:
         signals = case["signals"]
@@ -271,10 +212,12 @@ def extract_forecast_samples(
         if spo2 is None or len(spo2) == 0:
             continue
 
-        # spo2 (1Hz) 와 wave (100Hz) 의 시간 alignment 가정:
-        # parsed segment 가 raw 의 [0..len_sec] 같다고 가정 — 실제로는
-        # seg_start_sample 정보가 있어야 정확. 단순화: case-level 로 SpO2 전체 사용
-        # (sweep prepare 단계라 정확도 trade-off 수용)
+        # dtstart 원점 정렬: parser manifest 의 start_sample(100Hz 절대 인덱스).
+        # _seg_intersect 가 case 에 실어 준다. 없으면 정렬 불가 → case skip.
+        if "start_sample" not in case:
+            _bump("no_start_sample")
+            continue
+        seg_off_samples = int(case["start_sample"])
 
         for start in range(0, n_total - total_needed + 1, stride_samples):
             input_dict = {}
@@ -289,25 +232,42 @@ def extract_forecast_samples(
             if valid_ratio < valid_ratio_threshold:
                 if gap_stats is not None:
                     gap_stats.add_drop()
+                _bump("gap")
                 continue
 
-            future_start_sec = (start + win_samples) / TARGET_SR
+            win_end_sec = (seg_off_samples + start + win_samples) / TARGET_SR
+            future_start_sec = win_end_sec
             future_end_sec = future_start_sec + horizon_sec
 
-            f_start = int(future_start_sec)
-            f_end = int(future_end_sec)
-            if f_end > len(spo2):
-                if gap_stats is not None:
-                    gap_stats.add_drop()
+            # 아래 drop 들은 gap policy 가 아니라 **라벨 가용성/설계** 사유다.
+            # gap_stats 에 넣으면 논문에 보고할 "gap 으로 버린 비율"이 부풀려진다
+            # → drop_counts 로만 집계한다.
+            f_start = int(round(future_start_sec))
+            f_end = int(round(future_end_sec))
+            if f_start < 0 or f_end > len(spo2):
+                _bump("out_of_trend")
                 continue
+
+            # 예측 시점 baseline: 이미 저산소면 지속성 누수 → drop
+            if exclude_already_low:
+                b_start = max(0, f_start - int(baseline_sec))
+                base = spo2[b_start:f_start]
+                base = base[~np.isnan(base)]
+                base = base[(base >= 50.0) & (base <= 100.0)]
+                if base.size == 0:
+                    _bump("no_baseline")
+                    continue
+                if float(np.median(base)) < spo2_threshold:
+                    _bump("already_low")
+                    continue
+
             future_spo2 = spo2[f_start:f_end]
             future_spo2 = future_spo2[~np.isnan(future_spo2)]
             # SpO2 가용 범위: 50~100 외는 artifact
             future_spo2 = future_spo2[(future_spo2 >= 50.0) & (future_spo2 <= 100.0)]
 
             if len(future_spo2) < max(1, min_consecutive // 2):
-                if gap_stats is not None:
-                    gap_stats.add_drop()
+                _bump("no_future_spo2")
                 continue
 
             label = (
@@ -389,6 +349,10 @@ def save_split_dataset(
     fold_idx: int | None = None,
     n_folds: int = 1,
     chunk_idx: int | None = None,
+    spo2_threshold: float = 92.0,
+    sustained_sec: float = 60.0,
+    exclude_already_low: bool = True,
+    baseline_sec: float = 30.0,
 ) -> Path:
     """Single split chunk packed dict → 별도 .pt (OOM 회피 Stage 5)."""
     out_path = Path(out_dir)
@@ -405,8 +369,11 @@ def save_split_dataset(
             "horizon_sec": horizon_sec,
             "window_sec": window_sec,
             "sampling_rate": TARGET_SR,
-            "spo2_threshold": 92.0,
-            "sustained_sec": 60.0,
+            "spo2_threshold": spo2_threshold,
+            "sustained_sec": sustained_sec,
+            "exclude_already_low": exclude_already_low,
+            "baseline_sec": baseline_sec,
+            "label_alignment": "dtstart-absolute (start_sample offset)",
             "gap_policy": "drop+mask",
             "valid_ratio_threshold": DEFAULT_VALID_RATIO_THRESHOLD,
             "split": split_name,
@@ -461,7 +428,8 @@ def _patient_level_hypoxemia_labels(
 ) -> dict[str, list[int]]:
     """환자별 case 레벨 hypoxemia label (stratification 용).
 
-    각 case 의 SpO2 trend 에 < threshold 샘플 존재 여부를 binary 로 기록.
+    각 case 가 **실제로 덮는 시간 구간**의 SpO2 에 < threshold 샘플이 있는지 기록한다.
+    (구 코드는 recording 전체를 봐서, case 구간 밖 저산소까지 양성으로 셌다.)
     """
     patient_to_labels: dict[str, list[int]] = {}
     for case in cases:
@@ -469,7 +437,15 @@ def _patient_level_hypoxemia_labels(
         if pid not in spo2_map:
             continue
         sp = spo2_map[pid]
-        valid = sp[~np.isnan(sp)] if sp.size else sp
+        if sp.size == 0:
+            continue
+        off = int(case.get("start_sample", 0))
+        n_wave = min(len(s) for s in case["signals"].values())
+        s0 = max(0, int(off / TARGET_SR))
+        s1 = min(len(sp), int((off + n_wave) / TARGET_SR))
+        span = sp[s0:s1] if s1 > s0 else sp[:0]
+        valid = span[~np.isnan(span)]
+        valid = valid[(valid >= 50.0) & (valid <= 100.0)]
         has_hypo = bool(np.any(valid < spo2_threshold)) if valid.size else False
         patient_to_labels.setdefault(pid, []).append(1 if has_hypo else 0)
     return patient_to_labels
@@ -490,10 +466,17 @@ def prepare_hypoxemia_sweep(
     seed: int = 42,
     spo2_threshold: float = 92.0,
     sustained_sec: float = 60.0,
+    exclude_already_low: bool = True,
+    baseline_sec: float = 30.0,
+    workers: int = 16,
+    allow_tail_windows: bool = False,
 ) -> list[Path]:
     max_window = max(window_secs)
     max_horizon_sec = max(horizon_mins) * 60.0
-    min_duration_sec = max_window + max_horizon_sec + stride_sec
+    if allow_tail_windows:
+        min_duration_sec = max_window + stride_sec
+    else:
+        min_duration_sec = max_window + max_horizon_sec + stride_sec
 
     mode_str = " + ".join(s.upper() for s in input_signals)
     req_str = " + ".join(s.upper() for s in required_signals) if required_signals else "auto"
@@ -507,6 +490,7 @@ def prepare_hypoxemia_sweep(
     print(f"  Horizons:  {horizon_mins}")
     print(f"  Min dur:   {min_duration_sec / 60:.1f} min")
     print(f"  Label:     SpO2 < {spo2_threshold:.0f}% sustained >= {sustained_sec:.0f}s")
+    print(f"  Baseline:  exclude_already_low={exclude_already_low} (median of last {baseline_sec:.0f}s)")
     print(f"{'=' * 60}")
 
     print("\n[1/4] Loading aligned multi-channel waveform (manifest intersection)...")
@@ -522,21 +506,44 @@ def prepare_hypoxemia_sweep(
         print("ERROR: No valid cases loaded.", file=sys.stderr)
         sys.exit(1)
 
+    # 정렬 전제: 한 subject = 한 .vital = 한 session. 여러 session 이면 start_sample
+    # 원점이 session 마다 달라 단일 SpO2 trend 와 맞출 수 없다 → 해당 subject drop.
+    sessions_by_pid: dict[str, set[str]] = {}
+    for c in cases:
+        sessions_by_pid.setdefault(c["patient_id"], set()).add(str(c.get("session_id", "")))
+    multi_sess = {p for p, s in sessions_by_pid.items() if len(s) > 1}
+    if multi_sess:
+        print(f"  [WARN] multi-session subject {len(multi_sess)} 명 제외 (start_sample 원점 모호)")
+        cases = [c for c in cases if c["patient_id"] not in multi_sess]
+
     print("\n[2/4] Loading SpO2 trends from raw .vital...")
     raw_root = Path(raw_dir)
+    print("  indexing raw .vital tree (1-pass)...")
+    raw_index = build_raw_vital_index(raw_root)
+    print(f"  raw .vital 파일: {len(raw_index)}")
+
     spo2_map: dict[str, np.ndarray] = {}
     unique_pids = sorted({c["patient_id"] for c in cases})
-    n_found = 0
-    for i, pid in enumerate(unique_pids):
-        rv = _resolve_raw_vital_path(raw_root, pid)
+
+    def _one(pid: str) -> tuple[str, np.ndarray | None]:
+        rv = _resolve_raw_vital_path(raw_index, pid)
         if rv is None:
-            continue
-        spo2 = _load_spo2_trend(rv, 0)
-        if spo2 is not None:
-            spo2_map[pid] = spo2
-            n_found += 1
-        if (i + 1) % 50 == 0:
-            print(f"  {i+1}/{len(unique_pids)} processed, SpO2 found: {n_found}")
+            return pid, None
+        return pid, _load_spo2_trend(rv)
+
+    # 네트워크 마운트 I/O — ThreadPool 병렬 (memory: feedback_network_mounted_storage)
+    done = 0
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = [ex.submit(_one, pid) for pid in unique_pids]
+        for fut in as_completed(futs):
+            pid, spo2 = fut.result()
+            done += 1
+            if spo2 is not None and spo2.size > 0:
+                spo2_map[pid] = spo2
+            if done % 200 == 0:
+                print(f"  {done}/{len(unique_pids)} processed, SpO2 found: {len(spo2_map)}")
+
+    n_found = len(spo2_map)
     print(f"  SpO2 trend 보유 환자: {n_found} / {len(unique_pids)}")
     if n_found == 0:
         print("ERROR: No SpO2 trend found. raw_dir 또는 SPO2_TRACKS 확인.", file=sys.stderr)
@@ -578,6 +585,7 @@ def prepare_hypoxemia_sweep(
             test_cases = [c for c in cases if c["patient_id"] in test_pids]
             # OOM 회피 (Stage 5) — case-batch chunked save
             gap_stats = GapStats()
+            drop_counts: dict[str, int] = {}
             cur_fold_idx = fold_idx if n_folds > 1 else None
             CASES_PER_CHUNK = 200
 
@@ -590,15 +598,21 @@ def prepare_hypoxemia_sweep(
                     continue
                 chunk_idx = 0
                 total = 0
+                total_pos = 0
                 for batch_start in range(0, len(split_cases), CASES_PER_CHUNK):
                     case_batch = split_cases[batch_start:batch_start + CASES_PER_CHUNK]
                     samples = extract_forecast_samples(
                         case_batch, spo2_map, input_signals, window_sec, stride_sec, horizon_sec,
                         gap_stats=gap_stats,
                         spo2_threshold=spo2_threshold, sustained_sec=sustained_sec,
+                        exclude_already_low=exclude_already_low,
+                        baseline_sec=baseline_sec,
+                        drop_counts=drop_counts,
+                        allow_tail_windows=allow_tail_windows,
                     )
                     if not samples:
                         continue
+                    n_pos = sum(1 for s in samples if s.label == 1)
                     packed = pack_samples_to_dict(samples, input_signals, signal_dtype)
                     del samples; gc.collect()
                     n_in_chunk = int(packed.get("labels", torch.tensor([])).numel())
@@ -609,14 +623,24 @@ def prepare_hypoxemia_sweep(
                         fold_idx=cur_fold_idx,
                         n_folds=n_folds,
                         chunk_idx=chunk_idx,
+                        spo2_threshold=spo2_threshold,
+                        sustained_sec=sustained_sec,
+                        exclude_already_low=exclude_already_low,
+                        baseline_sec=baseline_sec,
                     )
                     saved_paths.append(save_path)
                     total += n_in_chunk
+                    total_pos += n_pos
                     chunk_idx += 1
                     del packed; gc.collect()
-                print(f"    {split_name.capitalize()}: {chunk_idx} chunk(s), {total} samples")
+                prev = f"{100.0 * total_pos / total:.2f}%" if total else "n/a"
+                print(f"    {split_name.capitalize()}: {chunk_idx} chunk(s), "
+                      f"{total} samples (+={total_pos}, prevalence={prev})")
 
             print(gap_stats.summary())
+            if drop_counts:
+                summary = ", ".join(f"{k}={v}" for k, v in sorted(drop_counts.items()))
+                print(f"    window drops: {summary}")
 
     print(f"\n{'=' * 60}")
     print(f"  Done! {len(saved_paths)}/{len(combos)} datasets saved to {out_dir}")
@@ -628,24 +652,36 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Intraop Hypoxemia Forecast — Data Prep")
     parser.add_argument("--data-dir", required=True, help="parsed .pt 디렉토리")
     parser.add_argument("--raw-dir", required=True, help="raw vitaldb .vital 디렉토리 (SpO2 라벨 추출용)")
-    # Task #6 Hypoxemia: PPG, ECG, ABP, CO2 (AWP/RESP 제거로 OR cohort ~10× 증가)
+    # 입력 조합은 코호트 크기와 trade-off: co2/awp 를 required 로 두면 capnography +
+    # 기도압이 있는 전신마취 케이스로 좁혀진다. --max-subjects 로 먼저 N 을 재 볼 것.
     parser.add_argument("--input-signals", nargs="+", default=["ecg", "ppg", "co2", "awp"],
                         choices=["abp", "ecg", "ppg", "co2", "awp"])
     parser.add_argument("--required-signals", nargs="+", default=None,
                         choices=["abp", "ecg", "ppg", "co2", "awp"])
     parser.add_argument("--max-subjects", type=int, default=None)
-    parser.add_argument("--horizon-mins", nargs="+", type=float, default=[5.0])
-    parser.add_argument("--window-secs", nargs="+", type=float, default=[60.0])
+    parser.add_argument("--horizon-mins", nargs="+", type=float, default=[5.0, 10.0, 15.0])
+    parser.add_argument("--window-secs", nargs="+", type=float, default=[300.0])
     parser.add_argument("--stride-sec", type=float, default=30.0)
     parser.add_argument("--n-folds", type=int, default=5,
                         help="Stratified patient-level K-fold CV (default 5).")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--workers", type=int, default=16,
+                        help="SpO2 trend 로딩 ThreadPool worker 수 (네트워크 마운트 I/O).")
     parser.add_argument("--out-dir", default="outputs/downstream/hypoxemia")
     parser.add_argument("--spo2-threshold", type=float, default=92.0,
                         help="hypoxemia 임계 SpO2(%). default 92 (Lundberg 2018·WHO ≤92, 수술중 예측 표준)")
     parser.add_argument("--sustained-sec", type=float, default=60.0,
                         help="positive 로 인정할 SpO2<threshold 연속 지속(초). "
                              "완화 시 10~30 권장 (양성↑)")
+    parser.add_argument("--include-already-low", action="store_true",
+                        help="예측 시점에 이미 SpO2<threshold 인 윈도우도 포함(기본 제외). "
+                             "포함하면 지속성만으로 양성이 맞아 성능이 부풀려진다.")
+    parser.add_argument("--baseline-sec", type=float, default=30.0,
+                        help="baseline SpO2 판정 구간(초, 윈도우 끝 직전 중앙값).")
+    parser.add_argument("--allow-tail-windows", action="store_true",
+                        help="파형이 horizon 만큼 남지 않은 case 말미 윈도우도 사용. "
+                             "라벨은 SpO2 trend 에서 오므로 유효하며 코호트가 늘어난다. "
+                             "기본 off(구 동작 유지 — 다른 task 와 표본 구성 일관).")
     dtype_map = add_signal_dtype_arg(parser)
     args = parser.parse_args()
 
@@ -664,6 +700,10 @@ def main() -> None:
         signal_dtype=dtype_map(args.signal_dtype),
         spo2_threshold=args.spo2_threshold,
         sustained_sec=args.sustained_sec,
+        exclude_already_low=not args.include_already_low,
+        baseline_sec=args.baseline_sec,
+        workers=args.workers,
+        allow_tail_windows=args.allow_tail_windows,
     )
 
 
