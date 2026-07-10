@@ -30,6 +30,7 @@ from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
+from tqdm import tqdm
 
 from data.parser._common import (
     resample_to_target,
@@ -159,24 +160,31 @@ def main() -> None:
     present = defaultdict(int)
     agg: dict[str, list[dict]] = defaultdict(list)
 
-    for fp in files:
+    # .vital 1개 로딩 + 트랙별 게이트 재현이 수십 초 걸릴 수 있어 진행바를 붙인다.
+    # 루프 안의 출력은 tqdm.write 로 (진행바가 깨지지 않게).
+    pbar = tqdm(files, desc="probing", unit="file", dynamic_ncols=True)
+    for fp in pbar:
+        pbar.set_description(f"probing {fp.name}")
         try:
             vf = vitaldb.VitalFile(str(fp))
             avail = set(vf.get_track_names())
         except Exception as exc:
-            print(f"  [WARN] {fp.name}: {exc}", file=sys.stderr)
+            tqdm.write(f"  [WARN] {fp.name}: {exc}", file=sys.stderr)
             continue
         for key in WATCH:
             hit = next((t for t in key_tracks[key] if t in avail), None)
             if hit is None:
                 continue
             present[key] += 1
+            pbar.set_postfix_str(f"{key}", refresh=True)
             r = probe_track(vf, hit, key)
             if r:
                 r["track"] = hit
                 agg[key].append(r)
-        print(f"  {fp.name}: tracks " + ", ".join(
+        tqdm.write(f"  {fp.name}: tracks " + ", ".join(
             f"{k}={'Y' if any(t in avail for t in key_tracks[k]) else '-'}" for k in WATCH))
+        pbar.set_postfix_str(", ".join(f"{k}={present[k]}" for k in WATCH), refresh=False)
+    pbar.close()
 
     n = len(files)
     print("\n── (A) 원본 트랙 존재율 ──")
