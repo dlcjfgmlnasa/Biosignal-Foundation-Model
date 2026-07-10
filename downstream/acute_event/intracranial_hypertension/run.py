@@ -22,9 +22,11 @@ from __future__ import annotations
 import argparse
 import copy
 import csv
+import gc
 import json
 import sys
 import warnings
+from collections.abc import Iterator
 from pathlib import Path
 
 import numpy as np
@@ -120,6 +122,30 @@ def _make_batches(
     # 버그 수정(2026-06-17): 윈도우당 1 행 보장(공유 헬퍼 위임). 예전엔 batch 의
     # 여러 윈도우가 1 pack 행으로 합쳐져 extract_features 가 B≠n_windows 를 냈다.
     return make_window_batches(
+        windows,
+        batch_size,
+        patch_size,
+        to_samples=lambda w, idx: _make_samples(w["signals"], idx),
+        get_label=lambda w: w["label"],
+    )
+
+
+def _iter_lora_batches(
+    windows: list[dict],
+    batch_size: int,
+    patch_size: int,
+) -> Iterator[tuple[PackedBatch, torch.Tensor]]:
+    """``_make_batches`` 의 스트리밍 버전 — batch 를 하나씩 yield (peak = batch 1개).
+
+    (batch, labels) 시퀀스는 ``_make_batches`` 와 바이트 단위로 동일하다
+    (window_task.iter_window_batches 계약) → 지표 불변.
+
+    anchored prediction 은 window 가 1200s(2채널 pack 행 240k sample)라 batch
+    리스트를 통째로 들고 있으면 val/test 만으로 수십 GB. 학습 종료 직후 test
+    batch 를 train+val batch 위에 추가로 빌드하다 host-RAM OOM 으로 죽었다.
+    generator 는 1회 소비용이므로 epoch 마다 새로 만들어 쓴다.
+    """
+    return iter_window_batches(
         windows,
         batch_size,
         patch_size,
@@ -1021,7 +1047,6 @@ def main() -> None:
     val_features = val_labels = None
     test_features = test_labels = None
     train_batches = None
-    val_batches = None
     lora_params = None
     ddp_module = None
 
@@ -1080,11 +1105,8 @@ def main() -> None:
         train_batches = _make_batches(
             train_windows, args.batch_size, args.patch_size, max_length,
         )
-        # val batch 는 rank0 만 평가에 쓴다(분할 X — full val set).
-        if is_main():
-            val_batches = _make_batches(
-                val_windows, args.batch_size, args.patch_size, max_length,
-            )
+        # val/test 는 rank0 만 평가에 쓰며(분할 X — full set), batch 리스트를 미리
+        # 빌드하지 않고 매번 _iter_lora_batches 로 스트리밍한다(host-RAM OOM 회피).
         probe = probe.to(device)
         lora_params = model.lora_parameters()
         optimizer = torch.optim.AdamW(
@@ -1165,7 +1187,11 @@ def main() -> None:
                 vm = _eval_probe_cached(probe, val_features, val_labels, device)
             else:
                 model.model.eval()
-                vm = evaluate_lora(model, probe, val_batches, device)
+                vm = evaluate_lora(
+                    model, probe,
+                    _iter_lora_batches(val_windows, args.batch_size, args.patch_size),
+                    device,
+                )
             val_auroc = float(vm["auroc"])
             if val_auroc > best_val_auroc:
                 best_val_auroc = val_auroc
@@ -1203,10 +1229,18 @@ def main() -> None:
     if not is_lora:
         metrics = _eval_probe_cached(probe, test_features, test_labels, device)
     else:
-        test_batches = _make_batches(
-            test_windows, args.batch_size, args.patch_size, max_length,
+        # 학습이 끝난 train batch(rank shard)는 test 평가에 불필요 — 먼저 해제한다.
+        # (이걸 들고 test batch 를 빌드하다 RAM peak 가 겹쳐 죽던 자리.)
+        # 마지막 epoch 의 tqdm(_bbar)이 train_batches 를 참조하므로 함께 끊어야 실제로
+        # 해제된다. epochs=0 이면 _bbar 는 미바인딩이지만 대입은 안전.
+        train_batches = None
+        _bbar = None
+        gc.collect()
+        metrics = evaluate_lora(
+            model, probe,
+            _iter_lora_batches(test_windows, args.batch_size, args.patch_size),
+            device,
         )
-        metrics = evaluate_lora(model, probe, test_batches, device)
 
     y_true = metrics.pop("y_true")
     y_score = metrics.pop("y_score")
