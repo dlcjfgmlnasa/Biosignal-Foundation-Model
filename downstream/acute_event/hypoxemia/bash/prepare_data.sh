@@ -4,19 +4,21 @@
 # 라벨: 미래 horizon 구간에 SpO2 < 92% 가 ≥60초 지속되면 positive.
 #   임계 92% = Lundberg et al., Nat Biomed Eng 2018 (Prescience) 및 WHO 중재 수준.
 #   Prescience 는 numeric AIMS 시계열로 5분 전 예측 — 우리는 raw waveform 으로 같은 문제를 푼다.
-# 입력: parsed .pt 파형 (ECG/PPG; CO2/AWP 는 파싱 부재 — 아래 주석). SpO2 numeric 은
+# 입력: parsed .pt 파형 (ECG/PPG/CO2/AWP — 심폐 4-modality). SpO2 numeric 은
 #   라벨 전용이며 입력에 넣지 않는다 (넣으면 persistence baseline 이 압도 — SWIFT 계열).
 #
 # 시간 정렬: parser manifest 의 start_sample(dtstart 원점 100Hz) 로 SpO2 1Hz trend 를 인덱싱.
 # Baseline 가드: 예측 시점에 이미 SpO2<92% 인 윈도우는 제외(기본) — 지속성 누수 차단.
 #
-# ⚠ 먼저 코호트 크기부터 재세요 (co2/awp 를 required 로 두면 전신마취+capnography 케이스로 좁혀짐):
-#   MAX_SUBJECTS=200 bash downstream/acute_event/hypoxemia/bash/prepare_data.sh
-#   → 로그의 "intersection intervals / subject(s)" 와 "Patient-level positive" 확인 후 전체 실행.
+# 코호트(inspect_cohort, 6,388 subject 전체, 2026-07-11 실측):
+#   ecg+ppg = 4,248 / ecg+ppg+co2 = 3,735 / ecg+ppg+co2+awp = 3,296 subject
+#   (1230s=window300+horizon900+stride30 연속 교집합 기준. --allow-tail-windows 시
+#    330s 기준 각각 5,676 / 5,221 / 4,994 로 늘어난다.)
+#   → canonical = 4-modality(ECG+PPG+CO2+AWP). 심혈관만(ECG+PPG)은 ablation 으로.
 #
 # 사용법:
 #   bash downstream/acute_event/hypoxemia/bash/prepare_data.sh
-#   (env override: DATA_DIR=... RAW_DIR=... OUT_DIR=... REQUIRED="ecg ppg" bash ...)
+#   (env override: DATA_DIR=... RAW_DIR=... OUT_DIR=... SIGNALS="ecg ppg" bash ...)
 
 set -e
 
@@ -29,14 +31,8 @@ OUT_DIR="${OUT_DIR:-${BIOFM_ROOT}/data/downstream/hypoxemia}"
 
 WINDOWS="${WINDOWS:-300}"              # canonical: 5 min input window
 HORIZONS="${HORIZONS:-5 10 15}"        # Table 3(a) 공통 lead-time 격자
-# ⚠ CO2/AWP 는 현재 **parsed** VitalDB 에 없다 (300 subject 중 1명, 2026-07-10 실측).
-#   원본에는 있다: vitaldb.find_cases → CO2 6,362 / AWP 6,360 / 4종 동시 6,129 case.
-#   parsed 보유율이 signal_type 0~3(ecg/abp/ppg/cvp)만 원본과 일치 → 파싱 때
-#   --signal-types 로 4·5 를 제외했을 가능성. (품질 게이트 가설은 반증됨:
-#   실제 Primus/CO2 는 파서 게이트를 74.7~91.8% 통과.)
-#   → 재파싱 전까지 canonical 은 ECG+PPG. CO2 복구 시 4-modality 로 확장.
-SIGNALS="${SIGNALS:-ecg ppg}"          # 입력 파형 (라벨은 SpO2 numeric)
-REQUIRED="${REQUIRED:-ecg ppg}"        # SIGNALS ⊆ REQUIRED 필수 (아니면 채널 소실)
+SIGNALS="${SIGNALS:-ecg ppg co2 awp}"  # 입력 파형 (라벨은 SpO2 numeric)
+REQUIRED="${REQUIRED:-ecg ppg co2 awp}" # SIGNALS ⊆ REQUIRED 필수 (아니면 채널 소실)
 N_FOLDS="${N_FOLDS:-5}"
 WORKERS="${WORKERS:-16}"               # 네트워크 마운트 → SpO2 로딩 ThreadPool
 SPO2_THRESHOLD="${SPO2_THRESHOLD:-92}"
