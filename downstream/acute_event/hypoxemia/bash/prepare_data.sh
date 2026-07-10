@@ -35,24 +35,47 @@ SIGNALS="${SIGNALS:-ecg ppg co2 awp}"  # 입력 파형 (라벨은 SpO2 numeric)
 REQUIRED="${REQUIRED:-ecg ppg co2 awp}" # SIGNALS ⊆ REQUIRED 필수 (아니면 채널 소실)
 N_FOLDS="${N_FOLDS:-5}"
 WORKERS="${WORKERS:-16}"               # 네트워크 마운트 → SpO2 로딩 ThreadPool
-SPO2_THRESHOLD="${SPO2_THRESHOLD:-92}"
-SUSTAINED_SEC="${SUSTAINED_SEC:-60}"
 MAX_SUBJECTS="${MAX_SUBJECTS:-}"       # 설정 시 dry-run (코호트 크기 확인용)
 
-EXTRA_ARGS=""
+# ── 라벨 정의 변이 (VARIANT) ──
+#   기본 SpO2<92%·60초 지속은 술중 prevalence 가 극히 낮다(5분 ~0.1%). 두 완화안:
+#   anypoint92 : SpO2<92% any-point + 아티팩트 게이트(HR concordance).  ~1.5/3.5/6.2%
+#                (Lundberg 2018 Prescience 정의. any-point 는 게이트 필수 — 라벨노이즈)
+#   sus95      : SpO2<95%·60초 지속.                                      ~0.24/0.63/1.4%
+#                (Park et al. PLoS One 2023 소아 임계)
+#   sus92      : 원안 SpO2<92%·60초 (참고용, 극희귀)
+# 결과 충돌 방지: 변이별 out-dir 접미사(_<VARIANT>). run.sh 도 동일 VARIANT 로 읽는다.
+VARIANT="${VARIANT:-anypoint92}"
+case "$VARIANT" in
+  anypoint92) SPO2_THRESHOLD=92; SUSTAINED_SEC=1;  GATE_ARG="--artifact-gate" ;;
+  sus95)      SPO2_THRESHOLD=95; SUSTAINED_SEC=60; GATE_ARG="" ;;
+  sus92)      SPO2_THRESHOLD=92; SUSTAINED_SEC=60; GATE_ARG="" ;;
+  *) echo "ERROR: unknown VARIANT '$VARIANT' (anypoint92|sus95|sus92)"; exit 1 ;;
+esac
+# env 로 직접 threshold/sustained override 도 허용 (VARIANT 프리셋 위에)
+SPO2_THRESHOLD="${SPO2_THRESHOLD_OVERRIDE:-$SPO2_THRESHOLD}"
+SUSTAINED_SEC="${SUSTAINED_SEC_OVERRIDE:-$SUSTAINED_SEC}"
+
+OUT_DIR="${OUT_DIR:-${BIOFM_ROOT}/data/downstream/hypoxemia_${VARIANT}}"
+
+EXTRA_ARGS="$GATE_ARG"
 if [ -n "$MAX_SUBJECTS" ]; then
-    EXTRA_ARGS="--max-subjects $MAX_SUBJECTS"
+    EXTRA_ARGS="$EXTRA_ARGS --max-subjects $MAX_SUBJECTS"
     OUT_DIR="${OUT_DIR}_dryrun"
 fi
 
+LABEL_DESC="SpO2 < ${SPO2_THRESHOLD}%"
+if [ "$SUSTAINED_SEC" -le 1 ] 2>/dev/null; then LABEL_DESC="$LABEL_DESC any-point"; else LABEL_DESC="$LABEL_DESC sustained >= ${SUSTAINED_SEC}s"; fi
+
 echo "============================================================"
 echo "  Intraoperative Hypoxemia — Data Preparation (VitalDB Open)"
+echo "  Variant:   $VARIANT"
 echo "  Parsed:    $DATA_DIR"
 echo "  Raw vital: $RAW_DIR"
 echo "  Output:    $OUT_DIR"
 echo "  Input:     $SIGNALS   (required: $REQUIRED)"
 echo "  Window:    ${WINDOWS}s | Horizons: ${HORIZONS} min | Folds: $N_FOLDS"
-echo "  Label:     SpO2 < ${SPO2_THRESHOLD}% sustained >= ${SUSTAINED_SEC}s"
+echo "  Label:     $LABEL_DESC ${GATE_ARG:+(+artifact-gate)}"
 if [ -n "$MAX_SUBJECTS" ]; then echo "  ⚠ DRY-RUN: max-subjects=$MAX_SUBJECTS"; fi
 echo "============================================================"
 

@@ -58,6 +58,58 @@ SPO2_TRACKS = [
     "Intellivue/PLETH_SAT_O2",    # K-MIMIC ICU
     "Solar8000/PLETH_SAT_O2",
 ]
+# 아티팩트 게이트용 (any-point 라벨의 motion/dropout 라벨노이즈 차단).
+# VitalDB 는 PI 트랙이 없어 range+HR concordance 만 적용된다(gate 함수가 자동 skip).
+PULSE_HR_TRACKS = ["Solar8000/PLETH_HR", "Intellivue/PLETH_HR"]   # 산소포화도 맥박수
+ECG_HR_TRACKS = ["Solar8000/HR", "Intellivue/ECG_HR"]             # ECG 심박수
+PI_TRACKS = ["Solar8000/PLETH_SPI", "Intellivue/PLETH_PERF_REL", "ROOT/PI"]
+
+
+def _gate_spo2_artifacts(
+    spo2: np.ndarray,
+    pulse_hr: np.ndarray | None,
+    ecg_hr: np.ndarray | None,
+    pi: np.ndarray | None,
+    hr_tol: float = 0.20,
+    pi_min: float = 0.3,
+) -> tuple[np.ndarray, dict]:
+    """SpO2 아티팩트 게이트 (PLOS One 2023 소아 프로토콜, desaturation task 와 동일).
+
+    NaN 처리(=라벨 계산에서 제외)되는 조건:
+      ① range: SpO2 ∉ [50, 100]
+      ② HR concordance: |pulse_hr - ecg_hr| / ecg_hr > hr_tol (motion/dropout)
+      ③ perfusion: pi < pi_min (저관류 → 부정확)
+    HR/PI 트랙이 없으면 해당 게이트는 skip. VitalDB 는 PI 부재 → ①②만 적용.
+    """
+    s = spo2.astype(np.float64).copy()
+    n = len(s)
+    invalid = ~np.isfinite(s) | (s < 50.0) | (s > 100.0)
+    n_range = int(invalid.sum())
+
+    n_hr = 0
+    if pulse_hr is not None and ecg_hr is not None:
+        m = min(n, len(pulse_hr), len(ecg_hr))
+        ph, eh = pulse_hr[:m], ecg_hr[:m]
+        ok = np.isfinite(ph) & np.isfinite(eh) & (eh > 20.0)
+        safe_eh = np.where(eh > 20.0, eh, np.nan)  # divide-by-zero 회피
+        discord = np.zeros(n, dtype=bool)
+        discord[:m] = ok & (np.abs(ph - eh) / safe_eh > hr_tol)
+        n_hr = int((discord & ~invalid).sum())
+        invalid |= discord
+
+    n_pi = 0
+    if pi is not None:
+        m = min(n, len(pi))
+        low = np.zeros(n, dtype=bool)
+        p = pi[:m]
+        low[:m] = np.isfinite(p) & (p < pi_min)
+        n_pi = int((low & ~invalid).sum())
+        invalid |= low
+
+    s[invalid] = np.nan
+    stats = {"n_total": n, "n_range": n_range, "n_hr_discord": n_hr,
+             "n_low_pi": n_pi, "n_gated": int(invalid.sum())}
+    return s, stats
 
 
 # ---- 데이터 구조 ----
@@ -84,11 +136,39 @@ class ForecastSample:
 # ---- SpO2 trend 추출 (raw .vital 사용) ----
 
 
-def _load_spo2_trend(raw_vital_path: Path) -> np.ndarray | None:
+def _pick_and_load_1hz(vf, avail: set, candidates: list[str], n: int | None) -> np.ndarray | None:
+    """후보 중 첫 존재 트랙을 1Hz numeric 으로 로드 (없으면 None). n 지정 시 길이 정렬."""
+    for trk in candidates:
+        if trk not in avail:
+            continue
+        try:
+            a = vf.to_numpy([trk], 1.0).flatten().astype(np.float64)
+        except Exception:
+            continue
+        if a.size == 0:
+            continue
+        if n is None:
+            return a
+        if len(a) >= n:
+            return a[:n]
+        out = np.full(n, np.nan)
+        out[:len(a)] = a
+        return out
+    return None
+
+
+def _load_spo2_trend(
+    raw_vital_path: Path,
+    artifact_gate: bool = False,
+    hr_tol: float = 0.20,
+    pi_min: float = 0.3,
+) -> np.ndarray | None:
     """raw .vital 에서 SpO2 1Hz trend 추출 (dtstart 원점).
 
-    SpO2 track 만 지정해 로드한다 — 전체 track 파싱은 네트워크 마운트에서 수십 배
-    느리다. 여러 track 후보를 순차 시도하고 첫 발견 사용.
+    필요한 track 만 지정해 로드한다 — 전체 track 파싱은 네트워크 마운트에서 수십 배
+    느리다. artifact_gate=True 면 pulse_hr/ecg_hr/pi 도 함께 로드해 SpO2 를 게이트
+    (motion/dropout 샘플 → NaN, 라벨 계산에서 제외). VitalDB 는 PI 부재라 range+HR
+    concordance 만 적용된다.
     Returns: (T,) 1Hz SpO2 array 또는 None.
     """
     try:
@@ -99,22 +179,29 @@ def _load_spo2_trend(raw_vital_path: Path) -> np.ndarray | None:
 
     if not raw_vital_path.is_file():
         return None
+    want = list(SPO2_TRACKS)
+    if artifact_gate:
+        want += PULSE_HR_TRACKS + ECG_HR_TRACKS + PI_TRACKS
     try:
-        vf = vitaldb.VitalFile(str(raw_vital_path), track_names=SPO2_TRACKS)
+        vf = vitaldb.VitalFile(str(raw_vital_path), track_names=want)
         avail = set(vf.get_track_names())
     except Exception:
         return None
 
-    for track in SPO2_TRACKS:
-        if track in avail:
-            try:
-                # interval=1.0 → dtstart 기준 1Hz 격자. parser 의 start_sample 과 동일 원점.
-                arr = vf.to_numpy([track], 1.0)
-                if arr is not None and arr.size > 0:
-                    return arr.flatten().astype(np.float32)
-            except Exception:
-                continue
-    return None
+    # interval=1.0 → dtstart 기준 1Hz 격자. parser 의 start_sample 과 동일 원점.
+    spo2 = _pick_and_load_1hz(vf, avail, SPO2_TRACKS, None)
+    if spo2 is None:
+        return None
+
+    if artifact_gate:
+        n = len(spo2)
+        pulse_hr = _pick_and_load_1hz(vf, avail, PULSE_HR_TRACKS, n)
+        ecg_hr = _pick_and_load_1hz(vf, avail, ECG_HR_TRACKS, n)
+        pi = _pick_and_load_1hz(vf, avail, PI_TRACKS, n)
+        spo2, _ = _gate_spo2_artifacts(spo2, pulse_hr, ecg_hr, pi,
+                                       hr_tol=hr_tol, pi_min=pi_min)
+
+    return spo2.astype(np.float32)
 
 
 def build_raw_vital_index(raw_dir: Path) -> dict[int, Path]:
@@ -353,6 +440,7 @@ def save_split_dataset(
     sustained_sec: float = 60.0,
     exclude_already_low: bool = True,
     baseline_sec: float = 30.0,
+    artifact_gate: bool = False,
 ) -> Path:
     """Single split chunk packed dict → 별도 .pt (OOM 회피 Stage 5)."""
     out_path = Path(out_dir)
@@ -371,6 +459,8 @@ def save_split_dataset(
             "sampling_rate": TARGET_SR,
             "spo2_threshold": spo2_threshold,
             "sustained_sec": sustained_sec,
+            "label_mode": "any-point" if sustained_sec <= 1 else "sustained",
+            "artifact_gate": artifact_gate,
             "exclude_already_low": exclude_already_low,
             "baseline_sec": baseline_sec,
             "label_alignment": "dtstart-absolute (start_sample offset)",
@@ -470,6 +560,9 @@ def prepare_hypoxemia_sweep(
     baseline_sec: float = 30.0,
     workers: int = 16,
     allow_tail_windows: bool = False,
+    artifact_gate: bool = False,
+    hr_tol: float = 0.20,
+    pi_min: float = 0.3,
 ) -> list[Path]:
     max_window = max(window_secs)
     max_horizon_sec = max(horizon_mins) * 60.0
@@ -489,7 +582,10 @@ def prepare_hypoxemia_sweep(
     print(f"  Windows:   {window_secs}")
     print(f"  Horizons:  {horizon_mins}")
     print(f"  Min dur:   {min_duration_sec / 60:.1f} min")
-    print(f"  Label:     SpO2 < {spo2_threshold:.0f}% sustained >= {sustained_sec:.0f}s")
+    dur = "any-point" if sustained_sec <= 1 else f"sustained >= {sustained_sec:.0f}s"
+    print(f"  Label:     SpO2 < {spo2_threshold:.0f}% {dur}")
+    print(f"  Gate:      artifact_gate={artifact_gate}"
+          + (f" (HR 괴리>{hr_tol:.0%}, PI<{pi_min})" if artifact_gate else ""))
     print(f"  Baseline:  exclude_already_low={exclude_already_low} (median of last {baseline_sec:.0f}s)")
     print(f"{'=' * 60}")
 
@@ -551,7 +647,8 @@ def prepare_hypoxemia_sweep(
         rv = _resolve_raw_vital_path(raw_index, pid)
         if rv is None:
             return pid, None
-        return pid, _load_spo2_trend(rv)
+        return pid, _load_spo2_trend(rv, artifact_gate=artifact_gate,
+                                     hr_tol=hr_tol, pi_min=pi_min)
 
     # 네트워크 마운트 I/O — ThreadPool 병렬 (memory: feedback_network_mounted_storage)
     done = 0
@@ -649,6 +746,7 @@ def prepare_hypoxemia_sweep(
                         sustained_sec=sustained_sec,
                         exclude_already_low=exclude_already_low,
                         baseline_sec=baseline_sec,
+                        artifact_gate=artifact_gate,
                     )
                     saved_paths.append(save_path)
                     total += n_in_chunk
@@ -694,7 +792,16 @@ def main() -> None:
                         help="hypoxemia 임계 SpO2(%). default 92 (Lundberg 2018·WHO ≤92, 수술중 예측 표준)")
     parser.add_argument("--sustained-sec", type=float, default=60.0,
                         help="positive 로 인정할 SpO2<threshold 연속 지속(초). "
-                             "완화 시 10~30 권장 (양성↑)")
+                             "1 이하면 any-point(미래 구간에 한 샘플이라도 <threshold). "
+                             "any-point 는 --artifact-gate 권장(라벨노이즈 차단).")
+    parser.add_argument("--artifact-gate", action="store_true",
+                        help="SpO2 아티팩트 게이트: HR concordance(|pulseHR-ecgHR|/ecgHR>hr_tol) "
+                             "및 저관류(PI<pi_min) 샘플을 라벨에서 제외. any-point 라벨 필수. "
+                             "VitalDB 는 PI 부재라 range+HR 만 적용.")
+    parser.add_argument("--hr-tol", type=float, default=0.20,
+                        help="[artifact-gate] pulse/ecg HR 상대 괴리 허용치 (기본 0.20).")
+    parser.add_argument("--pi-min", type=float, default=0.3,
+                        help="[artifact-gate] perfusion index 하한 (미만→제외, PI 트랙 있을 때만).")
     parser.add_argument("--include-already-low", action="store_true",
                         help="예측 시점에 이미 SpO2<threshold 인 윈도우도 포함(기본 제외). "
                              "포함하면 지속성만으로 양성이 맞아 성능이 부풀려진다.")
@@ -726,6 +833,9 @@ def main() -> None:
         baseline_sec=args.baseline_sec,
         workers=args.workers,
         allow_tail_windows=args.allow_tail_windows,
+        artifact_gate=args.artifact_gate,
+        hr_tol=args.hr_tol,
+        pi_min=args.pi_min,
     )
 
 

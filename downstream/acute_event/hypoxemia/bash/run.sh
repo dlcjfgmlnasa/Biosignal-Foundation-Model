@@ -16,10 +16,14 @@
 
 set -e
 
+# VARIANT = 라벨 정의 변이 (prepare_data.sh 와 동일해야 데이터 경로가 맞는다).
+#   anypoint92 (기본) | sus95 | sus92.  data/result 경로에 _${VARIANT} 접미사.
+VARIANT=${VARIANT:-anypoint92}
+
 # canonical 경로는 k-mimic-/bio_fm 아래 (updown 기본은 stale).
 CHECKPOINT=${CHECKPOINT:-/home/coder/workspace/k-mimic-/bio_fm/outputs/main/phase2/kmimic_phase2_k2/checkpoints/checkpoint_phase2_av_epoch049_final.pt}
-DATA_DIR=${DATA_DIR:-/home/coder/workspace/k-mimic-/bio_fm/data/downstream/hypoxemia}
-OUT_DIR=${OUT_DIR:-/home/coder/workspace/k-mimic-/bio_fm/result/main/hypoxemia}
+DATA_DIR=${DATA_DIR:-/home/coder/workspace/k-mimic-/bio_fm/data/downstream/hypoxemia_${VARIANT}}
+OUT_DIR=${OUT_DIR:-/home/coder/workspace/k-mimic-/bio_fm/result/main/hypoxemia_${VARIANT}}
 DEVICE=${DEVICE:-cuda}
 MODEL_VERSION=${MODEL_VERSION:-v2}   # v2 필수 (9 modality 단일 embedding). v1 로드 금지.
 
@@ -71,6 +75,7 @@ COUNT=0
 
 log "============================================================"
 log "  Intraoperative Hypoxemia — frozen/LoRA sweep"
+log "  Variant:    $VARIANT"
 log "  Checkpoint: $CHECKPOINT"
 log "  ModelVer:   $MODEL_VERSION"
 log "  Data:       $DATA_DIR"
