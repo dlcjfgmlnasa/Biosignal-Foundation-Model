@@ -29,10 +29,12 @@ OUT_DIR="${OUT_DIR:-${BIOFM_ROOT}/data/downstream/hypoxemia}"
 
 WINDOWS="${WINDOWS:-300}"              # canonical: 5 min input window
 HORIZONS="${HORIZONS:-5 10 15}"        # Table 3(a) 공통 lead-time 격자
-# ⚠ CO2/AWP 는 현재 parsed VitalDB 에 사실상 없다 (300 subject 중 1명, 2026-07-10 실측).
-#   원인 후보: 파서 품질 게이트(co2 flatline≤0.3·clip≤0.1)가 capnogram 의 정상적인
-#   plateau/baseline 을 탈락시킴. probe_raw_tracks.py 로 확인할 것.
-#   → canonical 은 ECG+PPG. 재파싱으로 CO2 를 살리면 그때 조합을 넓힌다.
+# ⚠ CO2/AWP 는 현재 **parsed** VitalDB 에 없다 (300 subject 중 1명, 2026-07-10 실측).
+#   원본에는 있다: vitaldb.find_cases → CO2 6,362 / AWP 6,360 / 4종 동시 6,129 case.
+#   parsed 보유율이 signal_type 0~3(ecg/abp/ppg/cvp)만 원본과 일치 → 파싱 때
+#   --signal-types 로 4·5 를 제외했을 가능성. (품질 게이트 가설은 반증됨:
+#   실제 Primus/CO2 는 파서 게이트를 74.7~91.8% 통과.)
+#   → 재파싱 전까지 canonical 은 ECG+PPG. CO2 복구 시 4-modality 로 확장.
 SIGNALS="${SIGNALS:-ecg ppg}"          # 입력 파형 (라벨은 SpO2 numeric)
 REQUIRED="${REQUIRED:-ecg ppg}"        # SIGNALS ⊆ REQUIRED 필수 (아니면 채널 소실)
 N_FOLDS="${N_FOLDS:-5}"

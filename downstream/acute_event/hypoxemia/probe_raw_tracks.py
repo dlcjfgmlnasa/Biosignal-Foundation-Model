@@ -10,6 +10,13 @@
 (C) 라면 어떤 체크(flatline/clip/high_freq/amplitude/domain)가 죽이는지까지 출력한다.
 파서 코드는 읽기만 하고 수정하지 않는다.
 
+2026-07-10 실측 참고:
+  - VitalDB 원본은 CO2/AWP 를 99.6% case 에서 보유 (vitaldb.find_cases).
+  - 실제 Primus/CO2 는 파서 게이트를 74.7~91.8% 통과 → **(C) 는 반증됨**.
+    ⇒ parsed 산출물의 CO2/AWP 부재는 (A) 또는 (B) 이다. 이 스크립트로 확정할 것.
+  - 합성(노이즈 없는) capnogram 은 flatline 0.995 로 탈락한다. 게이트를 합성
+    신호로 판정하지 말 것 — 실 데이터는 lowpass 후 평탄부가 흔들려 통과한다.
+
 사용법:
     python -m downstream.acute_event.hypoxemia.probe_raw_tracks \
         --raw-dir /home/coder/workspace/datasets/vitaldb_open/1.0.0 --n-files 12
