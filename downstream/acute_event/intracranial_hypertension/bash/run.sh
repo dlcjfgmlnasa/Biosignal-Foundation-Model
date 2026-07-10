@@ -48,6 +48,12 @@ FORCE="${FORCE:-0}"       # 1 이면 완료 fold(preds_fold{f}.npz)도 재실행
 #   메모리가 커 8 로 보수적 설정(서버 OOM 방지). torchrun 에선 effective = LORA_BATCH × nproc.
 #   여유되면 상향하되 batch 변경 시 LR 재튜닝 필요(최적화 궤적 달라짐).
 LORA_BATCH="${LORA_BATCH:-8}"
+# LORA_ACCUM: gradient accumulation. 실질 batch = LORA_BATCH × NPROC × LORA_ACCUM.
+#   ICH 양성 prevalence ~2% + micro-batch 8 이면 optimizer step 의 절반가량이 양성을
+#   하나도 못 본다(양성 기아 → encoder 가 음성 쪽으로 끌려감). accum 은 VRAM 을 안
+#   늘리고 실질 batch 만 키워 이를 없앤다. hypotension 은 실질 512(128×4)로 학습한다.
+#   기본 1 = 기존 동작 그대로. Frozen 과 공정 비교하려면 LORA_ACCUM=16(→512) 권장.
+LORA_ACCUM="${LORA_ACCUM:-1}"
 
 # ── 한 fold 를 여러 GPU 로 DDP 실행 (fold 순차, 각 fold torchrun 4-GPU) ──
 # 기본 NPROC=4 (cardiac_arrest/hypotension 과 동일). 단일 GPU 는 NPROC=1.
@@ -85,7 +91,7 @@ echo "  ModelVer:   $MODEL_VERSION"
 echo "  Data:       $DATA_DIR"
 echo "  Output:     $OUT_DIR"
 echo "  Input:      $SIGNALS  Window: ${WINDOW_SECS[*]}s  Horizon: ${HORIZON_MINS[*]}min"
-echo "  LoRA batch: $LORA_BATCH  (NPROC=$NPROC → eff $((LORA_BATCH * NPROC)))"
+echo "  LoRA batch: $LORA_BATCH  (NPROC=$NPROC × accum=$LORA_ACCUM → eff $((LORA_BATCH * NPROC * LORA_ACCUM)))"
 echo "============================================================"
 
 for WIN in "${WINDOW_SECS[@]}"; do
@@ -109,7 +115,7 @@ for WIN in "${WINDOW_SECS[@]}"; do
                 EXTRA="--batch-size $LP_BATCH"
             else
                 EPOCHS="$LORA_EPOCHS"; LR="$LORA_LR"
-                EXTRA="--lora-rank $LORA_RANK --batch-size $LORA_BATCH"
+                EXTRA="--lora-rank $LORA_RANK --batch-size $LORA_BATCH --grad-accum $LORA_ACCUM"
             fi
             EXP_DIR="${OUT_DIR}/${EXP_NAME}/${MODE}"
             mkdir -p "$EXP_DIR"

@@ -20,6 +20,7 @@ MIMIC-III ICP 기반 두개내 고혈압 탐지 — Foundation model representat
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import csv
 import gc
@@ -878,6 +879,14 @@ def main() -> None:
                         choices=["linear_probe", "lora"])
     parser.add_argument("--lora-rank", type=int, default=8)
     parser.add_argument("--lora-alpha", type=float, default=16.0)
+    parser.add_argument(
+        "--grad-accum", type=int, default=1,
+        help="[lora] gradient accumulation step 수. 실질 batch = batch_size × "
+        "nproc × grad_accum. 1(기본)이면 기존 동작과 동일. ICH 는 20min window 라 "
+        "VRAM 때문에 micro-batch 가 8 로 작은데, 양성 prevalence ~2%% 에서는 "
+        "optimizer step 의 절반가량이 양성을 하나도 못 본다(양성 기아). accum 으로 "
+        "VRAM 을 늘리지 않고 실질 batch 만 키워 이를 없앤다.",
+    )
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -1037,6 +1046,7 @@ def main() -> None:
 
     probe = LinearProbe(d_model, n_classes=1)
     is_lora = args.mode == "lora"
+    grad_accum = max(1, int(args.grad_accum))  # lora 전용 (1=기존 동작)
 
     # ── 준비: linear_probe=frozen feature 캐싱 / lora=batch 빌드 + DDP shard ──
     # hypotension 과 동일하게 매 epoch val AUROC 로 best-ckpt 를 잡고, 마지막에
@@ -1120,8 +1130,12 @@ def main() -> None:
         # 면 use_ddp=False → ddp_module=None → 기존 _make/forward 경로 그대로(불변).
         ddp_module = wrap_lora_ddp(model.model, probe) if use_ddp else None
         n_lora = sum(p.numel() for p in model.lora_parameters())
+        eff_batch = args.batch_size * (ddp_world_size() if use_ddp else 1) * grad_accum
         print(f"\nTraining LoRA + Probe (rank={args.lora_rank}, LoRA={n_lora:,}) "
               f"with val best-ckpt...")
+        print(f"  batch: micro={args.batch_size} × nproc="
+              f"{ddp_world_size() if use_ddp else 1} × accum={grad_accum} "
+              f"→ effective {eff_batch}")
 
     criterion = nn.BCEWithLogitsLoss()
     train_losses: list[float] = []
@@ -1157,21 +1171,43 @@ def main() -> None:
                 train_batches, desc=f"  ep{epoch + 1}/{args.epochs}",
                 unit="batch", leave=False, disable=not is_main(),
             )
-            for batch, labels in _bbar:
+            # grad accumulation: micro-batch 를 grad_accum 개 모아 1 optimizer step.
+            #   loss 를 실제 그룹 크기로 나눠 "한 번에 큰 batch" 와 같은 gradient 를
+            #   만든다(꼬리 그룹은 크기가 작아 그 크기로 나눔). DDP 는 마지막 micro
+            #   가 아니면 no_sync() 로 all-reduce 를 미뤄 통신을 grad_accum 배 절약.
+            #   equalize_shard 로 전 rank 의 micro-batch 수가 같으므로 그룹 경계·
+            #   sync 시점이 rank 간 일치한다(desync 없음).
+            #   grad_accum=1 이면 그룹 크기 1 → 기존 코드와 동일한 순서·수치.
+            n_micro = len(train_batches)
+            optimizer.zero_grad(set_to_none=True)
+            for i, (batch, labels) in enumerate(_bbar):
+                grp_start = (i // grad_accum) * grad_accum
+                grp_size = min(grad_accum, n_micro - grp_start)
+                is_last_micro = (i + 1 - grp_start) == grp_size
+
                 batch = model.batch_to_device(batch)
-                if ddp_module is not None:
-                    logits = ddp_module(batch)
-                else:
-                    out = model.model(batch, task="masked")
-                    features = _mean_pool(out["encoded"], out["patch_mask"])
-                    logits = probe(features)
-                loss = criterion(logits, labels.to(device).unsqueeze(-1))
-                optimizer.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(
-                    lora_params + list(probe.parameters()), 1.0,
+                sync_ctx = (
+                    ddp_module.no_sync()
+                    if (ddp_module is not None and not is_last_micro)
+                    else contextlib.nullcontext()
                 )
-                optimizer.step()
+                with sync_ctx:
+                    if ddp_module is not None:
+                        logits = ddp_module(batch)
+                    else:
+                        out = model.model(batch, task="masked")
+                        features = _mean_pool(out["encoded"], out["patch_mask"])
+                        logits = probe(features)
+                    loss = criterion(logits, labels.to(device).unsqueeze(-1))
+                    (loss / grp_size).backward()
+
+                if is_last_micro:
+                    nn.utils.clip_grad_norm_(
+                        lora_params + list(probe.parameters()), 1.0,
+                    )
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+
                 epoch_loss += loss.item()
                 n_steps += 1
                 if is_main():
