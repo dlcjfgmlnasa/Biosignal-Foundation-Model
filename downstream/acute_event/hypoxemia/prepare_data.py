@@ -493,6 +493,18 @@ def prepare_hypoxemia_sweep(
     print(f"  Baseline:  exclude_already_low={exclude_already_low} (median of last {baseline_sec:.0f}s)")
     print(f"{'=' * 60}")
 
+    # required 가 input 을 포함하지 않으면, 로더가 그 신호를 아예 안 읽어 입력 채널이
+    # 조용히 사라진다 (consume_input_signals 는 없는 stype 을 그냥 건너뜀).
+    if required_signals is not None:
+        missing = sorted(set(input_signals) - set(required_signals))
+        if missing:
+            print(
+                f"ERROR: --input-signals 가 --required-signals 의 부분집합이어야 합니다. "
+                f"required 에 빠진 입력: {missing}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
     print("\n[1/4] Loading aligned multi-channel waveform (manifest intersection)...")
     # Manifest 기반 시간선 intersection — filename seg_key 매칭 대비 cohort 13-124× 회복
     base_req = set(required_signals if required_signals else input_signals)
@@ -503,7 +515,17 @@ def prepare_hypoxemia_sweep(
         max_subjects=max_subjects,
     )
     if not cases:
-        print("ERROR: No valid cases loaded.", file=sys.stderr)
+        print(
+            f"ERROR: No valid cases loaded.\n"
+            f"  요구한 연속 교집합 길이 = {min_duration_sec:.0f}s "
+            f"(= window {max_window:.0f} + horizon {max_horizon_sec:.0f} + stride {stride_sec:.0f}).\n"
+            f"  원인 진단:\n"
+            f"    python -m downstream.acute_event.hypoxemia.inspect_cohort "
+            f"--data-dir {data_dir} --max-subjects 300\n"
+            f"  완화 옵션: --allow-tail-windows (min_dur → window+stride), "
+            f"또는 --required-signals 를 좁히기.",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     # 정렬 전제: 한 subject = 한 .vital = 한 session. 여러 session 이면 start_sample
