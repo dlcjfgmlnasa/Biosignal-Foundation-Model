@@ -31,7 +31,8 @@ Negative 구성 (``--neg-mode``, 2026-07-05 추가):
   - ``cross-patient`` (기본, SCOPE 논문 정합): pos=event 환자·neg=Discharge 환자.
     "arrest-환자 vs discharge-환자" 구분(who). horizon band 로 lead-time 매칭.
   - ``within-patient`` (같은 arrest 환자 임박 경보): **arrest 환자만** 사용, 같은 환자
-    안에서 **pos=임박(horizon band, arrest 5~15분 전)·neg=비-임박(tte≥12h)·회색지대 drop**.
+    안에서 **pos=임박(horizon band, 예 h=5 → arrest 5~10분 전)·neg=비-임박(tte≥12h)·
+    회색지대 drop**.
     환자 중증도(who) 대신 arrest 로의 가속(when) 학습. band 를 24h 로 확장(12h+ neg 확보),
     neg 는 pos×10 로 캡(자연 ~100:1 완화). ⚠ 74 환자뿐 → CI 넓음(환자 단위 bootstrap),
     SCOPE 논문(cross-patient)과 직접 비교 불가 — 우리 고유 imminence task.
@@ -46,7 +47,7 @@ Negative 구성 (``--neg-mode``, 2026-07-05 추가):
         --metadata datasets/icu-cardiac-arrest/1.0/metadata_v1.0.xlsx \
         --vital-dir datasets/icu-cardiac-arrest/1.0 \
         --task arrest --input-signals ecg ppg \
-        --window-secs 600 --horizon-mins 5 15 30 \
+        --window-secs 600 --horizon-mins 5 10 15 --max-lead-sec 300 \
         --out-dir datasets/processed/scope_cardiac_arrest --workers 8
 
     # within-patient (같은 arrest 환자 임박 경보)
@@ -120,7 +121,7 @@ def extract_ca_window_samples(
     window_sec: float = 600.0,
     stride_sec: float = 30.0,
     horizon_sec: float = 900.0,
-    max_lead_sec: float = 600.0,
+    max_lead_sec: float = 300.0,
     valid_ratio_threshold: float = DEFAULT_VALID_RATIO_THRESHOLD,
     gap_stats: GapStats | None = None,
     sample_dtype: str = "float16",
@@ -864,10 +865,16 @@ def main() -> None:
                         choices=["ecg", "ppg"],
                         help="SCOPE 가용 = ECG+PPG (2채널)")
     parser.add_argument("--horizon-mins", nargs="+", type=float,
-                        default=[5.0, 15.0, 30.0])
+                        default=[5.0, 10.0, 15.0],
+                        help="Imminent cardiac arrest 예측 horizon(분). Default 5/10/15.")
     parser.add_argument("--window-secs", nargs="+", type=float, default=[600.0])
     parser.add_argument("--stride-sec", type=float, default=30.0)
-    parser.add_argument("--max-lead-sec", type=float, default=600.0)
+    parser.add_argument(
+        "--max-lead-sec", type=float, default=300.0,
+        help="윈도우 종료 band 폭(초). horizon h 에 대해 h ≤ tte ≤ h+max_lead 인 "
+        "윈도우만 채택. Default 300 = horizon 간격 → 5/10/15 의 band 가 "
+        "[5,10]·[10,15]·[15,20]분으로 맞닿는다(양끝 포함이라 경계 윈도우 1개만 공유).",
+    )
     parser.add_argument("--n-folds", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--out-dir", type=str,

@@ -3,7 +3,9 @@
 #
 # 소스: SCOPE (SNUH ICU, KHDP icu-cardiac-arrest) — .vital + metadata_v1.0.xlsx.
 #   (구 MIMIC manifest 경로는 prepare_data_scope 로 대체됨.)
-# 입력: ECG + PPG (2채널). horizon 5/15/30 min. fold split = case_id 단위.
+# 입력: ECG + PPG (2채널). horizon 5/10/15 min. fold split = case_id 단위.
+#   band 폭 = MAX_LEAD_SEC(300s) → 세 horizon 의 윈도우 구간이 겹치지 않고 맞닿는다
+#   (tte [5,10]·[10,15]·[15,20]분; 양끝 포함이라 경계 윈도우 1개만 공유).
 #
 # 사용법:
 #   bash downstream/acute_event/cardiac_arrest/bash/prepare_data.sh
@@ -16,7 +18,8 @@ VITAL_DIR=${VITAL_DIR:-/home/coder/workspace/datasets/icu-cardiac-arrest/1.0}
 TASK=${TASK:-arrest}                 # arrest(pos=Cardiac Arrest) | death(pos=Death)
 INPUT_SIGNALS=${INPUT_SIGNALS:-ecg ppg}
 WINDOW_SECS=${WINDOW_SECS:-600}
-HORIZON_MINS=${HORIZON_MINS:-5 15 30}
+HORIZON_MINS=${HORIZON_MINS:-5 10 15}
+MAX_LEAD_SEC=${MAX_LEAD_SEC:-300}   # band 폭: h ≤ tte ≤ h+MAX_LEAD 인 윈도우만 채택
 N_FOLDS=${N_FOLDS:-5}
 WORKERS=${WORKERS:-8}
 TRAIN_NEG_CAP=${TRAIN_NEG_CAP:-0}   # [cross-patient] train 음성 case 당 window 캡(0=없음)
@@ -41,7 +44,7 @@ echo "============================================================"
 echo "  Imminent Cardiac Arrest (SCOPE) — Data Preparation"
 echo "  Metadata: $METADATA"
 echo "  Vital:    $VITAL_DIR"
-echo "  Task=$TASK | Neg-mode=$NEG_MODE | Signals: $INPUT_SIGNALS | Window: ${WINDOW_SECS}s | Horizons: $HORIZON_MINS min"
+echo "  Task=$TASK | Neg-mode=$NEG_MODE | Signals: $INPUT_SIGNALS | Window: ${WINDOW_SECS}s | Horizons: $HORIZON_MINS min | Band: ${MAX_LEAD_SEC}s"
 echo "  Output:   $OUT_DIR"
 echo "============================================================"
 
@@ -53,6 +56,7 @@ python -m downstream.acute_event.cardiac_arrest.prepare_data_scope \
     --input-signals $INPUT_SIGNALS \
     --window-secs $WINDOW_SECS \
     --horizon-mins $HORIZON_MINS \
+    --max-lead-sec $MAX_LEAD_SEC \
     --n-folds $N_FOLDS \
     --out-dir "$OUT_DIR" \
     --workers $WORKERS \

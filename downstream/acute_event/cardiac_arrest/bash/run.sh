@@ -18,7 +18,7 @@ NPROC=${NPROC:-4}
 TASK=${TASK:-arrest}          # prepare_data_scope --task (arrest|death) → prefix scope_{task}_...
 SIGNALS=${SIGNALS:-ecg_ppg}   # prefix 채널 토큰 (prepare_data_scope --input-signals 순서 = ecg ppg)
 WINDOW=${WINDOW:-600}
-HORIZONS=${HORIZONS:-5 15 30}
+HORIZONS=${HORIZONS:-5 10 15}
 
 LP_BATCH=${LP_BATCH:-512};    LP_LR=${LP_LR:-1e-3};    LP_EPOCHS=${LP_EPOCHS:-1000}
 LORA_BATCH=${LORA_BATCH:-128}; LORA_LR=${LORA_LR:-2e-4}; LORA_EPOCHS=${LORA_EPOCHS:-30}

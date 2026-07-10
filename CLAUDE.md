@@ -88,7 +88,7 @@ main.py     # Entry point / training orchestration
 - Intraoperative Hypotension Prediction
 - Arrhythmia Classification
 - Intracranial Hypertension
-- Cardiac Arrest Prediction (5/15/30 min horizon, risk-set matched negatives)
+- Cardiac Arrest Prediction (5/10/15 min horizon, risk-set matched negatives)
 
 ### 2. Outcome Prediction (분류 head — 시점 예측, 시간 단위 horizon)
 - Sepsis Prediction
