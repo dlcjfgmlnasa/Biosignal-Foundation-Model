@@ -29,6 +29,7 @@ import json
 import re
 import sys
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 # parser 가 디스크에 쓰는 키 (data/parser/vitaldb.py SIGNAL_TYPES 의 key)
@@ -48,10 +49,42 @@ def _key_from_filename(name: str) -> str | None:
     return m.group("key") if m else None
 
 
+def _scan_one(sd: Path, with_disk: bool) -> dict:
+    """subject 1개: manifest 파싱 (+ 선택적으로 disk .pt glob). I/O 만 담당."""
+    mp = sd / "manifest.json"
+    disk_files: set[str] = set()
+    if with_disk:
+        disk_files = {p.name for p in sd.glob("*.pt")}
+
+    out = {"name": sd.name, "disk_files": disk_files, "recs": None, "corrupt": False}
+    if not mp.is_file():
+        return out
+    try:
+        with open(mp, encoding="utf-8") as fh:
+            m = json.load(fh)
+    except (json.JSONDecodeError, OSError):
+        out["corrupt"] = True
+        return out
+    recs: list[tuple[int, str]] = []
+    for sess in m.get("sessions", []):
+        for rec in sess.get("recordings", []):
+            st = rec.get("signal_type")
+            if st is None:
+                continue
+            recs.append((int(st), rec.get("file", "")))
+    out["recs"] = recs
+    return out
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="parsed 트리 signal_type 교차 대조")
     ap.add_argument("--data-dir", required=True)
     ap.add_argument("--max-subjects", type=int, default=None)
+    ap.add_argument("--with-disk", action="store_true",
+                    help="디스크 .pt 도 glob 해서 orphan/ghost 까지 확인 (느림, "
+                         "subject 당 디렉토리 stat). 기본 off — manifest 만 읽는다.")
+    ap.add_argument("--workers", type=int, default=16,
+                    help="병렬 worker 수 (네트워크 마운트 I/O).")
     args = ap.parse_args()
 
     root = Path(args.data_dir)
@@ -62,7 +95,8 @@ def main() -> None:
     subj_dirs = sorted([d for d in root.iterdir() if d.is_dir()])
     if args.max_subjects:
         subj_dirs = subj_dirs[: args.max_subjects]
-    print(f"top-level 디렉토리: {len(subj_dirs)}  ({root})\n")
+    mode = "manifest+disk" if args.with_disk else "manifest-only (빠름)"
+    print(f"top-level 디렉토리: {len(subj_dirs)}  ({root})  [{mode}]\n")
 
     int_hist: Counter[int] = Counter()          # manifest 의 signal_type 정수
     key_hist_manifest: Counter[str] = Counter() # manifest rec 의 파일명 → 키
@@ -76,50 +110,56 @@ def main() -> None:
     name_shapes: Counter[str] = Counter()
     # 키별 subject **위치**(정렬 인덱스) — 특정 구간에만 몰려 있으면 batch 효과다.
     key_positions: dict[str, list[int]] = defaultdict(list)
+    idx_by_name = {sd.name: i for i, sd in enumerate(subj_dirs)}
 
-    for idx, sd in enumerate(subj_dirs):
+    try:
+        from tqdm import tqdm
+        prog = lambda it, **kw: tqdm(it, **kw)  # noqa: E731
+    except ImportError:
+        prog = lambda it, **kw: it  # noqa: E731
+
+    for sd in subj_dirs:
         name_shapes[re.sub(r"\d+", "#", sd.name)] += 1
-        mp = sd / "manifest.json"
-        disk_files = {p.name for p in sd.glob("*.pt")}
-        for f in disk_files:
-            k = _key_from_filename(f)
-            key_hist_disk[k or "UNPARSED_NAME"] += 1
 
-        if not mp.is_file():
-            no_manifest.append(sd.name)
+    with ThreadPoolExecutor(max_workers=args.workers) as ex:
+        futs = {ex.submit(_scan_one, sd, args.with_disk): sd for sd in subj_dirs}
+        for fut in prog(as_completed(futs), total=len(futs),
+                        desc="scanning", unit="subj", dynamic_ncols=True):
+            r = fut.result()
+            name = r["name"]
+            disk_files = r["disk_files"]
             for f in disk_files:
-                orphan[_key_from_filename(f) or "?"] += 1
-            continue
-        try:
-            with open(mp, encoding="utf-8") as fh:
-                m = json.load(fh)
-        except (json.JSONDecodeError, OSError):
-            no_manifest.append(sd.name + " (손상)")
-            continue
+                key_hist_disk[_key_from_filename(f) or "UNPARSED_NAME"] += 1
 
-        listed: set[str] = set()
-        for sess in m.get("sessions", []):
-            for rec in sess.get("recordings", []):
-                st = rec.get("signal_type")
-                fn = rec.get("file", "")
-                if st is None:
-                    continue
-                st = int(st)
+            if r["corrupt"]:
+                no_manifest.append(name + " (손상)")
+                continue
+            if r["recs"] is None:
+                no_manifest.append(name)
+                if args.with_disk:
+                    for f in disk_files:
+                        orphan[_key_from_filename(f) or "?"] += 1
+                continue
+
+            idx = idx_by_name[name]
+            listed: set[str] = set()
+            for st, fn in r["recs"]:
                 k = _key_from_filename(fn)
                 int_hist[st] += 1
                 if k:
                     key_hist_manifest[k] += 1
                     cross[st][k] += 1
-                    if sd.name not in subj_with_key[k]:
+                    if name not in subj_with_key[k]:
                         key_positions[k].append(idx)
-                    subj_with_key[k].add(sd.name)
+                    subj_with_key[k].add(name)
                 else:
                     cross[st]["UNPARSED_NAME"] += 1
                 listed.add(fn)
-                if fn not in disk_files:
+                if args.with_disk and fn not in disk_files:
                     ghost[k or "?"] += 1
-        for f in disk_files - listed:
-            orphan[_key_from_filename(f) or "?"] += 1
+            if args.with_disk:
+                for f in disk_files - listed:
+                    orphan[_key_from_filename(f) or "?"] += 1
 
     n = len(subj_dirs)
     print("── subject 디렉토리 이름 패턴 (숫자→#) ──")
@@ -142,10 +182,12 @@ def main() -> None:
         flag = "" if list(cross[st]) == [expect] else "   ← 불일치!"
         print(f"  signal_type={st:2d} (기대 {expect:5s}) : {pairs}{flag}")
 
-    print("\n── 파일명 키 기준 보유 subject 수 (정수 매핑과 무관) ──")
+    src = "disk" if args.with_disk else "manifest"
+    file_hist = key_hist_disk if args.with_disk else key_hist_manifest
+    print(f"\n── 파일명 키 기준 보유 subject 수 (정수 매핑과 무관, 출처={src}) ──")
     for k in DISK_KEYS:
         s = len(subj_with_key.get(k, ()))
-        print(f"  {k:5s} subjects={s:5d} ({100.0*s/max(1,n):5.1f}%)  files={key_hist_disk.get(k,0)}")
+        print(f"  {k:5s} subjects={s:5d} ({100.0*s/max(1,n):5.1f}%)  files={file_hist.get(k,0)}")
 
     # 위치 분포: subject 정렬 인덱스를 10 구간으로 나눠 보유율을 본다.
     # 특정 구간에만 몰려 있으면 "여러 번에 나눠 파싱했고 옵션이 달랐다" 는 뜻이다.
@@ -168,17 +210,21 @@ def main() -> None:
         print(f"{row}  {first} … {last}")
     print("  (co2/awp 만 특정 구간에 몰려 있으면 → 파싱을 나눠 했고 옵션이 달랐다)")
 
-    if orphan:
-        print("\n  ⚠ orphan .pt (디스크에 있으나 manifest 에 없음): " +
-              ", ".join(f"{k}={v}" for k, v in orphan.most_common()))
-    if ghost:
-        print("  ⚠ ghost recording (manifest 에 있으나 파일 없음): " +
-              ", ".join(f"{k}={v}" for k, v in ghost.most_common()))
+    if args.with_disk:
+        if orphan:
+            print("\n  ⚠ orphan .pt (디스크에 있으나 manifest 에 없음): " +
+                  ", ".join(f"{k}={v}" for k, v in orphan.most_common()))
+        if ghost:
+            print("  ⚠ ghost recording (manifest 에 있으나 파일 없음): " +
+                  ", ".join(f"{k}={v}" for k, v in ghost.most_common()))
+    else:
+        print("\n  (orphan/ghost 확인은 --with-disk 필요 — manifest-only 에선 생략)")
 
     print("\n해석:")
     print("  교차표 대각 + co2/awp 0  → 애초에 파싱 안 됨 (--signal-types 제외)")
     print("  교차표 불일치            → 정수 매핑 드리프트. 파일명 키가 정답.")
-    print("  orphan co2/awp 다수      → 파일은 있는데 manifest 누락 → 재-manifest 필요")
+    print("  위치분포가 특정 구간 집중 → 나눠 파싱(batch). inspect_cohort 앞 300명 착시.")
+    print("  orphan co2/awp 다수      → 파일은 있는데 manifest 누락 (--with-disk 로 확인)")
 
 
 if __name__ == "__main__":
