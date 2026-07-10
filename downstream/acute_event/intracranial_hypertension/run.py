@@ -880,6 +880,17 @@ def main() -> None:
     parser.add_argument("--lora-rank", type=int, default=8)
     parser.add_argument("--lora-alpha", type=float, default=16.0)
     parser.add_argument(
+        "--probe-lr", type=float, default=None,
+        help="[lora] probe(head) 전용 LR. 미지정이면 --lr 과 동일(기존 동작). "
+        "head 는 랜덤 초기화라 encoder adapter 보다 훨씬 큰 LR 이 필요하다. "
+        "frozen linear_probe 와 맞추려면 1e-3.",
+    )
+    parser.add_argument(
+        "--probe-wd", type=float, default=0.01,
+        help="[lora] probe 전용 weight decay. 기본 0.01(기존 AdamW 전역값과 동일). "
+        "frozen linear_probe 는 Adam(wd 없음)이라, 공정 비교하려면 0.0.",
+    )
+    parser.add_argument(
         "--grad-accum", type=int, default=1,
         help="[lora] gradient accumulation step 수. 실질 batch = batch_size × "
         "nproc × grad_accum. 1(기본)이면 기존 동작과 동일. ICH 는 20min window 라 "
@@ -1119,10 +1130,17 @@ def main() -> None:
         # 빌드하지 않고 매번 _iter_lora_batches 로 스트리밍한다(host-RAM OOM 회피).
         probe = probe.to(device)
         lora_params = model.lora_parameters()
+        # probe 는 랜덤 초기화라 encoder adapter 와 학습 시간 척도가 다르다. LoRA 는
+        # best epoch(~11) 까지 probe 가 2.4k step × 1e-4 밖에 못 밟는 반면, frozen
+        # linear_probe 의 probe 는 881k step × 1e-3 을 밟는다(LR×step 3,600배). 게다가
+        # AdamW 전역 weight_decay 가 probe 까지 0 으로 끌어당긴다. → probe 를 별도
+        # param group 으로 떼어 LR·wd 를 따로 준다. 기본값은 현행과 동일(변화 없음).
+        probe_lr = args.probe_lr if args.probe_lr is not None else args.lr
         optimizer = torch.optim.AdamW(
             [
-                {"params": lora_params, "lr": args.lr},
-                {"params": probe.parameters(), "lr": args.lr},
+                {"params": lora_params, "lr": args.lr, "weight_decay": 0.01},
+                {"params": probe.parameters(), "lr": probe_lr,
+                 "weight_decay": args.probe_wd},
             ],
             weight_decay=0.01,
         )
@@ -1136,6 +1154,8 @@ def main() -> None:
         print(f"  batch: micro={args.batch_size} × nproc="
               f"{ddp_world_size() if use_ddp else 1} × accum={grad_accum} "
               f"→ effective {eff_batch}")
+        print(f"  lr: lora={args.lr:g} (wd 0.01) | "
+              f"probe={probe_lr:g} (wd {args.probe_wd:g})")
 
     criterion = nn.BCEWithLogitsLoss()
     train_losses: list[float] = []

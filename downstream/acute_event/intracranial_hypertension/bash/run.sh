@@ -54,6 +54,14 @@ LORA_BATCH="${LORA_BATCH:-8}"
 #   늘리고 실질 batch 만 키워 이를 없앤다. hypotension 은 실질 512(128×4)로 학습한다.
 #   기본 1 = 기존 동작 그대로. Frozen 과 공정 비교하려면 LORA_ACCUM=16(→512) 권장.
 LORA_ACCUM="${LORA_ACCUM:-1}"
+# PROBE_LR / PROBE_WD: LoRA 의 head 전용 LR·weight decay (미지정이면 기존 동작).
+#   LoRA 는 best epoch(~11)까지 head 가 2.4k step × 1e-4 만 밟는데, frozen
+#   linear_probe 의 head 는 881k step × 1e-3 을 밟는다(LR×step 3,600배). AdamW 전역
+#   wd 0.01 이 head 를 0 으로 끌어당기기까지 한다(LP 는 Adam, wd 없음). 그 결과 LoRA
+#   의 예측 확률이 0 쪽으로 압축된다(같은 threshold 0.01 에서 sens 0.38 vs LP 0.82).
+#   LP 와 조건을 맞추려면: PROBE_LR=1e-3 PROBE_WD=0
+PROBE_LR="${PROBE_LR:-}"
+PROBE_WD="${PROBE_WD:-0.01}"
 
 # ── 한 fold 를 여러 GPU 로 DDP 실행 (fold 순차, 각 fold torchrun 4-GPU) ──
 # 기본 NPROC=4 (cardiac_arrest/hypotension 과 동일). 단일 GPU 는 NPROC=1.
@@ -115,7 +123,10 @@ for WIN in "${WINDOW_SECS[@]}"; do
                 EXTRA="--batch-size $LP_BATCH"
             else
                 EPOCHS="$LORA_EPOCHS"; LR="$LORA_LR"
-                EXTRA="--lora-rank $LORA_RANK --batch-size $LORA_BATCH --grad-accum $LORA_ACCUM"
+                EXTRA="--lora-rank $LORA_RANK --batch-size $LORA_BATCH --grad-accum $LORA_ACCUM --probe-wd $PROBE_WD"
+                if [ -n "$PROBE_LR" ]; then
+                    EXTRA="$EXTRA --probe-lr $PROBE_LR"
+                fi
             fi
             EXP_DIR="${OUT_DIR}/${EXP_NAME}/${MODE}"
             mkdir -p "$EXP_DIR"
