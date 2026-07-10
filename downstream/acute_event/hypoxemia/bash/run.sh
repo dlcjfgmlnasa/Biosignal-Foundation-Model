@@ -50,7 +50,8 @@ if [ "$NPROC" -gt 1 ] && [ "$PRINT_ONLY" = "1" ]; then
 fi
 
 # 입력 파형 조합. prepare_data.sh 의 SIGNALS 와 **같은 순서**여야 파일명 prefix 가 맞는다.
-SIGNAL_COMBOS=(${SIGNALS_OVERRIDE:-ecg_ppg_co2_awp})
+# CO2/AWP 는 parsed VitalDB 에 사실상 부재 → canonical = ecg_ppg.
+SIGNAL_COMBOS=(${SIGNALS_OVERRIDE:-ecg_ppg})
 WINDOWS=(${WINDOWS_OVERRIDE:-300})
 HORIZONS=(${HORIZONS_OVERRIDE:-5 10 15})
 MODES=(${MODES_OVERRIDE:-linear_probe lora})

@@ -4,8 +4,8 @@
 # 라벨: 미래 horizon 구간에 SpO2 < 92% 가 ≥60초 지속되면 positive.
 #   임계 92% = Lundberg et al., Nat Biomed Eng 2018 (Prescience) 및 WHO 중재 수준.
 #   Prescience 는 numeric AIMS 시계열로 5분 전 예측 — 우리는 raw waveform 으로 같은 문제를 푼다.
-# 입력: parsed .pt 파형 (ECG/PPG/CO2/AWP). SpO2 numeric 은 라벨 전용이며 입력에 넣지 않는다
-#   (넣으면 persistence baseline 이 압도 — SWIFT 계열).
+# 입력: parsed .pt 파형 (ECG/PPG; CO2/AWP 는 파싱 부재 — 아래 주석). SpO2 numeric 은
+#   라벨 전용이며 입력에 넣지 않는다 (넣으면 persistence baseline 이 압도 — SWIFT 계열).
 #
 # 시간 정렬: parser manifest 의 start_sample(dtstart 원점 100Hz) 로 SpO2 1Hz trend 를 인덱싱.
 # Baseline 가드: 예측 시점에 이미 SpO2<92% 인 윈도우는 제외(기본) — 지속성 누수 차단.
@@ -29,8 +29,12 @@ OUT_DIR="${OUT_DIR:-${BIOFM_ROOT}/data/downstream/hypoxemia}"
 
 WINDOWS="${WINDOWS:-300}"              # canonical: 5 min input window
 HORIZONS="${HORIZONS:-5 10 15}"        # Table 3(a) 공통 lead-time 격자
-SIGNALS="${SIGNALS:-ecg ppg co2 awp}"  # 입력 파형 (라벨은 SpO2 numeric)
-REQUIRED="${REQUIRED:-ecg ppg co2 awp}"
+# ⚠ CO2/AWP 는 현재 parsed VitalDB 에 사실상 없다 (300 subject 중 1명, 2026-07-10 실측).
+#   원인 후보: 파서 품질 게이트(co2 flatline≤0.3·clip≤0.1)가 capnogram 의 정상적인
+#   plateau/baseline 을 탈락시킴. probe_raw_tracks.py 로 확인할 것.
+#   → canonical 은 ECG+PPG. 재파싱으로 CO2 를 살리면 그때 조합을 넓힌다.
+SIGNALS="${SIGNALS:-ecg ppg}"          # 입력 파형 (라벨은 SpO2 numeric)
+REQUIRED="${REQUIRED:-ecg ppg}"        # SIGNALS ⊆ REQUIRED 필수 (아니면 채널 소실)
 N_FOLDS="${N_FOLDS:-5}"
 WORKERS="${WORKERS:-16}"               # 네트워크 마운트 → SpO2 로딩 ThreadPool
 SPO2_THRESHOLD="${SPO2_THRESHOLD:-92}"
