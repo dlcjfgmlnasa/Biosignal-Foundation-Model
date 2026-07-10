@@ -74,8 +74,10 @@ def main() -> None:
     orphan = Counter()   # 디스크엔 있는데 manifest 에 없음
     ghost = Counter()    # manifest 엔 있는데 파일 없음
     name_shapes: Counter[str] = Counter()
+    # 키별 subject **위치**(정렬 인덱스) — 특정 구간에만 몰려 있으면 batch 효과다.
+    key_positions: dict[str, list[int]] = defaultdict(list)
 
-    for sd in subj_dirs:
+    for idx, sd in enumerate(subj_dirs):
         name_shapes[re.sub(r"\d+", "#", sd.name)] += 1
         mp = sd / "manifest.json"
         disk_files = {p.name for p in sd.glob("*.pt")}
@@ -108,6 +110,8 @@ def main() -> None:
                 if k:
                     key_hist_manifest[k] += 1
                     cross[st][k] += 1
+                    if sd.name not in subj_with_key[k]:
+                        key_positions[k].append(idx)
                     subj_with_key[k].add(sd.name)
                 else:
                     cross[st]["UNPARSED_NAME"] += 1
@@ -142,6 +146,27 @@ def main() -> None:
     for k in DISK_KEYS:
         s = len(subj_with_key.get(k, ()))
         print(f"  {k:5s} subjects={s:5d} ({100.0*s/max(1,n):5.1f}%)  files={key_hist_disk.get(k,0)}")
+
+    # 위치 분포: subject 정렬 인덱스를 10 구간으로 나눠 보유율을 본다.
+    # 특정 구간에만 몰려 있으면 "여러 번에 나눠 파싱했고 옵션이 달랐다" 는 뜻이다.
+    print("\n── 키별 subject 위치 분포 (정렬 인덱스 10분위, 각 칸 = 해당 구간 보유율) ──")
+    B = 10
+    bounds = [(i * n // B, (i + 1) * n // B) for i in range(B)]
+    print("  " + "key".ljust(6) + "".join(f"{i*10:>3d}%" + " " for i in range(B)) + "  첫/끝 subject")
+    for k in DISK_KEYS:
+        pos = key_positions.get(k, [])
+        if not pos:
+            continue
+        row = "  " + k.ljust(6)
+        pset = set(pos)
+        for lo, hi in bounds:
+            width = max(1, hi - lo)
+            got = sum(1 for i in pset if lo <= i < hi)
+            row += f"{int(100.0*got/width):>3d}% "
+        first = subj_dirs[min(pos)].name
+        last = subj_dirs[max(pos)].name
+        print(f"{row}  {first} … {last}")
+    print("  (co2/awp 만 특정 구간에 몰려 있으면 → 파싱을 나눠 했고 옵션이 달랐다)")
 
     if orphan:
         print("\n  ⚠ orphan .pt (디스크에 있으나 manifest 에 없음): " +
