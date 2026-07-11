@@ -230,6 +230,7 @@ def load_aligned_signals_intersection(
     min_duration_sec: float = 60.0,
     max_subjects: int | None = None,
     workers: int = 16,
+    sample_seed: int | None = None,
 ) -> list[dict]:
     """Manifest 기반 시간선 intersection 으로 다신호 정렬 데이터 로드.
 
@@ -245,6 +246,9 @@ def load_aligned_signals_intersection(
         호출자가 명시적으로 포함시킬 것.
     min_duration_sec : intersection interval 최소 길이 (초).
     max_subjects : 처리 subject 상한 (디버깅용).
+    sample_seed : max_subjects 로 제한할 때, 정렬 앞 N 개 대신 이 seed 로 **무작위
+        N 개**를 뽑는다(대표성). None(기본)이면 정렬 앞 N 개. ⚠ 파싱이 배치로 나뉘어
+        앞쪽 subject 의 modality 커버리지가 낮을 수 있어, dry-run 은 shuffle 권장.
     workers : 병렬 worker 수.
 
     Returns
@@ -265,7 +269,12 @@ def load_aligned_signals_intersection(
 
     subject_dirs = sorted([d for d in root.iterdir() if d.is_dir()])
     if max_subjects is not None:
-        subject_dirs = subject_dirs[:max_subjects]
+        if sample_seed is not None and len(subject_dirs) > max_subjects:
+            import random
+            rng = random.Random(sample_seed)
+            subject_dirs = sorted(rng.sample(subject_dirs, max_subjects))
+        else:
+            subject_dirs = subject_dirs[:max_subjects]
 
     min_samples = int(min_duration_sec * TARGET_SR)
     req_str = ", ".join(required)

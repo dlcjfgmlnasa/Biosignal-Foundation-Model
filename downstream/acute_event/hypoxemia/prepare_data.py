@@ -563,6 +563,7 @@ def prepare_hypoxemia_sweep(
     artifact_gate: bool = False,
     hr_tol: float = 0.20,
     pi_min: float = 0.3,
+    sample_seed: int | None = None,
 ) -> list[Path]:
     max_window = max(window_secs)
     max_horizon_sec = max(horizon_mins) * 60.0
@@ -609,15 +610,24 @@ def prepare_hypoxemia_sweep(
         required_signals=sorted(base_req),
         min_duration_sec=min_duration_sec,
         max_subjects=max_subjects,
+        sample_seed=sample_seed,
     )
     if not cases:
+        cap_hint = ""
+        if max_subjects is not None and sample_seed is None:
+            cap_hint = (
+                f"  ⚠ --max-subjects {max_subjects} 는 정렬 앞 N 명만 본다. 파싱 배치에 따라\n"
+                f"    앞쪽 subject 는 특정 modality(co2/awp) 커버리지가 낮을 수 있다\n"
+                f"    (전체는 4-modality 3,296명 존재). 대표 표본은 --sample-seed 42 를 추가.\n"
+            )
         print(
             f"ERROR: No valid cases loaded.\n"
             f"  요구한 연속 교집합 길이 = {min_duration_sec:.0f}s "
             f"(= window {max_window:.0f} + horizon {max_horizon_sec:.0f} + stride {stride_sec:.0f}).\n"
+            f"{cap_hint}"
             f"  원인 진단:\n"
             f"    python -m downstream.acute_event.hypoxemia.inspect_cohort "
-            f"--data-dir {data_dir} --max-subjects 300\n"
+            f"--data-dir {data_dir}\n"
             f"  완화 옵션: --allow-tail-windows (min_dur → window+stride), "
             f"또는 --required-signals 를 좁히기.",
             file=sys.stderr,
@@ -779,6 +789,9 @@ def main() -> None:
     parser.add_argument("--required-signals", nargs="+", default=None,
                         choices=["abp", "ecg", "ppg", "co2", "awp"])
     parser.add_argument("--max-subjects", type=int, default=None)
+    parser.add_argument("--sample-seed", type=int, default=None,
+                        help="--max-subjects 제한 시 정렬 앞 N 대신 이 seed 로 무작위 N 명 "
+                             "(대표 dry-run). 파싱 배치로 앞쪽 modality 커버리지가 낮을 때 필수.")
     parser.add_argument("--horizon-mins", nargs="+", type=float, default=[5.0, 10.0, 15.0])
     parser.add_argument("--window-secs", nargs="+", type=float, default=[300.0])
     parser.add_argument("--stride-sec", type=float, default=30.0)
@@ -836,6 +849,7 @@ def main() -> None:
         artifact_gate=args.artifact_gate,
         hr_tol=args.hr_tol,
         pi_min=args.pi_min,
+        sample_seed=args.sample_seed,
     )
 
 

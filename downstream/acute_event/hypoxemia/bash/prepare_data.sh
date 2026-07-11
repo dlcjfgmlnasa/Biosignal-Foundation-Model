@@ -60,7 +60,10 @@ OUT_DIR="${OUT_DIR:-${BIOFM_ROOT}/data/downstream/hypoxemia_${VARIANT}}"
 
 EXTRA_ARGS="$GATE_ARG"
 if [ -n "$MAX_SUBJECTS" ]; then
-    EXTRA_ARGS="$EXTRA_ARGS --max-subjects $MAX_SUBJECTS"
+    # ⚠ 앞 N 명은 파싱 배치상 co2/awp 커버리지가 낮다(초기 subject 미포함). dry-run 은
+    #   대표 표본이 되도록 --sample-seed 로 무작위 추출(기본 42). 전체 실행 시엔 무시됨.
+    SAMPLE_SEED="${SAMPLE_SEED:-42}"
+    EXTRA_ARGS="$EXTRA_ARGS --max-subjects $MAX_SUBJECTS --sample-seed $SAMPLE_SEED"
     OUT_DIR="${OUT_DIR}_dryrun"
 fi
 
