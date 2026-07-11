@@ -54,8 +54,9 @@ if [ "$NPROC" -gt 1 ] && [ "$PRINT_ONLY" = "1" ]; then
 fi
 
 # 입력 파형 조합. prepare_data.sh 의 SIGNALS 와 **같은 순서**여야 파일명 prefix 가 맞는다.
-# canonical = ecg_ppg_co2_awp (심폐 4-modality). ablation 은 SIGNALS_OVERRIDE=ecg_ppg.
-SIGNAL_COMBOS=(${SIGNALS_OVERRIDE:-ecg_ppg_co2_awp})
+# canonical = ecg_ppg. CO2/AWP 는 4-modality 교집합이 저산소 구간을 배제해 degenerate
+# (prepare_data.sh 주석 참조) → 쓰지 않는다.
+SIGNAL_COMBOS=(${SIGNALS_OVERRIDE:-ecg_ppg})
 WINDOWS=(${WINDOWS_OVERRIDE:-300})
 HORIZONS=(${HORIZONS_OVERRIDE:-5 10 15})
 MODES=(${MODES_OVERRIDE:-linear_probe lora})

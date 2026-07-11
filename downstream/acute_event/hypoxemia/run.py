@@ -680,10 +680,11 @@ def main() -> None:
     parser.add_argument(
         "--input-signals",
         nargs="+",
-        default=["ecg", "ppg", "co2", "awp"],
+        default=["ecg", "ppg"],
         choices=["abp", "ecg", "ppg", "co2", "awp"],
         help="Input signal types. prepare_data.py 와 동일한 순서·조합이어야 한다 "
-             "(라벨은 SpO2 numeric 에서 별도로 온다).",
+             "(라벨은 SpO2 numeric 에서 별도로 온다). canonical=ecg ppg "
+             "(co2/awp 는 저산소 구간 배제로 degenerate).",
     )
     parser.add_argument(
         "--val-split-seed",

@@ -4,16 +4,20 @@
 # 라벨: 미래 horizon 구간에 SpO2 < 92% 가 ≥60초 지속되면 positive.
 #   임계 92% = Lundberg et al., Nat Biomed Eng 2018 (Prescience) 및 WHO 중재 수준.
 #   Prescience 는 numeric AIMS 시계열로 5분 전 예측 — 우리는 raw waveform 으로 같은 문제를 푼다.
-# 입력: parsed .pt 파형 (ECG/PPG/CO2/AWP — 심폐 4-modality). SpO2 numeric 은
-#   라벨 전용이며 입력에 넣지 않는다 (넣으면 persistence baseline 이 압도 — SWIFT 계열).
+# 입력: parsed .pt 파형 (ECG/PPG). SpO2 numeric 은 라벨 전용이며 입력에 넣지 않는다
+#   (넣으면 persistence baseline 이 압도 — SWIFT 계열).
+#
+# ⚠ CO2/AWP 를 required 로 두면 안 된다 (2026-07-11 실측): 4-modality 교집합은
+#   삽관 유지마취 구간(고농도 O2·조절환기)이라 SpO2 가 거의 항상 97~100%. 저산소는
+#   유도·각성(capnography/AWP 없음)에 몰려 교집합에서 배제됨 → 156명 중 1명만 any
+#   SpO2<92, prevalence 0.00%(degenerate). ECG/PPG 는 전 구간 존재해 저산소 시기 포함.
+#   (Prescience/Park 도 pulse-ox 계열만 사용.)
 #
 # 시간 정렬: parser manifest 의 start_sample(dtstart 원점 100Hz) 로 SpO2 1Hz trend 를 인덱싱.
-# Baseline 가드: 예측 시점에 이미 SpO2<92% 인 윈도우는 제외(기본) — 지속성 누수 차단.
+# Baseline 가드: 예측 시점에 이미 SpO2<threshold 인 윈도우는 제외(기본) — 지속성 누수 차단.
 #
-# 코호트(inspect_cohort, 6,388 subject 전체, 2026-07-11 실측):
-#   ecg+ppg = 4,248 / ecg+ppg+co2 = 3,735 / ecg+ppg+co2+awp = 3,296 subject
-#   (1230s=window300+horizon900+stride30 연속 교집합 기준. --allow-tail-windows 시
-#    330s 기준 각각 5,676 / 5,221 / 4,994 로 늘어난다.)
+# 코호트(inspect_cohort, 6,388 subject 전체): ecg+ppg = 4,248 subject
+#   (1230s=window300+horizon900+stride30 연속 교집합. --allow-tail-windows 시 5,676).
 #   → canonical = 4-modality(ECG+PPG+CO2+AWP). 심혈관만(ECG+PPG)은 ablation 으로.
 #
 # 사용법:
@@ -31,8 +35,8 @@ OUT_DIR="${OUT_DIR:-${BIOFM_ROOT}/data/downstream/hypoxemia}"
 
 WINDOWS="${WINDOWS:-300}"              # canonical: 5 min input window
 HORIZONS="${HORIZONS:-5 10 15}"        # Table 3(a) 공통 lead-time 격자
-SIGNALS="${SIGNALS:-ecg ppg co2 awp}"  # 입력 파형 (라벨은 SpO2 numeric)
-REQUIRED="${REQUIRED:-ecg ppg co2 awp}" # SIGNALS ⊆ REQUIRED 필수 (아니면 채널 소실)
+SIGNALS="${SIGNALS:-ecg ppg}"          # 입력 파형 (라벨은 SpO2 numeric). CO2/AWP 금지(위 주석)
+REQUIRED="${REQUIRED:-ecg ppg}"        # SIGNALS ⊆ REQUIRED 필수 (아니면 채널 소실)
 N_FOLDS="${N_FOLDS:-5}"
 WORKERS="${WORKERS:-16}"               # 네트워크 마운트 → SpO2 로딩 ThreadPool
 MAX_SUBJECTS="${MAX_SUBJECTS:-}"       # 설정 시 dry-run (코호트 크기 확인용)
