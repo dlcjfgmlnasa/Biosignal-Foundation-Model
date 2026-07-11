@@ -206,6 +206,68 @@ class LastKAggregator(nn.Module):
         return (chunk_reprs * m).sum(dim=1) / m.sum(dim=1).clamp(min=1.0)
 
 
+class MaxAggregator(nn.Module):
+    """파라미터 없는 masked max pooling — 급성 이벤트의 'peak risk window' 포착.
+
+    :class:`TransformerAggregator` drop-in (동일 forward 시그니처), **파라미터 없음**.
+    mean 이 정상 window 와 평균해 악화 신호를 희석하는 것을 피한다. cardiac arrest 처럼
+    악화가 소수 window 에 몰릴 때, 관측 구간 중 '가장 위험한 순간'을 대표로 삼는다.
+    순서 무관(``time_secs`` 무시).
+    """
+
+    def __init__(self, d_model: int, **kwargs) -> None:
+        super().__init__()
+        self.d_model = d_model
+
+    def forward(
+        self,
+        chunk_reprs: torch.Tensor,  # (B, K, d_model)
+        mask: torch.Tensor | None = None,  # (B, K) bool, True=valid
+        time_secs: torch.Tensor | None = None,  # 무시
+    ) -> torch.Tensor:  # (B, d_model)
+        if mask is None:
+            return chunk_reprs.max(dim=1).values
+        neg = torch.finfo(chunk_reprs.dtype).min
+        m = mask.unsqueeze(-1)  # (B, K, 1)
+        out = chunk_reprs.masked_fill(~m, neg).max(dim=1).values  # (B, d_model)
+        # 전부 invalid 인 행(all -inf) 방어 → 0
+        all_bad = (~mask).all(dim=1, keepdim=True)  # (B, 1)
+        return out.masked_fill(all_bad, 0.0)
+
+
+class AttentionMILAggregator(nn.Module):
+    """Gated-attention MIL (Ilse et al., ICML 2018) — rare-positive bag 분류 표준.
+
+    window 별 attention 가중합으로 환자 표현을 만든다. 학습 가능하나 low-param
+    (``attn_dim`` 으로 조절, transformer 대비 극소). 소수 positive(예: arrest 74명)
+    에서도 '어느 window 가 중요한가'를 데이터로 학습하되 과적합 위험은 transformer 보다
+    작다. mean 과 max 사이의 학습형 절충.
+
+        a_k = softmax_k( w^T ( tanh(V h_k) ⊙ sigmoid(U h_k) ) )
+        repr = Σ_k a_k h_k
+    """
+
+    def __init__(self, d_model: int, attn_dim: int = 64, **kwargs) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.V = nn.Linear(d_model, attn_dim)
+        self.U = nn.Linear(d_model, attn_dim)  # gating
+        self.w = nn.Linear(attn_dim, 1)
+
+    def forward(
+        self,
+        chunk_reprs: torch.Tensor,  # (B, K, d_model)
+        mask: torch.Tensor | None = None,  # (B, K) bool, True=valid
+        time_secs: torch.Tensor | None = None,  # 무시
+    ) -> torch.Tensor:  # (B, d_model)
+        a = self.w(torch.tanh(self.V(chunk_reprs)) * torch.sigmoid(self.U(chunk_reprs)))
+        a = a.squeeze(-1)  # (B, K)
+        if mask is not None:
+            a = a.masked_fill(~mask, torch.finfo(a.dtype).min)  # 무효 window 제외
+        a = torch.softmax(a, dim=1).unsqueeze(-1)  # (B, K, 1)  전부 무효면 uniform(=mean)
+        return (a * chunk_reprs).sum(dim=1)  # (B, d_model)
+
+
 def mean_pool(
     encoded: torch.Tensor,  # (B, N, d_model)
     patch_mask: torch.Tensor,  # (B, N)

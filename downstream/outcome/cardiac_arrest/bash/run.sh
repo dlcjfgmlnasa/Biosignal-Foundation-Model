@@ -29,13 +29,17 @@ TASK=${TASK:-arrest}
 WINDOW_SEC=${WINDOW_SEC:-300}
 MAX_WINDOWS=${MAX_WINDOWS:-144}
 N_FOLDS=${N_FOLDS:-5}
-# 환자-수준 집약: mean(기본, 파라미터 없는 masked mean) | transformer(학습 aggregator).
-#   arrest/death 코호트는 양성이 극소수(예: 38 arrest/2314)라 3.6M transformer
-#   aggregator 는 과적합 → 순수 frozen linear-probe 취지에 맞는 mean 을 기본으로.
-#   양성 수백+ 코호트에서만 transformer 가 의미. run.py --aggregator 로 전달.
-#   lastk: 관측 후반부(event 근접) 마지막 LAST_K개 window 만 평균 (mean 희석 회피, 0-param).
+# 환자-수준 집약(AGG): 양성 극소수(예: 74 arrest)라 파라미터 少/0 을 기본으로.
+#   mean(기본): 0-param masked mean. 순수 frozen linear-probe. 급성 신호는 희석 가능.
+#   lastk:  event 근접 마지막 LAST_K window 평균 (0-param, 후반 악화 집중).
+#   max:    peak-risk window (0-param). 급성 이벤트에 자연스러움 (mean 희석 회피).
+#   attention: gated-attention MIL (Ilse 2018, few-param, ATTN_DIM 조절). 학습형 절충.
+#   transformer: 학습형(param 多) — 양성 수백+ 코호트에서만.
+#   ⇒ aggregator ablation: for AGG in mean lastk max attention; do AGG=$AGG bash run.sh; done
+#      (frozen encoder 라 집약기만 바뀌어 저렴. OUT_DIR 에 _${AGG} 접미사로 분리 권장.)
 AGG=${AGG:-mean}
 LAST_K=${LAST_K:-36}    # [AGG=lastk] 5min window 기준 36=마지막 3h
+ATTN_DIM=${ATTN_DIM:-32}  # [AGG=attention] gated-MIL hidden dim. 74 양성엔 16~32 (64=과적합)
 
 # Linear Probe (frozen feature 캐싱 — batch 는 probe SGD 미니배치에만 영향).
 LP_BATCH=${LP_BATCH:-512};    LP_LR=${LP_LR:-1e-3};    LP_EPOCHS=${LP_EPOCHS:-1000}
@@ -106,7 +110,7 @@ for f in $FOLD_LIST; do
         --checkpoint "$CHECKPOINT" --model-version "$MODEL_VERSION" \
         --data-path "$PREFIX" --mode linear_probe --n-folds "$N_FOLDS" --fold "$f" \
         --epochs "$LP_EPOCHS" --lr "$LP_LR" --batch-size "$LP_BATCH" \
-        --aggregator "$AGG" --last-k "$LAST_K" \
+        --aggregator "$AGG" --last-k "$LAST_K" --attn-dim "$ATTN_DIM" \
         --max-windows "$MAX_WINDOWS" --device "$DEVICE" --out-dir "$LP_OUT" $DRY_FLAG
   fi
 
@@ -118,7 +122,7 @@ for f in $FOLD_LIST; do
         --data-path "$PREFIX" --mode lora --lora-rank "$LORA_RANK" --lora-alpha "$LORA_ALPHA" \
         --n-folds "$N_FOLDS" --fold "$f" \
         --epochs "$LORA_EPOCHS" --lr "$LORA_LR" --batch-size "$LORA_BATCH" \
-        --aggregator "$AGG" --last-k "$LAST_K" \
+        --aggregator "$AGG" --last-k "$LAST_K" --attn-dim "$ATTN_DIM" \
         --max-windows "$MAX_WINDOWS" --device "$DEVICE" --out-dir "$LORA_OUT" $DRY_FLAG
   fi
 done

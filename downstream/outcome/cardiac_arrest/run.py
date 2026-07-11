@@ -52,7 +52,9 @@ from downstream._save_utils import (
 )
 from downstream.aggregator import (
     SIGNAL_TYPE_INT,
+    AttentionMILAggregator,
     LastKAggregator,
+    MaxAggregator,
     MeanAggregator,
     TransformerAggregator,
     collate_patients,
@@ -383,11 +385,17 @@ def main() -> None:
     parser.add_argument("--last-k", type=int, default=36,
                         help="[aggregator=lastk] 관측 후반부 마지막 K개 valid window 만 "
                              "평균 (5min window 기준 36=마지막 3h). event 직전 구간 집중.")
+    parser.add_argument("--attn-dim", type=int, default=32,
+                        help="[aggregator=attention] gated-attention MIL hidden dim. "
+                             "param ≈ 2·d_model·attn_dim (d384·32≈25K). 양성 74명엔 "
+                             "16(≈12K)~32 권장 + weight_decay 병행. 64 는 과적합 위험.")
     parser.add_argument("--aggregator", type=str, default="mean",
-                        choices=["transformer", "mean", "lastk"],
-                        help="환자-수준 집약 방식. transformer(기본): 학습 가능 "
-                             "aggregator. mean: 파라미터 없는 masked mean "
-                             "(소규모 코호트 aggregator 과적합 방지, cardiac arrest 등).")
+                        choices=["transformer", "mean", "lastk", "max", "attention"],
+                        help="환자-수준 집약 방식. mean(기본): 파라미터 없는 masked mean "
+                             "(소규모 코호트 과적합 방지). lastk: event 직전 K window mean. "
+                             "max: peak-risk window(0-param, 급성이벤트 적합). "
+                             "attention: gated MIL(Ilse 2018, few-param). "
+                             "transformer: 학습형(param 多, 과적합 위험).")
     parser.add_argument("--out-dir", type=str, default=".")
     parser.add_argument("--fold", type=int, default=0,
                         help="현재 fold 인덱스 (run_eval OOF 집계용 .npz 라벨)")
@@ -586,6 +594,10 @@ def main() -> None:
         aggregator = MeanAggregator(d_model=d_model)
     elif args.aggregator == "lastk":
         aggregator = LastKAggregator(d_model=d_model, last_k=args.last_k)
+    elif args.aggregator == "max":
+        aggregator = MaxAggregator(d_model=d_model)
+    elif args.aggregator == "attention":
+        aggregator = AttentionMILAggregator(d_model=d_model, attn_dim=args.attn_dim)
     else:
         aggregator = TransformerAggregator(
             d_model=d_model,
@@ -602,6 +614,10 @@ def main() -> None:
               f"{args.agg_layers} layers, {args.agg_heads} heads)")
     elif args.aggregator == "lastk":
         print(f"\n  Aggregator: lastk (non-parametric, last_k={args.last_k})")
+    elif args.aggregator == "max":
+        print(f"\n  Aggregator: max (non-parametric, {n_agg:,} params)")
+    elif args.aggregator == "attention":
+        print(f"\n  Aggregator: attention-MIL ({n_agg:,} params, attn_dim={args.attn_dim})")
     else:
         print(f"\n  Aggregator: mean (non-parametric, {n_agg:,} params)")
     print(f"  Probe: {n_probe:,} params")
@@ -682,9 +698,11 @@ def main() -> None:
         "config": {
             "task": "scope_cardiac_arrest_outcome",
             "mode": args.mode,
-            "aggregation": "transformer",
+            "aggregation": args.aggregator,  # ablation 라벨 (mean/lastk/max/attention/transformer)
             "agg_layers": args.agg_layers,
             "agg_heads": args.agg_heads,
+            "last_k": args.last_k,
+            "attn_dim": args.attn_dim,
             "max_windows": args.max_windows,
             "data_path": args.data_path,
             "epochs": args.epochs, "lr": args.lr,
