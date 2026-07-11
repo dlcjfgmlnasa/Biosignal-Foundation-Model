@@ -613,6 +613,35 @@ def _extract_features_presharded(
     return feats_all[order], labels_all[order]
 
 
+def _load_test_subject_ids_ordered(data_path: str, fold: int | None) -> list[str]:
+    """test split 을 chunk 순서대로 훑어 subject_id 만 뽑는다(신호 로드 없이).
+
+    linear_probe DDP 는 test_windows 를 rank 별 stride shard(1/world)로 들지만,
+    y_true/y_score 는 feature gather(gidx argsort)로 **원본 chunk 순서** 전체로
+    복원된다. 그 전체 순서에 맞는 subject_id 가 필요한데, rank shard 의
+    test_windows 에서 뽑으면 1/world 만 나와 길이·정렬이 어긋나 patient-cluster
+    bootstrap 이 오염된다(#patient_ids != #y_score). 여기선 chunk 를 순서대로
+    훑어(= gidx 오름차순 = feature 복원 순서) 전체 subject_id 를 만든다.
+    """
+    ids: list[str] = []
+    for payload in iter_prepared_split_chunks(data_path, fold, "test"):
+        if not isinstance(payload, dict):
+            continue
+        subj = payload.get("subject_ids")
+        case = payload.get("case_ids")
+        labels = payload.get("labels")
+        n = (len(labels) if labels is not None
+             else len(subj) if subj is not None else 0)
+        for i in range(n):
+            if subj is not None:
+                ids.append(str(subj[i]))
+            elif case is not None:
+                ids.append(str(case[i]))
+            else:
+                ids.append("unknown")
+    return ids
+
+
 # ── LOSO (Leave-One-Subject-Out) ─────────────────────────────
 
 
@@ -898,6 +927,16 @@ def main() -> None:
         "optimizer step 의 절반가량이 양성을 하나도 못 본다(양성 기아). accum 으로 "
         "VRAM 을 늘리지 않고 실질 batch 만 키워 이를 없앤다.",
     )
+    parser.add_argument(
+        "--head-warmup-epochs", type=int, default=0,
+        help="[lora] LoRA co-train 전에 frozen feature 로 head 를 먼저 수렴시키는 "
+        "epoch 수 (LP→LoRA warm-start, Kumar 2022 LP-FT). 0(기본)이면 warm-start "
+        "없이 기존 동작. LoRA head 는 랜덤 초기화라 30ep·저LR 로는 undertrain 되고, "
+        "그 랜덤 head 의 큰 gradient 가 encoder 를 왜곡한다(LP>FT). warm-start 는 "
+        "encoder(LoRA B=0 → frozen)의 feature 로 head 를 LP 수준까지 먼저 수렴시켜 "
+        "이 둘을 동시에 해소한다. frozen feature fit 이라 빠름(encoder forward 없음). "
+        "권장 200~500. warm-start LR 은 --probe-lr(미지정이면 1e-3, LP 와 동일).",
+    )
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -1103,6 +1142,14 @@ def main() -> None:
             # 전 rank 최소 길이로만 정렬(step 동기화). (val/test 는 rank0 full.)
             n_shard = len(train_windows)
             train_windows = equalize_shard(train_windows)
+            if tr_gidx is not None:
+                # equalize_shard 는 tail 을 잘라 앞쪽 n_min 개만 남긴다(_ddp_utils
+                # items[:n_min]) → tr_gidx 도 같은 길이로 맞춰 window↔global-index 정합을
+                # 복원한다. 안 그러면 head warm-start 의 _extract_features_presharded 에서
+                # len(gidx) > len(feats) → gather 후 feats_all[argsort(idx_all)] 이
+                # out-of-range → rank0 crash → non-main 은 wrap_lora_ddp broadcast 에서
+                # NCCL timeout 까지 hang. (warmup=0 이면 tr_gidx 미소비라 무해하지만 항상 맞춤.)
+                tr_gidx = tr_gidx[: len(train_windows)]
             if is_main():
                 print(
                     f"  [DDP] train shard: {n_shard} → {len(train_windows)}"
@@ -1144,6 +1191,34 @@ def main() -> None:
             ],
             weight_decay=0.01,
         )
+        # ── LP→LoRA head warm-start (Kumar 2022 LP-FT) ──
+        # co-train 전에 frozen feature 로 head 를 먼저 수렴시킨다. LoRA 는 B=0 초기화라
+        # inject 후 encoder 출력 = frozen 과 동일 → extract_features 가 곧 frozen feature.
+        # random head 의 undertrain 과 encoder 왜곡(LP>FT)을 동시에 없앤다.
+        #   DDP: 전 rank 가 _extract_features_presharded 의 gather(collective)에 참여하고
+        #   rank0 만 full feature 로 head 를 fit → 직후 wrap_lora_ddp(DDP construction)가
+        #   rank0 head 를 전 rank 로 broadcast(파라미터 동기). head_warmup_epochs=0 이면
+        #   이 블록 전체가 no-op(기존 동작 불변).
+        if args.head_warmup_epochs > 0:
+            ws_lr = args.probe_lr if args.probe_lr is not None else 1e-3
+            ws_feats, ws_labels = _extract_features_presharded(
+                model, train_windows, tr_gidx,
+                args.batch_size, args.patch_size, device,
+            )
+            if is_main():
+                ws_n = int(ws_feats.size(0))
+                ws_batch = min(256, max(1, ws_n))
+                print(
+                    f"  [warm-start] head {args.head_warmup_epochs}ep on frozen "
+                    f"feats (N={ws_n}, lr={ws_lr:g}, batch={ws_batch})"
+                )
+                _fit_probe_cached(
+                    probe, ws_feats, ws_labels, ws_batch,
+                    args.head_warmup_epochs, ws_lr, device,
+                )
+                del ws_feats, ws_labels
+                gc.collect()
+
         # DDP: encode→pool→probe 를 한 forward 로 묶어 grad all-reduce 등록. 단일 GPU
         # 면 use_ddp=False → ddp_module=None → 기존 _make/forward 경로 그대로(불변).
         ddp_module = wrap_lora_ddp(model.model, probe) if use_ddp else None
@@ -1300,8 +1375,20 @@ def main() -> None:
 
     y_true = metrics.pop("y_true")
     y_score = metrics.pop("y_score")
-    # subject-level grouping id (test_windows 순서 = 예측 순서).
-    patient_ids = [str(w.get("subject_id", "unknown")) for w in test_windows]
+    # subject-level grouping id (patient-cluster bootstrap 용) — y_score 순서와 정합 필수.
+    if use_ddp and not is_lora:
+        # linear_probe DDP: test_windows 는 rank stride shard(1/world)라 gather 로
+        # 복원된 전체 y_true/y_score 와 길이·순서가 어긋난다. chunk 순서(=feature
+        # gather 복원 순서)대로 subject_id 를 다시 읽어 정합시킨다.
+        patient_ids = _load_test_subject_ids_ordered(args.data_path, load_fold)
+    else:
+        # 단일 GPU / LoRA(DDP): test_windows 가 이미 full·순서대로 → 그대로 사용.
+        patient_ids = [str(w.get("subject_id", "unknown")) for w in test_windows]
+    if len(patient_ids) != len(y_true):
+        print(f"WARNING: patient_ids({len(patient_ids)}) != n_pred({len(y_true)}) — "
+              f"patient-cluster grouping 불가, window-level 로 degrade",
+              file=sys.stderr)
+        patient_ids = [str(i) for i in range(len(y_true))]
 
     print(f"\n{'=' * 60}")
     print(f"  Intracranial Hypertension Detection - {args.mode}")
