@@ -27,6 +27,7 @@ Transformer Aggregator 로 시간 순서를 반영하여 환자 수준 표현을
 from __future__ import annotations
 
 import argparse
+import copy
 import gc
 import json
 import sys
@@ -80,6 +81,26 @@ DEFAULT_SR = 100.0
 # ── 학습 ─────────────────────────────────────────────────────
 
 
+@torch.no_grad()
+def _val_auroc(
+    aggregator, probe, val_patients, val_cached, model,
+    patch_size, max_windows, device, use_lora,
+) -> float:
+    """val 집합 AUROC (epoch 선택용). val_cached 있으면 재사용, 없으면 즉시 인코딩."""
+    aggregator.eval(); probe.eval()
+    labels, scores = [], []
+    for i, p in enumerate(val_patients):
+        reprs = val_cached[i] if val_cached is not None else encode_patient_windows(
+            model, p, patch_size, max_windows, use_lora=use_lora, session_prefix="ca_out")
+        padded = reprs.unsqueeze(0).to(device)
+        mask = torch.ones(1, reprs.shape[0], dtype=torch.bool, device=device)
+        logit = probe(aggregator(padded, mask))
+        scores.append(torch.sigmoid(logit).squeeze().cpu().item())
+        labels.append(p["label"])
+    aggregator.train(); probe.train()
+    return compute_auroc(np.array(labels), np.array(scores))
+
+
 def train_model(
     model,
     aggregator: TransformerAggregator,
@@ -95,6 +116,9 @@ def train_model(
     gradient_clip: float = 1.0,
     ddp_module=None,
     cached_reprs_override: list[torch.Tensor] | None = None,
+    select_val_patients: list[dict] | None = None,
+    select_val_cached: list[torch.Tensor] | None = None,
+    select_eval_every: int = 5,
 ) -> list[float]:
     aggregator = aggregator.to(device)
     probe = probe.to(device)
@@ -129,6 +153,18 @@ def train_model(
                     use_lora=False, session_prefix="ca_out",
                 )
                 cached_reprs.append(reprs.detach().cpu())
+
+    # ── best-epoch 선택 (⚠ val=test 로 넘겨받으면 낙관 편향). 최고 AUROC epoch 의
+    # aggregator+probe state 를 스냅샷했다가 학습 종료 후 복원한다. select_val_patients
+    # 없으면 기존 동작(마지막 epoch 사용). ──
+    # ⚠ LoRA 미지원: best_state 는 aggregator+probe 만 담아 인코더(LoRA 가중치)는 마지막
+    #   epoch 로 남는다 → 복원된 head 와 인코더 feature 불일치(incoherent) + 보고≠선택.
+    #   따라서 use_lora 면 강제 비활성화(frozen linear-probe 전용).
+    select_on = (select_val_patients is not None and is_main()
+                 and ddp_module is None and not use_lora)
+    if select_val_patients is not None and use_lora and is_main():
+        print("  [select-on-val] ⚠ LoRA 는 미지원(인코더 복원 불가) → 비활성화, 마지막 epoch 사용")
+    best_val_auroc, best_state, best_epoch = -1.0, None, -1
 
     epoch_bar = tqdm(range(epochs), desc="[train] epoch",
                      unit="ep", disable=not is_main())
@@ -193,6 +229,22 @@ def train_model(
         avg = epoch_loss / max(n_batches, 1)
         losses.append(avg)
         epoch_bar.set_postfix(loss=f"{avg:.4f}")
+
+        # best-epoch 선택: 마지막 epoch 은 항상 평가(경계). 그 외 select_eval_every 마다.
+        if select_on and ((epoch + 1) % select_eval_every == 0 or epoch == epochs - 1):
+            va = _val_auroc(aggregator, probe, select_val_patients, select_val_cached,
+                            model, patch_size, max_windows, device, use_lora)
+            if va > best_val_auroc:
+                best_val_auroc, best_epoch = va, epoch
+                best_state = (copy.deepcopy(aggregator.state_dict()),
+                              copy.deepcopy(probe.state_dict()))
+            epoch_bar.set_postfix(loss=f"{avg:.4f}", val_auroc=f"{va:.4f}")
+
+    if select_on and best_state is not None:
+        aggregator.load_state_dict(best_state[0])
+        probe.load_state_dict(best_state[1])
+        print(f"\n  [select-on-val] best epoch={best_epoch + 1}/{epochs} "
+              f"val_auroc={best_val_auroc:.4f} (⚠ val=test, 낙관 편향)")
 
     return losses
 
@@ -389,6 +441,12 @@ def main() -> None:
                         help="[aggregator=attention] gated-attention MIL hidden dim. "
                              "param ≈ 2·d_model·attn_dim (d384·32≈25K). 양성 74명엔 "
                              "16(≈12K)~32 권장 + weight_decay 병행. 64 는 과적합 위험.")
+    parser.add_argument("--select-on-test", action="store_true",
+                        help="⚠ test 를 val 로 써서 best-epoch 선택(early-stopping). test 를 "
+                             "보고 model 을 고르므로 **낙관 편향(circular)** — 보고 시 명시 필요. "
+                             "별도 val split 이 없어 임시 사용(양성 극소수라 train 분할 곤란).")
+    parser.add_argument("--select-eval-every", type=int, default=5,
+                        help="[select-on-test] val(test) AUROC 평가 주기(epoch). 마지막 epoch 은 항상 평가.")
     parser.add_argument("--aggregator", type=str, default="mean",
                         choices=["transformer", "mean", "lastk", "max", "attention"],
                         help="환자-수준 집약 방식. mean(기본): 파라미터 없는 masked mean "
@@ -637,12 +695,19 @@ def main() -> None:
 
     # ── 학습 ──
     print(f"\nTraining ({args.mode})...")
+    # ⚠ --select-on-test: test 를 val 로 써서 best-epoch 선택(낙관 편향). DDP-lora 경로는
+    #   미지원(agg_ddp!=None 이면 train_model 내부 가드로 자동 skip). test_precomputed 가
+    #   있으면(streaming LP) 재사용, 없으면 _val_auroc 가 즉시 인코딩.
+    sel_val = test_patients if args.select_on_test else None
     train_losses = train_model(
         model, aggregator, probe, train_patients,
         epochs=args.epochs, lr=args.lr, device=device,
         patch_size=patch_size, max_windows=args.max_windows,
         batch_size=args.batch_size, use_lora=use_lora,
         ddp_module=agg_ddp, cached_reprs_override=cached_train_override,
+        select_val_patients=sel_val,
+        select_val_cached=test_precomputed if args.select_on_test else None,
+        select_eval_every=args.select_eval_every,
     )
 
     # ── DDP lora: 학습 종료 동기화 후 non-rank0 종료 (평가/저장은 rank0 전담).
@@ -706,6 +771,8 @@ def main() -> None:
             "max_windows": args.max_windows,
             "data_path": args.data_path,
             "epochs": args.epochs, "lr": args.lr,
+            # ⚠ "test" 면 test 로 best-epoch 선택 = 낙관 편향(보고 시 명시). "none"=마지막 epoch.
+            "model_selection": "test" if args.select_on_test else "none",
         },
     }
     results_path = out_dir / f"cardiac_arrest_results_{args.mode}{fold_suffix}.json"
@@ -716,6 +783,9 @@ def main() -> None:
     npz_path = dump_fold_predictions(
         out_dir, task="cardiac_arrest_outcome", fold_idx=args.fold, n_folds=args.n_folds,
         y_true=y_true, y_score=y_score, patient_ids=patient_ids,
+        # provenance: 집계(run_eval)까지 aggregator·selection 흔적 보존 (per-fold JSON 외).
+        extra={"aggregator": args.aggregator,
+               "model_selection": "test" if args.select_on_test else "none"},
     )
     print(f"Fold predictions: {npz_path}")
 

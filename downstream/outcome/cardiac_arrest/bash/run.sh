@@ -40,6 +40,11 @@ N_FOLDS=${N_FOLDS:-5}
 AGG=${AGG:-mean}
 LAST_K=${LAST_K:-36}    # [AGG=lastk] 5min window 기준 36=마지막 3h
 ATTN_DIM=${ATTN_DIM:-32}  # [AGG=attention] gated-MIL hidden dim. 74 양성엔 16~32 (64=과적합)
+# ⚠ SELECT_ON_TEST=1: test 를 val 로 써서 best-epoch 선택(early-stopping). test 로 model 을
+#   고르므로 낙관 편향(circular) — 보고 시 명시 필요. 별도 val split 부재로 임시 사용.
+#   attention 처럼 학습형 aggregator 가 LP_EPOCHS 를 다 돌면 과적합할 때 유용.
+SELECT_ON_TEST=${SELECT_ON_TEST:-0}
+SEL_ARGS=""; [ "$SELECT_ON_TEST" = "1" ] && SEL_ARGS="--select-on-test"
 
 # Linear Probe (frozen feature 캐싱 — batch 는 probe SGD 미니배치에만 영향).
 LP_BATCH=${LP_BATCH:-512};    LP_LR=${LP_LR:-1e-3};    LP_EPOCHS=${LP_EPOCHS:-1000}
@@ -110,7 +115,7 @@ for f in $FOLD_LIST; do
         --checkpoint "$CHECKPOINT" --model-version "$MODEL_VERSION" \
         --data-path "$PREFIX" --mode linear_probe --n-folds "$N_FOLDS" --fold "$f" \
         --epochs "$LP_EPOCHS" --lr "$LP_LR" --batch-size "$LP_BATCH" \
-        --aggregator "$AGG" --last-k "$LAST_K" --attn-dim "$ATTN_DIM" \
+        --aggregator "$AGG" --last-k "$LAST_K" --attn-dim "$ATTN_DIM" $SEL_ARGS \
         --max-windows "$MAX_WINDOWS" --device "$DEVICE" --out-dir "$LP_OUT" $DRY_FLAG
   fi
 
@@ -122,7 +127,7 @@ for f in $FOLD_LIST; do
         --data-path "$PREFIX" --mode lora --lora-rank "$LORA_RANK" --lora-alpha "$LORA_ALPHA" \
         --n-folds "$N_FOLDS" --fold "$f" \
         --epochs "$LORA_EPOCHS" --lr "$LORA_LR" --batch-size "$LORA_BATCH" \
-        --aggregator "$AGG" --last-k "$LAST_K" --attn-dim "$ATTN_DIM" \
+        --aggregator "$AGG" --last-k "$LAST_K" --attn-dim "$ATTN_DIM" $SEL_ARGS \
         --max-windows "$MAX_WINDOWS" --device "$DEVICE" --out-dir "$LORA_OUT" $DRY_FLAG
   fi
 done
