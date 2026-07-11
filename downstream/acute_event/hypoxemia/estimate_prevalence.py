@@ -144,8 +144,13 @@ def main() -> None:
     ap.add_argument("--horizons", nargs="+", type=int, default=[5, 10, 15])
     ap.add_argument("--stride-sec", type=float, default=30.0)
     ap.add_argument("--allow-tail-windows", action="store_true")
-    ap.add_argument("--max-subjects", type=int, default=None)
-    ap.add_argument("--workers", type=int, default=16)
+    ap.add_argument("--max-subjects", type=int, default=None,
+                    help="양성 환자 '비율' 추정엔 무작위 ~800 이면 충분(전체 4.5h 회피). "
+                         "--sample-seed 와 함께 대표 표본.")
+    ap.add_argument("--sample-seed", type=int, default=None,
+                    help="max-subjects 제한 시 정렬 앞 N 대신 이 seed 로 무작위 N (대표성).")
+    ap.add_argument("--workers", type=int, default=16,
+                    help="raw .vital SpO2 로딩 I/O bound → 서버(64 vCPU)에선 32~48 권장.")
     args = ap.parse_args()
 
     max_h = max(args.horizons) * 60.0
@@ -155,9 +160,14 @@ def main() -> None:
 
     root = Path(args.data_dir)
     subj_dirs = sorted([d for d in root.iterdir() if d.is_dir()])
-    if args.max_subjects:
-        subj_dirs = subj_dirs[:args.max_subjects]
-    print(f"subjects: {len(subj_dirs)}  | window={args.window_sec:.0f}s "
+    total_dirs = len(subj_dirs)
+    if args.max_subjects and total_dirs > args.max_subjects:
+        if args.sample_seed is not None:
+            import random
+            subj_dirs = sorted(random.Random(args.sample_seed).sample(subj_dirs, args.max_subjects))
+        else:
+            subj_dirs = subj_dirs[:args.max_subjects]
+    print(f"subjects: {len(subj_dirs)}/{total_dirs}  | window={args.window_sec:.0f}s "
           f"horizons={args.horizons} allow_tail={args.allow_tail_windows} "
           f"(min_dur={min_dur:.0f}s)", file=sys.stderr)
     print("indexing raw .vital ...", file=sys.stderr)
@@ -187,18 +197,23 @@ def main() -> None:
                 if npz > 0:
                     agg[key][2] += 1
 
-    print(f"\n=== hypoxemia prevalence 추정 (ecg+ppg 코호트 {n_pat} 환자) ===")
-    print(f"{'variant':>12} {'horizon':>8} {'windows':>10} {'pos_win':>8} "
-          f"{'win prev':>9} {'양성환자':>8} {'환자율':>7}")
+    # 표본 → 전체 코호트 외삽 배수 (대표 표본 가정).
+    scale = total_dirs / max(1, len(subj_dirs))
+    est_full_ecgppg = int(round(n_pat * scale))
+    print(f"\n=== hypoxemia prevalence 추정 "
+          f"(표본 ecg+ppg {n_pat} 환자 → 전체 ~{est_full_ecgppg} 추정, ×{scale:.1f}) ===")
+    print(f"{'variant':>12} {'horizon':>8} {'win prev':>9} {'양성환자':>8} "
+          f"{'환자율':>7} {'전체추정':>9}")
     for name, _, _, _ in VARIANTS:
         for h in args.horizons:
             nw, npz, pp = agg[(name, h)]
             wp = 100 * npz / max(1, nw)
             pr = 100 * pp / max(1, n_pat)
-            print(f"{name:>12} {h:>6}분 {nw:>10} {npz:>8} {wp:>8.2f}% "
-                  f"{pp:>8} {pr:>6.1f}%")
-    print("\n주: window prevalence 는 gap-policy drop 미반영 상한. 양성환자 수가 "
-          "stratified 5-fold 평가의 실제 병목(각 fold test 에 ≥ 수 명 필요).")
+            est_pos = int(round(pp * scale))   # 전체 코호트 양성 환자 외삽
+            print(f"{name:>12} {h:>6}분 {wp:>8.2f}% {pp:>8} {pr:>6.1f}% {est_pos:>9}")
+    print("\n판정 기준: '전체추정' 양성환자 ≥ ~50 이면 5-fold 평가 가능(각 test ~10명).")
+    print("  window prevalence 는 gap-policy drop 미반영 상한(실제는 약간 낮음).")
+    print("  게이트는 양성환자 수에 거의 영향 없어 미적용(로딩 가속).")
 
 
 if __name__ == "__main__":
