@@ -44,7 +44,11 @@ ATTN_DIM=${ATTN_DIM:-32}  # [AGG=attention] gated-MIL hidden dim. 74 양성엔 1
 #   고르므로 낙관 편향(circular) — 보고 시 명시 필요. 별도 val split 부재로 임시 사용.
 #   attention 처럼 학습형 aggregator 가 LP_EPOCHS 를 다 돌면 과적합할 때 유용.
 SELECT_ON_TEST=${SELECT_ON_TEST:-0}
-SEL_ARGS=""; [ "$SELECT_ON_TEST" = "1" ] && SEL_ARGS="--select-on-test"
+SEL_EVAL_EVERY=${SEL_EVAL_EVERY:-5}     # val(test) 평가 주기(epoch)
+SEL_PATIENCE=${SEL_PATIENCE:-20}        # early stop: 개선없는 평가 N회 연속 → 중단(0=끔). 실제≈N×eval_every epoch
+SEL_MIN_DELTA=${SEL_MIN_DELTA:-0}       # 개선 최소 증가폭
+SEL_ARGS=""
+[ "$SELECT_ON_TEST" = "1" ] && SEL_ARGS="--select-on-test --select-eval-every $SEL_EVAL_EVERY --select-patience $SEL_PATIENCE --select-min-delta $SEL_MIN_DELTA"
 
 # Linear Probe (frozen feature 캐싱 — batch 는 probe SGD 미니배치에만 영향).
 LP_BATCH=${LP_BATCH:-512};    LP_LR=${LP_LR:-1e-3};    LP_EPOCHS=${LP_EPOCHS:-1000}

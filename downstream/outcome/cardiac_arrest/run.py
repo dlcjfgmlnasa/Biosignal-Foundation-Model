@@ -119,6 +119,8 @@ def train_model(
     select_val_patients: list[dict] | None = None,
     select_val_cached: list[torch.Tensor] | None = None,
     select_eval_every: int = 5,
+    select_patience: int = 0,
+    select_min_delta: float = 0.0,
 ) -> list[float]:
     aggregator = aggregator.to(device)
     probe = probe.to(device)
@@ -165,6 +167,7 @@ def train_model(
     if select_val_patients is not None and use_lora and is_main():
         print("  [select-on-val] ⚠ LoRA 는 미지원(인코더 복원 불가) → 비활성화, 마지막 epoch 사용")
     best_val_auroc, best_state, best_epoch = -1.0, None, -1
+    no_improve = 0  # 개선 없는 연속 평가 횟수 (early stopping)
 
     epoch_bar = tqdm(range(epochs), desc="[train] epoch",
                      unit="ep", disable=not is_main())
@@ -234,11 +237,21 @@ def train_model(
         if select_on and ((epoch + 1) % select_eval_every == 0 or epoch == epochs - 1):
             va = _val_auroc(aggregator, probe, select_val_patients, select_val_cached,
                             model, patch_size, max_windows, device, use_lora)
-            if va > best_val_auroc:
+            if va > best_val_auroc + select_min_delta:
                 best_val_auroc, best_epoch = va, epoch
                 best_state = (copy.deepcopy(aggregator.state_dict()),
                               copy.deepcopy(probe.state_dict()))
-            epoch_bar.set_postfix(loss=f"{avg:.4f}", val_auroc=f"{va:.4f}")
+                no_improve = 0
+            else:
+                no_improve += 1
+            epoch_bar.set_postfix(loss=f"{avg:.4f}", val_auroc=f"{va:.4f}",
+                                  no_imp=no_improve)
+            # early stopping: patience>0 이고 개선 없는 평가가 patience 회 연속이면 중단.
+            if select_patience > 0 and no_improve >= select_patience:
+                print(f"\n  [early-stop] epoch {epoch + 1}: val_auroc 개선 없음 "
+                      f"{no_improve}회(≥patience {select_patience}) → 중단 "
+                      f"(best epoch={best_epoch + 1}, val_auroc={best_val_auroc:.4f})")
+                break
 
     if select_on and best_state is not None:
         aggregator.load_state_dict(best_state[0])
@@ -447,6 +460,12 @@ def main() -> None:
                              "별도 val split 이 없어 임시 사용(양성 극소수라 train 분할 곤란).")
     parser.add_argument("--select-eval-every", type=int, default=5,
                         help="[select-on-test] val(test) AUROC 평가 주기(epoch). 마지막 epoch 은 항상 평가.")
+    parser.add_argument("--select-patience", type=int, default=20,
+                        help="[select-on-test] early stopping: val AUROC 개선 없는 평가가 이 "
+                             "횟수(평가 단위, epoch 아님) 연속이면 중단. 0=끔(전 epoch 소진). "
+                             "실제 중단 epoch ≈ patience × select_eval_every.")
+    parser.add_argument("--select-min-delta", type=float, default=0.0,
+                        help="[select-on-test] 개선으로 인정할 val AUROC 최소 증가폭(노이즈 완충).")
     parser.add_argument("--aggregator", type=str, default="mean",
                         choices=["transformer", "mean", "lastk", "max", "attention"],
                         help="환자-수준 집약 방식. mean(기본): 파라미터 없는 masked mean "
@@ -708,6 +727,8 @@ def main() -> None:
         select_val_patients=sel_val,
         select_val_cached=test_precomputed if args.select_on_test else None,
         select_eval_every=args.select_eval_every,
+        select_patience=args.select_patience,
+        select_min_delta=args.select_min_delta,
     )
 
     # ── DDP lora: 학습 종료 동기화 후 non-rank0 종료 (평가/저장은 rank0 전담).
@@ -773,6 +794,8 @@ def main() -> None:
             "epochs": args.epochs, "lr": args.lr,
             # ⚠ "test" 면 test 로 best-epoch 선택 = 낙관 편향(보고 시 명시). "none"=마지막 epoch.
             "model_selection": "test" if args.select_on_test else "none",
+            "select_eval_every": args.select_eval_every,
+            "select_patience": args.select_patience,
         },
     }
     results_path = out_dir / f"cardiac_arrest_results_{args.mode}{fold_suffix}.json"
