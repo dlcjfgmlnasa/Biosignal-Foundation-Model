@@ -459,10 +459,14 @@ def extract_paper_windows(
     valid_ratio_threshold: float,
     sample_dtype: str,
     rng: np.random.Generator,
+    mt_max_lead_sec: float = 300.0,
 ) -> dict[float, list[MTWindowSample]]:
     """Kwon 2024 per-case 단일 window: case 당 정확히 window 1개.
 
-    - MT+ : horizon h 마다 [onset−(h+obs), onset−h] 10분 관측 window 1개.
+    - MT+ : horizon h 마다 관측 10분 window 1개. 논문 위치는 [onset−(h+obs), onset−h]
+      (정확히 onset h분 전 종료). 원시 파형은 출혈기 gap 이 잦아 그 정확 위치가 invalid
+      한 경우가 많으므로, window 종료를 onset−h 부터 최대 mt_max_lead 만큼 뒤로 밀며
+      **첫 valid window** 를 채택한다(onset 에 가장 가까운 = 정보량 최대, leakage 없음).
     - 음성: 수술 중 랜덤 valid endpoint 의 10분 window 1개 (horizon 무관 → 전 horizon 공유).
     """
     obs_samples = int(obs_window_sec * TARGET_SR)
@@ -472,17 +476,25 @@ def extract_paper_windows(
 
     if case.label == 1:
         onset = case.center_epoch
+        n_steps = max(1, int(mt_max_lead_sec // 30) + 1)
         for h in horizons_sec:
-            got = _window_at(
-                spans, onset - h - obs_window_sec, obs_samples,
-                input_signals, valid_ratio_threshold, sample_dtype,
-            )
+            got = None
+            k = 0
+            for k in range(n_steps):
+                end_epoch = onset - h - k * 30.0  # onset−h 부터 30s 씩 뒤로
+                got = _window_at(
+                    spans, end_epoch - obs_window_sec, obs_samples,
+                    input_signals, valid_ratio_threshold, sample_dtype,
+                )
+                if got is not None:
+                    break
             if got is None:
                 continue
             filled, gapm, wstart = got
             result[h].append(MTWindowSample(
                 input_signals=filled, input_gap_masks=gapm, label=1,
-                label_value=h / 60.0, case_id=f"{case.patient_id}_h{int(h / 60)}",
+                label_value=(h + k * 30.0) / 60.0,  # 실제 window end→onset 잔여(분)
+                case_id=f"{case.patient_id}_h{int(h / 60)}",
                 patient_id=case.patient_id, win_start_sec=wstart, horizon_sec=h,
             ))
     else:
@@ -515,6 +527,7 @@ def process_one_case(
     sampling: str = "per_case",
     obs_window_sec: float = 600.0,
     seed: int = 42,
+    mt_max_lead_sec: float = 300.0,
 ) -> dict[float, list[MTWindowSample]]:
     """단일 case: `.vital` 파싱(1회) → window 추출.
 
@@ -540,6 +553,7 @@ def process_one_case(
         result = extract_paper_windows(
             spans, case, input_signals, horizons_sec, obs_window_sec,
             valid_ratio_threshold, sample_dtype, rng,
+            mt_max_lead_sec=mt_max_lead_sec,
         )
     else:
         for h in horizons_sec:
@@ -572,6 +586,7 @@ def _worker(case: CaseMeta) -> tuple[str, int, dict[float, list[MTWindowSample]]
         sampling=_MP_ARGS["sampling"],
         obs_window_sec=_MP_ARGS["obs_window_sec"],
         seed=_MP_ARGS["seed"],
+        mt_max_lead_sec=_MP_ARGS["mt_max_lead_sec"],
     )
     return case.patient_id, case.label, res
 
@@ -595,6 +610,7 @@ def load_case_metas(
     sampling: str = "per_case",
     horizon_mins: list[float] | None = None,
     obs_window_sec: float = 600.0,
+    mt_max_lead_sec: float = 300.0,
 ) -> tuple[list[CaseMeta], float]:
     """study_population.csv → CaseMeta 리스트 (신호 파싱 전).
 
@@ -657,7 +673,8 @@ def load_case_metas(
         # per_case: MT+ window 는 [onset−(h+obs), onset−h] → 전 horizon 커버 구간만 crop
         cfrom = cto = None
         if sampling == "per_case":
-            cfrom = onset - (max_h_sec + obs_window_sec) - CROP_MARGIN
+            # 유연 배치 탐색(onset−h 부터 mt_max_lead 뒤로)까지 커버하도록 crop 확장
+            cfrom = onset - (max_h_sec + obs_window_sec + mt_max_lead_sec) - CROP_MARGIN
             cto = onset - min_h_sec + CROP_MARGIN
         metas.append(CaseMeta(
             patient_id=Path(fid).stem, vital_path=vpath, label=1,
@@ -866,6 +883,7 @@ def prepare_mt_sweep(
     seed: int = 42,
     sampling: str = "per_case",
     all_negatives: bool = True,
+    mt_max_lead_sec: float = 300.0,
 ) -> list[Path]:
     """(window, horizon) 조합 × stratified K-fold CV 데이터셋 생성 (window-level).
 
@@ -894,7 +912,7 @@ def prepare_mt_sweep(
         study_csv, raw_dir, neg_per_pos, max_neg_cases, seed,
         max_pos_cases=max_pos_cases, all_negatives=all_negatives,
         sampling=sampling, horizon_mins=horizon_mins,
-        obs_window_sec=window_secs[0],
+        obs_window_sec=window_secs[0], mt_max_lead_sec=mt_max_lead_sec,
     )
     if not metas:
         print("ERROR: No cases loaded.", file=sys.stderr)
@@ -929,6 +947,7 @@ def prepare_mt_sweep(
         "sampling": sampling,
         "obs_window_sec": window_sec,
         "seed": seed,
+        "mt_max_lead_sec": mt_max_lead_sec,
     }
 
     try:
@@ -1161,6 +1180,11 @@ def main() -> None:
         "--all-negatives", action="store_true",
         help="음성 전체 사용(자연 prevalence). per_case + 무제한 실행 시 자동 적용.",
     )
+    parser.add_argument(
+        "--mt-max-lead-sec", type=float, default=300.0,
+        help="per_case MT+ window 유연 배치 폭(초): window 종료를 onset−h 부터 최대 "
+             "이만큼 뒤로 밀며 첫 valid 채택(양성 yield↑, leakage 없음). Default 300s.",
+    )
     parser.add_argument("--stride-sec", type=float, default=30.0,
                         help="band 모드 슬라이딩 stride(초).")
     parser.add_argument(
@@ -1220,6 +1244,7 @@ def main() -> None:
         signal_dtype=dtype_map(args.signal_dtype),
         sampling=args.sampling,
         all_negatives=all_negatives,
+        mt_max_lead_sec=args.mt_max_lead_sec,
     )
 
 
