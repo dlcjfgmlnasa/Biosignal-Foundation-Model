@@ -1,11 +1,16 @@
 # -*- coding:utf-8 -*-
-"""Massive Transfusion Prediction — 데이터 준비 (SNUH OR, VitalDB `.vital`, window-level).
+"""Massive Transfusion Prediction — 데이터 준비 (SNUH OR, VitalDB `.vital`).
 
 `study_population.csv` 의 case-level label(`masstf`) + onset 시각(`correct_start_time`)
-을 읽어, 해당 case 의 raw `.vital` 파형을 직접 파싱해 **anchor-relative window-level**
-(input_window, label) 쌍을 만든다. Cardiac Arrest / IOH / ICH 와 동일한 sliding-window
-/ horizon-sweep / stratified K-fold 구조 — 소스가 MIMIC WFDB 가 아니라 raw `.vital`,
-라벨이 `masstf` 라는 점만 다르다.
+을 읽어, 해당 case 의 raw `.vital` 파형을 직접 파싱해 (input_window, label) 쌍을 만든다.
+
+두 sampling 모드:
+  - **per_case** (기본, Kwon 2024 JBI 프로토콜): case 당 관측 window **1개**.
+      · MT+ : onset h분 전에 끝나는 10분 관측 window ([onset−(h+10), onset−h]).
+      · 음성: 수술 중 랜덤 valid endpoint 의 10분 window, **전체 음성 사용**(자연 prevalence).
+      최적화: 필요 구간만 crop + 필요 트랙만 로드 → 전체 17,984 파일 파싱 실용적.
+  - **band** (legacy): onset band 슬라이딩 다수 window + 음성 risk-set 서브샘플.
+    (Cardiac Arrest / IOH / ICH 와 동일한 sliding-window 구조.)
 
 라벨 규칙 (Future Prediction, 5/10/15 min horizon):
   - center(anchor):
@@ -49,6 +54,7 @@ from __future__ import annotations
 import argparse
 import csv
 import gc
+import hashlib
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -128,6 +134,9 @@ class CaseMeta:
     vital_path: Path
     label: int
     center_epoch: float  # onset(양성) 또는 risk-set anchor(음성)의 epoch(초)
+    # per_case 최적화: 필요 구간만 crop 해 파싱(전체 4h 녹화 파싱·필터링 회피).
+    crop_from: float | None = None  # epoch(초), None=crop 안 함(전체)
+    crop_to: float | None = None
 
 
 # ── 시각 파싱 ────────────────────────────────────────────────
@@ -173,6 +182,7 @@ def _select_tracks(available: set[str], channels: list[str]) -> dict[str, str] |
 def parse_vital_aligned_spans(
     vital_path: Path,
     channels: list[str],
+    crop_epoch: tuple[float, float] | None = None,
 ) -> list[tuple[float, dict[str, np.ndarray]]]:
     """`.vital` 레코드 → **채널 정렬·타임라인 보존** aligned span 리스트.
 
@@ -192,15 +202,30 @@ def parse_vital_aligned_spans(
         print("ERROR: vitaldb 패키지 필요. pip install vitaldb", file=sys.stderr)
         sys.exit(1)
 
+    # selective 트랙 로딩: 요청 채널의 후보 트랙만 로드(EEG/vent 등 불필요 트랙 skip → open 가속).
+    wanted_tracks = [
+        t for c in channels for t in CHANNEL_TRACK_CANDIDATES.get(c, [])
+    ]
     try:
-        vf = vitaldb.VitalFile(str(vital_path))
+        vf = vitaldb.VitalFile(str(vital_path), wanted_tracks)
     except Exception:
-        return []
+        try:
+            vf = vitaldb.VitalFile(str(vital_path))  # fallback: 전체 로드
+        except Exception:
+            return []
 
     available = set(vf.get_track_names())
     chosen = _select_tracks(available, channels)
     if chosen is None:
         return []
+
+    # per_case 최적화: 필요 구간만 crop 해 이후 to_numpy·필터 비용을 대폭 절감
+    # (전체 4h 녹화가 아니라 10~30분만 처리). crop 은 파일 시간범위로 자동 clamp.
+    if crop_epoch is not None:
+        try:
+            vf.crop(float(crop_epoch[0]), float(crop_epoch[1]))
+        except Exception:
+            pass  # crop 실패 시 전체로 진행(정확성 우선)
 
     # 공통 grid SR = 선택 트랙들의 최대 native SR (없으면 500).
     srates: list[float] = []
@@ -356,6 +381,128 @@ def extract_windows_from_spans(
     return samples
 
 
+# ── per-case 단일 window 추출 (Kwon 2024 논문 프로토콜) ──────
+
+
+def _window_at(
+    spans: list[tuple[float, dict[str, np.ndarray]]],
+    target_start_epoch: float,
+    obs_samples: int,
+    input_signals: list[str],
+    valid_ratio_threshold: float,
+    sample_dtype: str,
+) -> tuple[dict, dict, float] | None:
+    """target_start_epoch 에서 시작하는 obs_samples 길이 window 1개 추출 (없으면 None).
+
+    논문: MT+ 는 onset Δt분 전에 끝나는 10분 관측 window. 이 함수는 그 절대 시작
+    시각을 포함하는 span 을 찾아 정확한 offset 으로 window 를 잘라낸다.
+    """
+    for span_start, signals in spans:
+        if any(s not in signals for s in input_signals):
+            continue
+        min_len = min(len(signals[s]) for s in input_signals)
+        offset = int(round((target_start_epoch - span_start) * TARGET_SR))
+        if offset < 0 or offset + obs_samples > min_len:
+            continue
+        input_dict = {s: signals[s][offset:offset + obs_samples] for s in input_signals}
+        if compute_valid_ratio(list(input_dict.values())) < valid_ratio_threshold:
+            continue
+        filled, gapm = apply_gap_mask_multichannel(input_dict, output_dtype=sample_dtype)
+        return filled, gapm, offset / TARGET_SR
+    return None
+
+
+def _random_window(
+    spans: list[tuple[float, dict[str, np.ndarray]]],
+    obs_samples: int,
+    input_signals: list[str],
+    valid_ratio_threshold: float,
+    sample_dtype: str,
+    rng: np.random.Generator,
+    max_tries: int = 20,
+) -> tuple[dict, dict, float] | None:
+    """수술 중 랜덤 valid endpoint 의 obs_samples window 1개 추출 (논문 control 방식).
+
+    span 을 가용 window 수로 가중 샘플 → 랜덤 offset → valid_ratio 통과 시 채택.
+    """
+    cand = [
+        (ss, sig) for ss, sig in spans
+        if all(s in sig for s in input_signals)
+        and min(len(sig[s]) for s in input_signals) >= obs_samples
+    ]
+    if not cand:
+        return None
+    avail = np.array(
+        [min(len(sig[s]) for s in input_signals) - obs_samples + 1 for _ss, sig in cand],
+        dtype=np.float64,
+    )
+    weights = avail / avail.sum()
+    for _ in range(max_tries):
+        j = int(rng.choice(len(cand), p=weights))
+        _ss, sig = cand[j]
+        min_len = min(len(sig[s]) for s in input_signals)
+        offset = int(rng.integers(0, min_len - obs_samples + 1))
+        input_dict = {s: sig[s][offset:offset + obs_samples] for s in input_signals}
+        if compute_valid_ratio(list(input_dict.values())) < valid_ratio_threshold:
+            continue
+        filled, gapm = apply_gap_mask_multichannel(input_dict, output_dtype=sample_dtype)
+        return filled, gapm, offset / TARGET_SR
+    return None
+
+
+def extract_paper_windows(
+    spans: list[tuple[float, dict[str, np.ndarray]]],
+    case: CaseMeta,
+    input_signals: list[str],
+    horizons_sec: list[float],
+    obs_window_sec: float,
+    valid_ratio_threshold: float,
+    sample_dtype: str,
+    rng: np.random.Generator,
+) -> dict[float, list[MTWindowSample]]:
+    """Kwon 2024 per-case 단일 window: case 당 정확히 window 1개.
+
+    - MT+ : horizon h 마다 [onset−(h+obs), onset−h] 10분 관측 window 1개.
+    - 음성: 수술 중 랜덤 valid endpoint 의 10분 window 1개 (horizon 무관 → 전 horizon 공유).
+    """
+    obs_samples = int(obs_window_sec * TARGET_SR)
+    result: dict[float, list[MTWindowSample]] = {h: [] for h in horizons_sec}
+    if not spans:
+        return result
+
+    if case.label == 1:
+        onset = case.center_epoch
+        for h in horizons_sec:
+            got = _window_at(
+                spans, onset - h - obs_window_sec, obs_samples,
+                input_signals, valid_ratio_threshold, sample_dtype,
+            )
+            if got is None:
+                continue
+            filled, gapm, wstart = got
+            result[h].append(MTWindowSample(
+                input_signals=filled, input_gap_masks=gapm, label=1,
+                label_value=h / 60.0, case_id=f"{case.patient_id}_h{int(h / 60)}",
+                patient_id=case.patient_id, win_start_sec=wstart, horizon_sec=h,
+            ))
+    else:
+        got = _random_window(
+            spans, obs_samples, input_signals,
+            valid_ratio_threshold, sample_dtype, rng,
+        )
+        if got is not None:
+            filled, gapm, wstart = got
+            for h in horizons_sec:
+                # control window 는 horizon 무관 → 같은 window 를 각 horizon 데이터셋에 포함
+                # (dict 는 얕은 복사, 하부 ndarray 는 공유 — pack 시 copy_ 로 read-only 소비)
+                result[h].append(MTWindowSample(
+                    input_signals=dict(filled), input_gap_masks=dict(gapm), label=0,
+                    label_value=float("nan"), case_id=f"{case.patient_id}_ctrl",
+                    patient_id=case.patient_id, win_start_sec=wstart, horizon_sec=h,
+                ))
+    return result
+
+
 def process_one_case(
     case: CaseMeta,
     input_signals: list[str],
@@ -365,24 +512,43 @@ def process_one_case(
     max_lead_sec: float,
     valid_ratio_threshold: float,
     sample_dtype: str,
+    sampling: str = "per_case",
+    obs_window_sec: float = 600.0,
+    seed: int = 42,
 ) -> dict[float, list[MTWindowSample]]:
-    """단일 case: `.vital` 파싱(1회) → 모든 horizon band window 추출.
+    """단일 case: `.vital` 파싱(1회) → window 추출.
+
+    sampling="per_case" (Kwon 2024): case 당 단일 window.
+    sampling="band"     (legacy): onset band 슬라이딩 다수 window.
 
     Returns
     -------
     {horizon_sec: [MTWindowSample, ...]}  (span 은 추출 직후 폐기 → 메모리 최소).
     """
-    spans = parse_vital_aligned_spans(case.vital_path, input_signals)
+    crop = (
+        (case.crop_from, case.crop_to)
+        if case.crop_from is not None and case.crop_to is not None
+        else None
+    )
+    spans = parse_vital_aligned_spans(case.vital_path, input_signals, crop_epoch=crop)
     result: dict[float, list[MTWindowSample]] = {h: [] for h in horizons_sec}
     if not spans:
         return result
-    for h in horizons_sec:
-        result[h] = extract_windows_from_spans(
-            spans, case.center_epoch, case.label, case.patient_id,
-            input_signals, window_sec, stride_sec, h, max_lead_sec,
-            valid_ratio_threshold=valid_ratio_threshold,
-            sample_dtype=sample_dtype,
+    if sampling == "per_case":
+        pid_hash = int(hashlib.sha1(case.patient_id.encode()).hexdigest()[:8], 16)
+        rng = np.random.default_rng(seed ^ pid_hash)
+        result = extract_paper_windows(
+            spans, case, input_signals, horizons_sec, obs_window_sec,
+            valid_ratio_threshold, sample_dtype, rng,
         )
+    else:
+        for h in horizons_sec:
+            result[h] = extract_windows_from_spans(
+                spans, case.center_epoch, case.label, case.patient_id,
+                input_signals, window_sec, stride_sec, h, max_lead_sec,
+                valid_ratio_threshold=valid_ratio_threshold,
+                sample_dtype=sample_dtype,
+            )
     del spans
     return result
 
@@ -403,6 +569,9 @@ def _worker(case: CaseMeta) -> tuple[str, int, dict[float, list[MTWindowSample]]
         _MP_ARGS["max_lead_sec"],
         _MP_ARGS["valid_ratio_threshold"],
         _MP_ARGS["sample_dtype"],
+        sampling=_MP_ARGS["sampling"],
+        obs_window_sec=_MP_ARGS["obs_window_sec"],
+        seed=_MP_ARGS["seed"],
     )
     return case.patient_id, case.label, res
 
@@ -422,12 +591,17 @@ def load_case_metas(
     max_neg_cases: int | None,
     seed: int,
     max_pos_cases: int | None = None,
+    all_negatives: bool = False,
+    sampling: str = "per_case",
+    horizon_mins: list[float] | None = None,
+    obs_window_sec: float = 600.0,
 ) -> tuple[list[CaseMeta], float]:
     """study_population.csv → CaseMeta 리스트 (신호 파싱 전).
 
-    양성(masstf=1)은 전부, 음성은 neg_per_pos 배(seeded)만 채택.
-    음성 anchor 는 양성의 (onset − opstart) 분포에서 뽑아 opstart 에 더한다(risk-set).
-    실제 `.vital` 이 존재하는 row 만 유지.
+    양성(masstf=1)은 전부. 음성은 all_negatives=True 면 전체(논문 자연 prevalence),
+    아니면 neg_per_pos 배(seeded) 서브샘플. band 모드 anchor 는 양성의
+    (onset − opstart) 분포에서 뽑아 opstart 에 더한다(risk-set). per_case 모드는
+    음성 anchor 를 쓰지 않는다(랜덤 endpoint). 실제 `.vital` 이 존재하는 row 만 유지.
 
     Returns
     -------
@@ -456,6 +630,13 @@ def load_case_metas(
     print(f"  study_population: {len(pos_rows)} 양성(masstf+), {len(neg_rows)} 음성 "
           f"(population prevalence {100 * population_prevalence:.2f}%)")
 
+    # per_case crop margin/구간 계산용
+    hmins = horizon_mins if horizon_mins else [5.0, 10.0, 15.0]
+    max_h_sec = max(hmins) * 60.0
+    min_h_sec = min(hmins) * 60.0
+    CROP_MARGIN = 120.0        # crop 경계 여유(초)
+    CTRL_REGION = 1800.0       # 음성 crop 구간 폭(초, 30분)
+
     # 양성 onset-from-opstart 분포 (risk-set anchor 소스)
     pos_offsets: list[float] = []
     metas: list[CaseMeta] = []
@@ -473,9 +654,14 @@ def load_case_metas(
             continue
         if opstart is not None and onset > opstart:
             pos_offsets.append(onset - opstart)
+        # per_case: MT+ window 는 [onset−(h+obs), onset−h] → 전 horizon 커버 구간만 crop
+        cfrom = cto = None
+        if sampling == "per_case":
+            cfrom = onset - (max_h_sec + obs_window_sec) - CROP_MARGIN
+            cto = onset - min_h_sec + CROP_MARGIN
         metas.append(CaseMeta(
             patient_id=Path(fid).stem, vital_path=vpath, label=1,
-            center_epoch=onset,
+            center_epoch=onset, crop_from=cfrom, crop_to=cto,
         ))
         n_pos_used += 1
 
@@ -483,29 +669,45 @@ def load_case_metas(
         # onset-opstart 파생 실패 시 보수적 기본값(수술 시작 2시간 후).
         pos_offsets = [7200.0]
 
-    # 음성 서브샘플 (seeded)
+    # 음성 선택: all_negatives → 전체(논문), 아니면 neg_per_pos 서브샘플 (seeded)
     rng = np.random.default_rng(seed)
-    n_target = int(round(neg_per_pos * n_pos_used))
-    if max_neg_cases is not None:
-        n_target = min(n_target, max_neg_cases)
-    n_target = min(n_target, len(neg_rows))
-    neg_idx = rng.permutation(len(neg_rows))[:n_target]
+    if all_negatives:
+        neg_idx = np.arange(len(neg_rows))
+        n_target = len(neg_rows)
+    else:
+        n_target = int(round(neg_per_pos * n_pos_used))
+        if max_neg_cases is not None:
+            n_target = min(n_target, max_neg_cases)
+        n_target = min(n_target, len(neg_rows))
+        neg_idx = rng.permutation(len(neg_rows))[:n_target]
     offsets_arr = np.asarray(pos_offsets)
 
     n_neg_used = 0
     n_neg_skip = 0
     for j in neg_idx:
-        row = neg_rows[j]
+        row = neg_rows[int(j)]
         fid = row["fileid"].strip()
         vpath = raw / fid
-        opstart = parse_local_epoch(row.get("opstart"))
-        if opstart is None or not vpath.is_file():
+        if not vpath.is_file():
             n_neg_skip += 1
             continue
-        anchor = opstart + float(rng.choice(offsets_arr))
+        # per_case 모드는 anchor 불필요(랜덤 endpoint). band 모드용 risk-set anchor 는
+        # opstart 가용 시 계산, 없으면 NaN(band 모드에서 자연 배제).
+        opstart = parse_local_epoch(row.get("opstart"))
+        opend = parse_local_epoch(row.get("opend"))
+        anchor = (opstart + float(rng.choice(offsets_arr))
+                  if opstart is not None else float("nan"))
+        # per_case: 음성은 수술 중 랜덤 30분 구간만 crop → 그 안에서 랜덤 10분 window.
+        cfrom = cto = None
+        if sampling == "per_case" and opstart is not None:
+            hi = (max(opstart, opend - CTRL_REGION) if opend is not None
+                  else opstart + 1800.0)
+            span = max(0.0, hi - opstart)
+            cfrom = opstart + float(rng.uniform(0.0, span))
+            cto = cfrom + CTRL_REGION + CROP_MARGIN
         metas.append(CaseMeta(
             patient_id=Path(fid).stem, vital_path=vpath, label=0,
-            center_epoch=anchor,
+            center_epoch=anchor, crop_from=cfrom, crop_to=cto,
         ))
         n_neg_used += 1
 
@@ -587,6 +789,7 @@ def save_split_dataset(
     chunk_idx: int | None = None,
     dataset_prevalence: float | None = None,
     population_prevalence: float | None = None,
+    sampling: str = "per_case",
 ) -> Path:
     """Single split chunk packed dict → 별도 .pt."""
     out_path = Path(out_dir)
@@ -604,9 +807,15 @@ def save_split_dataset(
             "input_signals": input_signals,
             "horizon_sec": horizon_sec,
             "window_sec": window_sec,
+            "observation_window_sec": window_sec,
             "max_lead_sec": max_lead_sec,
             "sampling_rate": TARGET_SR,
-            "negative_strategy": "risk-set matching (time-from-opstart)",
+            "sampling": sampling,  # per_case(Kwon2024) | band(legacy)
+            "negative_strategy": (
+                "random intraoperative endpoint, all controls (Kwon 2024)"
+                if sampling == "per_case"
+                else "risk-set matching (time-from-opstart), subsampled"
+            ),
             "dataset_prevalence": dataset_prevalence,       # 서브샘플 case-level 양성비
             "population_prevalence": population_prevalence,  # 전체 study_pop 실제(≈0.023)
             "split": split_name,
@@ -655,25 +864,37 @@ def prepare_mt_sweep(
     out_dir: str = "F:/Massive_Transfusion_Downstream",
     signal_dtype: torch.dtype = torch.float16,
     seed: int = 42,
+    sampling: str = "per_case",
+    all_negatives: bool = True,
 ) -> list[Path]:
-    """(window, horizon) 조합 × stratified K-fold CV 데이터셋 생성 (window-level)."""
+    """(window, horizon) 조합 × stratified K-fold CV 데이터셋 생성 (window-level).
+
+    sampling="per_case" (Kwon 2024): case 당 window 1개, 음성 전체(자연 prevalence).
+    sampling="band"     (legacy): onset band 슬라이딩 다수, 음성 서브샘플.
+    """
     mode_str = " + ".join(s.upper() for s in input_signals)
+    neg_desc = "전체(all, 논문)" if all_negatives else f"{neg_per_pos}x 서브샘플"
     print(f"\n{'=' * 62}")
-    print(f"  Massive Transfusion Prediction — SNUH OR (window-level)")
+    print(f"  Massive Transfusion Prediction — SNUH OR (sampling={sampling})")
     print(f"  Study CSV: {study_csv}")
     print(f"  Raw dir:   {raw_dir}")
     print(f"  Input:     {mode_str}")
     print(f"  Windows:   {window_secs}s  Horizons: {horizon_mins} min")
-    print(f"  Max lead:  {max_lead_sec / 60:.1f} min (윈도우 종료 band)")
-    print(f"  Neg/Pos:   {neg_per_pos}x  Workers: {workers}")
+    if sampling == "per_case":
+        print(f"  관측 window: {window_secs[0]}s, MT+ = onset h분 전 종료 · 음성 = 랜덤 endpoint")
+    else:
+        print(f"  Max lead:  {max_lead_sec / 60:.1f} min (윈도우 종료 band)")
+    print(f"  Negatives: {neg_desc}  Workers: {workers}")
     print(f"  Output:    {out_dir}")
     print(f"{'=' * 62}")
 
     # 1. case 메타 로딩 (label + anchor, 신호 파싱 전)
-    print("\n[1/4] Loading case labels + risk-set anchors from study_population...")
+    print("\n[1/4] Loading case labels from study_population...")
     metas, population_prev = load_case_metas(
         study_csv, raw_dir, neg_per_pos, max_neg_cases, seed,
-        max_pos_cases=max_pos_cases,
+        max_pos_cases=max_pos_cases, all_negatives=all_negatives,
+        sampling=sampling, horizon_mins=horizon_mins,
+        obs_window_sec=window_secs[0],
     )
     if not metas:
         print("ERROR: No cases loaded.", file=sys.stderr)
@@ -705,6 +926,9 @@ def prepare_mt_sweep(
         "max_lead_sec": max_lead_sec,
         "valid_ratio_threshold": DEFAULT_VALID_RATIO_THRESHOLD,
         "sample_dtype": str(signal_dtype).replace("torch.", ""),
+        "sampling": sampling,
+        "obs_window_sec": window_sec,
+        "seed": seed,
     }
 
     try:
@@ -792,7 +1016,16 @@ def prepare_mt_sweep(
 
     for h in horizons_sec:
         horizon_min = int(h / 60)
-        pid_to_shard = {pid: sp for (pid, _lab, sp) in shard_index[h]}
+        # 이 horizon 의 shard 를 **1회만** 로드해 메모리에 올리고, 5-fold 분할은 메모리에서
+        # 수행한다. (fold 마다 재읽기하면 case×fold×horizon 회 read → 전체 음성 시 수십만
+        # read 로 phase4 가 수 시간. per_case 는 case당 window 1개라 horizon 데이터가 작다.)
+        pid_data: dict[str, dict] = {}
+        for pid, _lab, sp in shard_index[h]:
+            try:
+                pid_data[pid] = torch.load(sp, weights_only=False)
+            except Exception:
+                continue
+        print(f"    h={horizon_min}min: {len(pid_data)} shards loaded → in-memory fold split")
 
         for fold_idx, (train_pids, val_pids, test_pids) in enumerate(splits):
             cur_fold = fold_idx if len(splits) > 1 else None
@@ -829,6 +1062,7 @@ def prepare_mt_sweep(
                         fold_idx=cur_fold, n_folds=len(splits), chunk_idx=chunk_idx,
                         dataset_prevalence=dataset_prev,
                         population_prevalence=population_prev,
+                        sampling=sampling,
                     )
                     saved_paths.append(sp)
                     chunk_idx += 1
@@ -841,10 +1075,9 @@ def prepare_mt_sweep(
                     del packed; gc.collect()
 
                 for pid in sorted(split_pids):
-                    sp = pid_to_shard.get(pid)
-                    if sp is None:
+                    shard = pid_data.get(pid)
+                    if shard is None:
                         continue
-                    shard = torch.load(sp, weights_only=False)
                     n = int(shard["labels"].numel())
                     if n == 0:
                         continue
@@ -866,6 +1099,9 @@ def prepare_mt_sweep(
                 if total > 0:
                     print(f"    h={horizon_min}min fold{fold_idx} {split_name}: "
                           f"{chunk_idx} chunk(s), {total} windows (+={total_pos})")
+
+        del pid_data
+        gc.collect()
 
     # shard 임시파일 정리
     shutil.rmtree(shard_dir, ignore_errors=True)
@@ -915,14 +1151,25 @@ def main() -> None:
         "--window-secs", nargs="+", type=float, default=[600.0],
         help="Input window 길이(초). Default 600 (10분). 여러 개면 첫 값만 사용.",
     )
-    parser.add_argument("--stride-sec", type=float, default=30.0)
+    parser.add_argument(
+        "--sampling", type=str, default="per_case",
+        choices=["per_case", "band"],
+        help="per_case(Kwon 2024, 기본): case 당 window 1개, 음성 전체(자연 prevalence). "
+             "band(legacy): onset band 슬라이딩 다수, 음성 서브샘플.",
+    )
+    parser.add_argument(
+        "--all-negatives", action="store_true",
+        help="음성 전체 사용(자연 prevalence). per_case + 무제한 실행 시 자동 적용.",
+    )
+    parser.add_argument("--stride-sec", type=float, default=30.0,
+                        help="band 모드 슬라이딩 stride(초).")
     parser.add_argument(
         "--max-lead-sec", type=float, default=300.0,
-        help="윈도우 종료 band: h ≤ tte ≤ h+max_lead. Default 300s(5분).",
+        help="band 모드 윈도우 종료 band: h ≤ tte ≤ h+max_lead. Default 300s(5분).",
     )
     parser.add_argument(
         "--neg-per-pos", type=float, default=3.0,
-        help="음성 case 서브샘플 배수(양성 대비). Default 3.",
+        help="음성 서브샘플 배수(양성 대비). all-negatives/per_case 무제한 시 무시. Default 3.",
     )
     parser.add_argument(
         "--max-neg-cases", type=int, default=None,
@@ -947,6 +1194,14 @@ def main() -> None:
     dtype_map = add_signal_dtype_arg(parser)
     args = parser.parse_args()
 
+    # 음성 전체 사용 결정: --all-negatives 명시 OR (per_case 이면서 cap 없는 full 실행).
+    # cap(--max-pos/neg-cases)이 있으면 smoke/디버깅 → 서브샘플로 축소.
+    all_negatives = args.all_negatives or (
+        args.sampling == "per_case"
+        and args.max_pos_cases is None
+        and args.max_neg_cases is None
+    )
+
     prepare_mt_sweep(
         study_csv=args.study_csv,
         raw_dir=args.raw_dir,
@@ -963,6 +1218,8 @@ def main() -> None:
         seed=args.seed,
         out_dir=args.out_dir,
         signal_dtype=dtype_map(args.signal_dtype),
+        sampling=args.sampling,
+        all_negatives=all_negatives,
     )
 
 
