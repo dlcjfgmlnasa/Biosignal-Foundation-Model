@@ -1019,6 +1019,30 @@ _mp_skip_quality: bool = False
 _mp_lenient_quality: bool = False
 
 
+def _init_worker(
+    min_dur: float,
+    sig_filter: set[int] | None,
+    subj_depth: int,
+    skip_quality: bool,
+    lenient_quality: bool,
+) -> None:
+    """Pool initializer — 각 worker 프로세스의 모듈 전역을 직접 설정한다.
+
+    ⚠️ Windows(및 spawn start method)에서는 부모가 ``main()`` 에서 한 런타임 전역
+    할당이 spawn 된 worker 로 상속되지 않는다 (worker 는 모듈을 새로 import → 전역이
+    import-time 기본값으로 초기화됨). 그 결과 ``_mp_sig_filter`` 가 None 이 되어
+    ``--signal-types`` 필터가 조용히 무력화되고 제외 대상(예: PAP)까지 파싱된다.
+    initializer 로 worker 안에서 전역을 세팅해 fork/spawn 양쪽에서 필터가 작동하게 한다.
+    """
+    global _mp_min_dur, _mp_sig_filter, _mp_subj_depth
+    global _mp_skip_quality, _mp_lenient_quality
+    _mp_min_dur = min_dur
+    _mp_sig_filter = sig_filter
+    _mp_subj_depth = subj_depth
+    _mp_skip_quality = skip_quality
+    _mp_lenient_quality = lenient_quality
+
+
 def _worker_split(task_tuple: tuple) -> tuple | None:
     """병렬 처리용 worker. (vf_path, out_dir) 튜플을 받아 처리한다."""
     vf_path, target_dir = task_tuple
@@ -1361,21 +1385,23 @@ def main() -> None:
 
         print(f"병렬 처리: {args.workers} workers\n")
 
-        # 모듈 레벨 변수 설정 (worker가 참조)
-        global _mp_min_dur, _mp_sig_filter, _mp_subj_depth, _mp_skip_quality, _mp_lenient_quality
-        _mp_min_dur = min_dur
-        _mp_sig_filter = sig_filter
-        _mp_subj_depth = args.subject_from_parent
-        _mp_skip_quality = args.skip_quality_window
-        _mp_lenient_quality = args.lenient_quality
-
         # 파일별로 출력 디렉토리 결정하여 worker에 전달
         tasks = []
         for i, vf_path in enumerate(vital_files):
             target_dir = test_out_dir if i in test_indices else out_dir
             tasks.append((vf_path, target_dir))
 
-        with Pool(processes=args.workers) as pool:
+        # ⚠️ worker 전역은 반드시 Pool initializer 로 설정한다. Windows/spawn 에서는
+        # 부모의 런타임 전역 할당이 worker 로 상속되지 않아 --signal-types 필터가 조용히
+        # 무력화된다(PAP 등 제외 대상까지 파싱됨).
+        with Pool(
+            processes=args.workers,
+            initializer=_init_worker,
+            initargs=(
+                min_dur, sig_filter, args.subject_from_parent,
+                args.skip_quality_window, args.lenient_quality,
+            ),
+        ) as pool:
             iterator = pool.imap(_worker_split, tasks)
             if _have_tqdm:
                 iterator = tqdm(
