@@ -31,7 +31,7 @@ ada_cond = ada_cond * valid_token
 - **효과**: 게이팅된 토큰의 LSCNorm은 `norm(x)·(1+bias_γ)+bias_β`(학습된 static affine)로 fallback — 제대로 된 학습 norm, loc/scale/device 의존만 제거.
 - **유지**: modality 임베딩(sig_emb)·z-score 정규화 그대로. loc/scale **conditioning만** 차단.
 - **체크포인트**: 호환(입력 마스크, 차원 불변) → warm-start 가능.
-- **플래그**: `gate_unitless_cond: bool = True`.
+- **플래그**: `gate_unitless_cond` — **기본 False(구 ckpt 로딩 호환), 재사전학습 config에서 True**.
 
 ## 2. Change B — conditioning enrichment [mean,std] → [mean,std,max,min]
 
@@ -59,7 +59,9 @@ return loc, scale, max_, min_
 
 - **RAW 물리 단위 유지** — max/min을 z-정규화 금지(그래야 max=SBP·ETCO2 의미 살아있음).
 - **체크포인트**: **비호환**(cond_proj 2→4) → from-scratch. 어차피 신규 코퍼스 재학습이라 **추가비용 0**.
-- **플래그**: `enrich_cond_peak: bool = True` (생성 시 cond_proj 입력 2 vs 4 선택).
+- **플래그**: `enrich_cond_peak` — **기본 False, 재사전학습 config에서 True** (cond_proj 입력 2 vs 4 결정).
+
+> **구현 완료 (2026-07-15, `feat/conditioning-redesign`)**: `module/packed_scaler.py`(4-tuple + winsorized scatter max/min), `model/biosignal_model.py`(게이팅·enrich·cond_proj 2/4), `model/_config.py`(플래그 2개, 기본 False). 스모크 테스트 통과(4-tuple·forward·게이팅 작동·구 ckpt 호환). **재사전학습 yaml `model:` 섹션에 `gate_unitless_cond: true`·`enrich_cond_peak: true` 추가하면 활성.**
 
 ## 3. Change C — DROPPED
 

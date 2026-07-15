@@ -144,6 +144,8 @@ class BiosignalFoundationModel(nn.Module):
         contrastive_proj_dim: int = 0,
         d_cond: int = 16,
         use_lscnorm: bool = True,
+        gate_unitless_cond: bool = False,
+        enrich_cond_peak: bool = False,
     ) -> None:
         super().__init__()
         self.d_model = d_model
@@ -151,6 +153,11 @@ class BiosignalFoundationModel(nn.Module):
         self.num_signal_types = num_signal_types
         # d_cond: AdaLN modulation 입력 차원 (override 가능 hyperparameter).
         self.d_cond = d_cond
+        # Conditioning redesign (2026-07-15): A=게이팅, B=peak enrichment (기본 off, config로 on).
+        self.gate_unitless_cond = gate_unitless_cond
+        self.enrich_cond_peak = enrich_cond_peak
+        # device-arbitrary loc/scale 을 가진 unitless modality (게이팅 대상): PPG=2, RESP_Imp=7.
+        self._gated_signal_types = (2, 7)
 
         # 1. Scaler (point-level)
         self.scaler = scaler or PackedStdScaler()
@@ -202,8 +209,10 @@ class BiosignalFoundationModel(nn.Module):
         # (loc, scale) 2D scalar → d_cond conditioning vector → encoder 모든 layer의
         # LSCNorm modulation 입력. MLP(2 → d_cond → d_cond) — non-linearity로
         # expressiveness 확보.
+        # B(enrich_cond_peak): 입력이 [loc,scale](2) 또는 [loc,scale,max,min](4).
+        cond_in_dim = 4 if enrich_cond_peak else 2
         self.cond_proj = nn.Sequential(
-            nn.Linear(2, self.d_cond),
+            nn.Linear(cond_in_dim, self.d_cond),
             nn.SiLU(),
             nn.Linear(self.d_cond, self.d_cond),
         )
@@ -352,7 +361,7 @@ class BiosignalFoundationModel(nn.Module):
         """
         # 1. Scaler: point-level 정규화
         values = batch.values.unsqueeze(-1)  # (B, L, 1)
-        loc, scale = self.scaler(
+        loc, scale, gmax, gmin = self.scaler(
             values,
             sample_id=batch.sample_id,
             variate_id=batch.variate_id,
@@ -426,9 +435,25 @@ class BiosignalFoundationModel(nn.Module):
         patch_loc = loc[:, patch_starts, :]  # (B, N, 1)
         patch_scale = scale[:, patch_starts, :]  # (B, N, 1)
 
-        # AdaLN: loc/scale을 cond_proj로 → encoder 모든 layer의 LSCNorm modulation 입력
-        loc_scale = torch.cat([patch_loc, patch_scale], dim=-1)  # (B, N, 2)
-        ada_cond = self.cond_proj(loc_scale)  # (B, N, d_cond)
+        # AdaLN conditioning 입력 (B: enrich 시 winsorized max/min 추가)
+        if self.enrich_cond_peak:
+            patch_max = gmax[:, patch_starts, :]  # (B, N, 1)
+            patch_min = gmin[:, patch_starts, :]  # (B, N, 1)
+            cond_stats = torch.cat(
+                [patch_loc, patch_scale, patch_max, patch_min], dim=-1
+            )  # (B, N, 4)
+        else:
+            cond_stats = torch.cat([patch_loc, patch_scale], dim=-1)  # (B, N, 2)
+        ada_cond = self.cond_proj(cond_stats)  # (B, N, d_cond)
+
+        # A(gate_unitless_cond): unitless modality(PPG·RESP_Imp)의 loc/scale conditioning
+        # 차단 (device 지문). 마스크는 cond_proj 출력에 — 입력에 걸면 bias 때문에 의미 깨짐.
+        if self.gate_unitless_cond and patch_signal_types is not None:
+            gated = (patch_signal_types == self._gated_signal_types[0]) | (
+                patch_signal_types == self._gated_signal_types[1]
+            )  # (B, N)
+            ada_cond = ada_cond * (~gated).unsqueeze(-1)
+
         ada_cond = ada_cond * valid_token  # 패딩 위치는 0으로
         cond = cond * valid_token  # signal_type + spatial_id만 token에 더해짐
 

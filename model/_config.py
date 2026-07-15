@@ -89,6 +89,13 @@ class ModelConfig:
     use_lscnorm: bool = True
     d_cond: int = 16  # AdaLN cond vector 차원 (ablation에서 16 채택, override 가능)
 
+    # Conditioning redesign (2026-07-15) — 기본 False(opt-in): 구 checkpoint 로딩 호환.
+    # 재사전학습 config(yaml)에서만 True 로 켠다.
+    #  A: PPG(2)·RESP_Imp(7) 의 device-arbitrary loc/scale conditioning 차단 (ckpt 호환).
+    gate_unitless_cond: bool = False
+    #  B: cond 입력을 [loc,scale]→[loc,scale,max,min] 확장 (cond_proj 2→4, ckpt 비호환→from-scratch).
+    enrich_cond_peak: bool = False
+
     def to_dict(self) -> dict:
         """Checkpoint 저장용 직렬화."""
         return asdict(self)
