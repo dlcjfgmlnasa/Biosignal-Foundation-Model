@@ -33,6 +33,19 @@ BAND_ORDER = ["0-4", "5-9", "10-14", "15-19", "20-24", "25-29", "30-34",
 BAND_LABEL = {b: ("90+" if "90" in b else b) for b in BAND_ORDER}
 M_COLOR, F_COLOR = "#4e79a7", "#e8a0b8"
 
+# 10세 단위 그룹 (--decade)
+DECADE_ORDER = ["0-9", "10-19", "20-29", "30-39", "40-49", "50-59",
+                "60-69", "70-79", "80-89", "90+"]
+
+
+def to_decade(band: str) -> str:
+    """5세 밴드 → 10세 그룹 라벨. '90 years or older' → '90+'."""
+    if "90" in band:
+        return "90+"
+    lo = int(band.split("-")[0])
+    d = (lo // 10) * 10
+    return f"{d}-{d + 9}"
+
 
 def load(patients: Path, ids_path: Path | None):
     keep = None
@@ -54,14 +67,17 @@ def load(patients: Path, ids_path: Path | None):
     return recs
 
 
-def render(recs, out: Path, pct: bool = False):
+def render(recs, out: Path, pct: bool = False, decade: bool = False):
     cross = defaultdict(lambda: {"M": 0, "F": 0})
     for r in recs:
         band = (r.get("anchor_age") or "").strip()
         sex = (r.get("sex") or "").strip().upper()
         if band in BAND_LABEL and sex in ("M", "F"):
-            cross[band][sex] += 1
-    bands = [b for b in BAND_ORDER if b in cross]
+            key = to_decade(band) if decade else band
+            cross[key][sex] += 1
+    order = DECADE_ORDER if decade else BAND_ORDER
+    label_map = {d: d for d in DECADE_ORDER} if decade else BAND_LABEL
+    bands = [b for b in order if b in cross]
     m_cnt = [cross[b]["M"] for b in bands]
     f_cnt = [cross[b]["F"] for b in bands]
     n = len(bands)
@@ -77,7 +93,7 @@ def render(recs, out: Path, pct: bool = False):
     ax.barh(y, [-m for m in males], color=M_COLOR, label=f"Male (n={tot_m:,})")
     ax.barh(y, females, color=F_COLOR, label=f"Female (n={tot_f:,})")
     ax.set_yticks(list(y))
-    ax.set_yticklabels([BAND_LABEL[b] for b in bands], fontsize=9)
+    ax.set_yticklabels([label_map[b] for b in bands], fontsize=10)
     ax.set_xlabel("% of cohort" if pct else "Patients")
     ax.set_title("Age × Sex Distribution", fontsize=15, weight="bold")
     # x축 음수 → 절대값 라벨
@@ -112,8 +128,9 @@ def main():
                     help="파형 코호트 subject_id JSON 리스트 (없으면 전체)")
     ap.add_argument("--out", type=Path, default=Path("pyramid.eps"))
     ap.add_argument("--pct", action="store_true", help="절대수 대신 전체 대비 %")
+    ap.add_argument("--decade", action="store_true", help="10세 단위로 묶기 (기본 5세)")
     a = ap.parse_args()
-    render(load(a.patients, a.ids), a.out, pct=a.pct)
+    render(load(a.patients, a.ids), a.out, pct=a.pct, decade=a.decade)
 
 
 if __name__ == "__main__":

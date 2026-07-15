@@ -5,7 +5,7 @@
 #
 # 필수 env: ENCODER WEIGHTS
 # 주요 env override:
-#   ENCODER          biot|ecgfounder|papagei|pulseppg|heartbeit
+#   ENCODER          biot|ecgfounder|papagei|pulseppg|stmem|anyppg
 #   WEIGHTS          사전학습 가중치 파일(또는 HF 디렉토리)
 #   THIRD_PARTY_ROOT upstream 레포 루트 (미지정 시 모델별 FM_*_ROOT env 사용)
 #   TASK_NAME        npz task 태그 접두 (예: cardiac_arrest)  [default fm]
@@ -19,7 +19,7 @@
 
 set -e
 
-ENCODER=${ENCODER:?ENCODER 필요 (biot|ecgfounder|papagei|pulseppg|heartbeit)}
+ENCODER=${ENCODER:?ENCODER 필요 (biot|ecgfounder|papagei|pulseppg|stmem|anyppg)}
 WEIGHTS=${WEIGHTS:?WEIGHTS 필요 (사전학습 가중치 경로)}
 THIRD_PARTY_ROOT=${THIRD_PARTY_ROOT:-}
 
@@ -39,7 +39,7 @@ EPOCHS=${EPOCHS:-100}
 LR=${LR:-1e-3}
 BATCH=${BATCH:-256}
 DROPOUT=${DROPOUT:-0.1}
-MAX_SEGMENTS=${MAX_SEGMENTS:-8}
+MAX_SEGMENTS=${MAX_SEGMENTS:-0}
 FEAT_BATCH=${FEAT_BATCH:-64}
 PATIENCE=${PATIENCE:-0}
 FORCE=${FORCE:-0}

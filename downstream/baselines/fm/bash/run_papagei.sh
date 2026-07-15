@@ -12,7 +12,7 @@ export ENCODER=papagei
 export WEIGHTS=${WEIGHTS:?WEIGHTS 필요 (예: /repos/papagei-foundation-model/weights/papagei_s.pt)}
 export THIRD_PARTY_ROOT=${THIRD_PARTY_ROOT:-${FM_PAPAGEI_ROOT:-}}
 export EPOCHS=${EPOCHS:-100} LR=${LR:-1e-3} BATCH=${BATCH:-256} DEVICE=${DEVICE:-cuda}
-export FEAT_BATCH=${FEAT_BATCH:-64} MAX_SEGMENTS=${MAX_SEGMENTS:-8} FORCE=${FORCE:-0}
+export FEAT_BATCH=${FEAT_BATCH:-64} MAX_SEGMENTS=${MAX_SEGMENTS:-0} FORCE=${FORCE:-0}
 
 run_task () {  # name data_subdir signals window horizons prefix_stem id_fields
   TASK_NAME="$1" DATA_DIR="$DATA_ROOT/$2" SIGNALS="$3" WINDOW="$4" \

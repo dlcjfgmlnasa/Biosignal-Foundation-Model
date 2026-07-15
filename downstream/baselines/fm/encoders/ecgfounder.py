@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import torch
 
-from downstream.baselines.fm.encoders import add_repo_to_path
+from downstream.baselines.fm.encoders import _dsp, add_repo_to_path
 from downstream.baselines.fm.encoders.base import FMEncoder
 
 # upstream Net1D 하이퍼파라미터 (finetune_model.py 의 ECGFounder 설정과 일치).
@@ -47,7 +47,9 @@ class ECGFounderEncoder(FMEncoder):
         from net1d import Net1D  # type: ignore
 
         model = Net1D(in_channels=1, n_classes=1, return_features=True, **_NET1D_KW)
-        ckpt = torch.load(self.weights_path, map_location="cpu")
+        # weights_only=False 필수: 이 체크포인트는 optimizer state 에 numpy scalar 를 담고 있어
+        # torch>=2.6 의 weights_only=True 기본값으로는 UnpicklingError 가 난다.
+        ckpt = torch.load(self.weights_path, map_location="cpu", weights_only=False)
         state = ckpt.get("state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
         state = {k: v for k, v in state.items() if not k.startswith("dense.")}
         missing, unexpected = model.load_state_dict(state, strict=False)
@@ -60,6 +62,14 @@ class ECGFounderEncoder(FMEncoder):
         model.return_features = True
         self.model = model
         self.embed_dim = 1024  # filter_list[-1]
+
+    def _preprocess(self, x: torch.Tensor) -> torch.Tensor:
+        # upstream util.filter_bandpass → dataset.py z-score 와 동일 순서.
+        # HF 모델카드 Notice 가 이 전처리(filtering + z-score)를 엄격히 요구한다.
+        x = _dsp.notch(x, self.native_sr, 50.0, q=30.0)
+        x = _dsp.bandpass(x, self.native_sr, 0.67, 40.0, order=4)
+        x = _dsp.remove_baseline_median(x, self.native_sr, frac=0.4)
+        return super()._preprocess(x)  # per-channel z-score
 
     def _forward_native(self, x: torch.Tensor) -> torch.Tensor:
         # Net1D(return_features=True) → (logits, deep_features); 임베딩만 사용.

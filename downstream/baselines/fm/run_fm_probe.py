@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """외부 FM baseline 통합 실행 진입점 (frozen encoder + linear probe).
 
-하나의 CLI 로 5개 외부 FM(BIOT / ECGFounder / PaPaGei / Pulse-PPG / HeartBEiT)을
+하나의 CLI 로 외부 FM(BIOT / ECGFounder / PaPaGei / Pulse-PPG / ST-MEM / AnyPPG)을
 ``--encoder`` 로 선택해, CARMEN 과 **같은 prepared 데이터·같은 5-fold·같은 평가**
 위에서 frozen linear-probe 로 돌린다. 산출물(preds_fold{f}.npz + fold{f}.json)은
 CARMEN·CNN baseline 과 동일 스키마 → ``python -m downstream.run_eval`` 로 함께 집계.
@@ -39,8 +39,10 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="upstream 레포 루트 (미지정 시 모델별 FM_*_ROOT env 사용)")
     p.add_argument("--feat-batch", type=int, default=64, help="frozen feature 추출 배치")
     p.add_argument("--dropout", type=float, default=0.1, help="LinearProbe dropout")
-    p.add_argument("--max-segments", type=int, default=8,
-                   help="긴 window 를 세그먼트로 분할해 인코딩할 최대 개수(균등 샘플·평균)")
+    p.add_argument("--max-segments", type=int, default=0,
+                   help="긴 window 를 세그먼트로 분할해 인코딩할 최대 개수(균등 샘플·평균). "
+                        "0=window 전체 커버(겹침 없이 연속, 권장). CARMEN 은 window 전체를 pool 하므로 "
+                        "부분 커버는 외부 FM 을 불리하게 만든다.")
     p.add_argument("--task-name", type=str, default=None,
                    help="npz task 태그 접두(미지정 시 'fm'). 실제 태그=<task-name>_<encoder>")
     p.add_argument("--id-fields", type=str, nargs="+", default=["case_ids"],

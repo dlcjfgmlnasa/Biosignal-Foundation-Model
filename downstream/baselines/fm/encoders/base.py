@@ -2,7 +2,7 @@
 """외부 사전학습 Foundation Model(FM) baseline 용 공통 encoder 인터페이스.
 
 CARMEN 과 **같은 prepared 데이터·같은 5-fold·같은 평가** 위에서, 공개된 외부 FM
-(BIOT / ECGFounder / PaPaGei / Pulse-PPG / HeartBEiT) 을 **frozen feature extractor**
+(BIOT / ECGFounder / PaPaGei / Pulse-PPG / ST-MEM / AnyPPG) 을 **frozen feature extractor**
 로 붙여 linear-probe 로 비교하기 위한 어댑터 계층이다.
 
 핵심 문제: 우리 prepared window 는 **100Hz, (n, C, L)** 인데 각 FM 은 네이티브 SR·입력
@@ -111,14 +111,16 @@ class FMEncoder(abc.ABC):
     def _segment(self, x: torch.Tensor, seg_src: int) -> list[torch.Tensor]:
         """(b, C, L) → 세그먼트 리스트, 각 (b, C, seg_src). 소스 SR 기준.
 
-        L < seg_src 면 zero-pad 한 1개. full 세그먼트 수가 max_segments 초과면
-        [0, L-seg_src] 구간에서 균등 시작점을 골라 max_segments 개만 사용.
+        L < seg_src 면 zero-pad 한 1개. ``max_segments <= 0`` (또는 full 세그먼트 수 이상)
+        이면 **겹침 없이 전 구간**을 연속 세그먼트로 커버한다(권장 — CARMEN 은 window 전체를
+        pool 하므로 부분 커버는 외부 FM 을 불리하게 만든다). full 세그먼트 수가 양의
+        max_segments 를 초과할 때만 [0, L-seg_src] 구간에서 균등 시작점을 골라 그만큼만 쓴다.
         """
         L = x.shape[-1]
         if L < seg_src:
             return [F.pad(x, (0, seg_src - L))]
         n_full = L // seg_src
-        if n_full <= self.max_segments:
+        if self.max_segments <= 0 or n_full <= self.max_segments:
             starts = [i * seg_src for i in range(n_full)]
         else:
             starts = np.linspace(0, L - seg_src, self.max_segments).round().astype(int).tolist()

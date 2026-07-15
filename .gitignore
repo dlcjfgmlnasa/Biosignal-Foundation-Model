@@ -57,7 +57,11 @@ obsidian/
 bquxjob_*.csv
 
 # wget commands with embedded PhysioNet credentials (local-only, never commit)
-wget_commands.txt
+# 정확일치 패턴은 wget_commands_mortality_signals.txt 등 접미사 변형을 놓친다.
+wget_commands*.txt
+
+# Downloaded patient datasets (clinical tables + per-patient waveforms) — 코드 레포에 두지 않는다
+06569a69d0794f4e862d41055160872a_V2/
 
 # MIMIC-III derived queries and exports (PHI / DUA risk)
 downstream/**/sql/
@@ -65,8 +69,18 @@ downstream/**/sql/
 # Generated download record lists (per-task, regenerable via build_records_to_download.py)
 downstream/**/RECORDS-to-download
 
+# Landmark 2-pass 산출물 (build_landmark_records.py 로 재생성 가능, 환자 시각 포함 → PHI 위험)
+downstream/**/FILES-to-download
+downstream/**/landmark_manifest.json
+
 # Raw cohort RECORDS — ignore by default, whitelist ICH for reproducibility
 downstream/**/RECORDS-ich-cohort
 downstream/**/ICP-RECORDS
 !downstream/acute_event/intracranial_hypertension/RECORDS-ich-cohort
 !downstream/acute_event/intracranial_hypertension/ICP-RECORDS
+
+# 외부 FM baseline 사전학습 가중치 (수 GB, 각 upstream 에서 별도 다운로드 — README 참조)
+foundation_baseline_models/
+
+# 생성된 figure 파일 (EPS/PNG) — git 미추적
+figures/

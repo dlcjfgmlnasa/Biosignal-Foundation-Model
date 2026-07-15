@@ -114,28 +114,29 @@ variants:
       reuse: "00_full"
     run_phase2: false                # Phase 2 skip
 
-  # ── #5 Modality-balanced sampling ────────────────────────────
-  - name: "05a_samp_a0"
-    description: "Modality-balanced sampling α=0 (uniform)"
-    ablation_group: "sampling"
-    phase1:
-      overrides:
-        modality_balanced_alpha: 0.0
-        exp_name: ablation_05a_samp_a0_p1
-    phase2:
-      overrides:
-        exp_name: ablation_05a_samp_a0_p2
-
-  - name: "05b_samp_a1"
-    description: "Modality-balanced sampling α=1.0 (full inverse)"
-    ablation_group: "sampling"
-    phase1:
-      overrides:
-        modality_balanced_alpha: 1.0
-        exp_name: ablation_05b_samp_a1_p1
-    phase2:
-      overrides:
-        exp_name: ablation_05b_samp_a1_p2
+  # ── #5 Modality-balanced sampling ── DROPPED (run/aggregate에서 제외) ──
+  # sampling ablation(05a/05b)은 제외하기로 결정. 되살리려면 주석 해제.
+  # - name: "05a_samp_a0"
+  #   description: "Modality-balanced sampling α=0 (uniform)"
+  #   ablation_group: "sampling"
+  #   phase1:
+  #     overrides:
+  #       modality_balanced_alpha: 0.0
+  #       exp_name: ablation_05a_samp_a0_p1
+  #   phase2:
+  #     overrides:
+  #       exp_name: ablation_05a_samp_a0_p2
+  #
+  # - name: "05b_samp_a1"
+  #   description: "Modality-balanced sampling α=1.0 (full inverse)"
+  #   ablation_group: "sampling"
+  #   phase1:
+  #     overrides:
+  #       modality_balanced_alpha: 1.0
+  #       exp_name: ablation_05b_samp_a1_p1
+  #   phase2:
+  #     overrides:
+  #       exp_name: ablation_05b_samp_a1_p2
 
   # ── #6 Variate attention bias ────────────────────────────────
   - name: "06_no_attnbias"
@@ -151,64 +152,3 @@ variants:
         model_config:
           use_var_attn_bias: false
         exp_name: ablation_06_no_attnbias_p2
-
-  # ── #7 Model scale ───────────────────────────────────────────
-  # B-option (10M anchor) — baseline(00_full)=10.68M 을 anchor 로 하여
-  # 3M / 10M(=00_full) / 30M / 100M 4-point log-uniform sweep.
-  # 10M anchor 는 00_full 을 그대로 사용 → 별도 variant 추가 없음
-  # (runner 가 ablation_group="model_scale" 의 anchor 를 00_full 로 해석).
-  # 변경 키: model_config 의 size 관련 (d_model/num_layers/num_heads) 만.
-  # 다른 설정 (loss, sampler, attn_bias, LSCNorm, FFN, RoPE 등) 은 base 상속.
-  - name: "07a_size_3m"
-    description: "Model scale 3M (d=128, L=12, H=4) — ~0.28x baseline params"
-    ablation_group: "model_scale"
-    phase1:
-      overrides:
-        model_config:
-          d_model: 128
-          num_layers: 12
-          num_heads: 4
-        exp_name: ablation_07a_3m_p1
-    phase2:
-      overrides:
-        model_config:
-          d_model: 128
-          num_layers: 12
-          num_heads: 4
-        exp_name: ablation_07a_3m_p2
-
-  - name: "07b_size_30m"
-    description: "Model scale 30M (d=384, L=16, H=6) — ~2.83x baseline params"
-    ablation_group: "model_scale"
-    phase1:
-      overrides:
-        model_config:
-          d_model: 384
-          num_layers: 16
-          num_heads: 6
-        exp_name: ablation_07b_30m_p1
-    phase2:
-      overrides:
-        model_config:
-          d_model: 384
-          num_layers: 16
-          num_heads: 6
-        exp_name: ablation_07b_30m_p2
-
-  - name: "07c_size_100m"
-    description: "Model scale 100M (d=640, L=20, H=8) — ~9.55x baseline params"
-    ablation_group: "model_scale"
-    phase1:
-      overrides:
-        model_config:
-          d_model: 640
-          num_layers: 20
-          num_heads: 8
-        exp_name: ablation_07c_100m_p1
-    phase2:
-      overrides:
-        model_config:
-          d_model: 640
-          num_layers: 20
-          num_heads: 8
-        exp_name: ablation_07c_100m_p2

@@ -62,6 +62,12 @@ LORA_ACCUM="${LORA_ACCUM:-1}"
 #   LP 와 조건을 맞추려면: PROBE_LR=1e-3 PROBE_WD=0
 PROBE_LR="${PROBE_LR:-}"
 PROBE_WD="${PROBE_WD:-0.01}"
+# HEAD_WARMUP: LoRA co-train 전에 frozen feature 로 head 를 먼저 수렴시키는 epoch 수
+#   (LP→LoRA, Kumar 2022 LP-FT). 0(기본)=warm-start 없음(기존 동작). LoRA head 가
+#   랜덤 초기화라 undertrain 되고 그 랜덤 head 가 encoder 를 왜곡(LP>FT)하는 두 문제를
+#   동시에 해소한다. frozen feature fit 이라 encoder forward 없이 빠름. 권장 200~500.
+#   warm-start LR 은 PROBE_LR(미지정이면 1e-3). 예: HEAD_WARMUP=300 bash run.sh
+HEAD_WARMUP="${HEAD_WARMUP:-0}"
 
 # ── 한 fold 를 여러 GPU 로 DDP 실행 (fold 순차, 각 fold torchrun 4-GPU) ──
 # 기본 NPROC=4 (cardiac_arrest/hypotension 과 동일). 단일 GPU 는 NPROC=1.
@@ -100,6 +106,7 @@ echo "  Data:       $DATA_DIR"
 echo "  Output:     $OUT_DIR"
 echo "  Input:      $SIGNALS  Window: ${WINDOW_SECS[*]}s  Horizon: ${HORIZON_MINS[*]}min"
 echo "  LoRA batch: $LORA_BATCH  (NPROC=$NPROC × accum=$LORA_ACCUM → eff $((LORA_BATCH * NPROC * LORA_ACCUM)))"
+[ "$HEAD_WARMUP" != "0" ] && echo "  Head warm-start: ${HEAD_WARMUP}ep (LP→LoRA, lr=${PROBE_LR:-1e-3})"
 echo "============================================================"
 
 for WIN in "${WINDOW_SECS[@]}"; do
@@ -126,6 +133,9 @@ for WIN in "${WINDOW_SECS[@]}"; do
                 EXTRA="--lora-rank $LORA_RANK --batch-size $LORA_BATCH --grad-accum $LORA_ACCUM --probe-wd $PROBE_WD"
                 if [ -n "$PROBE_LR" ]; then
                     EXTRA="$EXTRA --probe-lr $PROBE_LR"
+                fi
+                if [ "$HEAD_WARMUP" != "0" ]; then
+                    EXTRA="$EXTRA --head-warmup-epochs $HEAD_WARMUP"
                 fi
             fi
             EXP_DIR="${OUT_DIR}/${EXP_NAME}/${MODE}"

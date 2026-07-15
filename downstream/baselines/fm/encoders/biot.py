@@ -19,9 +19,13 @@ README 에 명시한다.
 """
 from __future__ import annotations
 
+import importlib.util
+import os
+import sys
+
 import torch
 
-from downstream.baselines.fm.encoders import add_repo_to_path
+from downstream.baselines.fm.encoders import _dsp, resolve_repo_root
 from downstream.baselines.fm.encoders.base import FMEncoder
 
 
@@ -29,6 +33,32 @@ def _strip_prefix(state: dict, prefix: str) -> dict:
     if any(k.startswith(prefix) for k in state):
         return {k[len(prefix):] if k.startswith(prefix) else k: v for k, v in state.items()}
     return state
+
+
+def _load_upstream_biot(root: str):
+    """upstream ``model/biot.py`` 를 파일 경로에서 직접 로드해 ``BIOTEncoder`` 를 반환.
+
+    BIOT 레포의 최상위 패키지명이 ``model`` 이라 CARMEN 의 ``model/`` 패키지와 충돌한다.
+    runner 가 ``_fm_common`` → CARMEN ``model`` 을 먼저 import 하므로 ``sys.modules['model']``
+    이 선점되어, sys.path 앞에 레포 루트를 넣어도 ``from model.biot import ...`` 는
+    ModuleNotFoundError 가 난다. 따라서 패키지 경로를 거치지 않고 파일에서 직접 로드한다
+    (``biot.py`` 는 패키지 내부 상대 import 가 없어 안전하며, ``model/__init__.py`` 를
+    건너뛰어 sparcnet 등 불필요한 의존성도 피한다).
+    """
+    path = os.path.join(root, "model", "biot.py")
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"BIOT 레포에 model/biot.py 없음: {path}")
+    mod_name = "_upstream_biot"
+    if mod_name not in sys.modules:
+        spec = importlib.util.spec_from_file_location(mod_name, path)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[mod_name] = mod
+        try:
+            spec.loader.exec_module(mod)
+        except Exception:
+            sys.modules.pop(mod_name, None)
+            raise
+    return sys.modules[mod_name].BIOTEncoder
 
 
 class BIOTEncoderWrapper(FMEncoder):
@@ -39,10 +69,10 @@ class BIOTEncoderWrapper(FMEncoder):
     max_channels: int | None = None  # 체크포인트 n_channels 로 로드 후 clamp
 
     def _build_and_load(self) -> None:
-        add_repo_to_path(self.third_party_root, "FM_BIOT_ROOT")
-        from model.biot import BIOTEncoder  # type: ignore
+        root = resolve_repo_root(self.third_party_root, "FM_BIOT_ROOT")
+        BIOTEncoder = _load_upstream_biot(root)
 
-        ckpt = torch.load(self.weights_path, map_location="cpu")
+        ckpt = torch.load(self.weights_path, map_location="cpu", weights_only=False)
         state = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
         state = _strip_prefix(state, "biot.")  # wrapper 로 저장된 경우 대비
         # 아키텍처 파라미터를 체크포인트에서 추론.
@@ -69,6 +99,12 @@ class BIOTEncoderWrapper(FMEncoder):
         if self.max_channels is not None and x.shape[1] > self.max_channels:
             x = x[:, : self.max_channels, :]
         return x.contiguous()
+
+    def _preprocess(self, x: torch.Tensor) -> torch.Tensor:
+        # upstream utils.py 의 모든 로더가 쓰는 정규화: x / (q95(|x|) + 1e-8).
+        # 평균을 빼지 않아 DC/baseline 이 보존되며, 이것이 STFT bin-0·저주파에 직접 반영된다.
+        # (기본 z-norm 은 평균을 빼고 std 로 나눠 진폭이 ~2배 커진다 → 사전학습 분포 이탈)
+        return _dsp.amplitude_norm_q95(x)
 
     def _forward_native(self, x: torch.Tensor) -> torch.Tensor:
         return self.model(x)  # (b, emb_size)

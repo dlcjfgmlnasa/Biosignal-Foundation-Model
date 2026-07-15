@@ -14,28 +14,25 @@ baseline 과 동일 스키마라 `python -m downstream.run_eval` 로 **구분 �
 | Encoder      | modality  | native SR | 세그먼트 | 임베딩 | 가중치 | upstream |
 |--------------|-----------|-----------|----------|--------|--------|----------|
 | `ecgfounder` | ECG 전용  | 500Hz     | 10s      | 1024   | HF 공개 ✅ | [PKUDigitalHealth/ECGFounder](https://github.com/PKUDigitalHealth/ECGFounder) |
-| `heartbeit`  | ECG 전용(이미지) | 500Hz | 10s | 768 | **접근 신청 필요** ⚠ | [arXiv 2212.14040](https://arxiv.org/abs/2212.14040) |
 | `stmem`      | ECG 전용  | 250Hz     | 9s       | 768    | Google Drive 공개 ✅ | [vuno/ST-MEM](https://github.com/vuno/ST-MEM) |
 | `papagei`    | PPG 전용  | 125Hz     | 10s      | 512    | Zenodo 공개 ✅ | [Nokia-Bell-Labs/papagei-foundation-model](https://github.com/Nokia-Bell-Labs/papagei-foundation-model) |
 | `pulseppg`   | PPG 전용  | 50Hz      | 60s      | 512*   | Zenodo 공개 ✅ | [maxxu05/pulseppg](https://github.com/maxxu05/pulseppg) |
 | `anyppg`     | PPG 전용  | 125Hz     | 10s      | 512    | repo 공개 ✅ | [PKUDigitalHealth/AnyPPG](https://github.com/PKUDigitalHealth/AnyPPG) |
 | `biot`       | 다채널    | 200Hz     | 10s      | 256    | repo/HF 공개 ✅ | [ycq091044/BIOT](https://github.com/ycq091044/BIOT) |
-| `csfm`       | ECG+PPG 멀티모달 | 100Hz | 25s   | 768/1024 | **접근 신청 필요** ⚠ | [guxiao0822/Cardiac-Sensing-FM](https://github.com/guxiao0822/Cardiac-Sensing-FM) |
 
 `*` Pulse-PPG 임베딩 차원은 로드 시 dummy forward 로 추론합니다.
-CSFM(Gu et al., *Nat. Mach. Intell.* 2026)은 **CARMEN 과 SR·모달리티가 가장 가까운** 핵심
-비교군입니다(둘 다 ECG+PPG, 100Hz → 리샘플 불필요). variant 는 `FM_CSFM_VARIANT`(tiny|base|large).
+CSFM·HeartBEiT 는 가중치 미확보로 제외했습니다(아래 "검토했으나 미통합" 참조).
 
 **task 적용 가능 여부** = task 신호 조합에 encoder 지원 modality 가 포함되는지로 결정됩니다.
 ECG 전용 모델은 ecg 채널만, PPG 전용 모델은 ppg 채널만 사용하고, 나머지는 무시합니다.
 비호환 task 는 실행 시 `[SKIP]` 후 종료(exit 0)합니다.
 
-| task | 신호(on-disk) | ecgfounder / heartbeit / stmem | papagei / pulseppg / anyppg | csfm | biot |
-|------|---------------|:--:|:--:|:--:|:--:|
-| hypotension     | ecg_ppg_abp | ✅(ecg) | ✅(ppg) | ✅(ecg+ppg) | ✅(3ch) |
-| cardiac_arrest  | ecg_ppg     | ✅(ecg) | ✅(ppg) | ✅(ecg+ppg) | ✅(2ch) |
-| ich             | abp_icp_ecg | ✅(ecg) | ✖(ppg 없음) | ✅(ecg) | ✅(3ch) |
-| desaturation    | co2_awp_resp_flow | ✖ | ✖ | ✖ | ✅ |
+| task | 신호(on-disk) | ecgfounder / stmem | papagei / pulseppg / anyppg | biot |
+|------|---------------|:--:|:--:|:--:|
+| hypotension     | ecg_ppg_abp | ✅(ecg) | ✅(ppg) | ✅(3ch) |
+| cardiac_arrest  | ecg_ppg     | ✅(ecg) | ✅(ppg) | ✅(2ch) |
+| ich             | abp_icp_ecg | ✅(ecg) | ✖(ppg 없음) | ✅(3ch) |
+| desaturation    | co2_awp_resp_flow | ✖ | ✖ | ✅ |
 
 ## 어댑터 동작
 
@@ -45,8 +42,28 @@ ECG 전용 모델은 ecg 채널만, PPG 전용 모델은 ppg 채널만 사용하
 1. **채널 선택** — encoder 가 지원하는 modality 채널만 선택(ECG/PPG 전용) 또는 전부(BIOT).
 2. **세그먼트 분할** — 긴 window 를 `seg_sec` 단위로 잘라 최대 `--max-segments` 개(균등 샘플).
 3. **리샘플** — 100Hz → native SR 선형보간.
-4. **정규화** — 세그먼트별 per-channel z-norm(기본).
+4. **전처리** — `_preprocess`. 기본은 세그먼트별 per-channel z-norm 이지만, upstream 전처리가
+   명시된 모델은 `encoders/_dsp.py` 로 그것을 재현한다(아래).
 5. **forward + 세그먼트 평균** → window 당 임베딩 `(n, d)`.
+
+### upstream 전처리 재현 (`_preprocess` override)
+
+| Encoder | upstream 전처리 | 근거 |
+|---|---|---|
+| `ecgfounder` | notch 50Hz(Q=30) → Butterworth N=4 bandpass [0.67,40] → median(0.4·fs) baseline 제거 → z-score | `util.filter_bandpass` + `dataset.py`. HF 모델카드 Notice 가 준수를 명시 요구 |
+| `stmem` | highpass 0.67 → lowpass 40 (Butterworth SOS order 5, `sosfiltfilt`) → standardize | `util/transforms.py`, `configs/pretrain/st_mem.yaml` |
+| `biot` | `x / (quantile(|x|, 0.95) + 1e-8)` — **평균 미차감**(DC 보존) | `utils.py` 전 데이터 로더 |
+| `papagei` | z-score → pyPPG Chebyshev II bandpass(order4/rs20, [0.5,12]) + 0.02·fs 이동평균 | `preprocessing/ppg.py` → pyPPG `preproc.Preprocessing` |
+| `pulseppg` | upstream 전처리 미재현(기본 z-norm) — forward 첫 층이 InstanceNorm 이라 스케일 불변 | — |
+
+**샘플링레이트에 대해**: 우리 파서가 ECG 를 native SR 에서 bandpass (0.5, 40)Hz 로 자른 뒤 100Hz 로
+내리고(`data/parser/vitaldb.py` `SIGNAL_CONFIGS`), ECGFounder·ST-MEM 역시 40Hz 에서 저역통과한다.
+따라서 두 모델이 소비하는 대역은 100Hz(Nyquist 50Hz) 데이터 안에 **전부** 들어 있으며, native SR
+prepared set 을 따로 만들 실익이 없다. 실측(합성 ECG): upstream 필터 적용 시 100Hz 경로와
+native-SR 경로의 임베딩 cosine 이 ECGFounder **0.987**, ST-MEM **0.997** 로 수렴한다(필터 미적용 시
+각각 0.73/0.94). upstream 의 40Hz 저역통과가 선형보간 imaging 아티팩트도 함께 제거하기 때문이다.
+BIOT 만 0–100Hz 전체(101 STFT bin)를 소비하므로 상위 절반이 비지만, 이는 리샘플이 아니라
+ECG/PPG/ABP 에 50Hz 초과 성분이 원래 없기 때문이다(>50Hz 파워 0.2% 미만).
 
 이후 frozen 임베딩(1회 추출·캐시) 위에서 `LinearProbe`(LayerNorm→Dropout→Linear)를 학습하고,
 CARMEN 과 동일하게 val Youden threshold·per-fold bootstrap CI 로 평가합니다.
@@ -78,11 +95,6 @@ git clone https://github.com/ycq091044/BIOT /repos/BIOT
 # pretrained-models/*.ckpt (repo 동봉) 또는 HF braindecode/BIOT
 export FM_BIOT_ROOT=/repos/BIOT
 
-# 예: CSFM (가중치 Academic Access Agreement 필요 — xiao.gu@eng.ox.ac.uk)
-git clone https://github.com/guxiao0822/Cardiac-Sensing-FM /repos/Cardiac-Sensing-FM
-export FM_CSFM_ROOT=/repos/Cardiac-Sensing-FM
-export FM_CSFM_VARIANT=base      # tiny|base|large (받은 가중치에 맞춰)
-
 # 예: ST-MEM
 git clone https://github.com/vuno/ST-MEM /repos/ST-MEM
 # 가중치: repo README 의 Google Drive (encoder-only)
@@ -92,14 +104,10 @@ export FM_STMEM_ROOT=/repos/ST-MEM
 git clone https://github.com/PKUDigitalHealth/AnyPPG /repos/AnyPPG
 # 가중치: repo 내 공개 load_anyppg/anyppg_ckpt.pth
 export FM_ANYPPG_ROOT=/repos/AnyPPG
-
-# 예: HeartBEiT (가중치 접근 신청 필요, HF BEiT 디렉토리)
-pip install transformers
-export FM_HEARTBEIT_ROOT=/repos/HeartBEiT   # (선택)
 ```
 
 모델별 환경변수: `FM_ECGFOUNDER_ROOT`, `FM_STMEM_ROOT`, `FM_PAPAGEI_ROOT`, `FM_PULSEPPG_ROOT`,
-`FM_ANYPPG_ROOT`, `FM_BIOT_ROOT`, `FM_CSFM_ROOT`(+`FM_CSFM_VARIANT`), `FM_HEARTBEIT_ROOT`.
+`FM_ANYPPG_ROOT`, `FM_BIOT_ROOT`.
 
 ## 실행
 
@@ -117,9 +125,6 @@ FM_PULSEPPG_ROOT=/repos/pulseppg WEIGHTS=/repos/pulseppg/model_weights/<ckpt>.pt
 
 FM_BIOT_ROOT=/repos/BIOT WEIGHTS=/repos/BIOT/pretrained-models/EEG-six-datasets-18-channels.ckpt \
   bash downstream/baselines/fm/bash/run_biot.sh
-
-FM_CSFM_ROOT=/repos/Cardiac-Sensing-FM FM_CSFM_VARIANT=base WEIGHTS=/weights/csfm_base.pth \
-  bash downstream/baselines/fm/bash/run_csfm.sh
 
 FM_STMEM_ROOT=/repos/ST-MEM WEIGHTS=/weights/st_mem_encoder.pth \
   bash downstream/baselines/fm/bash/run_stmem.sh
@@ -159,14 +164,38 @@ CARMEN·CNN baseline 과 같은 표에 넣습니다.
   window-task 만 지원합니다.
 - **BIOT 도메인 이질**: BIOT 사전학습 채널 임베딩은 EEG montage 의미라, ECG/ABP/PPG 를 앞
   채널 슬롯에 매핑해 쓰는 것은 근사입니다(BIOT 의 cross-data 설계 취지에는 부합).
-- **HeartBEiT 렌더링**: 저자 원본 ECG 이미지 렌더와 화소 단위로 동일하지 않은 경량
-  line-raster 를 사용합니다. 가중치도 접근 신청이 필요합니다.
-- **정규화**: 기본 per-segment z-norm 을 씁니다. 일부 모델(PaPaGei)은 자체 bandpass 전처리를
-  쓰지만, 이식성·배치처리를 위해 통일했습니다.
+- **ST-MEM 단일 lead**: 12-lead 모델이라 `num_leads=1` 로 생성하고 사전학습 lead 임베딩
+  12개 중 **Lead II(index 1)** 하나만 로드합니다(`encoders/stmem.py` 의 `LEAD_INDEX`).
+  num_leads=12 로 두고 단일 lead 를 넣으면 upstream `forward_encoding` 의 브로드캐스트로
+  신호가 12배 복제되어 **에러 없이 잘못된 임베딩**이 나오므로 주의하세요.
+- **정규화**: ECGFounder·ST-MEM·BIOT·PaPaGei 는 upstream 전처리를 재현합니다(위 표,
+  `encoders/_dsp.py`). Pulse-PPG 만 미재현(InstanceNorm 자체 정규화).
+- **ECGFounder lead 불일치**: 1-lead 체크포인트는 upstream `dataset.py` 상 **Lead I** 로 학습된
+  것으로 보입니다. 우리 모니터링 ECG 는 Lead II 계열이라 전처리로 변환할 수 없는 불일치이며,
+  논문에 한계로 명시해야 합니다.
+- **ST-MEM single-lead**: upstream 은 12-lead 전용 config 만 제공합니다. `num_leads=1` + Lead II
+  임베딩 선택은 우리 구현이며, 12-lead spatio-temporal 설계를 온전히 쓰지 못하는 한계가 있습니다.
+- **세그먼트 커버리지**: `--max-segments` 기본은 **0 = window 전체 커버**(겹침 없이 연속)입니다.
+  CARMEN 은 window 전체를 pool 하므로 부분 커버는 외부 FM 을 불리하게 만듭니다. frozen 추출은
+  1회뿐이라 비용은 선형입니다. RAM/시간을 제한하려면 `MAX_SEGMENTS=<N>` 으로 상한을 두세요
+  (그 경우 [0, L-seg] 구간 균등 샘플).
 - **API 검증 수준**: 각 encoder wrapper 상단 docstring 에 upstream 빌드/로드 방식을
   명시했습니다. 서버의 실제 레포 버전과 시그니처가 다르면 해당 wrapper 만 조정하세요.
 
 ### 검토했으나 미통합
+- **CSFM** ([guxiao0822/Cardiac-Sensing-FM](https://github.com/guxiao0822/Cardiac-Sensing-FM),
+  Gu et al., *Nat. Mach. Intell.* 2026): CARMEN 과 SR·모달리티가 가장 가까운(둘 다 ECG+PPG, 100Hz)
+  핵심 비교군이었으나 **가중치가 공개되지 않음**(레포 `pretrained/` 는 빈 `__init__.py`뿐, Academic
+  Access Agreement 를 institutional email `xiao.gu@eng.ox.ac.uk` 로 신청해야 함). 확보 불가로 **제외**
+  (2026-07-12). 어댑터 코드(`encoders/csfm.py`)와 러너는 삭제했으며 git 이력에 보존됨 — 향후 가중치를
+  받으면 복원. 어댑터 API(`network.model.CSFM_model`, forward 시그니처, mlp_head, ts_pos_embedding)는
+  삭제 전 upstream 과 대조해 일치 확인 완료.
+- **HeartBEiT** ([akhilvaid/HeartBEiT](https://github.com/akhilvaid/HeartBEiT),
+  npj Digital Medicine 2023, Mount Sinai): ECG 파형→이미지→BEiT. 가중치는 **Mount Sinai
+  Intellectual Partners 와의 IRB-approved agreement** 로만 배포(공개 다운로드·HF gated·저자 이메일
+  창구 없음) → CSFM 보다 확보가 더 어려워 **제외**(2026-07-12). 게다가 어댑터가
+  `transformers.BeitModel.from_pretrained`(HF 디렉토리)를 가정하나 upstream 은 unilm/timm 커스텀
+  `.pth` 라 확보하더라도 포맷 변환이 추가로 필요. 어댑터(`encoders/heartbeit.py`)·러너 삭제, git 이력 보존.
 - **ECG-FM** ([bowang-lab/ECG-FM](https://github.com/bowang-lab/ECG-FM), HF `wanglab/ecg-fm`):
   가중치는 공개(MIT)지만 ⑴ **12-lead 입력 전제**(feature extractor conv in_channels=12)라
   우리 단일-lead 모니터링 ECG 와 맞지 않고(단일 lead→12ch 복제는 오해 소지), ⑵ 로딩이

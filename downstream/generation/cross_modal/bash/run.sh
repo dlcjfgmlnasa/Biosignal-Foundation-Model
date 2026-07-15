@@ -11,11 +11,11 @@ OUT_DIR="${OUT_DIR:-outputs/downstream/any_to_any}"
 
 # Data files (output of prepare_data.sh)
 CARDIO_DATA="${CARDIO_DATA:-$OUT_DIR/cross_modal_local_ecg_abp_ppg_w30s.pt}"
-RESP_DATA="${RESP_DATA:-$OUT_DIR/cross_modal_vitaldb_co2_awp_w30s.pt}"
+RESP_DATA="${RESP_DATA:-$OUT_DIR/cross_modal_vitaldb_awp_resp_flow_w30s.pt}"
 
 # Fallback: if local cardio data doesn't exist, try vitaldb version
 if [ ! -f "$CARDIO_DATA" ]; then
-    CARDIO_DATA="$OUT_DIR/cross_modal_vitaldb_ecg_abp_ppg_cvp_w30s.pt"
+    CARDIO_DATA="$OUT_DIR/cross_modal_vitaldb_ecg_abp_ppg_w30s.pt"
 fi
 
 # LoRA config
@@ -29,10 +29,9 @@ BATCH_SIZE="${BATCH_SIZE:-16}"
 COMMON="--checkpoint $CHECKPOINT --model-version $MODEL_VERSION --device $DEVICE --out-dir $OUT_DIR"
 LORA_ARGS="--epochs $EPOCHS --lr $LR --lora-rank $LORA_RANK --lora-alpha $LORA_ALPHA --batch-size $BATCH_SIZE"
 
-# ── Cardiovascular Scenarios ────────────────────────────────
+# ── Cardiovascular Scenarios (강결합 γ) ─────────────────────
 CARDIO_SCENARIOS=(
     "ECG->ABP"
-    "ABP->ECG"
     "PPG->ABP"
     "ECG+PPG->ABP"
 )
@@ -69,10 +68,9 @@ else
     echo "  Run prepare_data.sh first."
 fi
 
-# ── Respiratory Scenarios ───────────────────────────────────
+# ── Respiratory Scenarios (강결합 γ) ────────────────────────
 RESP_SCENARIOS=(
-    "CO2->AWP"
-    "AWP->CO2"
+    "AWP->RESP_FLOW"
 )
 
 if [ -f "$RESP_DATA" ]; then
