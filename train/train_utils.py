@@ -70,8 +70,11 @@ class TrainConfig:
     crop_ratio_max: float = 0.0  # >0이면 random crop 활성 (max ratio)
     min_patches: int = 5  # random crop 최소 patch 수 (임상 10s floor @ patch_size=200, 100Hz)
 
-    # Shard backend (file open() 폭증 방지) — None이면 file backend
-    shard_index_path: str | None = None  # build_shards.py가 만든 shard_index.json 경로
+    # Shard backend (file open() 폭증 방지) — None이면 file backend.
+    # str: 단일소스 shard_index.json 경로.
+    # list[str]: 멀티소스(Option A) — data_dir(list) 와 병렬·길이/순서 일치.
+    #   각 shard set 을 물리 병합 없이 하나의 코퍼스로 라우팅한다.
+    shard_index_path: str | list[str] | None = None  # build_shards.py가 만든 shard_index.json 경로
     shard_cache_size: int = 4  # shard LRU 크기 (한 shard ~수백 MB)
 
     # 학습

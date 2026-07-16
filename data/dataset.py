@@ -5,7 +5,7 @@ import bisect
 import json
 import random
 import tempfile
-from collections.abc import Sequence
+from collections.abc import Hashable, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 import multiprocessing as _mp
@@ -94,8 +94,9 @@ class BiosignalDataset(Dataset[BiosignalSample]):
         patch_size: int | None = None,
         min_patches: int = 5,  # random crop 최소 patch 수 (임상: 10s floor @ patch_size=200,100Hz)
         preload: bool = False,  # deprecated, 무시됨
-        shard_index_path: str | Path | None = None,  # shard backend 활성화
+        shard_index_path: str | Path | list | None = None,  # shard backend 활성화 (list=멀티소스)
         shard_cache_size: int = 4,  # shard LRU 크기 (recording cache_size와 별도)
+        source_dirs: list[str] | None = None,  # 멀티소스: shard_index_path 와 병렬, manifest authoritative resolve
     ) -> None:
         super().__init__()
         self.max_length = max_length
@@ -118,101 +119,72 @@ class BiosignalDataset(Dataset[BiosignalSample]):
             if crop_ratio_range is not None else None
         )
 
-        # ── Shard backend (Option D) — file open() 폭증 방지 ──
+        # ── Shard backend (Option D 단일 / Option A 멀티) — file open() 폭증 방지 ──
         # shard_index.json이 주어지면 파일 단위가 아닌 shard 단위로 LRU 캐싱.
         # 한 shard는 수백 recording을 dict로 묶고 있어 한 번 로드로 다수 처리 가능.
-        self._shard_index_path: Path | None = (
-            Path(shard_index_path) if shard_index_path else None
-        )
+        #
+        # shard_index_path 가 list 이면 멀티소스(Option A): 여러 소스의 shard set 을
+        # 물리 병합 없이 하나의 코퍼스로 라우팅한다. source_dirs 와 병렬(길이/순서 일치).
+        self._multi_source: bool = isinstance(shard_index_path, list)
+
+        # 단일소스 attr (멀티소스에선 모두 None)
+        self._shard_index_path: Path | None = None
         self._shard_dir: Path | None = None
         self._rec_to_shard: dict[str, int] | None = None
         # path → original_rec_idx (= shard 내 key) — STABLE KEY.
         # train/val split, signal_types 필터링 등으로 manifest가 부분집합/재정렬되어도
         # path는 변하지 않으므로 정확히 같은 recording을 shard에서 가져올 수 있다.
         self._path_to_shard_key: dict[str, str] | None = None
-        if self._shard_index_path is not None:
-            with open(self._shard_index_path, encoding="utf-8") as f:
-                idx = json.load(f)
-            self._shard_dir = self._shard_index_path.parent
-            # JSON key는 str — 내부에서도 str로 통일
-            self._rec_to_shard = {str(k): int(v) for k, v in idx["rec_to_shard"].items()}
 
-            # source_manifest를 다시 파싱하여 path → shard rec_idx 매핑 빌드.
-            # build_shards.py가 파일에 entry를 추가한 순서가 곧 rec_global_idx.
-            # source_manifest는 상대/절대 경로 둘 다 가능 — 여러 base 시도.
-            source_manifest = idx.get("source_manifest")
-            if source_manifest:
-                # path separator 정규화 (Windows ↔ Linux)
-                src_str = source_manifest.replace("\\", "/")
-                candidates = [Path(src_str)]
-                if not candidates[0].is_absolute():
-                    # 1) CWD 기준
-                    candidates.append(Path.cwd() / src_str)
-                    # 2) shard 디렉토리의 parent의 parent (보통 project root)
-                    candidates.append(self._shard_index_path.parent.parent.parent / src_str)
-                    # 3) shard 디렉토리 자체 기준
-                    candidates.append(self._shard_index_path.parent / src_str)
+        # 멀티소스 attr (단일소스에선 모두 None)
+        self._shard_dirs: list[Path] | None = None
+        self._rec_to_shards: list[dict[str, int]] | None = None
+        # entry_path → (source_id, shard_key) 통합 라우팅 맵.
+        self._path_to_route: dict[str, tuple[int, str]] | None = None
 
-                # 디스크 캐시: source_manifest 옆에 .shard_path_map.pkl 저장.
-                # 첫 실행만 느리고, 이후 257K entry를 즉시 로드.
-                # DDP: 여러 rank가 동시에 재파싱 + 쓰기 하면 race condition →
-                # OOM spike 또는 pickle corruption 발생 가능.
-                # → rank 0만 빌드/쓰고, 다른 rank는 파일이 나타날 때까지 대기 후 읽음.
-                # atomic write (.tmp → rename) 로 partial read 방지.
-                import os as _os
-                rank = int(_os.environ.get("RANK", 0)) if "RANK" in _os.environ else 0
-                for cand in candidates:
-                    if not cand.exists():
-                        continue
-                    cache_path = cand.parent / f".shard_path_map_{self._shard_index_path.parent.name}.pkl"
-                    manifest_mtime = cand.stat().st_mtime_ns
+        if not self._multi_source:
+            # ── 단일소스 (기존 거동 그대로 유지) ──
+            self._shard_index_path = (
+                Path(shard_index_path) if shard_index_path else None
+            )
+            if self._shard_index_path is not None:
+                with open(self._shard_index_path, encoding="utf-8") as f:
+                    idx = json.load(f)
+                self._shard_dir = self._shard_index_path.parent
+                # JSON key는 str — 내부에서도 str로 통일
+                self._rec_to_shard = {
+                    str(k): int(v) for k, v in idx["rec_to_shard"].items()
+                }
 
-                    def _try_load_cache() -> dict | None:
-                        if not cache_path.exists():
-                            return None
-                        try:
-                            import pickle
-                            with open(cache_path, "rb") as f:
-                                cached = pickle.load(f)
-                            if cached.get("mtime") == manifest_mtime:
-                                return cached["map"]
-                        except Exception:
-                            return None
-                        return None
+                # source_manifest를 다시 파싱하여 path → shard rec_idx 매핑 빌드.
+                # build_shards.py가 파일에 entry를 추가한 순서가 곧 rec_global_idx.
+                # source_manifest는 상대/절대 경로 둘 다 가능 — 여러 base 시도.
+                source_manifest = idx.get("source_manifest")
+                if source_manifest:
+                    # path separator 정규화 (Windows ↔ Linux)
+                    src_str = source_manifest.replace("\\", "/")
+                    candidates = [Path(src_str)]
+                    if not candidates[0].is_absolute():
+                        # 1) CWD 기준
+                        candidates.append(Path.cwd() / src_str)
+                        # 2) shard 디렉토리의 parent의 parent (보통 project root)
+                        candidates.append(
+                            self._shard_index_path.parent.parent.parent / src_str
+                        )
+                        # 3) shard 디렉토리 자체 기준
+                        candidates.append(self._shard_index_path.parent / src_str)
 
-                    cached_map = _try_load_cache()
-                    if cached_map is not None:
-                        self._path_to_shard_key = cached_map
+                    for cand in candidates:
+                        if not cand.exists():
+                            continue
+                        # 기존 pkl 파일명·거동 유지 (cache_tag = shard dir 이름)
+                        self._path_to_shard_key = self._load_or_build_path_map(
+                            cand, self._shard_index_path.parent.name
+                        )
                         break
-
-                    if rank == 0:
-                        # rank 0만 빌드 + 원자적으로 저장
-                        built = self._build_path_to_shard_key(cand)
-                        self._path_to_shard_key = built
-                        try:
-                            import pickle
-                            tmp_path = cache_path.with_suffix(".pkl.tmp")
-                            with open(tmp_path, "wb") as f:
-                                pickle.dump(
-                                    {"mtime": manifest_mtime, "map": built},
-                                    f, protocol=pickle.HIGHEST_PROTOCOL,
-                                )
-                            _os.replace(tmp_path, cache_path)  # atomic rename
-                        except OSError:
-                            pass
-                    else:
-                        # 다른 rank: cache 파일 나타날 때까지 대기 (최대 5분)
-                        import time as _time
-                        for _ in range(300):  # 300 × 1s = 5 min
-                            cached_map = _try_load_cache()
-                            if cached_map is not None:
-                                self._path_to_shard_key = cached_map
-                                break
-                            _time.sleep(1.0)
-                        if self._path_to_shard_key is None:
-                            # 대기 시간 초과 — 자체 빌드 (fallback)
-                            self._path_to_shard_key = self._build_path_to_shard_key(cand)
-                    break
+        else:
+            # ── 멀티소스 (Option A) ──
+            self._build_multi_source(shard_index_path, source_dirs)
 
         # LRU 캐시를 인스턴스별로 생성 (lru_cache는 함수 레벨이므로 래핑)
         self._load_recording = lru_cache(maxsize=cache_size)(self._load_recording_impl)
@@ -222,7 +194,8 @@ class BiosignalDataset(Dataset[BiosignalSample]):
         # leak 회피). 새 shard 로드 전 del + gc.collect() 강제로 이전 shard
         # 메모리 즉시 해제. 같은 shard 연속 hit 시엔 cache hit 으로 동작.
         # shard_cache_size 인자는 호환성 위해 받지만 1-slot 으로 고정 동작.
-        self._shard_cache_key: int | None = None
+        # 멀티소스: 키가 (src, shard_id) 튜플 → 소스 경계에서 정확히 evict.
+        self._shard_cache_key: tuple | None = None
         self._shard_cache_value: dict | None = None
 
         # 레코딩별 window/stride (샘플 단위로 변환)
@@ -264,13 +237,149 @@ class BiosignalDataset(Dataset[BiosignalSample]):
             self._n_windows_per_rec.append(n_win)
             self._rec_offsets.append(self._rec_offsets[-1] + entry.n_channels * n_win)
 
-    def _load_shard(self, shard_id: int) -> dict:
+    def _load_or_build_path_map(
+        self, manifest_path: Path, cache_tag: str
+    ) -> dict[str, str] | None:
+        """source_manifest 를 파싱해 path → shard rec_idx(str) 매핑을 만든다.
+
+        DDP-safe: rank 0 만 빌드+원자적 저장(.tmp→rename), 다른 rank 는 캐시 파일이
+        나타날 때까지 최대 5분 대기 후 읽는다(없으면 자체 빌드 fallback). 디스크 캐시
+        ``.shard_path_map_<cache_tag>.pkl`` 로 재실행 시 257K entry 를 즉시 로드.
+
+        ``manifest_path`` 가 존재하지 않으면 None 반환.
+        """
+        if not manifest_path.exists():
+            return None
+
+        import os as _os
+
+        rank = int(_os.environ.get("RANK", 0)) if "RANK" in _os.environ else 0
+        cache_path = manifest_path.parent / f".shard_path_map_{cache_tag}.pkl"
+        manifest_mtime = manifest_path.stat().st_mtime_ns
+
+        def _try_load_cache() -> dict | None:
+            if not cache_path.exists():
+                return None
+            try:
+                import pickle
+
+                with open(cache_path, "rb") as f:
+                    cached = pickle.load(f)
+                if cached.get("mtime") == manifest_mtime:
+                    return cached["map"]
+            except Exception:
+                return None
+            return None
+
+        cached_map = _try_load_cache()
+        if cached_map is not None:
+            return cached_map
+
+        if rank == 0:
+            # rank 0만 빌드 + 원자적으로 저장
+            built = self._build_path_to_shard_key(manifest_path)
+            try:
+                import pickle
+
+                tmp_path = cache_path.with_suffix(".pkl.tmp")
+                with open(tmp_path, "wb") as f:
+                    pickle.dump(
+                        {"mtime": manifest_mtime, "map": built},
+                        f,
+                        protocol=pickle.HIGHEST_PROTOCOL,
+                    )
+                _os.replace(tmp_path, cache_path)  # atomic rename
+            except OSError:
+                pass
+            return built
+
+        # 다른 rank: cache 파일 나타날 때까지 대기 (최대 5분)
+        import time as _time
+
+        for _ in range(300):  # 300 × 1s = 5 min
+            cached_map = _try_load_cache()
+            if cached_map is not None:
+                return cached_map
+            _time.sleep(1.0)
+        # 대기 시간 초과 — 자체 빌드 (fallback)
+        return self._build_path_to_shard_key(manifest_path)
+
+    def _build_multi_source(
+        self,
+        shard_index_paths: list,
+        source_dirs: list[str] | None,
+    ) -> None:
+        """멀티소스 shard 백엔드 구성 (Option A).
+
+        각 소스의 shard_index.json + ``source_dirs[i]/manifest_full.jsonl`` 을 로드해
+        소스별 ``_shard_dirs`` / ``_rec_to_shards`` 와 통합 ``_path_to_route`` 를 만든다.
+        저장된 source_manifest(빌드 시점 절대경로, SNUH 는 Windows 경로)는 무시하고
+        source_dirs 에서 authoritative 하게 manifest 를 resolve 한다.
+        """
+        if source_dirs is None or len(source_dirs) != len(shard_index_paths):
+            raise ValueError(
+                "multi-source shard backend requires source_dirs parallel to "
+                f"shard_index_path (source_dirs="
+                f"{None if source_dirs is None else len(source_dirs)}, "
+                f"shard_index_path={len(shard_index_paths)}). "
+                "각 소스의 data_dir 을 shard_index_path 와 같은 순서로 전달해야 합니다."
+            )
+
+        self._shard_dirs = []
+        self._rec_to_shards = []
+        self._path_to_route = {}
+
+        for src_i, (sip, sdir) in enumerate(zip(shard_index_paths, source_dirs)):
+            sip_path = Path(sip)
+            with open(sip_path, encoding="utf-8") as f:
+                idx = json.load(f)
+            self._shard_dirs.append(sip_path.parent)
+            self._rec_to_shards.append(
+                {str(k): int(v) for k, v in idx["rec_to_shard"].items()}
+            )
+
+            # authoritative manifest: source_dir/manifest_full.jsonl (저장된 절대경로 무시)
+            manifest_path = Path(sdir) / "manifest_full.jsonl"
+            cache_tag = f"src{src_i}_{sip_path.parent.name}"  # 소스별 pkl 분리
+            src_map = self._load_or_build_path_map(manifest_path, cache_tag)
+            if src_map is None:
+                raise FileNotFoundError(
+                    f"multi-source: manifest_full.jsonl not found for source "
+                    f"{src_i} at {manifest_path}"
+                )
+
+            # 통합 route 병합 — 중복 path 는 즉시 ValueError (cross/intra-source, P0-3·E)
+            for path, shard_key in src_map.items():
+                if path in self._path_to_route:
+                    prev_src = self._path_to_route[path][0]
+                    raise ValueError(
+                        f"multi-source: duplicate recording path across sources: "
+                        f"{path!r} (source {prev_src} and {src_i}). "
+                        "소스 간 경로가 유일해야 합니다."
+                    )
+                self._path_to_route[path] = (src_i, shard_key)
+
+        # coverage assert — 모든 manifest entry.path 가 route 에 존재 (P0-2 fail-fast).
+        # source_dirs/manifest 불일치·경로 정규화 mismatch 를 조기에 잡는다.
+        missing = [
+            e.path for e in self._manifest if e.path not in self._path_to_route
+        ]
+        if missing:
+            raise KeyError(
+                f"multi-source: {len(missing)}/{len(self._manifest)} manifest paths "
+                f"not found in route map (first missing: {missing[0]!r}). "
+                "source_dirs 가 manifest 로딩에 쓴 data_dir 과 동일한지 확인하세요."
+            )
+
+    def _load_shard(self, src: int | None, shard_id: int) -> dict:
         """1-slot manual cache (lru_cache 의 reference leak 회피).
 
+        cache key = ``(src, shard_id)`` (멀티소스 소스 간 shard_id 충돌 방지).
         같은 shard 연속 hit 시 cached value 반환. 새 shard 로드 전
         ``del`` + ``gc.collect()`` 로 이전 shard 메모리 즉시 해제.
         """
-        if shard_id != self._shard_cache_key:
+        cache_key = (src, shard_id)
+        if cache_key != self._shard_cache_key:
             # 이전 shard 명시적 해제
             if self._shard_cache_value is not None:
                 del self._shard_cache_value
@@ -278,13 +387,17 @@ class BiosignalDataset(Dataset[BiosignalSample]):
                 import gc
                 gc.collect()
             # 새 shard 로드
-            self._shard_cache_value = self._load_shard_impl(shard_id)
-            self._shard_cache_key = shard_id
+            self._shard_cache_value = self._load_shard_impl(src, shard_id)
+            self._shard_cache_key = cache_key
         return self._shard_cache_value
 
-    def _load_shard_impl(self, shard_id: int) -> dict:
-        """Shard 파일 로드. 한 번 로드로 수백 recording 처리."""
-        shard_path = self._shard_dir / f"shard_{shard_id:05d}.pt"
+    def _load_shard_impl(self, src: int | None, shard_id: int) -> dict:
+        """Shard 파일 로드. 한 번 로드로 수백 recording 처리.
+
+        ``src is None`` (단일소스) → ``_shard_dir``, 아니면 ``_shard_dirs[src]``.
+        """
+        shard_dir = self._shard_dir if src is None else self._shard_dirs[src]
+        shard_path = shard_dir / f"shard_{shard_id:05d}.pt"
         return torch.load(shard_path, weights_only=True, mmap=self._use_mmap)
 
     def _build_path_to_shard_key(self, source_manifest: Path) -> dict[str, str]:
@@ -318,7 +431,30 @@ class BiosignalDataset(Dataset[BiosignalSample]):
         return mapping
 
     def _load_recording_impl(self, rec_idx: int) -> torch.Tensor:  # (channels, time)
-        # ── Shard backend 경로 ──
+        # ── 멀티소스 shard backend 경로 (Option A) ──
+        # entry_path → (src, shard_key) 로 라우팅. route 미스는 곧 버그(coverage
+        # assert 를 통과했어야 함)이므로 rec_idx fallback 절대 없이 KeyError.
+        if self._multi_source:
+            entry_path = self._manifest[rec_idx].path
+            route = self._path_to_route.get(entry_path)
+            if route is None:
+                raise KeyError(
+                    f"multi-source: no route for recording path {entry_path!r} "
+                    f"(rec_idx={rec_idx}). 멀티소스에서 shard 미스는 버그입니다."
+                )
+            src, shard_key = route
+            shard = self._load_shard(src, self._rec_to_shards[src][shard_key])
+            rec = shard[shard_key]
+            values = rec["values"]
+            if not torch.is_tensor(values):
+                values = torch.from_numpy(values).float()
+            if values.dtype == torch.float16:
+                values = values.float()
+            if values.ndim == 1:
+                values = values.unsqueeze(0)
+            return values
+
+        # ── 단일소스 Shard backend 경로 (기존 거동) ──
         # train/val split이나 signal_types 필터로 self._manifest는 원본 manifest의
         # SUBSET일 수 있다. 그래서 rec_idx를 그대로 shard key로 쓰면 잘못된
         # recording을 가져옴. PATH(stable)로 lookup하여 정확한 shard entry 가져옴.
@@ -332,7 +468,7 @@ class BiosignalDataset(Dataset[BiosignalSample]):
                 # 2) Fallback: rec_idx 자체를 key로 (subset 안 한 경우 정상 동작)
                 shard_key = str(rec_idx)
             if shard_key in self._rec_to_shard:
-                shard = self._load_shard(self._rec_to_shard[shard_key])
+                shard = self._load_shard(None, self._rec_to_shard[shard_key])
                 rec = shard[shard_key]
                 values = rec["values"]
                 if not torch.is_tensor(values):
@@ -388,6 +524,37 @@ class BiosignalDataset(Dataset[BiosignalSample]):
         if fallback_idx == rec_idx:
             raise last_err  # type: ignore[misc]
         return self._load_recording_impl(fallback_idx)
+
+    @property
+    def has_shard_backend(self) -> bool:
+        """shard 백엔드(단일 또는 멀티) 사용 여부 — sampler locality 게이팅용.
+
+        기존 ``getattr(dataset, "_rec_to_shard") is not None`` 게이팅을 대체한다.
+        멀티소스에선 ``_rec_to_shard`` 가 None 이므로 이 프로퍼티로 통일한다.
+        """
+        return self._multi_source or (self._rec_to_shard is not None)
+
+    def shard_group_of(self, rec_i: int) -> Hashable:
+        """rec_i 의 shard locality 그룹 키를 반환한다 (sampler 가 그룹핑에 사용).
+
+        - 멀티소스: ``(src, shard_id)`` 튜플. route 미스는 ``(-1, rec_i)`` 튜플
+          sentinel (bare int 아님 → ``sorted()`` 타입 안전, val 경로 crash 방지).
+        - 단일소스: 기존 인라인과 **정확히 동일한** bare int shard_id
+          (byte-identical 보장).
+        """
+        path = self._manifest[rec_i].path
+        if self._multi_source:
+            route = self._path_to_route.get(path)
+            if route is None:
+                return (-1, rec_i)
+            src, shard_key = route
+            return (src, self._rec_to_shards[src].get(shard_key, -1))
+        # 단일소스 — 기존 sampler 인라인 로직과 동일한 값
+        if self._path_to_shard_key is not None:
+            shard_key = self._path_to_shard_key.get(path, str(rec_i))
+        else:
+            shard_key = str(rec_i)
+        return self._rec_to_shard.get(shard_key, 0)
 
     def __getstate__(self) -> dict:
         """Pickle 직렬화: lru_cache wrapper는 pickle 불가이므로 제외.

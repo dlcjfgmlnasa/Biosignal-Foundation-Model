@@ -462,6 +462,8 @@ def main():
         min_patches=config.min_patches,
         shard_index_path=config.shard_index_path,
         shard_cache_size=config.shard_cache_size,
+        # 멀티소스: data_dir(list) 을 소스별 authoritative manifest resolve 에 사용.
+        source_dirs=config.data_dir if isinstance(config.data_dir, list) else None,
     )
     if rank0:
         if config.shard_index_path:
@@ -494,6 +496,7 @@ def main():
             min_patches=config.min_patches,
             shard_index_path=config.shard_index_path,
             shard_cache_size=config.shard_cache_size,
+            source_dirs=config.data_dir if isinstance(config.data_dir, list) else None,
         )
         val_dataloader = create_dataloader(
             val_dataset,
