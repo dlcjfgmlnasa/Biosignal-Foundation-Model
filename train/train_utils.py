@@ -94,6 +94,9 @@ class TrainConfig:
     beta: float = 0.0  # next-patch prediction (β=0이면 next-pred만 비활성)
     gamma: float = 0.0  # cross-modal prediction (γ=0이면 cross-modal만 비활성)
     delta: float = 0.0  # cross-modal contrastive
+    # [deprecated] 경험적 가중(EMPIRICAL_COUPLING_WEIGHTS) 폐기로 무효화됨 — CMPM(γ)는
+    # 항상 directed allowlist 균일 1.0(CROSS_COUPLING_WEIGHTS)을 사용한다. 하위호환 유지.
+    use_soft_coupling: bool = False
     peak_alpha: float = 0.0  # Peak-Weighted MSE 강도 (0=일반 MSE)
     lambda_spec: float = 0.0  # Spectral Loss 가중치 (하위 호환)
     spec_n_ffts: tuple[int, ...] = (16, 32, 64)  # 하위 호환

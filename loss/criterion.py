@@ -47,6 +47,7 @@ class CombinedLoss(nn.Module):
         spec_n_ffts: tuple[int, ...] = (16, 32, 64),
         contrastive_temperature: float = 0.07,
         learnable_temperature: bool = True,
+        coupling_weights: dict[tuple[int, int], float] | None = None,
     ) -> None:
         super().__init__()
         self.alpha = alpha
@@ -58,10 +59,13 @@ class CombinedLoss(nn.Module):
             lambda_spec=lambda_spec,
             spec_n_ffts=spec_n_ffts,
         )
+        # coupling_weights=None → directed allowlist 균일 1.0(CROSS_COUPLING_WEIGHTS).
+        # 경험적 가중은 폐기됨(팀 검증). dict override 시 임의 가중 주입 가능.
         self.next_loss_fn = NextPredictionLoss(
             peak_alpha=peak_alpha,
             lambda_spec=lambda_spec,
             spec_n_ffts=spec_n_ffts,
+            coupling_weights=coupling_weights,
         )
         if delta > 0:
             self.contrastive_loss_fn = CrossModalContrastiveLoss(

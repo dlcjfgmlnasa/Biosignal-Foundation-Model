@@ -205,6 +205,27 @@ CROSS_PRED_ALLOWED_PAIRS: set[tuple[int, int]] = {
 #   모든 신호는 MPM + same-variate next + δ 수신.
 
 
+# ── γ (CMPM) cross-modal 예측 방향 (directed) + 가중 ─────────────────────────
+# W[(source, target)] = source 로 target 을 생성 예측할 때의 CMPM loss 가중치.
+# patch(2s) 안에서 보이는 빠른·같은대역·shape 결합만 CMPM 재구성 대상이며, 방향은
+# 생리적 복원가능성으로 확정한다 (범위·변조·희소 쌍은 δ contrastive 로만 정렬):
+#   ECG → ABP/PPG   : 전기→기계 트리거 (역방향 QRS 복원불가 → 단방향)
+#   ABP ↔ PPG       : 같은 동맥맥파 (양방향; ppg→abp = cuffless BP)
+#   AWP ↔ RESP_Flow : P–V̇ 운동방정식 (양방향)
+# 균일 1.0. 경험적 best-lag corr 실측(2026-07-16)은 쌍별 null-floor 편향(호흡쌍
+# 바닥 ~0.5)·소스편차(SNUH↔K-MIMIC 3×)로 정밀 가중에 부적합 → 폐기(팀 4-agent
+# 검증: 구조는 robust, 정밀 가중은 측정불가). 방향만 생리로 확정.
+CROSS_PRED_DIRECTED: set[tuple[int, int]] = {
+    (0, 1),          # ECG → ABP
+    (0, 2),          # ECG → PPG
+    (1, 2), (2, 1),  # ABP ↔ PPG
+    (5, 8), (8, 5),  # AWP ↔ RESP_Flow
+}
+CROSS_COUPLING_WEIGHTS: dict[tuple[int, int], float] = {
+    (_s, _t): 1.0 for (_s, _t) in CROSS_PRED_DIRECTED
+}
+
+
 # 채널명 → signal_type (v2: spatial 폐지, 단일 int 반환)
 #
 # 구 ``CHANNEL_NAME_TO_SPATIAL`` (튜플 반환) 을 대체한다. 모든 ECG lead 표기는

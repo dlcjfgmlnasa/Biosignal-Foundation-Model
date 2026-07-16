@@ -431,6 +431,7 @@ def main():
         spec_n_ffts=config.spec_n_ffts,
         contrastive_temperature=config.contrastive_temperature,
         learnable_temperature=config.learnable_temperature,
+        coupling_weights=None,  # CMPM γ = directed allowlist 균일 1.0 (경험적 가중 폐기)
     ).to(device)
     optimizer = create_optimizer(
         list(model.parameters()) + list(criterion.parameters()),

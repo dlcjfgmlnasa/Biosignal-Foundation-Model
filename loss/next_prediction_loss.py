@@ -9,7 +9,11 @@ Phase 2 (Any-variate): 같은 variate 시간 예측 + cross-modal 예측 (causal
 import torch
 from torch import nn
 
-from data.spatial_map import CROSS_PRED_ALLOWED_PAIRS, MECHANISM_GROUP
+from data.spatial_map import (
+    CROSS_COUPLING_WEIGHTS,
+    CROSS_PRED_ALLOWED_PAIRS,
+    MECHANISM_GROUP,
+)
 from loss.masked_mse_loss import compute_patch_loss
 
 
@@ -19,11 +23,18 @@ _MECH_GROUP_LUT = torch.zeros(_MAX_ST, dtype=torch.long)
 for _st, _mg in MECHANISM_GROUP.items():
     _MECH_GROUP_LUT[_st] = _mg
 
-# Cross-pred 허용 쌍 lookup tensor (양방향)
+# Cross-pred 허용 쌍 lookup tensor (양방향) — 하위호환 참조용
 _ALLOWED_PAIR_LUT = torch.zeros(_MAX_ST, _MAX_ST, dtype=torch.bool)
 for _a, _b in CROSS_PRED_ALLOWED_PAIRS:
     _ALLOWED_PAIR_LUT[_a, _b] = True
     _ALLOWED_PAIR_LUT[_b, _a] = True
+
+# Directed coupling weight LUT: W[source, target]. 기본값은 CROSS_COUPLING_WEIGHTS
+# (directed allowlist, 균일 1.0)를 재현 — ECG 는 source 전용(→ABP/PPG), ABP↔PPG·
+# AWP↔RESP_Flow 만 양방향. 가중치 전부 1 → 가중평균 = pair 균등평균.
+_DEFAULT_COUPLING_W = torch.zeros(_MAX_ST, _MAX_ST, dtype=torch.float32)
+for (_s, _t), _w in CROSS_COUPLING_WEIGHTS.items():
+    _DEFAULT_COUPLING_W[_s, _t] = float(_w)
 
 
 class NextPredictionLoss(nn.Module):
@@ -48,11 +59,23 @@ class NextPredictionLoss(nn.Module):
         peak_alpha: float = 0.0,
         lambda_spec: float = 0.0,
         spec_n_ffts: tuple[int, ...] = (16, 32, 64),
+        coupling_weights: dict[tuple[int, int], float] | None = None,
     ) -> None:
         super().__init__()
         self.peak_alpha = peak_alpha
         self.lambda_spec = lambda_spec
         self.spec_n_ffts = spec_n_ffts
+        # Directed cross-modal coupling weights W[source→target] (soft CMPM).
+        # None → allowlist 재현 기본값(_DEFAULT_COUPLING_W). dict override 시 그 값으로
+        # (미지정 쌍 = 0 = γ 비활성, δ contrastive 만). buffer 로 등록해 device 이동 대응
+        # (config 상수라 state_dict 저장 X → persistent=False).
+        if coupling_weights is None:
+            _cw = _DEFAULT_COUPLING_W.clone()
+        else:
+            _cw = torch.zeros(_MAX_ST, _MAX_ST, dtype=torch.float32)
+            for (_s, _t), _w in coupling_weights.items():
+                _cw[_s, _t] = float(_w)
+        self.register_buffer("_coupling_w", _cw, persistent=False)
 
     def forward(
         self,
@@ -206,10 +229,10 @@ class NextPredictionLoss(nn.Module):
         같은 (sample_id, time_id)에서 서로 다른 variate_id를 가진 패치 쌍을 매칭하고,
         target의 signal type에 해당하는 cross_pred를 선택하여 MSE를 계산한다.
 
-        ``CROSS_PRED_ALLOWED_PAIRS``(data/spatial_map.py)에 정의된 생리학적으로
-        타당한 쌍만 허용 (v2, 2026-06-23 PAP 제거 후 번호 재배치). 현재 γ 강결합:
-        ECG↔ABP, ECG↔PPG, ABP↔PPG, AWP↔RESP_Flow. (약결합 ECG↔CVP·ABP↔ICP·
-        CO2↔RESP_Imp·RESP_Imp↔Flow 는 δ contrastive 전용으로 기각.)
+        ``CROSS_COUPLING_WEIGHTS``(data/spatial_map.py, directed)에 W>0 인 방향만
+        허용 (v2). 현재 γ 방향: ECG→ABP, ECG→PPG (단방향), ABP↔PPG, AWP↔RESP_Flow
+        (양방향). ECG-as-target(ABP/PPG→ECG) 및 약결합 CVP·CO2·ICP·RESP_Imp 관련
+        쌍은 γ 제외 → δ contrastive 전용.
         """
         # group_key: (batch, sample_id, time_id)가 같은 패치를 그룹핑
         b, n = time_id.shape
@@ -229,13 +252,14 @@ class NextPredictionLoss(nn.Module):
 
         cross_mask = same_group & diff_variate & both_valid & non_pad  # (B, N, N)
 
-        # Allowed Pair 필터: 생리학적으로 타당한 쌍만 허용
+        # Directed coupling 필터: W[source→target] > 0 인 쌍만 (양의 가중).
+        # st_i = source(예측 근거), st_j = target(복원 대상) — 방향 구분.
         if patch_signal_types is not None:
-            allowed_lut = _ALLOWED_PAIR_LUT.to(patch_signal_types.device)
-            st_i = patch_signal_types.unsqueeze(-1)  # (B, N, 1)
-            st_j = patch_signal_types.unsqueeze(-2)  # (B, 1, N)
-            allowed = allowed_lut[st_i, st_j]  # (B, N, N)
-            cross_mask = cross_mask & allowed
+            cw = self._coupling_w.to(patch_signal_types.device)
+            st_i = patch_signal_types.unsqueeze(-1)  # (B, N, 1) = source
+            st_j = patch_signal_types.unsqueeze(-2)  # (B, 1, N) = target
+            w_ij = cw[st_i, st_j]  # (B, N, N) directed weight
+            cross_mask = cross_mask & (w_ij > 0)
 
         b_idx, i_idx, j_idx = torch.where(cross_mask)
 
@@ -257,10 +281,15 @@ class NextPredictionLoss(nn.Module):
         mse_sum = pred_p.new_tensor(0.0)
         spec_sum = pred_p.new_tensor(0.0)
         total_sum = pred_p.new_tensor(0.0)
-        n_pairs = 0
+        w_sum = pred_p.new_tensor(0.0)
 
+        # directed coupling 가중평균: 각 (source→target) pair 를 W[source, target] 로
+        # 가중. 가중치가 전부 1 이면 = 기존 균등 pair-balanced 평균과 동일.
+        cw = self._coupling_w.to(pred_p.device)
         for pk in unique_pairs:
             mask = pair_key == pk
+            # pk = source_st * _MAX_ST + target_st → 방향별 W 조회 (CUDA sync 없이 텐서 인덱싱)
+            w = cw[pk // _MAX_ST, pk % _MAX_ST]  # 0-dim tensor
             pair_loss = compute_patch_loss(
                 pred_p[mask],
                 target_p[mask],
@@ -268,13 +297,14 @@ class NextPredictionLoss(nn.Module):
                 lambda_spec=self.lambda_spec,
                 spec_n_ffts=self.spec_n_ffts,
             )
-            mse_sum = mse_sum + pair_loss["mse"]
-            spec_sum = spec_sum + pair_loss["spec"]
-            total_sum = total_sum + pair_loss["total"]
-            n_pairs += 1
+            mse_sum = mse_sum + w * pair_loss["mse"]
+            spec_sum = spec_sum + w * pair_loss["spec"]
+            total_sum = total_sum + w * pair_loss["total"]
+            w_sum = w_sum + w
 
+        w_sum = w_sum.clamp(min=1e-8)
         return {
-            "mse": mse_sum / max(n_pairs, 1),
-            "spec": spec_sum / max(n_pairs, 1),
-            "total": total_sum / max(n_pairs, 1),
+            "mse": mse_sum / w_sum,
+            "spec": spec_sum / w_sum,
+            "total": total_sum / w_sum,
         }
