@@ -1,0 +1,121 @@
+# Phase 2: Any-Variate Cross-Modal Training — K-MIMIC + SNUH 2026 (멀티소스 shard backend, Option A)
+# ──────────────────────────────────────────────────────────────
+# Server: 2×L40S 48GB, KHDP 분석환경
+# Corpus: K-MIMIC ICU + SNUH 2026 OR+ICU 4개월 (멀티소스, ~1.85B tokens)
+# Combined Phase 1 checkpoint 에서 resume → cross-modal 학습
+#
+# ⚠️ run1 = "신규 코퍼스 + 현 conditioning" clean baseline (conditioning A/B 플래그 미설정).
+# ⚠️⚠️ LEAKAGE: SNUH ICU ↔ Ventilation·SCOPE·MT eval 환자중복 → manifest 단계 환자배제 선행
+#     (phase1_combined_snuh.yaml 과 동일 조건). 방식 무관 blocking.
+#
+# 멀티소스 규약: data_dir·shard_index_path 는 같은 순서 병렬 리스트. source_dirs 자동 도출.
+#
+# Usage (2-GPU DDP):
+#   torchrun --nproc_per_node=2 -m train.2_any_variate \
+#       --config configs/phase2_combined_snuh.yaml
+#
+# Smoke test:
+#   python -m train.2_any_variate --config configs/phase2_combined_snuh.yaml --dry-run
+
+# ── Combined Phase 1 checkpoint (d384/L16) ──
+# ⚠️ 실제 파일명은 phase1_combined_snuh 완료 후 확정 (best 또는 최종 epoch).
+resume: /home/coder/workspace/k-mimic-/bio_fm/outputs/main/phase1_combined_snuh/combined_snuh_d384_L16_10min_p200_k2/checkpoints/checkpoint_phase1_ci_best.pt
+
+# ── 모델 (Phase 1 과 동일 — checkpoint 에서 로드: d=384, L=16, ~30M) ──
+model_config:
+  d_model: 384
+  num_layers: 16
+  patch_size: 200              # 100Hz × 2초 = 200 samples/patch
+  stride: null                 # non-overlapping (= patch_size)
+  num_heads: 6                 # head_dim = 384/6 = 64
+  num_groups: null             # MHA (= num_heads)
+  num_signal_types: 9        # v2 단일 modality 9종 (ECG0~RESP_Flow8, 2026-06-23 PAP 제거)
+  use_glu: true
+  use_moe: false
+  use_rope: true
+  use_var_attn_bias: true
+  use_spatial_embed: true
+  dropout_p: 0.1
+
+  # ── Task heads ──
+  next_block_size: 3           # Block Next Prediction K=3 — 6s 미래 예측 (Phase 1 과 동일)
+  contrastive_proj_dim: 128    # Contrastive projection head (Phase 2 활성)
+
+# ── 데이터 (멀티소스: K-MIMIC + SNUH 4개월) ──
+# ⚠️ 순서 = shard_index_path 와 1:1 병렬. 서버 SNUH 경로가 다르면 두 리스트를 함께 수정.
+data_dir:
+  - /home/coder/workspace/k-mimic-/bio_fm/data/train/k_mimic/
+  - /home/coder/workspace/k-mimic-/bio_fm/data/train/snuh/processed/202602/
+  - /home/coder/workspace/k-mimic-/bio_fm/data/train/snuh/processed/202603/
+  - /home/coder/workspace/k-mimic-/bio_fm/data/train/snuh/processed/202604/
+  - /home/coder/workspace/k-mimic-/bio_fm/data/train/snuh/processed/202606/
+signal_types: [0, 1, 2, 3, 4, 5, 6, 7, 8]  # ECG ABP PPG CVP CO2 AWP ICP RESP_Imp RESP_Flow
+max_subjects: null
+window_seconds: 600.0          # 10분 윈도우 — 다변량 세션
+max_length: 180000             # row 당 다수 unit packing 지원 (cross-session neg 풍부)
+cache_size: 16
+crop_ratio_min: 0.01           # Long recording(≥600s) 만 crop
+crop_ratio_max: 1.0
+min_patches: 5                 # 10s floor (cross-modal multi-tier truncate 기준)
+
+# ── Modality-balanced sampling (Phase 1과 통일, √-inverse) ──
+modality_balanced_alpha: 0.5         # p_m ∝ n_m^(1-α); 0.5 = 제곱근 tempering
+modality_balanced_w_max_ratio: 5.0   # recording 가중치 상한 = 5 × mean(w)
+
+# ── Shard backend (멀티소스 — data_dir 와 병렬 순서) ──
+shard_index_path:
+  - /home/coder/workspace/k-mimic-/bio_fm/data/train/k_mimic_shard_500mb/shard_index.json
+  - /home/coder/workspace/k-mimic-/bio_fm/data/train/snuh/sharded/202602/shard_index.json
+  - /home/coder/workspace/k-mimic-/bio_fm/data/train/snuh/sharded/202603/shard_index.json
+  - /home/coder/workspace/k-mimic-/bio_fm/data/train/snuh/sharded/202604/shard_index.json
+  - /home/coder/workspace/k-mimic-/bio_fm/data/train/snuh/sharded/202606/shard_index.json
+shard_cache_size: 1            # OOM 회피 · (src,shard_id) 캐시키
+
+# ── 학습 ──
+# ⚠️ 코퍼스 +54% — K-MIMIC 레시피 그대로. 동일 revisit 원하면 max_batches/n_epochs ~1.5× 상향 검토.
+batch_size: 64                 # any_variate multi-channel packing
+lr: 2.0e-4                     # Phase 1(8e-4) 대비 낮은 LR (fine-tuning)
+weight_decay: 0.1              # AdamW decoupled WD (Phase 1과 통일)
+n_epochs: 50
+warmup_epochs: 3
+min_lr_ratio: 0.1              # 최종 LR = 2e-5
+mask_ratio: 0.4
+gradient_clip: 1.0
+seed: 42
+collate_mode: any_variate      # Phase 2 핵심: 다변량 collate
+max_batches: 2000              # 4-GPU(global 256) 기준. 2-GPU면 4000. (+54% 코퍼스면 ~3000 검토)
+
+# ── Loss 가중치 (Phase 2: MPM + Next-Pred + Cross-Modal + Contrastive) ──
+alpha: 0.7                     # masked reconstruction
+beta: 0.3                      # next-patch prediction
+gamma: 0.15                    # cross-modal
+delta: 0.5                     # cross-modal contrastive (InfoNCE)
+peak_alpha: 1.0                # Peak-Weighted MSE
+lambda_spec: 0.2               # Multi-Resolution STFT Loss
+spec_n_ffts: [16, 32, 64]      # Phase 1과 통일
+aux_loss_weight: 0.01
+contrastive_temperature: 0.07
+learnable_temperature: true
+
+# ── Masking (Block MPM) ──
+variate_mask_prob: 0.3         # 30% 확률로 전체 variate 마스킹 (virtual sensing)
+variate_drop_prob: 0.1         # 10% 확률로 variate 를 attention 에서 완전 제거 (zero-shot용)
+block_mask: true
+block_size_min: 3              # Phase 1과 통일 — 최소 3패치(6초)
+block_size_max: 8              # Phase 1과 통일 — 최대 8패치(16초)
+
+# ── Mixed Precision ──
+use_amp: true
+
+# ── Validation & Early Stopping ──
+val_ratio: 0.05
+val_max_batches: 500
+patience: 15
+
+# ── 시스템 ──
+device: auto
+num_workers: 4                 # 보수적
+output_dir: /home/coder/workspace/k-mimic-/bio_fm/outputs/main/phase2_combined_snuh
+checkpoint_every: 5
+viz_every: 1
+exp_name: combined_snuh_phase2_k2
