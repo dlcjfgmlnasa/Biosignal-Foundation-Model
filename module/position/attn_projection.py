@@ -109,11 +109,21 @@ class RotaryProjection(Projection):
     def forward(
         self,
         x: torch.Tensor,  # (*batch, group, hpg, seq, dim)
-        seq_id: torch.Tensor | None,  # (*batch, #group, #hpg, seq) long
+        seq_id: torch.Tensor | None,  # (*batch, #group, #hpg, seq) long 또는 float
     ) -> torch.Tensor:  # (*batch, group, hpg, seq, dim)
-        self._init_freq(max_len=seq_id.max() + 1)
-        rot_cos = self.cos[seq_id]
-        rot_sin = self.sin[seq_id]
+        if torch.is_floating_point(seq_id):
+            # Position interpolation 경로 (overlapping-stride 추론 전용).
+            # 분수 position에서 각도를 직접 계산한다. _init_freq와 동일한 theta·
+            # (width 2) interleave를 재사용하므로, 정수값 position이면 테이블 경로와
+            # bit-exact (float32는 우리 time_id 범위의 정수를 정확히 표현).
+            m_theta = seq_id.unsqueeze(-1).to(self.theta.dtype) * self.theta  # (..., seq, width)
+            m_theta = repeat(m_theta, "... width -> ... (width 2)")  # (..., seq, proj_width)
+            rot_cos = torch.cos(m_theta)
+            rot_sin = torch.sin(m_theta)
+        else:
+            self._init_freq(max_len=seq_id.max() + 1)
+            rot_cos = self.cos[seq_id]
+            rot_sin = self.sin[seq_id]
         return rot_cos * x + rot_sin * self._rotate(x)
 
 

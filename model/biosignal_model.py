@@ -168,6 +168,10 @@ class BiosignalFoundationModel(nn.Module):
             d_model=d_model,
             stride=stride,
         )
+        # RoPE position interpolation 토글 (overlapping-stride 추론 전용, 기본 on).
+        # stride==patch_size(학습/비중첩)에선 무의미(PI 분기 자체가 비활성).
+        # ablation(naive-overlap vs PI-overlap)에서 wrapper가 False로 끌 수 있다.
+        self.rope_pi = True
 
         # 3. Transformer Encoder
         num_heads = num_heads or d_model // 64
@@ -518,9 +522,20 @@ class BiosignalFoundationModel(nn.Module):
 
         # MoE 라우팅에서 padded 토큰 제외용 — (B, N) bool
         token_valid = (p_vid > 0)
+        # RoPE position: overlapping-stride 추론 시 정수 ordinal(time_id)은 물리간격을
+        # 과대평가한다(인접 토큰이 stride/patch_size 배로 촘촘한데 ordinal 차는 여전히 1).
+        # → position interpolation으로 교정: physical position = time_id * stride/patch_size.
+        # 비중첩(stride==patch_size)이면 정수 time_id 그대로 → 학습/기존 경로 byte-identical.
+        # 원본 정수 time_id는 result dict·abs_time_id용으로 그대로 보존한다.
+        if self.patch_embed.stride < self.patch_size and self.rope_pi:
+            rope_time_id = time_id.to(torch.float32) * (
+                self.patch_embed.stride / self.patch_size
+            )
+        else:
+            rope_time_id = time_id
         encoder_kwargs = dict(
-            var_id=p_vid, time_id=time_id, token_mask=token_valid, cond=ada_cond,
-        )  # RoPE는 상대적 time_id; token_mask는 MoE aux_loss 산정용; cond는 AdaLN용 (None이면 무시)
+            var_id=p_vid, time_id=rope_time_id, token_mask=token_valid, cond=ada_cond,
+        )  # RoPE는 상대 time_id(overlapping 시 PI 적용); token_mask는 MoE aux_loss용; cond는 AdaLN용
         use_causal = task in ("next_pred", "both")
 
         # causal mask (next_pred, both에서 공유)

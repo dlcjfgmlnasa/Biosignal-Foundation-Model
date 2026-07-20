@@ -86,6 +86,8 @@ class DownstreamModelWrapper(nn.Module):
         checkpoint_path: str | Path,
         model_version: str = "v1",
         device: str | torch.device = "cuda",
+        patch_stride: int | None = None,
+        rope_pi: bool = True,
     ) -> None:
         super().__init__()
         self.device = torch.device(device)
@@ -100,8 +102,17 @@ class DownstreamModelWrapper(nn.Module):
         else:
             raise ValueError("Checkpoint에 'config' 키가 없습니다.")
 
+        # overlapping-stride 추론 override (granularity 프로브 전용).
+        # stride는 학습 파라미터가 아니라 PatchEmbedding 생성 인자 → 같은 checkpoint를
+        # 다른 stride로 재구성 가능(projection 가중치 shape 불변, byte-identical 로드).
+        # patch_size % stride == 0 필수(PatchEmbedding에서 assert).
+        if patch_stride is not None:
+            config.stride = patch_stride
+
         model_cls = BiosignalFoundationModel
         self.model: BiosignalFoundationModel = model_cls.from_config(config)
+        # RoPE PI 토글: overlapping일 때만 유효. naive-overlap ablation은 rope_pi=False.
+        self.model.rope_pi = rope_pi
         self.model.to(self.device)
 
         # 2. State dict 로드
