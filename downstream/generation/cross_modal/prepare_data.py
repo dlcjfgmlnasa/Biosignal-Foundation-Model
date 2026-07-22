@@ -52,6 +52,111 @@ from downstream._kfold_utils import (
 TARGET_SR: float = 100.0
 
 
+# ---- 절대압(calibrated) 게이팅 / 계약 유틸 ----
+
+# 절대 mmHg ABP window 생리 게이트 파라미터 (chunk meta 에 그대로 기록).
+# pointwise 하드리밋(20/300)은 data_utils.joint_clean_and_slice 가 이미 적용.
+ABP_GATE: dict[str, object] = {
+    "abp_hard": [20.0, 300.0],  # pointwise (joint_clean_and_slice 에서 적용)
+    "map": [30.0, 180.0],
+    "sbp": [40.0, 260.0],
+    "dbp": [20.0, 160.0],
+    "pp": [10.0, 150.0],
+    "flatline_std_min": 1.0,   # window std(mmHg) 하한 → 미만이면 zeroed/분리
+    "flush_clip_val": 250.0,   # 고압 포화 표본 판정값
+    "flush_clip_ratio": 0.02,  # 포화 표본 비율 상한 (fast-flush 스파이크)
+}
+
+
+def _abp_window_ok(abp: np.ndarray) -> bool:
+    """절대 mmHg ABP window 의 생리 타당성 게이트. 불량이면 False → window drop.
+
+    damped-trace(DBP↑·PP↓), flush-spike(PP↑·포화), flat-line/분리(std≈0),
+    비생리 MAP/SBP/DBP 를 걸러 절대압 라벨 오염을 방지한다. clip 이 아니라 drop.
+    """
+    if abp.size == 0 or np.isnan(abp).any():
+        return False
+    if float(np.std(abp)) < float(ABP_GATE["flatline_std_min"]):
+        return False
+    sbp = float(np.percentile(abp, 95))  # 강건 SBP/DBP/MAP 근사
+    dbp = float(np.percentile(abp, 5))
+    mapv = float(np.mean(abp))
+    pp = sbp - dbp
+    lo, hi = ABP_GATE["map"]
+    ok = lo <= mapv <= hi
+    lo, hi = ABP_GATE["sbp"]
+    ok = ok and (lo <= sbp <= hi)
+    lo, hi = ABP_GATE["dbp"]
+    ok = ok and (lo <= dbp <= hi)  # damped → DBP↑ 로 여기서 탈락
+    lo, hi = ABP_GATE["pp"]
+    ok = ok and (lo <= pp <= hi)   # damped → PP↓, flush → PP↑
+    clip_ratio = float(np.mean(abp >= float(ABP_GATE["flush_clip_val"])))
+    ok = ok and (clip_ratio <= float(ABP_GATE["flush_clip_ratio"]))
+    return bool(ok)
+
+
+def _mark_anchors(windows: list[dict]) -> np.ndarray:
+    """환자별 첫 gated-valid window(causal, 가장 이른 시각) 를 is_anchor=True 로.
+
+    (patient_id, case_id, win_start) 오름차순에서 각 환자의 첫 window 를 anchor 로
+    표시하되, 반환 배열은 입력 ``windows`` 원래 순서에 정렬된다. patient-disjoint
+    split 전제에서 split 당 환자마다 정확히 1개의 anchor 가 생긴다.
+    """
+    is_anchor = np.zeros(len(windows), dtype=bool)
+    seen: set[str] = set()
+    order = sorted(
+        range(len(windows)),
+        key=lambda i: (
+            str(windows[i]["patient_id"]),
+            str(windows[i]["case_id"]),
+            int(windows[i]["win_start"]),
+        ),
+    )
+    for i in order:
+        pid = str(windows[i]["patient_id"])
+        if pid not in seen:
+            is_anchor[i] = True
+            seen.add(pid)
+    return is_anchor
+
+
+def _abp_train_scale(train_windows: list[dict]) -> tuple[float, float]:
+    """train split window 의 raw ABP(mmHg) 표본에서만 전역 고정 정규화 스케일 산출.
+
+    val/test 에 동일 (mu, sd) 를 적용(가역 affine) → leakage 없이 절대압 보존.
+    ABP 가 없으면 (0.0, 1.0).
+    """
+    if not train_windows or "abp" not in train_windows[0]["signals"]:
+        return 0.0, 1.0
+    vals = np.concatenate([w["signals"]["abp"].ravel() for w in train_windows])
+    return float(vals.mean()), float(vals.std() + 1e-6)
+
+
+def _assert_no_patient_leak(splits_windows: dict[str, list[dict]]) -> None:
+    """공정성 게이트: split 간 환자 disjoint + split 내 환자당 anchor 정확히 1개.
+
+    실패 시 AssertionError 로 abort (착시 승리 방지).
+    """
+    pid_sets = {
+        name: {str(w["patient_id"]) for w in ws}
+        for name, ws in splits_windows.items()
+        if ws
+    }
+    names = list(pid_sets)
+    for i in range(len(names)):
+        for j in range(i + 1, len(names)):
+            inter = pid_sets[names[i]] & pid_sets[names[j]]
+            assert not inter, (
+                f"patient leak {names[i]}∩{names[j]}: {sorted(inter)[:5]}"
+            )
+    for name, ws in splits_windows.items():
+        if not ws:
+            continue
+        n_anchor = int(_mark_anchors(ws).sum())
+        n_pat = len(pid_sets[name])
+        assert n_anchor == n_pat, f"{name}: anchors({n_anchor}) != patients({n_pat})"
+
+
 # ---- MIMIC-III 로더 ----
 
 
@@ -72,9 +177,9 @@ def _load_mimic3_cases(
     from data.parser.mimic3_waveform import (
         scan_abp_records,
         load_manifest,
-        _apply_pipeline,
         MIMIC3_NATIVE_SR,
     )
+    from downstream.data_utils import joint_clean_and_slice
 
     # manifest 로드 또는 스캔
     manifest_file = Path(out_dir) / "mimic3_abp_manifest.json"
@@ -173,32 +278,34 @@ def _load_mimic3_cases(
             print("SKIP (no signal)")
             continue
 
-        # 각 채널 추출 + 전처리
-        signals = {}
+        # 각 채널을 같은 segment(공통 125Hz 그리드)에서 raw 로 추출 → joint 정렬.
+        # 채널별 독립 전처리(구 _apply_pipeline)는 desync 를 유발하므로 사용 안 함.
+        raw_cols: dict[str, np.ndarray] = {}
         valid = True
         for stype, ch_name in ch_map.items():
             if ch_name not in seg.sig_name:
                 valid = False
                 break
             ch_idx = seg.sig_name.index(ch_name)
-            raw = seg.p_signal[:, ch_idx].astype(np.float64)
-
-            processed = _apply_pipeline(raw, stype, MIMIC3_NATIVE_SR)
-            if processed is None or len(processed) < int(min_duration_sec * TARGET_SR):
-                valid = False
-                break
-            signals[stype] = processed
+            raw_cols[stype] = seg.p_signal[:, ch_idx].astype(np.float64)
 
         if not valid:
-            print("SKIP (preprocessing failed)")
+            print("SKIP (channel missing)")
             continue
 
-        # 동일 길이로 자르기
-        min_len = min(len(s) for s in signals.values())
-        signals = {k: v[:min_len] for k, v in signals.items()}
+        # joint valid mask + 최장 공통 구간 → 등길이·100Hz (절대 mmHg 보존)
+        signals = joint_clean_and_slice(
+            raw_cols, MIMIC3_NATIVE_SR, list(ch_map.keys())
+        )
+        if not signals or any(
+            len(v) < int(min_duration_sec * TARGET_SR) for v in signals.values()
+        ):
+            print("SKIP (no joint-aligned segment)")
+            continue
 
         elapsed = time.time() - t0
-        dur_min = min_len / TARGET_SR / 60
+        n_aligned = len(next(iter(signals.values())))  # joint 후 모든 신호 등길이
+        dur_min = n_aligned / TARGET_SR / 60
         print(f"OK ({dur_min:.1f}min, {len(signals)} ch) [{elapsed:.1f}s]")
 
         cases.append(
@@ -215,49 +322,107 @@ def _load_mimic3_cases(
 # ---- VitalDB 로더 ----
 
 
+def _vitaldb_caseid_to_subject(clinical_csv: str | None = None) -> dict[int, int]:
+    """VitalDB Open clinical info 에서 caseid→subjectid 매핑을 얻는다.
+
+    우선순위: (1) ``clinical_csv`` 로컬 파일(사내망 API 차단 환경), (2) 공개 API
+    ``https://api.vitaldb.net/cases``. 둘 다 실패하면 빈 dict (호출부에서
+    ``patient_id=case_id`` fallback + WARN).
+    """
+    import pandas as pd
+
+    # (1) 로컬 clinical CSV 주입
+    if clinical_csv:
+        p = Path(clinical_csv)
+        if p.exists():
+            try:
+                df = pd.read_csv(str(p))
+                return dict(
+                    zip(df["caseid"].astype(int), df["subjectid"].astype(int))
+                )
+            except Exception as e:  # noqa: BLE001
+                print(f"  WARN: clinical-csv 파싱 실패({e}) → API/fallback 시도")
+        else:
+            print(f"  WARN: clinical-csv 없음: {clinical_csv} → API/fallback 시도")
+
+    # (2) 공개 API
+    try:
+        df = pd.read_csv("https://api.vitaldb.net/cases")
+        return dict(zip(df["caseid"].astype(int), df["subjectid"].astype(int)))
+    except Exception as e:  # noqa: BLE001
+        print(f"  WARN: api.vitaldb.net/cases 접근 실패({e}) → patient_id=case_id fallback")
+        return {}
+
+
 def _load_vitaldb_cases(
     n_cases: int,
     signal_types: list[str],
     min_duration_sec: float = 600.0,
     offset_from_end: int = 200,
     vital_dir: str | None = None,
+    clinical_csv: str | None = None,
 ) -> list[dict]:
-    """VitalDB에서 시간 정렬된 다채널 데이터를 로드한다.
+    """VitalDB에서 joint 시간축 정렬된 다채널 데이터를 로드한다.
+
+    ``load_joint_cases`` 로 모든 신호를 공통 100Hz 그리드에서 함께 로드·정렬하며
+    (신호별 독립 세그먼트 선택 없음), caseid→subjectid 매핑으로 실제 환자
+    ``patient_id`` 를 부여한다.
 
     Returns
     -------
     list of {"case_id": str, "patient_id": str, "signals": {stype: array}}
     """
-    from downstream.data_utils import load_pilot_cases
+    from downstream.data_utils import load_joint_cases
 
-    print(f"  Loading {n_cases} VitalDB cases (signals={signal_types})...")
-    raw_cases = load_pilot_cases(
+    print(f"  Loading {n_cases} VitalDB cases joint-aligned (signals={signal_types})...")
+    raw_cases = load_joint_cases(
         n_cases=n_cases,
         offset_from_end=offset_from_end,
         signal_types=signal_types,
         vital_dir=vital_dir,
     )
 
+    # 실제 환자 매핑 (로컬 .vital 은 subjectid 부재 → fallback)
+    cid2subj: dict[int, int] = {}
+    if vital_dir is None:
+        cid2subj = _vitaldb_caseid_to_subject(clinical_csv)
+
     cases = []
+    n_fallback = 0
     for rc in raw_cases:
         # 모든 필요 채널이 있는지 확인
         if not all(st in rc.tracks for st in signal_types):
             continue
 
-        # 동일 길이로 자르기
-        min_len = min(len(rc.tracks[st]) for st in signal_types)
-        if min_len < int(min_duration_sec * TARGET_SR):
+        # joint 로더가 이미 등길이·정렬 → min_len 절단 불필요 (안전용 assert)
+        lens = {len(rc.tracks[st]) for st in signal_types}
+        assert len(lens) == 1, f"joint misaligned lengths for case {rc.case_id}: {lens}"
+        n = lens.pop()
+        if n < int(min_duration_sec * TARGET_SR):
             continue
 
-        signals = {st: rc.tracks[st][:min_len] for st in signal_types}
+        # 실제 환자 id 결정 (없으면 case_id fallback)
+        pid: str
+        if cid2subj and str(rc.case_id).isdigit() and int(rc.case_id) in cid2subj:
+            pid = str(cid2subj[int(rc.case_id)])
+        else:
+            pid = f"vitaldb_{rc.case_id}"
+            n_fallback += 1
+
+        signals = {st: rc.tracks[st] for st in signal_types}
         cases.append(
             {
                 "case_id": f"vitaldb_{rc.case_id}",
-                "patient_id": str(rc.case_id),
+                "patient_id": pid,
                 "signals": signals,
             }
         )
 
+    if n_fallback:
+        print(
+            f"  WARN: patient_id fallback to case_id ({n_fallback}/{len(cases)} cases) "
+            f"— 같은 환자 다중 case 누수 방어 불완전 (subjectid 매핑 필요)"
+        )
     print(f"  Loaded {len(cases)} cases with all required signals")
     return cases
 
@@ -447,11 +612,16 @@ def extract_aligned_windows(
                     break
                 win[st] = seg
 
+            # 절대압 window 생리 게이트 (ABP 포함 시). clip 아니라 drop.
+            if valid and "abp" in win and not _abp_window_ok(win["abp"]):
+                valid = False
+
             if valid:
                 windows.append(
                     {
                         "case_id": case["case_id"],
                         "patient_id": case["patient_id"],
+                        "win_start": int(start),  # anchor 인과성 / 재현용
                         "signals": win,
                     }
                 )
@@ -501,16 +671,26 @@ def save_dataset(
         split_items.append(("val", val_windows))
     split_items.append(("test", test_windows))
 
+    # 전역 고정 ABP 정규화 스케일 = train split 에서만 산출 (val/test 동일 적용).
+    # prepare 는 raw mmHg 를 저장하고, 이 (mu, sd) 는 meta 로만 전달 → 모델/eval 에서
+    # 가역 affine 정규화. train ABP 를 pop 전에 계산해야 하므로 여기서 먼저 수행.
+    abp_mu, abp_sd = _abp_train_scale(train_windows)
+
     saved: list[Path] = []
     for split_name, windows in split_items:
         if not windows:
             continue
+        # 환자별 첫 gated-valid window(causal) = anchor. 원래 순서 정렬 배열.
+        is_anchor_full = _mark_anchors(windows)
         chunk_idx = 0
         total = 0
         for bstart in range(0, len(windows), chunk_windows):
             batch = windows[bstart:bstart + chunk_windows]
             n_w = len(batch)
             case_ids = [w["case_id"] for w in batch]
+            patient_ids = [str(w["patient_id"]) for w in batch]
+            win_starts = [int(w["win_start"]) for w in batch]
+            is_anchor_b = is_anchor_full[bstart:bstart + n_w].tolist()
             sig_tensors: dict[str, torch.Tensor] = {}
             for st in signal_types:
                 # 각 윈도우 dict 에서 stype pop → numpy 즉시 해제하며 (n_w, T) build
@@ -519,8 +699,11 @@ def save_dataset(
 
             chunk = {
                 "split": split_name,
-                "signals": sig_tensors,          # {stype: (n_w, win_samples)}
+                "signals": sig_tensors,          # {stype: (n_w, win_samples)} raw mmHg(ABP)
                 "case_ids": case_ids,            # list[str], len == n_w
+                "patient_ids": patient_ids,      # list[str] 실제 환자, len == n_w
+                "win_starts": win_starts,        # list[int] 100Hz sample idx
+                "is_anchor": is_anchor_b,        # list[bool] 환자별 첫 window
                 "metadata": {
                     "task": "any_to_any_cross_modal",
                     "source": source,
@@ -533,6 +716,11 @@ def save_dataset(
                     "chunk_idx": chunk_idx,
                     "n_windows": n_w,
                     "signal_dtype": str(signal_dtype).replace("torch.", ""),
+                    "abp_mu_train": abp_mu,      # mmHg, train-only, freeze
+                    "abp_sd_train": abp_sd,      # mmHg, train-only, freeze
+                    "gating": ABP_GATE,          # 절대압 게이트 파라미터(재현성)
+                    "align": "joint_load_v1",    # 정렬 프로비넌스
+                    "abp_units": "mmHg_raw",     # ABP 는 raw mmHg (z-norm 안 함)
                 },
             }
             out_file = (
@@ -602,6 +790,7 @@ def prepare_any_to_any(
     chunk_windows: int = 2000,
     n_folds: int = 1,
     seed: int = 42,
+    clinical_csv: str | None = None,
 ) -> list[Path]:
     """Any-to-Any cross-modal 평가 데이터를 준비한다.
 
@@ -619,6 +808,8 @@ def prepare_any_to_any(
     n_folds : >=2 면 patient-level K-fold CV (fold별 train/val/test chunk 저장).
         1 이면 기존 단일 train/test (fold suffix 없음, back-compat).
     seed : patient split RNG seed.
+    clinical_csv : VitalDB caseid→subjectid 매핑용 로컬 clinical CSV 경로
+        (source=vitaldb API 경로, 사내망 API 차단 시). None 이면 API 시도 후 fallback.
     """
     if signal_types is None:
         signal_types = ["ecg", "abp", "ppg", "cvp"]
@@ -649,6 +840,7 @@ def prepare_any_to_any(
             signal_types,
             min_duration_sec,
             vital_dir=vital_dir,
+            clinical_csv=clinical_csv,
         )
     elif source == "local":
         if not data_dir:
@@ -696,6 +888,8 @@ def prepare_any_to_any(
             if not any(fold_windows.values()):
                 print(f"  WARN: fold {fold_idx} produced no windows — skip.")
                 continue
+            # 공정성 게이트: 환자 disjoint + 환자당 anchor 1개 (실패=abort)
+            _assert_no_patient_leak(fold_windows)
             saved = save_dataset(
                 fold_windows["train"],
                 fold_windows["test"],
@@ -749,6 +943,9 @@ def prepare_any_to_any(
     if not train_windows and not test_windows:
         print("ERROR: No windows extracted.", file=sys.stderr)
         sys.exit(1)
+
+    # 공정성 게이트: 환자 disjoint + 환자당 anchor 1개 (실패=abort)
+    _assert_no_patient_leak({"train": train_windows, "test": test_windows})
 
     # 4. 저장 (split별 chunk)
     print("\n[4/4] Saving...")
@@ -849,6 +1046,13 @@ def main() -> None:
     parser.add_argument(
         "--seed", type=int, default=42, help="Patient split RNG seed.",
     )
+    parser.add_argument(
+        "--clinical-csv",
+        type=str,
+        default=None,
+        help="VitalDB caseid→subjectid 매핑용 로컬 clinical CSV 경로 "
+             "(사내망 api.vitaldb.net 차단 시). 없으면 API 시도 후 case_id fallback.",
+    )
     dtype_map = add_signal_dtype_arg(parser)
     args = parser.parse_args()
 
@@ -867,6 +1071,7 @@ def main() -> None:
         chunk_windows=args.chunk_windows,
         n_folds=args.n_folds,
         seed=args.seed,
+        clinical_csv=args.clinical_csv,
     )
 
 

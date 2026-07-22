@@ -61,6 +61,11 @@ NATIVE_SR: dict[str, float] = {
 }
 
 
+# ── 절대압 게이팅 / joint 정렬 상수 (cross_modal prepare 와 공유) ──
+ABP_HARD_MIN, ABP_HARD_MAX = 20.0, 300.0  # pointwise 물리 하드리밋 (mmHg)
+MIN_JOINT_SEC = 60.0                       # 최장 공통 유효 구간 최소 길이 (초)
+
+
 # ── 데이터 구조 ────────────────────────────────────────────────
 
 
@@ -294,8 +299,9 @@ def _apply_full_pipeline(
     if not segments:
         return None
 
-    # 가장 긴 세그먼트 선택
-    # segments: list of (start_sample, segment_array) — 배열만 꺼낸다.
+    # 가장 긴 세그먼트 선택 (단일 신호 전용 — 절대 시작 인덱스를 버린다).
+    # ⚠️ 다신호 정렬에는 절대 쓰지 말 것: 신호별 독립 선택 → cross-modal desync.
+    #    다신호 정렬은 joint_clean_and_slice / load_joint_cases 를 사용한다.
     _, segment = max(segments, key=lambda s: len(s[1]))
 
     # Step 4: Median -> Notch -> Filter
@@ -310,6 +316,219 @@ def _apply_full_pipeline(
         segment = resample_to_target(segment, orig_sr=native_sr, target_sr=TARGET_SR)
 
     return segment
+
+
+# ── Joint(다신호 시간축 정렬) 로딩 ─────────────────────────────
+# 신호별 독립 최장세그먼트 선택(desync 버그)을 대체한다. 두 트랙 이상을 공통
+# 그리드에서 함께 로드 → joint valid mask → 최장 공통 contiguous 구간을 모든
+# 신호에 동일 적용 → cross-modal PPG↔ABP 시간축 정렬을 보존한다.
+
+
+def _longest_true_run(mask: np.ndarray) -> tuple[int, int]:
+    """boolean mask 에서 가장 긴 연속 True 구간의 [start, end) 를 반환한다.
+
+    유효 구간이 없으면 (0, 0).
+    """
+    if not mask.any():
+        return 0, 0
+    diff = np.diff(mask.astype(np.int8), prepend=0, append=0)
+    starts = np.where(diff == 1)[0]
+    ends = np.where(diff == -1)[0]
+    i = int(np.argmax(ends - starts))
+    return int(starts[i]), int(ends[i])
+
+
+def joint_clean_and_slice(
+    cols: dict[str, np.ndarray],  # {stype: (T,)} — 이미 공통 그리드(sr_in) 위 등길이
+    sr_in: float,
+    signal_types: list[str],
+) -> dict[str, np.ndarray]:
+    """공통 그리드 다채널을 joint valid mask + 최장 공통 구간으로 정렬해 100Hz 로 반환.
+
+    각 신호에 pointwise 클린(range-check / spike / PPG motion) 을 적용해 불량을
+    NaN 으로 마킹하고(길이 보존), 모든 신호의 ~NaN 을 AND 한 joint mask 와 ABP
+    pointwise 생리 하드게이트로 **최장 공통 contiguous 구간** 하나를 선택한 뒤,
+    그 구간에서만 신호별 median/notch/filter 를 적용하고 필요 시 100Hz 로 리샘플한다.
+
+    반환 dict 는 모든 신호가 동일 길이·동일 시간축이다. 유효 공통 구간이
+    ``MIN_JOINT_SEC`` 미만이면 빈 dict 를 반환한다.
+
+    ABP filter 는 lowpass(DC 보존) 이므로 절대 mmHg 스케일이 보존된다.
+    """
+    if not cols:
+        return {}
+    T = len(next(iter(cols.values())))
+
+    cleaned: dict[str, np.ndarray] = {}
+    for st in signal_types:
+        col = np.asarray(cols[st], dtype=np.float64).copy()
+        cfg = SIGNAL_CONFIGS.get(st)
+        if cfg is None:
+            return {}
+        if cfg.valid_range is not None:  # 범위 밖 → NaN (길이 보존)
+            col, _ = _apply_range_check(col, cfg.valid_range)
+        if cfg.spike_detection:  # 전기소작 / 스파이크 → NaN
+            col, _ = _detect_electrocautery(
+                col, sr_in, threshold_std=cfg.spike_threshold_std
+            )
+        if st == "ppg":  # PPG motion artifact → NaN
+            col, _ = _detect_motion_artifact(col, sr_in)
+        cleaned[st] = col
+
+    # joint valid mask: 모든 신호가 동시에 유효한 표본만
+    valid = np.ones(T, dtype=bool)
+    for st in signal_types:
+        valid &= ~np.isnan(cleaned[st])
+    if "abp" in cleaned:  # ABP pointwise 생리 하드게이트
+        abp = cleaned["abp"]
+        valid &= (abp > ABP_HARD_MIN) & (abp < ABP_HARD_MAX)
+
+    s, e = _longest_true_run(valid)  # 최장 공통 contiguous 구간
+    if (e - s) < int(MIN_JOINT_SEC * sr_in):
+        return {}
+
+    out: dict[str, np.ndarray] = {}
+    for st in signal_types:  # 슬라이스(=NaN 없음) 후 필터
+        seg = cleaned[st][s:e]
+        cfg = SIGNAL_CONFIGS[st]
+        if cfg.median_kernel > 0:
+            seg = _apply_median_filter(seg, kernel_size=cfg.median_kernel)
+        if cfg.notch_freq is not None:
+            seg = _apply_notch_filter(seg, freq=cfg.notch_freq, sr=sr_in)
+        seg = _apply_filter(seg, cfg, sr_in)  # ABP=lowpass → DC(절대 mmHg) 보존
+        if sr_in != TARGET_SR:
+            seg = resample_to_target(seg, orig_sr=sr_in, target_sr=TARGET_SR)
+        out[st] = seg
+    return out
+
+
+def _load_joint_single_case(
+    case_id: int,
+    signal_types: list[str],
+) -> CaseData:
+    """VitalDB API: 모든 트랙을 공통 100Hz 그리드로 함께 로드 후 joint 정렬한다."""
+    import vitaldb
+
+    keys = [st for st in signal_types if st in PREFERRED_TRACKS]
+    tracks = [PREFERRED_TRACKS[st][0] for st in keys]  # 대표 트랙(첫 우선순위)
+    if not tracks:
+        return CaseData(case_id=case_id)
+    try:
+        arr = vitaldb.load_case(case_id, tracks, interval=1.0 / TARGET_SR)  # (T, n)
+    except Exception:  # noqa: BLE001 — 로드 실패 케이스 스킵
+        return CaseData(case_id=case_id)
+    if arr is None or arr.shape[0] == 0:
+        return CaseData(case_id=case_id)
+
+    cols = {st: arr[:, i] for i, st in enumerate(keys)}
+    aligned = joint_clean_and_slice(cols, TARGET_SR, keys)
+    c = CaseData(case_id=case_id)
+    c.tracks = aligned
+    return c
+
+
+def _load_joint_local_vital_cases(
+    vital_dir: str,
+    n_cases: int,
+    offset_from_end: int,
+    signal_types: list[str],
+) -> list[CaseData]:
+    """로컬 VitalDB Open ``.vital`` 을 공통 100Hz 그리드로 함께 로드 후 joint 정렬한다.
+
+    ``vf.to_numpy([tracks], 1/TARGET_SR)`` 로 요청 트랙을 한 번에 (T, n) 으로 읽어
+    ``_load_joint_single_case`` 와 동일한 규약(공통 그리드 → joint_clean_and_slice)을 따른다.
+    """
+    import vitaldb
+
+    files = sorted(Path(vital_dir).glob("*.vital"))
+    total = len(files)
+    if total == 0:
+        print(f"ERROR: no .vital files in {vital_dir}")
+        return []
+
+    start_idx = max(0, total - offset_from_end - n_cases)
+    end_idx = max(0, total - offset_from_end)
+    selected = files[start_idx:end_idx]
+    print(f"[joint] local .vital files: {len(selected)}/{total} (dir={vital_dir})")
+
+    results: list[CaseData] = []
+    for vp in selected:
+        try:
+            vf = vitaldb.VitalFile(str(vp))
+            avail = set(vf.get_track_names())
+        except Exception as e:  # noqa: BLE001 — 손상 파일 스킵
+            print(f"  skip {vp.name}: {e}")
+            continue
+
+        # signal_type -> 첫 존재 트랙명 (하나라도 없으면 케이스 스킵)
+        keys: list[str] = []
+        tracks: list[str] = []
+        ok = True
+        for st in signal_types:
+            picked = next((t for t in PREFERRED_TRACKS.get(st, []) if t in avail), None)
+            if picked is None:
+                ok = False
+                break
+            keys.append(st)
+            tracks.append(picked)
+        if not ok or not keys:
+            continue
+
+        try:
+            arr = vf.to_numpy(tracks, 1.0 / TARGET_SR)  # (T, n) @100Hz 공통 그리드
+        except Exception:  # noqa: BLE001
+            continue
+        if arr is None or arr.shape[0] == 0:
+            continue
+
+        cols = {st: arr[:, i] for i, st in enumerate(keys)}
+        aligned = joint_clean_and_slice(cols, TARGET_SR, keys)
+        if aligned:
+            c = CaseData(case_id=vp.stem)
+            c.tracks = aligned
+            results.append(c)
+
+    print(f"[joint] loaded {len(results)}/{len(selected)} cases with data")
+    return results
+
+
+def load_joint_cases(
+    n_cases: int = 50,
+    offset_from_end: int = 0,
+    signal_types: list[str] | None = None,
+    vital_dir: str | None = None,
+) -> list[CaseData]:
+    """cross_modal 전용 joint-aligned 로더.
+
+    반환 CaseData.tracks 는 모든 신호가 동일 길이·동일 시간축이다
+    (``load_pilot_cases`` 의 신호별 독립 처리와 달리 desync 가 없다).
+    single-signal downstream 경로는 기존 ``load_pilot_cases`` 를 그대로 쓴다.
+    """
+    import vitaldb
+
+    if signal_types is None:
+        signal_types = ["ecg", "abp", "ppg", "cvp"]
+
+    # 로컬 .vital 우선 (사내망 API 차단 환경)
+    if vital_dir is not None:
+        return _load_joint_local_vital_cases(
+            vital_dir, n_cases, offset_from_end, signal_types
+        )
+
+    # ABP 가 있는 케이스를 기준으로 목록 구성 (PPG→ABP 는 ABP 필수)
+    all_cases = sorted(vitaldb.find_cases([PREFERRED_TRACKS["abp"][0]]))
+    total = len(all_cases)
+    start_idx = max(0, total - offset_from_end - n_cases)
+    end_idx = max(0, total - offset_from_end)
+    pilot_ids = all_cases[start_idx:end_idx]
+
+    results: list[CaseData] = []
+    for cid in pilot_ids:
+        cd = _load_joint_single_case(cid, signal_types)
+        if cd.tracks and all(st in cd.tracks for st in signal_types):
+            results.append(cd)
+    print(f"[joint] loaded {len(results)}/{len(pilot_ids)} cases (signals={signal_types})")
+    return results
 
 
 # ── 윈도우 추출 ────────────────────────────────────────────────
