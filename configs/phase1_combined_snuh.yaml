@@ -48,13 +48,28 @@ model_config:
   next_block_size: 3         # Block Next Prediction K=3 — 미래 6s (3 patch × 2s), 호흡 1주기
   contrastive_proj_dim: 0    # Contrastive (Phase 2에서 활성)
 
-# ── 데이터 (멀티소스: K-MIMIC + SNUH 4개월) ──
-# ⚠️ 순서 = shard_index_path 와 1:1 병렬. 서버 SNUH 경로가 다르면 두 리스트를 함께 수정.
+# ── 데이터 (멀티소스: K-MIMIC + SNUH 17개월 = 2025 전체 12 + 2026 Feb~Jun 5) ──
+# ⚠️ 순서 = shard_index_path 와 1:1 병렬(source i↔index i). 서버 SNUH 경로 다르면 두 리스트 함께 수정.
+# ⚠️ 로컬은 12개월=C:\...\Desktop\Shard, 5개월(202501~505)=F:\Shard 로 나뉘어 있으나
+#    서버 업로드 시 전부 .../snuh/{processed,sharded}/<월>/ 로 통일(아래 경로 기준).
 data_dir:
   - /home/coder/workspace/k-mimic-/bio_fm/data/train/k_mimic/
+  - /home/coder/workspace/k-mimic-/bio_fm/data/train/snuh/processed/202501/
+  - /home/coder/workspace/k-mimic-/bio_fm/data/train/snuh/processed/202502/
+  - /home/coder/workspace/k-mimic-/bio_fm/data/train/snuh/processed/202503/
+  - /home/coder/workspace/k-mimic-/bio_fm/data/train/snuh/processed/202504/
+  - /home/coder/workspace/k-mimic-/bio_fm/data/train/snuh/processed/202505/
+  - /home/coder/workspace/k-mimic-/bio_fm/data/train/snuh/processed/202506/
+  - /home/coder/workspace/k-mimic-/bio_fm/data/train/snuh/processed/202507/
+  - /home/coder/workspace/k-mimic-/bio_fm/data/train/snuh/processed/202508/
+  - /home/coder/workspace/k-mimic-/bio_fm/data/train/snuh/processed/202509/
+  - /home/coder/workspace/k-mimic-/bio_fm/data/train/snuh/processed/202510/
+  - /home/coder/workspace/k-mimic-/bio_fm/data/train/snuh/processed/202511/
+  - /home/coder/workspace/k-mimic-/bio_fm/data/train/snuh/processed/202512/
   - /home/coder/workspace/k-mimic-/bio_fm/data/train/snuh/processed/202602/
   - /home/coder/workspace/k-mimic-/bio_fm/data/train/snuh/processed/202603/
   - /home/coder/workspace/k-mimic-/bio_fm/data/train/snuh/processed/202604/
+  - /home/coder/workspace/k-mimic-/bio_fm/data/train/snuh/processed/202605/
   - /home/coder/workspace/k-mimic-/bio_fm/data/train/snuh/processed/202606/
 signal_types: [0, 1, 2, 3, 4, 5, 6, 7, 8]  # ECG ABP PPG CVP CO2 AWP ICP RESP_Imp RESP_Flow (v2 9종, PAP는 remap_record_v2가 load-time drop)
 max_subjects: null
@@ -75,15 +90,28 @@ modality_balanced_w_max_ratio: 5.0   # recording 가중치 상한 = 5 × mean(w)
 #    shard 를 연속 read → 1-slot 유지 가능. SNUH shard 도 ~500MB/개.
 shard_index_path:
   - /home/coder/workspace/k-mimic-/bio_fm/data/train/k_mimic_shard_500mb/shard_index.json
+  - /home/coder/workspace/k-mimic-/bio_fm/data/train/snuh/sharded/202501/shard_index.json
+  - /home/coder/workspace/k-mimic-/bio_fm/data/train/snuh/sharded/202502/shard_index.json
+  - /home/coder/workspace/k-mimic-/bio_fm/data/train/snuh/sharded/202503/shard_index.json
+  - /home/coder/workspace/k-mimic-/bio_fm/data/train/snuh/sharded/202504/shard_index.json
+  - /home/coder/workspace/k-mimic-/bio_fm/data/train/snuh/sharded/202505/shard_index.json
+  - /home/coder/workspace/k-mimic-/bio_fm/data/train/snuh/sharded/202506/shard_index.json
+  - /home/coder/workspace/k-mimic-/bio_fm/data/train/snuh/sharded/202507/shard_index.json
+  - /home/coder/workspace/k-mimic-/bio_fm/data/train/snuh/sharded/202508/shard_index.json
+  - /home/coder/workspace/k-mimic-/bio_fm/data/train/snuh/sharded/202509/shard_index.json
+  - /home/coder/workspace/k-mimic-/bio_fm/data/train/snuh/sharded/202510/shard_index.json
+  - /home/coder/workspace/k-mimic-/bio_fm/data/train/snuh/sharded/202511/shard_index.json
+  - /home/coder/workspace/k-mimic-/bio_fm/data/train/snuh/sharded/202512/shard_index.json
   - /home/coder/workspace/k-mimic-/bio_fm/data/train/snuh/sharded/202602/shard_index.json
   - /home/coder/workspace/k-mimic-/bio_fm/data/train/snuh/sharded/202603/shard_index.json
   - /home/coder/workspace/k-mimic-/bio_fm/data/train/snuh/sharded/202604/shard_index.json
+  - /home/coder/workspace/k-mimic-/bio_fm/data/train/snuh/sharded/202605/shard_index.json
   - /home/coder/workspace/k-mimic-/bio_fm/data/train/snuh/sharded/202606/shard_index.json
 shard_cache_size: 1            # OOM 회피 (locality sampler 가 sequential read 보장)
 
 # ── 학습 ──
-# ⚠️ 코퍼스가 1.203B→~1.85B (+54%). 아래는 K-MIMIC 레시피 그대로(=same recipe, more data).
-#    동일 revisit 유지를 원하면 max_batches/n_epochs 를 ~1.5× 상향 검토 (예산·과적합 트레이드오프).
+# ⚠️ 코퍼스 1.203B(K-MIMIC) + ~2.1B(SNUH 17개월) ≈ 3.3B (+175%). 아래는 K-MIMIC 레시피 그대로.
+#    3.3B는 Chinchilla ~170M 최적점 — 30M은 under-param. 동일 revisit 원하면 max_batches ~2× 상향.
 batch_size: 96                 # L40S 44GB
 lr: 8.0e-4
 weight_decay: 0.1              # AdamW decoupled WD (2D+ 텐서만)
