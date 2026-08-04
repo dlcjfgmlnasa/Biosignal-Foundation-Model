@@ -156,8 +156,15 @@ class BiosignalFoundationModel(nn.Module):
         # Conditioning redesign (2026-07-15): A=게이팅, B=peak enrichment (기본 off, config로 on).
         self.gate_unitless_cond = gate_unitless_cond
         self.enrich_cond_peak = enrich_cond_peak
-        # device-arbitrary loc/scale 을 가진 unitless modality (게이팅 대상): PPG=2, RESP_Imp=7.
-        self._gated_signal_types = (2, 7)
+        # loc/scale 이 물리적 영점에 추적되지 않는 modality (게이팅 대상):
+        #   ECG=0, PPG=2, RESP_Imp=7.
+        # PPG·RESP_Imp 는 unitless (device gain 이 진폭을 임의로 결정).
+        # ECG 는 명목상 mV 이나 (a) highpass 로 patch mean 이 항등적 0 → loc 정보량 없음,
+        # (b) 진폭은 환자별 상수에 가까워 (within/between rCV 비 0.065) 생리가 아닌 지문으로
+        # 작동한다. 무차원 형태((max-min)/std, max/|min|) 로도 환자 내 변동이 없어 기각.
+        # 근거: SNUH OR raw probe 2026-08-03 (모달리티당 60-644명, shard 5개).
+        # 비게이팅 6종 = ABP·CVP·ICP·CO2·AWP·RespFlow (모두 물리적 영점 기준 절대값).
+        self._gated_signal_types = (0, 2, 7)
 
         # 1. Scaler (point-level)
         self.scaler = scaler or PackedStdScaler()
@@ -450,12 +457,15 @@ class BiosignalFoundationModel(nn.Module):
             cond_stats = torch.cat([patch_loc, patch_scale], dim=-1)  # (B, N, 2)
         ada_cond = self.cond_proj(cond_stats)  # (B, N, d_cond)
 
-        # A(gate_unitless_cond): unitless modality(PPG·RESP_Imp)의 loc/scale conditioning
-        # 차단 (device 지문). 마스크는 cond_proj 출력에 — 입력에 걸면 bias 때문에 의미 깨짐.
+        # A(gate_unitless_cond): 물리적 영점에 추적되지 않는 modality(ECG·PPG·RESP_Imp)의
+        # loc/scale conditioning 차단 (device 지문 / 환자 지문).
+        # 마스크는 cond_proj 출력에 — 입력에 걸면 bias 때문에 의미 깨짐.
+        # NOTE: 게이팅해도 LSCNorm.modulation 의 bias 는 살아 있으므로, 해당 modality 는
+        # 입력 비의존적 affine 만 갖는 표준 정규화로 환원된다 (affine 자체가 사라지지 않음).
         if self.gate_unitless_cond and patch_signal_types is not None:
-            gated = (patch_signal_types == self._gated_signal_types[0]) | (
-                patch_signal_types == self._gated_signal_types[1]
-            )  # (B, N)
+            gated = torch.zeros_like(patch_signal_types, dtype=torch.bool)  # (B, N)
+            for st in self._gated_signal_types:
+                gated |= patch_signal_types == st
             ada_cond = ada_cond * (~gated).unsqueeze(-1)
 
         ada_cond = ada_cond * valid_token  # 패딩 위치는 0으로
