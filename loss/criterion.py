@@ -48,6 +48,8 @@ class CombinedLoss(nn.Module):
         contrastive_temperature: float = 0.07,
         learnable_temperature: bool = True,
         coupling_weights: dict[tuple[int, int], float] | None = None,
+        cross_masked_target_only: bool = True,
+        cross_observed_source_only: bool = True,
     ) -> None:
         super().__init__()
         self.alpha = alpha
@@ -66,6 +68,8 @@ class CombinedLoss(nn.Module):
             lambda_spec=lambda_spec,
             spec_n_ffts=spec_n_ffts,
             coupling_weights=coupling_weights,
+            cross_masked_target_only=cross_masked_target_only,
+            cross_observed_source_only=cross_observed_source_only,
         )
         if delta > 0:
             self.contrastive_loss_fn = CrossModalContrastiveLoss(
@@ -110,6 +114,7 @@ class CombinedLoss(nn.Module):
                 patch_variate_id,
                 time_id=time_id,
                 patch_signal_types=patch_signal_types,
+                pred_mask=pred_mask,
                 compute_next=compute_next,
                 compute_cross=compute_cross,
             )

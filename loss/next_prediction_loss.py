@@ -52,6 +52,15 @@ class NextPredictionLoss(nn.Module):
         Multi-Resolution STFT loss 가중치. 0이면 비활성.
     spec_n_ffts:
         STFT window 크기들.
+    cross_masked_target_only:
+        True 면 CMPM 타깃을 **마스킹된 패치**로 제한한다. False (구 동작) 면 같은
+        시점의 모든 유효 패치가 타깃이 되는데, 마스킹되지 않은 타깃은 원본 파형이
+        인코더 입력에 그대로 남아 있고 MPM 은 양방향 attention 이므로 소스 토큰이
+        타깃 토큰을 읽어 그대로 옮기는 copy shortcut 이 열린다.
+    cross_observed_source_only:
+        True 면 CMPM 소스를 **마스킹되지 않은(관측된) 패치**로 제한한다. 소스가
+        마스킹되면 그 자리는 [MASK] 로 대체되어 cross-modal 복원이 아니라 같은
+        모달리티의 문맥 추론이 된다.
     """
 
     def __init__(
@@ -60,11 +69,15 @@ class NextPredictionLoss(nn.Module):
         lambda_spec: float = 0.0,
         spec_n_ffts: tuple[int, ...] = (16, 32, 64),
         coupling_weights: dict[tuple[int, int], float] | None = None,
+        cross_masked_target_only: bool = True,
+        cross_observed_source_only: bool = True,
     ) -> None:
         super().__init__()
         self.peak_alpha = peak_alpha
         self.lambda_spec = lambda_spec
         self.spec_n_ffts = spec_n_ffts
+        self.cross_masked_target_only = cross_masked_target_only
+        self.cross_observed_source_only = cross_observed_source_only
         # Directed cross-modal coupling weights W[source→target] (soft CMPM).
         # None → allowlist 재현 기본값(_DEFAULT_COUPLING_W). dict override 시 그 값으로
         # (미지정 쌍 = 0 = γ 비활성, δ contrastive 만). buffer 로 등록해 device 이동 대응
@@ -89,6 +102,8 @@ class NextPredictionLoss(nn.Module):
         time_id: torch.Tensor | None = None,  # (B, N) long — cross-modal 페어링용
         patch_signal_types: torch.Tensor
         | None = None,  # (B, N) long — mechanism group 필터용
+        pred_mask: torch.Tensor
+        | None = None,  # (B, N) bool — 마스킹된 패치. CMPM 타깃/소스 제한에 사용
         compute_next: bool = True,
         compute_cross: bool = True,
     ) -> dict[str, torch.Tensor]:
@@ -138,6 +153,7 @@ class NextPredictionLoss(nn.Module):
                 patch_variate_id,
                 time_id,
                 patch_signal_types,
+                pred_mask,
             )
             cross_modal_loss = cross_dict["total"]
         else:
@@ -223,6 +239,7 @@ class NextPredictionLoss(nn.Module):
         patch_variate_id: torch.Tensor,  # (B, N) long
         time_id: torch.Tensor,  # (B, N) long
         patch_signal_types: torch.Tensor | None = None,  # (B, N) long
+        pred_mask: torch.Tensor | None = None,  # (B, N) bool — 마스킹된 패치
     ) -> dict[str, torch.Tensor]:
         """Cross-modal prediction loss (target-conditioned).
 
@@ -251,6 +268,25 @@ class NextPredictionLoss(nn.Module):
         ).unsqueeze(-2)
 
         cross_mask = same_group & diff_variate & both_valid & non_pad  # (B, N, N)
+
+        # ── 마스킹 제약: "관측된 소스 → 마스킹된 타깃" 만 CMPM 대상 ──
+        # cross_mask 축 규약: axis -2 = source(i), axis -1 = target(j)
+        # (아래 st_i/st_j 의 unsqueeze 방향과 동일). patch_mask 는 '유효/패딩'
+        # 플래그일 뿐 마스킹 여부가 아니므로, pred_mask 를 따로 적용해야 한다.
+        # 이 제약이 없으면 마스킹되지 않은 타깃의 원본이 인코더 입력에 남아 있어
+        # 양방향 attention 으로 복사 가능한 shortcut 이 된다.
+        if self.cross_masked_target_only or self.cross_observed_source_only:
+            if pred_mask is None:
+                raise ValueError(
+                    "cross_masked_target_only / cross_observed_source_only 가 켜져 "
+                    "있으면 pred_mask 를 반드시 넘겨야 합니다 (None 수신)."
+                )
+            if self.cross_masked_target_only:
+                # target j 가 마스킹된 경우만
+                cross_mask = cross_mask & pred_mask.unsqueeze(-2)
+            if self.cross_observed_source_only:
+                # source i 는 관측(비마스킹)된 경우만
+                cross_mask = cross_mask & (~pred_mask).unsqueeze(-1)
 
         # Directed coupling 필터: W[source→target] > 0 인 쌍만 (양의 가중).
         # st_i = source(예측 근거), st_j = target(복원 대상) — 방향 구분.
