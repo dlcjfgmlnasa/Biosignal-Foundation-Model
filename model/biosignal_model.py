@@ -561,9 +561,19 @@ class BiosignalFoundationModel(nn.Module):
         use_causal = task in ("next_pred", "both")
 
         # causal mask (next_pred, both에서 공유)
+        # ⚠️ packed 인덱스 하한삼각(torch.tril)은 any-variate packing 에서 인과성을
+        # 보장하지 못한다. 한 unit 안의 신호가 variate-major 로 놓이므로
+        # (ECG t0..t2 → PPG t0..t2 → ABP t0..t2), PPG@t0 의 packed 인덱스가 ECG@t2 보다
+        # 커서 "미래" ECG 를 참조하게 된다 (3-variate 예시에서 causal 허용칸의 18%).
+        # → 물리 시간(abs_time_id) 기준으로 비교한다. 같은 시각(t_j == t_i)의 cross-modal
+        #   참조는 허용하고 미래만 차단한다.
+        # Phase 1 (channel-independent) 은 블록마다 variate 가 하나뿐이라 packed 순서 =
+        # 시간 순서 → tril 과 결과가 동일하다 (기존 checkpoint 재현 가능).
         if use_causal:
-            causal_tri = torch.tril(torch.ones(n, n, dtype=torch.bool, device=device))
-            causal_mask = base_attn_mask & causal_tri.unsqueeze(0)  # (B, N, N)
+            causal_ok = abs_time_id.unsqueeze(-1) >= abs_time_id.unsqueeze(
+                -2
+            )  # (B, N, N) — t_i >= t_j
+            causal_mask = base_attn_mask & causal_ok  # (B, N, N)
 
         # bidirectional 입력: pred_mask | drop_mask 위치를 mask_token으로 교체
         bi_content_mask = drop_mask
