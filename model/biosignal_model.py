@@ -295,26 +295,35 @@ class BiosignalFoundationModel(nn.Module):
         patch_mask: torch.Tensor,  # (B, N)
         drop_prob: float,
     ) -> torch.Tensor | None:
-        """Complete Variate Dropout: 행별로 하나의 variate를 attention에서 완전히 제거.
+        """Complete Variate Dropout: **packing unit 별로** 하나의 variate를 attention에서 제거.
 
         Returns (B, N) bool mask — True = dropped from attention.
-        다변량(2+ variates)인 행에서만 작동. None if no drop.
+        다변량(2+ variates)인 unit 에서만 작동. None if no drop.
+
+        ⚠️ ``variate_id`` 는 packing unit 마다 1 부터 재시작하므로 반드시 ``p_sid`` 로
+        스코핑해야 한다. 행 전체에서 ``p_vid == chosen`` 을 비교하면 같은 행에 packing 된
+        **서로 다른 환자의 k번째 variate 가 함께 제거**된다.
         """
         b, n = p_vid.shape
         drop_mask = torch.zeros(b, n, dtype=torch.bool, device=p_vid.device)
         any_dropped = False
         for bi in range(b):
-            if torch.rand(1).item() >= drop_prob:
+            valid_idx = patch_mask[bi].nonzero(as_tuple=True)[0]
+            if len(valid_idx) == 0:
                 continue
-            valid = patch_mask[bi]
-            valid_vids = p_vid[bi][valid]
-            unique_vids = valid_vids[valid_vids > 0].unique()
-            if len(unique_vids) < 2:
-                continue  # 단일 variate → dropout 불가
-            # 랜덤으로 하나 선택
-            chosen = unique_vids[torch.randint(len(unique_vids), (1,))]
-            drop_mask[bi] = (p_vid[bi] == chosen) & valid
-            any_dropped = True
+            row_sids = p_sid[bi, valid_idx]
+            for uid in row_sids.unique():
+                if torch.rand(1).item() >= drop_prob:
+                    continue
+                u_idx = valid_idx[row_sids == uid]
+                u_vids = p_vid[bi, u_idx]
+                unique_vids = u_vids[u_vids > 0].unique()
+                if len(unique_vids) < 2:
+                    continue  # 단일 variate unit → dropout 불가
+                # 랜덤으로 하나 선택
+                chosen = unique_vids[torch.randint(len(unique_vids), (1,)).item()]
+                drop_mask[bi, u_idx[u_vids == chosen]] = True
+                any_dropped = True
         return drop_mask if any_dropped else None
 
     @classmethod
@@ -482,6 +491,9 @@ class BiosignalFoundationModel(nn.Module):
                 block_mask=block_mask,
                 block_size_min=block_size_min,
                 block_size_max=block_size_max,
+                # unit 스코핑은 variate-level 마스킹이 켜진 경우에만 활성 (Phase 2).
+                # Phase 1 (variate_mask_prob=0) 은 구 동작 그대로 → 기존 ckpt 재현 가능.
+                patch_sample_id=p_sid if variate_mask_prob > 0 else None,
             )
 
         # 8. Base Attention Mask: 같은 sample 내에서만 attend + 유효 패치만

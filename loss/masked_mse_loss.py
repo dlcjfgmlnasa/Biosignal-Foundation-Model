@@ -200,6 +200,7 @@ def create_patch_mask(
     block_mask: bool = False,  # True면 연속 블록 마스킹
     block_size_min: int = 3,  # 블록 최소 크기 (패치 수)
     block_size_max: int = 8,  # 블록 최대 크기 (패치 수)
+    patch_sample_id: torch.Tensor | None = None,  # (B, N) — packing unit 식별자
 ) -> torch.Tensor:  # (B, N) bool — 마스킹 대상 (True=마스킹)
     """패치 마스킹 생성.
 
@@ -221,6 +222,13 @@ def create_patch_mask(
         블록 최소 크기 (패치 수). 기본 3 (3초).
     block_size_max:
         블록 최대 크기 (패치 수). 기본 8 (8초).
+    patch_sample_id:
+        패치별 sample_id (packing unit 식별자). **None 이면 행 전체를 하나의 unit 으로
+        취급하는 구 동작**(Phase 1 재현용). 주어지면 unit 단위로 스코핑한다 —
+        ``variate_id`` 는 unit 마다 1 부터 재시작하므로, 이것 없이 행 전체에서
+        ``patch_variate_id == chosen`` 을 비교하면 서로 다른 환자의 k번째 variate 가
+        **동시에** 마스킹되고, chosen 번호가 없는 unit 은 마스킹이 0개가 되어 그 스텝의
+        MPM·CMPM 기여가 사라진다.
 
     Returns
     -------
@@ -233,90 +241,149 @@ def create_patch_mask(
     pred_mask = torch.zeros(b, n, dtype=torch.bool, device=device)
 
     for bi in range(b):
-        valid_idx = patch_mask[bi].nonzero(as_tuple=True)[0]  # 유효 패치 인덱스
-        if len(valid_idx) == 0:
+        row_valid_idx = patch_mask[bi].nonzero(as_tuple=True)[0]  # 유효 패치 인덱스
+        if len(row_valid_idx) == 0:
             continue
 
-        # variate-level 마스킹 (Phase 2)
-        if (
-            variate_mask_prob > 0
-            and patch_variate_id is not None
-            and torch.rand(1).item() < variate_mask_prob
-        ):
-            valid_var_ids = patch_variate_id[bi, valid_idx]
-            unique_vars = valid_var_ids[valid_var_ids > 0].unique()
-            if len(unique_vars) > 1:
-                chosen_var = unique_vars[torch.randint(len(unique_vars), (1,)).item()]
-                var_mask = patch_variate_id[bi] == chosen_var
-                pred_mask[bi] = var_mask & patch_mask[bi]
+        # packing unit 분해. patch_sample_id 가 None 이면 행 전체 = 1 unit (구 동작).
+        if patch_sample_id is None:
+            unit_groups = [row_valid_idx]
+        else:
+            row_sids = patch_sample_id[bi, row_valid_idx]
+            unit_groups = [row_valid_idx[row_sids == uid] for uid in row_sids.unique()]
+
+        for valid_idx in unit_groups:
+            if len(valid_idx) == 0:
                 continue
 
-        n_valid = len(valid_idx)
-        n_mask = max(1, int(n_valid * mask_ratio))
+            # variate-level 마스킹 (Phase 2) — 이 unit 안에서만 선택
+            if (
+                variate_mask_prob > 0
+                and patch_variate_id is not None
+                and torch.rand(1).item() < variate_mask_prob
+            ):
+                valid_var_ids = patch_variate_id[bi, valid_idx]
+                unique_vars = valid_var_ids[valid_var_ids > 0].unique()
+                if len(unique_vars) > 1:
+                    chosen_var = unique_vars[
+                        torch.randint(len(unique_vars), (1,)).item()
+                    ]
+                    if patch_sample_id is None:
+                        # 구 동작 보존: 행 전체에 broadcast
+                        pred_mask[bi] = (
+                            patch_variate_id[bi] == chosen_var
+                        ) & patch_mask[bi]
+                    else:
+                        pred_mask[bi, valid_idx[valid_var_ids == chosen_var]] = True
+                    continue
+                # 단일 variate unit → 아래 block/random 마스킹으로 폴백
+                # (구 동작은 여기서 행 전체가 block 마스킹으로 넘어갔다)
 
-        if block_mask and n_valid >= block_size_min:
-            # ── Block Masking ──
-            # variate별로 연속 구간을 찾아 블록 단위로 마스킹.
-            # 블록 배치 후 해당 영역을 run에서 제외하여 중복/인접 배치를 방지한다.
-            masked_count = 0
-            # valid_idx는 정렬되어 있으므로 연속 구간(run) 추출
-            runs = _find_contiguous_runs(valid_idx)
+            n_valid = len(valid_idx)
+            n_mask = max(1, int(n_valid * mask_ratio))
 
-            while masked_count < n_mask and runs:
-                # 배치 가능한 run만 필터링
-                eligible = [
-                    (i, s, l) for i, (s, l) in enumerate(runs) if l >= block_size_min
-                ]
-                if not eligible:
-                    break
+            if block_mask and n_valid >= block_size_min:
+                # ── Block Masking ──
+                # variate별로 연속 구간을 찾아 블록 단위로 마스킹.
+                # 블록 배치 후 해당 영역을 run에서 제외하여 중복/인접 배치를 방지한다.
+                masked_count = 0
+                # valid_idx는 정렬되어 있으므로 연속 구간(run) 추출.
+                # unit 스코핑 시에는 variate 경계도 끊어, 하나의 블록이 서로 다른
+                # 신호에 걸치지 않도록 한다.
+                if patch_sample_id is not None and patch_variate_id is not None:
+                    runs = _find_contiguous_runs_grouped(
+                        valid_idx, patch_variate_id[bi, valid_idx]
+                    )
+                else:
+                    runs = _find_contiguous_runs(valid_idx)
 
-                # 랜덤 run 선택
-                pick = torch.randint(0, len(eligible), (1,)).item()
-                _, run_start, run_len = eligible[pick]
+                while masked_count < n_mask and runs:
+                    # 배치 가능한 run만 필터링
+                    eligible = [
+                        (i, s, l)
+                        for i, (s, l) in enumerate(runs)
+                        if l >= block_size_min
+                    ]
+                    if not eligible:
+                        break
 
-                bs = torch.randint(
-                    block_size_min, min(block_size_max, run_len) + 1, (1,)
-                ).item()
-                bs = min(bs, n_mask - masked_count)  # 초과 방지
-                if bs < 1:
-                    break
+                    # 랜덤 run 선택
+                    pick = torch.randint(0, len(eligible), (1,)).item()
+                    _, run_start, run_len = eligible[pick]
 
-                max_start = run_len - bs
-                offset = torch.randint(0, max_start + 1, (1,)).item()
-                start_idx = run_start + offset
-                pred_mask[bi, start_idx : start_idx + bs] = True
-                masked_count += bs
+                    bs = torch.randint(
+                        block_size_min, min(block_size_max, run_len) + 1, (1,)
+                    ).item()
+                    bs = min(bs, n_mask - masked_count)  # 초과 방지
+                    if bs < 1:
+                        break
 
-                # 배치된 블록 영역 + 양옆 1패치 gap을 run에서 제거
-                ri = eligible[pick][0]
-                old_start, old_len = runs[ri]
-                old_end = old_start + old_len
-                new_runs: list[tuple[int, int]] = []
-                # 왼쪽 sub-run (1패치 gap 확보)
-                left_len = start_idx - old_start - 1
-                if left_len > 0:
-                    new_runs.append((old_start, left_len))
-                # 오른쪽 sub-run (1패치 gap 확보)
-                right_start = start_idx + bs + 1
-                right_len = old_end - right_start
-                if right_len > 0:
-                    new_runs.append((right_start, right_len))
-                # 기존 run을 교체 (block_size_min 미만 run도 보존 — eligible 필터가 걸러줌)
-                runs = runs[:ri] + new_runs + runs[ri + 1 :]
+                    max_start = run_len - bs
+                    offset = torch.randint(0, max_start + 1, (1,)).item()
+                    start_idx = run_start + offset
+                    pred_mask[bi, start_idx : start_idx + bs] = True
+                    masked_count += bs
 
-            # 목표 미달 시 랜덤으로 나머지 채움
-            if masked_count < n_mask:
-                remaining = valid_idx[~pred_mask[bi, valid_idx]]
-                if len(remaining) > 0:
-                    extra = min(n_mask - masked_count, len(remaining))
-                    perm = torch.randperm(len(remaining), device=device)[:extra]
-                    pred_mask[bi, remaining[perm]] = True
-        else:
-            # ── Random Masking (기본) ──
-            perm = torch.randperm(n_valid, device=device)[:n_mask]
-            pred_mask[bi, valid_idx[perm]] = True
+                    # 배치된 블록 영역 + 양옆 1패치 gap을 run에서 제거
+                    ri = eligible[pick][0]
+                    old_start, old_len = runs[ri]
+                    old_end = old_start + old_len
+                    new_runs: list[tuple[int, int]] = []
+                    # 왼쪽 sub-run (1패치 gap 확보)
+                    left_len = start_idx - old_start - 1
+                    if left_len > 0:
+                        new_runs.append((old_start, left_len))
+                    # 오른쪽 sub-run (1패치 gap 확보)
+                    right_start = start_idx + bs + 1
+                    right_len = old_end - right_start
+                    if right_len > 0:
+                        new_runs.append((right_start, right_len))
+                    # 기존 run을 교체 (block_size_min 미만 run도 보존 — eligible 필터가 걸러줌)
+                    runs = runs[:ri] + new_runs + runs[ri + 1 :]
+
+                # 목표 미달 시 랜덤으로 나머지 채움
+                if masked_count < n_mask:
+                    remaining = valid_idx[~pred_mask[bi, valid_idx]]
+                    if len(remaining) > 0:
+                        extra = min(n_mask - masked_count, len(remaining))
+                        perm = torch.randperm(len(remaining), device=device)[:extra]
+                        pred_mask[bi, remaining[perm]] = True
+            else:
+                # ── Random Masking (기본) ──
+                perm = torch.randperm(n_valid, device=device)[:n_mask]
+                pred_mask[bi, valid_idx[perm]] = True
 
     return pred_mask
+
+
+def _find_contiguous_runs_grouped(
+    indices: torch.Tensor,  # (K,) sorted 인덱스
+    group_key: torch.Tensor,  # (K,) indices 와 같은 순서의 그룹 키 (예: variate_id)
+) -> list[tuple[int, int]]:
+    """인덱스가 연속이면서 **같은 그룹**인 구간 (start, length) 리스트를 반환한다.
+
+    ``_find_contiguous_runs`` 는 인덱스 연속성만 보므로, packed 시퀀스에서 서로 다른
+    신호(variate)가 이어 붙은 지점을 하나의 run 으로 잇는다. 그 run 에 블록을 놓으면
+    한 블록이 두 신호에 걸쳐 "연속 6-16초 구간" 이라는 전제가 깨진다.
+    """
+    if len(indices) == 0:
+        return []
+    runs: list[tuple[int, int]] = []
+    start = indices[0].item()
+    prev = start
+    prev_g = group_key[0].item()
+    for i in range(1, len(indices)):
+        cur = indices[i].item()
+        cur_g = group_key[i].item()
+        if cur == prev + 1 and cur_g == prev_g:
+            prev = cur
+        else:
+            runs.append((start, prev - start + 1))
+            start = cur
+            prev = cur
+            prev_g = cur_g
+    runs.append((start, prev - start + 1))
+    return runs
 
 
 def _find_contiguous_runs(
