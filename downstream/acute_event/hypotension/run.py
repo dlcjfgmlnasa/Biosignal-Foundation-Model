@@ -934,8 +934,12 @@ def main() -> None:
         "--mode",
         type=str,
         default="linear_probe",
-        choices=["linear_probe", "lora"],
-        help="linear_probe: frozen encoder, lora: LoRA adapters",
+        choices=["linear_probe", "lora", "scratch"],
+        help=(
+            "linear_probe: frozen encoder, lora: LoRA adapters, "
+            "scratch: 동일 구조 random init + 전체 파라미터 학습 (사전학습 대조군). "
+            "scratch 도 --checkpoint 이 필요하나 ModelConfig 만 읽고 가중치는 버린다."
+        ),
     )
     parser.add_argument("--lora-rank", type=int, default=8, help="LoRA rank")
     parser.add_argument("--lora-alpha", type=float, default=16.0, help="LoRA alpha")
@@ -1003,8 +1007,18 @@ def main() -> None:
     elif args.checkpoint:
         from downstream.model_wrapper import DownstreamModelWrapper
 
-        print(f"Loading checkpoint: {args.checkpoint}")
-        model = DownstreamModelWrapper(args.checkpoint, args.model_version, args.device)
+        # scratch: 가중치는 버리고 ModelConfig 만 재사용 → 사전학습 모델과 아키텍처
+        # 동일한 random-init 대조군 (파라미터 수가 자동으로 일치).
+        if args.mode == "scratch":
+            print(f"Reading ModelConfig only (weights discarded): {args.checkpoint}")
+        else:
+            print(f"Loading checkpoint: {args.checkpoint}")
+        model = DownstreamModelWrapper(
+            args.checkpoint,
+            args.model_version,
+            args.device,
+            init_random=(args.mode == "scratch"),
+        )
         d_model = model.d_model
 
         if args.mode == "lora":
@@ -1019,7 +1033,11 @@ def main() -> None:
     sig_str = " + ".join(s.upper() for s in args.input_signals)
     print(f"Mode: {args.mode} | Input: {sig_str} | Window: {args.window_sec}s")
 
-    is_lora = args.mode == "lora"
+    # is_lora = "encoder 를 함께 학습하는 end-to-end 경로" 플래그다(데이터 로딩·
+    # on-the-fly batch·DDP wrap·best_model_state 저장이 모두 이 경로를 공유).
+    # scratch 는 학습 대상 파라미터만 다르므로(전체 vs LoRA adapter) 같은 경로를 탄다.
+    is_scratch = args.mode == "scratch"
+    is_lora = args.mode in ("lora", "scratch")
     load_fold = int(args.fold) if int(args.n_folds) > 1 else None
 
     # ── 데이터 로드 (Patch A: train/val/test 3-way) — 메모리 절약 로딩 ──
@@ -1261,16 +1279,28 @@ def main() -> None:
     probe = LinearProbe(d_model, n_classes=1)
 
     if is_lora:
-        n_lora = sum(p.numel() for p in model.lora_parameters())
-        n_probe = sum(p.numel() for p in probe.parameters())
-        print(
-            f"\nTraining LoRA + Probe (rank={args.lora_rank}, "
-            f"LoRA={n_lora:,} + Probe={n_probe:,} params)..."
+        # 학습 대상 encoder 파라미터: lora=adapter 만, scratch=encoder 전체.
+        enc_params = (
+            [p for p in model.model.parameters() if p.requires_grad]
+            if is_scratch
+            else model.lora_parameters()
         )
+        n_enc = sum(p.numel() for p in enc_params)
+        n_probe = sum(p.numel() for p in probe.parameters())
+        if is_scratch:
+            print(
+                f"\nTraining from scratch (random init, full encoder="
+                f"{n_enc:,} + Probe={n_probe:,} params)..."
+            )
+        else:
+            print(
+                f"\nTraining LoRA + Probe (rank={args.lora_rank}, "
+                f"LoRA={n_enc:,} + Probe={n_probe:,} params)..."
+            )
         probe = probe.to(device)
         probe.train()
         model.model.train()
-        lora_params = model.lora_parameters()
+        lora_params = enc_params
         optimizer = torch.optim.AdamW(
             [
                 {"params": lora_params, "lr": args.lr},

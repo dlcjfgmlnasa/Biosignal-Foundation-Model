@@ -64,6 +64,19 @@ LORA_ALPHA=${LORA_ALPHA:-16}
 # 전 fold/config 는 동일 (실행모드 × effective batch × LR) 로 고정해야 표 비교 성립.
 LORA_BATCH=${LORA_BATCH:-128}
 
+# ── Scratch 설정 (random init + 전체 파라미터 end-to-end 학습) ──
+# 사전학습 대조군(CARMEN-scratch, Table 3). LoRA 는 adapter 만 학습하지만 scratch 는
+# encoder 전체를 학습하므로 epoch 상한을 크게 낮춘다(LORA 200 → 30). early-stop
+# (SCRATCH_PATIENCE)이 val AUROC 수렴 시 자동 중단한다.
+# ⚠ 결과 json 의 best_epoch 이 상한(SCRATCH_EPOCHS)에 붙어 있으면 아직 개선 중이라
+#   잘린 것이다 — 그 경우 SCRATCH_EPOCHS 를 올려 재실행해야 대조군이 공정하다.
+# LR 은 LoRA(1e-4) 보다 높게 잡는다: 사전학습 가중치에서 출발하는 미세조정이 아니라
+# random init 에서 처음 학습하는 것이라 더 큰 step 이 필요하다.
+SCRATCH_EPOCHS=${SCRATCH_EPOCHS:-30}
+SCRATCH_PATIENCE=${SCRATCH_PATIENCE:-5}
+SCRATCH_LR=${SCRATCH_LR:-3e-4}
+SCRATCH_BATCH=${SCRATCH_BATCH:-128}
+
 # ── 한 fold 를 여러 GPU 로 DDP 실행 (단일 fold 데이터 병렬, fold 는 순차) ──
 # 기본 NPROC=4: 각 fold 를 torchrun --nproc_per_node=4 로 4-GPU DDP 실행한다
 # (linear_probe=feature 추출 shard→gather, lora=grad all-reduce; 저장은 rank0 전담).
@@ -105,6 +118,12 @@ log "  Horizons:   ${HORIZONS[*]}"
 log "  Modes:      ${MODES[*]}"
 log "  Total:      $TOTAL experiments"
 log "  LoRA batch: $LORA_BATCH  (NPROC=$NPROC → eff $((LORA_BATCH * NPROC)))"
+case " ${MODES[*]} " in
+    *" scratch "*)
+        log "  Scratch:    epochs≤$SCRATCH_EPOCHS  lr=$SCRATCH_LR  batch=$SCRATCH_BATCH  patience=$SCRATCH_PATIENCE"
+        log "              (checkpoint 은 ModelConfig 용으로만 읽고 가중치는 버림)"
+        ;;
+esac
 log "  PRINT_ONLY: $PRINT_ONLY"
 if [ "$LORA_BATCH" != "32" ]; then
     log "  ⚠ LoRA batch≠32: 결과가 batch=32 기준선과 비교 불가 — LR 재튜닝 권장"
@@ -136,6 +155,12 @@ for SIGNALS in "${SIGNAL_COMBOS[@]}"; do
                     BATCH=$LP_BATCH
                     EXTRA_ARGS=""
                     PAT=0                       # LP 는 early-stop 없이 1000 고정
+                elif [ "$MODE" = "scratch" ]; then
+                    EPOCHS=$SCRATCH_EPOCHS
+                    LR=$SCRATCH_LR
+                    BATCH=$SCRATCH_BATCH
+                    EXTRA_ARGS=""               # LoRA 미주입 (전체 파라미터 학습)
+                    PAT=$SCRATCH_PATIENCE
                 else
                     EPOCHS=$LORA_EPOCHS
                     LR=$LORA_LR
@@ -167,7 +192,10 @@ for SIGNALS in "${SIGNAL_COMBOS[@]}"; do
 
                     loge "\n[${COUNT}/${TOTAL}] ${MODE} | ${SIGNALS} | w=${W}s h=${H}min | fold ${f}"
 
-                    CMD="EARLY_STOP_PATIENCE=$PAT $LAUNCH downstream.acute_event.hypotension.run \
+                    # ⚠ env-var 접두어는 `env` 명령으로 감싼다: 직접 eval(셸)뿐 아니라
+                    #   run_sharded(shlex.split+Popen, 셸 미경유)에서도 실행되게 하기 위함.
+                    #   (그냥 'VAR=0 python' 이면 run_sharded 가 'VAR=0' 을 실행파일로 오인해 실패)
+                    CMD="env EARLY_STOP_PATIENCE=$PAT $LAUNCH downstream.acute_event.hypotension.run \
                         --checkpoint $CHECKPOINT \
                         --model-version $MODEL_VERSION \
                         --mode $MODE \
