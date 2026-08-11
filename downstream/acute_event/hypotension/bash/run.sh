@@ -72,10 +72,18 @@ LORA_BATCH=${LORA_BATCH:-128}
 #   잘린 것이다 — 그 경우 SCRATCH_EPOCHS 를 올려 재실행해야 대조군이 공정하다.
 # LR 은 LoRA(1e-4) 보다 높게 잡는다: 사전학습 가중치에서 출발하는 미세조정이 아니라
 # random init 에서 처음 학습하는 것이라 더 큰 step 이 필요하다.
+#
+# ⚠ batch 는 LoRA(128) 보다 작아야 한다. LoRA 는 base weight 가 frozen 이라 autograd
+#   가 그 Linear 들의 입력 activation 을 저장하지 않지만(weight grad 불필요), scratch
+#   는 q/k/v/out/fc1/fc2/gate 전부가 학습 대상이라 입력을 backward 까지 들고 있어야
+#   한다. 실측: L40S(44 GB)에서 SCRATCH_BATCH=128 은 OOM, 32 로 낮춰야 한다.
+#   여전히 OOM 이면 16 으로 내리고 PYTORCH_ALLOC_CONF=expandable_segments:True 를
+#   함께 준다 (memory project_expandable_segments_oom).
+#   ⚠ 한 task 의 전 fold·horizon 은 같은 batch 로 돌아야 표 비교가 성립한다.
 SCRATCH_EPOCHS=${SCRATCH_EPOCHS:-30}
 SCRATCH_PATIENCE=${SCRATCH_PATIENCE:-5}
 SCRATCH_LR=${SCRATCH_LR:-3e-4}
-SCRATCH_BATCH=${SCRATCH_BATCH:-128}
+SCRATCH_BATCH=${SCRATCH_BATCH:-32}
 
 # ── 한 fold 를 여러 GPU 로 DDP 실행 (단일 fold 데이터 병렬, fold 는 순차) ──
 # 기본 NPROC=4: 각 fold 를 torchrun --nproc_per_node=4 로 4-GPU DDP 실행한다
