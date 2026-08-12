@@ -306,7 +306,11 @@ def main() -> None:
     parser.add_argument("--model-version", type=str, default="v1", choices=["v1", "v2"])
     parser.add_argument("--data-path", type=str, required=True)
     parser.add_argument("--mode", type=str, default="linear_probe",
-                        choices=["linear_probe", "lora"])
+                        choices=["linear_probe", "lora", "scratch"],
+                        help="linear_probe: frozen encoder, lora: LoRA adapters, "
+                             "scratch: 동일 구조 random init + 전체 파라미터 학습 "
+                             "(사전학습 대조군). scratch 도 --checkpoint 이 필요하나 "
+                             "ModelConfig 만 읽고 가중치는 버린다.")
     parser.add_argument("--lora-rank", type=int, default=8)
     parser.add_argument("--lora-alpha", type=float, default=16.0)
     parser.add_argument("--epochs", type=int, default=100)
@@ -341,8 +345,18 @@ def main() -> None:
 
     from downstream.model_wrapper import DownstreamModelWrapper
 
-    print(f"Loading checkpoint: {args.checkpoint}")
-    model = DownstreamModelWrapper(args.checkpoint, args.model_version, args.device)
+    # scratch: 가중치는 버리고 ModelConfig 만 재사용 → 사전학습 모델과 아키텍처
+    # 동일한 random-init 대조군 (파라미터 수가 자동으로 일치).
+    if args.mode == "scratch":
+        print(f"Reading ModelConfig only (weights discarded): {args.checkpoint}")
+    else:
+        print(f"Loading checkpoint: {args.checkpoint}")
+    model = DownstreamModelWrapper(
+        args.checkpoint,
+        args.model_version,
+        args.device,
+        init_random=(args.mode == "scratch"),
+    )
     d_model = model.d_model
 
     if args.mode == "lora":
@@ -361,7 +375,11 @@ def main() -> None:
           f"{n_pos_test / max(len(test_windows), 1) * 100:.1f}%)")
 
     probe = LinearProbe(d_model, n_classes=1)
-    is_lora = args.mode == "lora"
+    # is_lora = "encoder 를 함께 학습하는 end-to-end 경로" 플래그다(batch 빌드·DDP
+    # wrap·best_model_state 저장이 이 경로를 공유). scratch 는 학습 대상 파라미터만
+    # 다르므로(전체 vs LoRA adapter) 같은 경로를 탄다. — IOH 러너와 동일 패턴.
+    is_scratch = args.mode == "scratch"
+    is_lora = args.mode in ("lora", "scratch")
 
     # ── 준비: linear_probe=frozen feature 캐싱 / lora=batch 빌드 + DDP shard ──
     # IOH/ICH 와 동일하게 매 epoch val AUROC 로 best-ckpt 를 잡고, 마지막에 best-val
@@ -433,7 +451,12 @@ def main() -> None:
                 val_windows, args.batch_size, args.patch_size, max_length,
             )
         probe = probe.to(device)
-        lora_params = model.lora_parameters()
+        # 학습 대상 encoder 파라미터: lora=adapter 만, scratch=encoder 전체.
+        lora_params = (
+            [p for p in model.model.parameters() if p.requires_grad]
+            if is_scratch
+            else model.lora_parameters()
+        )
         optimizer = torch.optim.AdamW(
             [
                 {"params": lora_params, "lr": args.lr},
@@ -444,9 +467,13 @@ def main() -> None:
         # DDP: encode→pool→probe 를 한 forward 로 묶어 grad all-reduce 등록. 단일 GPU
         # 면 use_ddp=False → ddp_module=None → 기존 _make/forward 경로 그대로(불변).
         ddp_module = wrap_lora_ddp(model.model, probe) if use_ddp else None
-        n_lora = sum(p.numel() for p in model.lora_parameters())
-        print(f"\nTraining LoRA + Probe (rank={args.lora_rank}, LoRA={n_lora:,}) "
-              f"with val best-ckpt...")
+        n_enc = sum(p.numel() for p in lora_params)
+        if is_scratch:
+            print(f"\nTraining from scratch (random init, full encoder={n_enc:,}) "
+                  f"with val best-ckpt...")
+        else:
+            print(f"\nTraining LoRA + Probe (rank={args.lora_rank}, LoRA={n_enc:,}) "
+                  f"with val best-ckpt...")
 
     criterion = nn.BCEWithLogitsLoss()
     train_losses: list[float] = []
