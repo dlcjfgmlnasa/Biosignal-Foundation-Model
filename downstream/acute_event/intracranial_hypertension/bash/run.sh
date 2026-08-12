@@ -54,6 +54,19 @@ LORA_BATCH="${LORA_BATCH:-8}"
 #   늘리고 실질 batch 만 키워 이를 없앤다. hypotension 은 실질 512(128×4)로 학습한다.
 #   기본 1 = 기존 동작 그대로. Frozen 과 공정 비교하려면 LORA_ACCUM=16(→512) 권장.
 LORA_ACCUM="${LORA_ACCUM:-1}"
+# ── CARMEN-scratch (random init + 전체 파라미터 end-to-end 학습) ──
+# 사전학습 대조군(Table 3). MODES=scratch 로 실행한다.
+# ⚠ batch 는 LoRA(8) 보다 더 작아야 한다. LoRA 는 base weight 가 frozen 이라 autograd
+#   가 그 Linear 들의 입력 activation 을 저장하지 않지만(weight grad 불필요), scratch 는
+#   q/k/v/out/fc1/fc2/gate 전부가 학습 대상이라 입력을 backward 까지 보유한다.
+#   ICH 는 window 가 20min(~1200 token)으로 전 task 중 가장 길어 특히 취약하다.
+#   → batch 4 + accum 2 로 실질 batch 는 LoRA 기본(8×4×1=32)과 같게 맞춘다.
+#   OOM 시 PYTORCH_ALLOC_CONF=expandable_segments:True, 그래도 나면 SCRATCH_BATCH=2·ACCUM=4.
+# ⚠ 한 task 의 전 fold·horizon 은 같은 batch/LR 로 돌아야 표 비교가 성립한다.
+SCRATCH_EPOCHS="${SCRATCH_EPOCHS:-30}"
+SCRATCH_LR="${SCRATCH_LR:-3e-4}"
+SCRATCH_BATCH="${SCRATCH_BATCH:-4}"
+SCRATCH_ACCUM="${SCRATCH_ACCUM:-2}"
 # PROBE_LR / PROBE_WD: LoRA 의 head 전용 LR·weight decay (미지정이면 기존 동작).
 #   LoRA 는 best epoch(~11)까지 head 가 2.4k step × 1e-4 만 밟는데, frozen
 #   linear_probe 의 head 는 881k step × 1e-3 을 밟는다(LR×step 3,600배). AdamW 전역
@@ -107,6 +120,12 @@ echo "  Output:     $OUT_DIR"
 echo "  Input:      $SIGNALS  Window: ${WINDOW_SECS[*]}s  Horizon: ${HORIZON_MINS[*]}min"
 echo "  LoRA batch: $LORA_BATCH  (NPROC=$NPROC × accum=$LORA_ACCUM → eff $((LORA_BATCH * NPROC * LORA_ACCUM)))"
 [ "$HEAD_WARMUP" != "0" ] && echo "  Head warm-start: ${HEAD_WARMUP}ep (LP→LoRA, lr=${PROBE_LR:-1e-3})"
+case " ${MODES:-linear_probe lora} " in
+    *" scratch "*)
+        echo "  Scratch: epochs=$SCRATCH_EPOCHS lr=$SCRATCH_LR batch=$SCRATCH_BATCH × accum=$SCRATCH_ACCUM (eff $((SCRATCH_BATCH * NPROC * SCRATCH_ACCUM)))"
+        echo "           (checkpoint 은 ModelConfig 용으로만 읽고 가중치는 버림, warm-start 미적용)"
+        ;;
+esac
 echo "============================================================"
 
 for WIN in "${WINDOW_SECS[@]}"; do
@@ -123,11 +142,16 @@ for WIN in "${WINDOW_SECS[@]}"; do
 
         EXP_NAME="w${WIN}s_h${HORIZON}min"
 
-        # MODES env 로 실행할 모드 선택 (기본 둘 다). LP 만: MODES=linear_probe
+        # MODES env 로 실행할 모드 선택 (기본 LP+LoRA). LP 만: MODES=linear_probe
+        # 사전학습 대조군만: MODES=scratch
         for MODE in ${MODES:-linear_probe lora}; do
             if [ "$MODE" = "linear_probe" ]; then
                 EPOCHS="$LP_EPOCHS"; LR="$LP_LR"
                 EXTRA="--batch-size $LP_BATCH"
+            elif [ "$MODE" = "scratch" ]; then
+                # LoRA 미주입·warm-start 미적용(run.py 가 is_scratch 로 건너뜀).
+                EPOCHS="$SCRATCH_EPOCHS"; LR="$SCRATCH_LR"
+                EXTRA="--batch-size $SCRATCH_BATCH --grad-accum $SCRATCH_ACCUM"
             else
                 EPOCHS="$LORA_EPOCHS"; LR="$LORA_LR"
                 EXTRA="--lora-rank $LORA_RANK --batch-size $LORA_BATCH --grad-accum $LORA_ACCUM --probe-wd $PROBE_WD"
