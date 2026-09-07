@@ -343,6 +343,17 @@ def _rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return float(np.sqrt(np.mean(d * d)))
 
 
+def _patient_cluster(case_ids: list[str]) -> np.ndarray:  # (N,)
+    """case_id 에서 **환자** 부분만 뽑아 bootstrap 클러스터 키를 만든다.
+
+    ``case_ids`` 값은 ``<환자>_s<세션>_int<구간>`` 형태의 **세그먼트** ID 다
+    (예: ``VDB_0010_sVDB_0010_S0_int1``). 이걸 그대로 클러스터로 쓰면 같은 환자의
+    창들이 독립 표본으로 취급돼 **CI 가 실제보다 좁아지고**(anti-conservative)
+    ``n_patients`` 도 부풀려진다 — VitalDB fold0 실측 39명 → 520 클러스터.
+    """
+    return np.array([str(c).split("_s")[0] for c in case_ids], dtype=str)
+
+
 def compute_bp_metrics(
     y_true: torch.Tensor,  # (N, 2)
     y_pred: torch.Tensor,  # (N, 2)
@@ -351,7 +362,7 @@ def compute_bp_metrics(
     seed: int = 42,
 ) -> dict:
     """SBP·DBP 각각 MAE/RMSE/Pearson r/Bland-Altman + patient-cluster bootstrap CI."""
-    pid = np.asarray(case_ids, dtype=str)
+    pid = _patient_cluster(case_ids)
     report: dict = {}
     for j, name in enumerate(TARGETS):
         yt = y_true[:, j].numpy().astype(np.float64)
