@@ -47,6 +47,12 @@ ENV_FILE = Path.home() / ".orch" / "orch.env"
 STATE_FILE = Path.home() / ".orch" / "state.json"
 TERMINAL_STATES = {"succeeded", "failed", "killed"}
 
+# 노드 출력에 콘솔 코드페이지(Windows cp949 등)가 못 쓰는 문자가 섞여도
+# 죽지 않도록. 잡 로그를 잃는 것보다 몇 글자 치환이 낫다.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(errors="replace")
+
 
 # --------------------------------------------------------------------------- #
 # config / state

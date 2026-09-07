@@ -9,6 +9,67 @@ Phase 2 (Any-variate): variate-level 마스킹 → 다른 모달리티로부터 
 import torch
 from torch import nn
 
+# ``reflection_pad1d``의 backward CUDA 커널은 배치 차원을 ``gridDim.z``에 싣는데
+# 그 상한이 65535다. ``torch.stft``는 ``center=True``일 때 내부적으로 reflect pad를
+# 쓰므로, 입력 개수 M이 이 값을 넘으면 backward에서 커널 launch가 실패한다
+# (``CUDA error: invalid argument`` — OOM이 아니라 launch 실패라 메시지가 헷갈린다).
+# forward는 다른 커널을 타서 통과하기 때문에 backward에서만 터진다.
+# next-pred(β) 경로가 valid한 (t, t+step) 쌍을 전부 넣으므로 M ≈ batch × patch/row.
+_MAX_STFT_BATCH = 65535
+
+
+def _stft_magnitude(
+    x: torch.Tensor,  # (M, P)
+    n_fft: int,
+    hop: int,
+    window: torch.Tensor,  # (n_fft,)
+) -> torch.Tensor:  # (M, n_fft//2+1, T)
+    return torch.stft(
+        x,
+        n_fft=n_fft,
+        hop_length=hop,
+        win_length=n_fft,
+        window=window,
+        return_complex=True,
+    ).abs()
+
+
+def _stft_terms_chunked(
+    pred_f: torch.Tensor,  # (M, P)
+    target_f: torch.Tensor,  # (M, P)
+    n_fft: int,
+    hop: int,
+    window: torch.Tensor,  # (n_fft,)
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """M > ``_MAX_STFT_BATCH``일 때 청크로 나눠 (sc, log_mag)를 계산한다.
+
+    두 항 모두 분할 누적으로 **정확히** 복원된다 (수식이 바뀌지 않음):
+
+    - ``sc``      = ``sqrt(Σ(T-P)²) / (sqrt(ΣT²) + eps)``  → 제곱합만 누적
+    - ``log_mag`` = ``Σ|log1p(P) - log1p(T)| / N``         → 합·개수 누적
+
+    autograd 그래프는 청크별로 이어지고 각 청크가 상한 아래이므로 backward도 통과한다.
+    """
+    diff_sq = pred_f.new_tensor(0.0)
+    target_sq = pred_f.new_tensor(0.0)
+    log_abs_sum = pred_f.new_tensor(0.0)
+    n_elem = 0
+
+    for start in range(0, pred_f.shape[0], _MAX_STFT_BATCH):
+        stop = start + _MAX_STFT_BATCH
+        pred_mag = _stft_magnitude(pred_f[start:stop], n_fft, hop, window)
+        target_mag = _stft_magnitude(target_f[start:stop], n_fft, hop, window)
+
+        diff_sq = diff_sq + (target_mag - pred_mag).pow(2).sum()
+        target_sq = target_sq + target_mag.pow(2).sum()
+        log_abs_sum = log_abs_sum + (
+            torch.log1p(pred_mag) - torch.log1p(target_mag)
+        ).abs().sum()
+        n_elem += target_mag.numel()
+
+    sc = diff_sq.sqrt() / (target_sq.sqrt() + 1e-8)
+    return sc, log_abs_sum / n_elem
+
 
 def _multi_resolution_stft_loss(
     pred: torch.Tensor,  # (M, P)
@@ -43,33 +104,23 @@ def _multi_resolution_stft_loss(
     for n_fft in valid_ffts:
         hop = n_fft // 4
         window = torch.hann_window(n_fft, device=pred.device)
-        pred_stft = torch.stft(
-            pred_f,
-            n_fft=n_fft,
-            hop_length=hop,
-            win_length=n_fft,
-            window=window,
-            return_complex=True,
-        )  # (M, n_fft//2+1, T)
-        target_stft = torch.stft(
-            target_f,
-            n_fft=n_fft,
-            hop_length=hop,
-            win_length=n_fft,
-            window=window,
-            return_complex=True,
-        )  # (M, n_fft//2+1, T)
 
-        pred_mag = pred_stft.abs()  # (M, F, T)
-        target_mag = target_stft.abs()  # (M, F, T)
+        if pred_f.shape[0] > _MAX_STFT_BATCH:
+            # 청크 경로. 아래 단일-샷 경로와 수식이 동일하지만 reduction 순서가
+            # 달라 마지막 비트가 어긋날 수 있어, 상한 아래에서는 기존 경로를
+            # 그대로 둔다 (기존 체크포인트와의 비트 재현성 보존).
+            sc, log_mag = _stft_terms_chunked(pred_f, target_f, n_fft, hop, window)
+        else:
+            pred_mag = _stft_magnitude(pred_f, n_fft, hop, window)  # (M, F, T)
+            target_mag = _stft_magnitude(target_f, n_fft, hop, window)  # (M, F, T)
 
-        # Spectral Convergence: Frobenius norm ratio
-        sc = torch.norm(target_mag - pred_mag, p="fro") / (
-            torch.norm(target_mag, p="fro") + 1e-8
-        )
+            # Spectral Convergence: Frobenius norm ratio
+            sc = torch.norm(target_mag - pred_mag, p="fro") / (
+                torch.norm(target_mag, p="fro") + 1e-8
+            )
 
-        # Log-magnitude L1
-        log_mag = (torch.log1p(pred_mag) - torch.log1p(target_mag)).abs().mean()
+            # Log-magnitude L1
+            log_mag = (torch.log1p(pred_mag) - torch.log1p(target_mag)).abs().mean()
 
         loss = loss + sc + log_mag
 
