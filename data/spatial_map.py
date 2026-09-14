@@ -4,9 +4,16 @@ CARMEN v2: spatial_id(소분류)를 폐지하고 modality(signal_type) 단위 �
 임베딩만 사용한다. 각 signal_type 내 로컬 ID는 항상 0(Unknown) 하나뿐이며,
 전역 spatial ID 총 수(``TOTAL_SPATIAL_IDS``)는 signal_type 수와 같다.
 
-지원 신호 (9종, 2026-06-23 갱신 — PAP 제거 후 연속 번호로 재배치):
+지원 신호 (10종, 2026-09-13 갱신 — PAP 를 9번 슬롯에 복원):
   ECG(0), ABP(1), PPG(2), CVP(3), CO2(4), AWP(5),
-  ICP(6), RESP_Impedance(7), RESP_Flow(8)
+  ICP(6), RESP_Impedance(7), RESP_Flow(8), PAP(9)
+
+2026-09-13 변경 (SNUH OR 재학습 준비):
+  - PAP 복원 — SNUH F: .vital 실측에서 Intellivue/PAP 125Hz 가 파일의 ~10% 에
+    존재. 기존 0~8 번호는 그대로 두고 **끝(9)에 추가**하여 하위호환 유지.
+  - 구 disk spec 의 PAP(6) 은 load-time 에 9 로 remap 된다 (drop 하지 않음).
+  - num_signal_types 는 config 에서 10 으로 지정해야 PAP 임베딩이 생긴다
+    (기존 9-슬롯 체크포인트는 PAP 미포함 데이터에서 그대로 동작).
 
 이전 체계(10종, PAP 슬롯 유지) 대비 변경:
   - PAP(구 6) 완전 제거 — 데이터가 없어 박제돼 있던 dead 슬롯을 폐지.
@@ -25,7 +32,7 @@ CARMEN v2: spatial_id(소분류)를 폐지하고 modality(signal_type) 단위 �
 
 디스크 manifest 는 구 disk spec(signal_type 0~8: ECG~RESP, PAP=6, ICP=7,
 RESP=8 + spatial_ids) 그대로 보존한다. load-time 에 ``remap_record_v2`` 로
-새 9종 연속 번호 체계로 변환한다 (데이터 재생성 없음).
+v2 번호 체계(0~9)로 변환한다 (데이터 재생성 없음).
 """
 
 from __future__ import annotations
@@ -49,6 +56,7 @@ SPATIAL_MAP: dict[int, dict[str, int]] = {
     6: {"Unknown": 0},  # ICP / Intracranial Pressure
     7: {"Unknown": 0},  # RESP_Impedance (가슴 임피던스 호흡)
     8: {"Unknown": 0},  # RESP_Flow (ventilator flow waveform)
+    9: {"Unknown": 0},  # PAP / Pulmonary Arterial Pressure (2026-09-13 복원)
 }
 
 # signal_type별 offset (누적 합). v2 에서는 각 type 이 local 1개라
@@ -60,7 +68,7 @@ for _st in sorted(SPATIAL_MAP.keys()):
     _cumulative += len(SPATIAL_MAP[_st])
 
 TOTAL_SPATIAL_IDS: int = _cumulative
-"""전역 spatial_id 총 수. v2 에서는 signal_type 수(=9)와 동일."""
+"""전역 spatial_id 총 수. v2 에서는 signal_type 수(=10)와 동일."""
 
 
 # signal_type 번호 → 사람이 읽는 이름 (validator/count 스크립트 공용)
@@ -74,6 +82,7 @@ SIGNAL_TYPE_NAMES: dict[int, str] = {
     6: "ICP",
     7: "RESP_Impedance",
     8: "RESP_Flow",
+    9: "PAP",
 }
 
 
@@ -81,7 +90,7 @@ SIGNAL_TYPE_NAMES: dict[int, str] = {
 # master_plan §7.1 번호 체계의 유일 소스. downstream 각 스크립트는 자체 dict 를
 # 두지 말고 이 표(또는 ``SIGNAL_TYPE_TO_KEY``)를 import 해 사용한다.
 #   - 구 단일 "resp"(disk 8) 는 v2 에서 "resp_impedance"(7) / "resp_flow"(8) 로 분리.
-#   - "pap" 는 v2 에서 완전 제거 (데이터 부재).
+#   - "pap" 는 2026-06-23 에 제거됐다가 2026-09-13 에 9 번으로 복원 (SNUH OR 데이터 존재).
 SIGNAL_KEY_TO_TYPE: dict[str, int] = {
     "ecg": 0,
     "abp": 1,
@@ -92,10 +101,13 @@ SIGNAL_KEY_TO_TYPE: dict[str, int] = {
     "icp": 6,
     "resp_impedance": 7,
     "resp_flow": 8,
+    "pap": 9,
 }
 
 # signal_type 번호 → 소문자 key (역방향, intersection/forecast 등에서 사용)
-SIGNAL_TYPE_TO_KEY: dict[int, str] = {v: k for k, v in SIGNAL_KEY_TO_TYPE.items()}
+SIGNAL_TYPE_TO_KEY: dict[int, str] = {
+    v: k for k, v in SIGNAL_KEY_TO_TYPE.items()
+}
 
 
 def get_global_spatial_id(signal_type: int, local_id: int) -> int:
@@ -138,6 +150,7 @@ MECHANISM_GROUP: dict[int, int] = {
     6: 0,  # ICP            → Cardiovascular
     7: 1,  # RESP_Impedance → Respiratory
     8: 1,  # RESP_Flow      → Respiratory
+    9: 0,  # PAP            → Cardiovascular
 }
 
 MECHANISM_GROUP_NAMES: dict[int, str] = {
@@ -192,7 +205,10 @@ CROSS_PRED_ALLOWED_PAIRS: set[tuple[int, int]] = {
     (0, 2),  # ECG ↔ PPG — cardiac cycle, 말초 맥파
     # Tier 1 — 강·형태 (waveform 직결)
     (1, 2),  # ABP ↔ PPG — arterial pulse wave (거의 동형)
-    (5, 8),  # AWP ↔ RESP_Flow — airway pressure ↔ flow, P–Q 운동방정식 직접 인과
+    (
+        5,
+        8,
+    ),  # AWP ↔ RESP_Flow — airway pressure ↔ flow, P–Q 운동방정식 직접 인과
 }
 # ── γ 에서 제외된 쌍 (δ contrastive 로만 cross-modal 정렬) — 약결합 ──
 #   (0,3) ECG↔CVP      : a/c/v파가 P/QRS/T에 타이밍 lock 되나, 절대압·진폭은
@@ -216,10 +232,12 @@ CROSS_PRED_ALLOWED_PAIRS: set[tuple[int, int]] = {
 # 바닥 ~0.5)·소스편차(SNUH↔K-MIMIC 3×)로 정밀 가중에 부적합 → 폐기(팀 4-agent
 # 검증: 구조는 robust, 정밀 가중은 측정불가). 방향만 생리로 확정.
 CROSS_PRED_DIRECTED: set[tuple[int, int]] = {
-    (0, 1),          # ECG → ABP
-    (0, 2),          # ECG → PPG
-    (1, 2), (2, 1),  # ABP ↔ PPG
-    (5, 8), (8, 5),  # AWP ↔ RESP_Flow
+    (0, 1),  # ECG → ABP
+    (0, 2),  # ECG → PPG
+    (1, 2),
+    (2, 1),  # ABP ↔ PPG
+    (5, 8),
+    (8, 5),  # AWP ↔ RESP_Flow
 }
 CROSS_COUPLING_WEIGHTS: dict[tuple[int, int], float] = {
     (_s, _t): 1.0 for (_s, _t) in CROSS_PRED_DIRECTED
@@ -233,23 +251,43 @@ CROSS_COUPLING_WEIGHTS: dict[tuple[int, int], float] = {
 # RESP/Impedance → 7(RESP_Impedance), FLOW/FLOW_WAV → 8(RESP_Flow).
 CHANNEL_NAME_TO_SIGNAL_TYPE: dict[str, int] = {
     # ECG (0) — 모든 lead 표기 단일 수렴
-    "ECG Lead I": 0, "ECG I": 0, "I": 0,
-    "ECG Lead II": 0, "ECG II": 0, "II": 0,
-    "ECG Lead III": 0, "ECG III": 0, "III": 0,
-    "ECG aVR": 0, "aVR": 0,
-    "ECG aVL": 0, "aVL": 0,
-    "ECG aVF": 0, "aVF": 0,
-    "ECG V1": 0, "V1": 0,
-    "ECG V2": 0, "V2": 0,
-    "ECG V3": 0, "V3": 0,
-    "ECG V4": 0, "V4": 0,
-    "ECG V5": 0, "V5": 0, "ECG Lead V5": 0,
-    "ECG V6": 0, "V6": 0,
+    "ECG Lead I": 0,
+    "ECG I": 0,
+    "I": 0,
+    "ECG Lead II": 0,
+    "ECG II": 0,
+    "II": 0,
+    "ECG Lead III": 0,
+    "ECG III": 0,
+    "III": 0,
+    "ECG aVR": 0,
+    "aVR": 0,
+    "ECG aVL": 0,
+    "aVL": 0,
+    "ECG aVF": 0,
+    "aVF": 0,
+    "ECG V1": 0,
+    "V1": 0,
+    "ECG V2": 0,
+    "V2": 0,
+    "ECG V3": 0,
+    "V3": 0,
+    "ECG V4": 0,
+    "V4": 0,
+    "ECG V5": 0,
+    "V5": 0,
+    "ECG Lead V5": 0,
+    "ECG V6": 0,
+    "V6": 0,
     # ABP (1) — Radial/Femoral 통합
-    "ABP Radial": 1, "ART": 1,
-    "ABP Femoral": 1, "FEM": 1,
+    "ABP Radial": 1,
+    "ART": 1,
+    "ABP Femoral": 1,
+    "FEM": 1,
     # PPG (2)
-    "PPG": 2, "PLETH": 2, "PPG Finger": 2,
+    "PPG": 2,
+    "PLETH": 2,
+    "PPG Finger": 2,
     # CVP (3)
     "CVP": 3,
     # CO2 (4)
@@ -259,9 +297,13 @@ CHANNEL_NAME_TO_SIGNAL_TYPE: dict[str, int] = {
     # ICP (6)
     "ICP": 6,
     # RESP_Impedance (7)
-    "RESP": 7, "Impedance": 7,
+    "RESP": 7,
+    "Impedance": 7,
     # RESP_Flow (8)
-    "FLOW": 8, "FLOW_WAV": 8,
+    "FLOW": 8,
+    "FLOW_WAV": 8,
+    # PAP (9)
+    "PAP": 9,
 }
 
 
@@ -275,7 +317,7 @@ CHANNEL_NAME_TO_SIGNAL_TYPE: dict[str, int] = {
 #
 # 변환 규칙 (구 disk → v2):
 #   0~5            ECG~AWP    → 그대로 0~5
-#   6              PAP        → None (drop, 데이터 제외 → 완전 폐기)
+#   6              PAP        → 9              (2026-09-13 복원, 끝 슬롯)
 #   7              ICP        → 6              (1칸 당김)
 #   8, sp=1        RESP Imped → (7, [0]*n)     RESP_Impedance
 #   8, sp=2        RESP Flow  → (8, [0]*n)     RESP_Flow
@@ -295,8 +337,9 @@ _OLD_DISK_TO_V2_ST: dict[int, int] = {
 # 구 disk RESP local spatial → v2 signal_type (7=Impedance, 8=Flow)
 _OLD_RESP_SPATIAL_TO_ST: dict[int, int] = {1: 7, 2: 8}
 
-# 구 disk PAP signal_type (drop 대상)
+# 구 disk PAP signal_type → v2 9
 _PAP_DISK_SIGNAL_TYPE = 6
+_PAP_V2_SIGNAL_TYPE = 9
 # 구 disk RESP signal_type (분리 대상)
 _OLD_RESP_DISK_SIGNAL_TYPE = 8
 
@@ -321,20 +364,23 @@ def remap_record_v2(
     Returns
     -------
     ``(new_signal_type, [0] * n_channels)`` 튜플.
-    PAP(구 disk 6)이면 ``None`` 을 반환한다 (drop — 데이터 제외, 완전 폐기).
+    PAP(구 disk 6)은 v2 9 로 변환한다 (2026-09-13 복원 전에는 ``None`` 으로
+    drop 했음). 반환 타입에 ``None`` 을 남겨 두는 것은 호출부 호환용이다.
     """
     # n_channels: spatial_ids 길이 기준 (없으면 1)
     n_channels = len(old_spatial_ids) if old_spatial_ids else 1
 
-    # PAP drop (완전 폐기)
+    # PAP: 구 disk 6 → v2 9 (끝 슬롯에 복원)
     if old_signal_type == _PAP_DISK_SIGNAL_TYPE:
-        return None
+        return _PAP_V2_SIGNAL_TYPE, [0] * n_channels
 
     # RESP 분기 (Impedance=7 / Flow=8)
     if old_signal_type == _OLD_RESP_DISK_SIGNAL_TYPE:
         # 구 disk RESP record 는 단일 채널(n_channels:1)이므로 첫 spatial 로 판단.
         first_sp = old_spatial_ids[0] if old_spatial_ids else 0
-        new_st = _OLD_RESP_SPATIAL_TO_ST.get(first_sp, 7)  # 0/미상 → Impedance 폴백
+        new_st = _OLD_RESP_SPATIAL_TO_ST.get(
+            first_sp, 7
+        )  # 0/미상 → Impedance 폴백
         return new_st, [0] * n_channels
 
     # 그 외: 구 disk → v2 재배치 (ICP 7→6 포함) + spatial 평탄화

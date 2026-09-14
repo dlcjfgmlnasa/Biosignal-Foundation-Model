@@ -11,16 +11,20 @@ bandpass filtering을 적용하고, 모든 유효 세그먼트를 개별 .pt로 
 
 사용법:
   # 트랙 탐색
-  python -m data.parser.vitaldb --raw datasets/raw/vitaldb --discover --max-files 3
+  python -m data.parser.vitaldb --raw datasets/raw/vitaldb --discover \
+      --max-files 3
 
   # 단일 파일 테스트
-  python -m data.parser.vitaldb --raw datasets/raw/vitaldb --out datasets/processed --max-files 1
+  python -m data.parser.vitaldb --raw datasets/raw/vitaldb --out \
+      datasets/processed --max-files 1
 
   # 전체 파싱
-  python -m data.parser.vitaldb --raw datasets/raw/vitaldb --out datasets/processed
+  python -m data.parser.vitaldb --raw datasets/raw/vitaldb --out \
+      datasets/processed
 
   # 병렬 파싱 (4 workers)
-  python -m data.parser.vitaldb --raw datasets/raw/vitaldb --out datasets/processed --workers 4
+  python -m data.parser.vitaldb --raw datasets/raw/vitaldb --out \
+      datasets/processed --workers 4
 """
 
 from __future__ import annotations
@@ -66,7 +70,9 @@ class SignalConfig:
         AWP: P95=0.54, 1.0 이상 스파이크 → 1.0
     """
 
-    valid_range: tuple[float, float] | None  # (min, max) — None이면 range check 안 함
+    valid_range: (
+        tuple[float, float] | None
+    )  # (min, max) — None이면 range check 안 함
     filter_type: str = "none"  # "bandpass" | "lowpass" | "none"
     filter_freq: tuple[float, float] | None = (
         None  # bandpass=(lo,hi), lowpass=(hi,) → (0, hi)로 저장
@@ -76,12 +82,16 @@ class SignalConfig:
     max_high_freq_ratio: float = 2.0  # 기본값; 신호별로 아래에서 재정의
     min_amplitude: float = 0.0  # 최소 peak-to-peak 진폭 (0=비활성)
     max_amplitude: float = 0.0  # 최대 peak-to-peak 진폭 (0=비활성)
-    min_high_freq_ratio: float = 0.0  # 최소 hf ratio (0=비활성, ECG용: QRS 없으면 불량)
+    min_high_freq_ratio: float = (
+        0.0  # 최소 hf ratio (0=비활성, ECG용: QRS 없으면 불량)
+    )
     notch_freq: float | None = None  # 50 또는 60Hz notch filter (None=비활성)
     spike_detection: bool = False  # 스파이크/아티팩트 검출 적용 여부
     spike_threshold_std: float = 10.0  # spike 검출 threshold (MAD 배수)
     median_kernel: int = 0  # median filter kernel size (0=비활성, 홀수만)
-    quality_window_s: float = 5.0  # 품질 검사 윈도우 크기 (초). 호흡 신호는 10초 권장
+    quality_window_s: float = (
+        5.0  # 품질 검사 윈도우 크기 (초). 호흡 신호는 10초 권장
+    )
 
 
 SIGNAL_CONFIGS: dict[str, SignalConfig] = {
@@ -100,13 +110,41 @@ SIGNAL_CONFIGS: dict[str, SignalConfig] = {
     ),
     # ABP/PPG/CVP: lowpass — DC(절대값) 보존, 고주파 노이즈만 제거
     #   PPG/ABP: median filter로 임펄스 노이즈 제거, spike detection 활성
+    # ⚠️ ABP 임계 완화 (2026-08-22). 근거는 아래.
+    #
+    #   기존 기준이 **아티팩트와 이상 생리를 구분하지 못했다.** 5초 창 단위 판정이라
+    #   저혈압일 때 나타나는 파형 특징이 그대로 "품질 불량"으로 잡힌다:
+    #     - min_amplitude=10 → 저혈량·쇼크에서 좁아진 맥압이 탈락
+    #     - valid_range 하한 20 → MAP 20대의 심한 저혈압에서 이완기가 탈락
+    #   저혈압·부정맥은 아티팩트가 아니라 임상적으로 가장 중요한 상태다.
+    #
+    #   실측(SNUH 수술실 202605, .vital 원본 대 processed 매칭 추적):
+    #     - 쓸 만한 ABP(유한 ≥300초)를 가진 세션 301개 중 processed 도달 145개 → **손실 53.5%**
+    #     - 손실 161건 중 160건이 매니페스트에는 있고 **ABP 레코딩만 없다**
+    #     - 잃은 세션은 짧지도 않다 (ABP 유한 길이 중앙 82분, 67.7%가 60분 이상)
+    #     - 무작위 150세션에서 앵커는 1.32배 차이인데 **양성(저혈압 직전)은 1.99배** 차이
+    #     - 개별 세션에서 MAP 최저가 20.8 → 30.6, 26.4 → 48.6 으로 **바닥이 깎였다**
+    #
+    #   비대칭이 중요하다. 아티팩트를 조금 남기면 사전학습 효율이 조금 떨어질 뿐인데,
+    #   이상 생리를 버리면 **그 사건을 표현할 능력 자체**를 잃는다. 급성 사건 다운스트림
+    #   (IOH·쇼크)에서는 잘려 나간 그 구간이 곧 예측 대상이다.
+    #
+    #   대신 아티팩트는 다른 축으로 계속 잡는다 — max_flatline_ratio(평탄선),
+    #   max_clip_ratio(포화), spike_detection, 그리고 음수/과대값은 넓힌 range가 여전히 막는다.
+    #
+    #   ⚠️ 이 변경은 **앞으로 파싱하는 데이터에만** 적용된다. 이미 만들어진
+    #   processed/ 산출물은 옛 기준으로 걸러진 상태다 — 다시 파싱해야 반영된다.
     "abp": SignalConfig(
-        valid_range=(20.0, 300.0),
+        # 하한 20 → 0. 동맥압이 0 미만인 것은 트랜스듀서 대기 개방(아티팩트)이라
+        # 여전히 막힌다. 0~20 구간은 심정지·체외순환 등에서 실재하는 값이다.
+        valid_range=(0.0, 300.0),
         filter_type="lowpass",
         filter_freq=(0.0, 15.0),
         max_high_freq_ratio=0.5,
         max_flatline_ratio=0.3,
-        min_amplitude=10.0,
+        # 10 → 4. 라인 분리·완전 감쇠는 진폭이 0~2로 붙고 평탄선 검사에도 걸린다.
+        # 4~10 구간은 심한 저혈량에서 실제로 관찰되는 좁은 맥압이다.
+        min_amplitude=4.0,
         spike_detection=True,
         spike_threshold_std=6.0,
         median_kernel=5,
@@ -198,10 +236,10 @@ SIGNAL_CONFIGS: dict[str, SignalConfig] = {
 TRACK_MAP: dict[str, tuple[str, int]] = {
     # ── VitalDB Open (SNUADC, OR) ──
     # ECG (0) — 500Hz, mV. spatial_id 는 spatial_map.py 의 ECG dict 참조 (12-lead).
-    "SNUADC/ECG_I":   ("ecg", 1),  # Lead I
-    "SNUADC/ECG_II":  ("ecg", 2),  # Lead II
+    "SNUADC/ECG_I": ("ecg", 1),  # Lead I
+    "SNUADC/ECG_II": ("ecg", 2),  # Lead II
     "SNUADC/ECG_III": ("ecg", 3),  # Lead III
-    "SNUADC/ECG_V5":  ("ecg", 11),  # Lead V5
+    "SNUADC/ECG_V5": ("ecg", 11),  # Lead V5
     "Solar8000/ECG_II": ("ecg", 2),  # Lead II — Solar8000 대체
     # ABP (1) — 500Hz, mmHg
     "SNUADC/ART": ("abp", 1),  # Radial artery
@@ -212,20 +250,22 @@ TRACK_MAP: dict[str, tuple[str, int]] = {
     # CVP (3) — 500Hz, mmHg
     "SNUADC/CVP": ("cvp", 0),  # Central venous pressure
     # CO2 (4) — Primus 62.5Hz, mmHg
-    "Primus/CO2": ("co2", 0),  # Capnography
+    # Primus/CO2·Primus/AWP 는 아래 "SNUH OR 마취기" 블록으로 이동 (2026-09-13):
+    # SNUH 파일에서 Intellivue 가스모듈과 공존할 때 Intellivue 가 우선하도록
+    # TRACK_MAP 순서(=우선순위)를 Intellivue 뒤에 둔다. VitalDB Open 파일에는
+    # Intellivue 트랙이 없으므로 동작 변화 없음.
     "Solar8000/CO2": ("co2", 0),  # Capnography — Solar8000 대체
     # AWP (5) — Primus 62.5Hz, hPa
-    "Primus/AWP": ("awp", 0),  # Airway pressure
     "Solar8000/AWP": ("awp", 0),  # Airway pressure — Solar8000 대체
     # PAP (6) — 500Hz, mmHg
     "SNUADC/PAP": ("pap", 0),  # Pulmonary arterial pressure
     # ICP (7) — 500Hz, mmHg
     "SNUADC/ICP": ("icp", 0),  # Intracranial pressure
     # ── K-MIMIC-MORTAL (SNUADCM, ICU) ──
-    "SNUADCM/ECG_I":   ("ecg", 1),  # Lead I
-    "SNUADCM/ECG_II":  ("ecg", 2),  # Lead II
+    "SNUADCM/ECG_I": ("ecg", 1),  # Lead I
+    "SNUADCM/ECG_II": ("ecg", 2),  # Lead II
     "SNUADCM/ECG_III": ("ecg", 3),  # Lead III
-    "SNUADCM/ECG_V5":  ("ecg", 11),  # Lead V5
+    "SNUADCM/ECG_V5": ("ecg", 11),  # Lead V5
     "SNUADCM/ART": ("abp", 1),  # Radial artery
     "SNUADCM/PLETH": ("ppg", 1),  # Finger
     "SNUADCM/CVP": ("cvp", 0),  # Central venous pressure
@@ -235,22 +275,22 @@ TRACK_MAP: dict[str, tuple[str, int]] = {
     # ── K-MIMIC-MORTAL (Philips Intellivue, ICU) ──
     # 161K files (bucket 410+) 다수. 67K SNUADCM 외 대부분.
     # ECG (0) — 12-lead spatial_id
-    "Intellivue/ECG_I":       ("ecg", 1),
-    "Intellivue/ECG_I_WAV":   ("ecg", 1),
-    "Intellivue/ECG_II":      ("ecg", 2),
-    "Intellivue/ECG_II_WAV":  ("ecg", 2),
-    "Intellivue/ECG_III":     ("ecg", 3),
+    "Intellivue/ECG_I": ("ecg", 1),
+    "Intellivue/ECG_I_WAV": ("ecg", 1),
+    "Intellivue/ECG_II": ("ecg", 2),
+    "Intellivue/ECG_II_WAV": ("ecg", 2),
+    "Intellivue/ECG_III": ("ecg", 3),
     "Intellivue/ECG_III_WAV": ("ecg", 3),
     "Intellivue/ECG_AVR_WAV": ("ecg", 4),  # aVR augmented limb
     "Intellivue/ECG_AVL_WAV": ("ecg", 5),  # aVL augmented limb
     "Intellivue/ECG_AVF_WAV": ("ecg", 6),  # aVF augmented limb
-    "Intellivue/ECG_V_WAV":   ("ecg", 11),  # V lead (가장 흔한 V5 로 가정)
-    "Intellivue/ECG_V1_WAV":  ("ecg", 7),
-    "Intellivue/ECG_V2_WAV":  ("ecg", 8),
-    "Intellivue/ECG_V3_WAV":  ("ecg", 9),
-    "Intellivue/ECG_V4_WAV":  ("ecg", 10),
-    "Intellivue/ECG_V5_WAV":  ("ecg", 11),
-    "Intellivue/ECG_V6_WAV":  ("ecg", 12),
+    "Intellivue/ECG_V_WAV": ("ecg", 11),  # V lead (가장 흔한 V5 로 가정)
+    "Intellivue/ECG_V1_WAV": ("ecg", 7),
+    "Intellivue/ECG_V2_WAV": ("ecg", 8),
+    "Intellivue/ECG_V3_WAV": ("ecg", 9),
+    "Intellivue/ECG_V4_WAV": ("ecg", 10),
+    "Intellivue/ECG_V5_WAV": ("ecg", 11),
+    "Intellivue/ECG_V6_WAV": ("ecg", 12),
     # ABP (1)
     "Intellivue/ABP": ("abp", 1),  # Arterial line waveform
     "Intellivue/ART": ("abp", 1),  # Arterial waveform (alternative naming)
@@ -266,9 +306,51 @@ TRACK_MAP: dict[str, tuple[str, int]] = {
     # PAP (6)
     "Intellivue/PAP": ("pap", 0),  # PAP waveform
     # RESP (8) — 호흡 wave 신규 추가 (2026-05-01)
-    "Intellivue/RESP": ("resp", 1),  # Impedance plethysmography (가슴 임피던스)
+    "Intellivue/RESP": (
+        "resp",
+        1,
+    ),  # Impedance plethysmography (가슴 임피던스)
     "Intellivue/FLOW_WAV": ("resp", 2),  # Vent flow waveform
     "Solar8000/RESP": ("resp", 1),  # Solar8000 호흡 (있을 시)
+    # ── SNUH OR 마취기 가스/환기 파형 (2026-09-13 추가, F: .vital 실측) ──
+    # 같은 파일에 Intellivue 가스모듈(CO2_WAV/AWP_WAV/FLOW_WAV)이 함께 있으면
+    # 위 Intellivue 항목이 먼저 처리되어 (signal_type, spatial) 중복으로 걸러진다
+    # (TRACK_MAP 순서 = 우선순위, process_vital 참고). 실측 120파일: 마취기가
+    # 추가로 채워주는 커버리지는 CO2 0 / AWP +16%p / Flow +4%p.
+    # 단위는 TRACK_UNIT_SCALE 로 mmHg·cmH2O 로 통일한다.
+    # Dräger Primus (VitalDB Open 공통): CO2 mmHg · AWP hPa · AWF L/min, 62.5Hz
+    "Primus/CO2": ("co2", 0),  # Capnography
+    "Primus/AWP": ("awp", 0),  # Airway pressure (hPa → cmH2O, TRACK_UNIT_SCALE)
+    "Primus/AWF": ("resp", 2),  # Vent flow waveform (L/min)
+    # Dräger MedibusX: Primus 와 동일 명명, 50~62.5Hz (실측 3% 파일)
+    "MedibusX/CO2": ("co2", 0),
+    "MedibusX/AWP": ("awp", 0),
+    "MedibusX/AWF": ("resp", 2),
+    # GE Datex-Ohmeda / Carestation(CS2·CS650): CO2 **%**, AWP cmH2O, Flow L/min, 25Hz
+    "Datex-Ohmeda/CO2": ("co2", 0),
+    "Datex-Ohmeda/AWP": ("awp", 0),
+    "Datex-Ohmeda/Flow": ("resp", 2),
+    "CS2/CO2": ("co2", 0),
+    "CS2/AWP": ("awp", 0),
+    "CS2/Flow": ("resp", 2),
+    "CS650/CO2": ("co2", 0),
+    "CS650/AWP": ("awp", 0),
+    "CS650/Flow": ("resp", 2),
+    # ⚠ Dräger Atlan 은 의도적으로 제외 (2026-09-13). 실측 12파일에서 gain 설정이
+    # 파일마다 다르고(0.1 / 0.0293) CO2 가 100~400 "mmHg" 로 나오는 등 스케일이
+    # 깨져 있음. 디코딩 규칙을 확정하기 전까지 매핑하지 않는다.
+    # Volume(mL) 트랙은 spec 밖이라 매핑하지 않는다.
+}
+
+# 트랙별 단위 환산 계수 (로드 직후 곱함). 목표 단위: CO2 mmHg · AWP cmH2O · Flow L/min.
+#   GE CO2 %(vol) → mmHg: ×(P_amb − P_H2O)/100 ≈ (760 − 47)/100 = 7.13
+#   Dräger AWP hPa → cmH2O: ×1.01972
+TRACK_UNIT_SCALE: dict[str, float] = {
+    "Datex-Ohmeda/CO2": 7.13,
+    "CS2/CO2": 7.13,
+    "CS650/CO2": 7.13,
+    "Primus/AWP": 1.01972,
+    "MedibusX/AWP": 1.01972,
 }
 
 SIGNAL_TYPES: dict[str, int] = {
@@ -381,7 +463,9 @@ def _apply_range_check(
     return out, n_bad
 
 
-def _apply_bandpass(data: np.ndarray, lo: float, hi: float, sr: float) -> np.ndarray:
+def _apply_bandpass(
+    data: np.ndarray, lo: float, hi: float, sr: float
+) -> np.ndarray:
     """Butterworth 대역통과 필터 (1D)."""
     from scipy.signal import butter, sosfiltfilt
 
@@ -409,17 +493,24 @@ def _apply_lowpass(data: np.ndarray, hi: float, sr: float) -> np.ndarray:
     return sosfiltfilt(sos, data).astype(data.dtype)
 
 
-def _apply_filter(data: np.ndarray, cfg: SignalConfig, sr: float) -> np.ndarray:
+def _apply_filter(
+    data: np.ndarray, cfg: SignalConfig, sr: float
+) -> np.ndarray:
     """SignalConfig의 filter_type에 따라 적절한 필터를 적용한다."""
     if cfg.filter_type == "bandpass" and cfg.filter_freq is not None:
-        return _apply_bandpass(data, cfg.filter_freq[0], cfg.filter_freq[1], sr)
+        return _apply_bandpass(
+            data, cfg.filter_freq[0], cfg.filter_freq[1], sr
+        )
     elif cfg.filter_type == "lowpass" and cfg.filter_freq is not None:
         return _apply_lowpass(data, cfg.filter_freq[1], sr)
     return data
 
 
 def _detect_electrocautery(
-    data: np.ndarray, sr: float, threshold_std: float = 10.0, blank_ms: float = 100.0
+    data: np.ndarray,
+    sr: float,
+    threshold_std: float = 10.0,
+    blank_ms: float = 100.0,
 ) -> tuple[np.ndarray, int]:
     """전기소작기 아티팩트 구간을 NaN으로 마킹한다. (ECG 등 spike detection 활성 신호용)
 
@@ -515,7 +606,9 @@ def _fill_short_nan_gaps(
     # multi-sample gap → fallback loop (드물게 발생)
     multi_valid = (~single) & valid
     if multi_valid.any():
-        for s, e, v in zip(starts[multi_valid], ends[multi_valid], fill[multi_valid]):
+        for s, e, v in zip(
+            starts[multi_valid], ends[multi_valid], fill[multi_valid]
+        ):
             out[s:e] = v
 
     return out
@@ -566,7 +659,8 @@ def _parse_subject_id(
 
     ``subject_from_parent=0``이면 파일명에서 digit을 뽑아 subject_id를 생성한다
     (VitalDB OR 기본). ``>0``이면 해당 깊이의 부모 디렉토리명을 subject_id로 사용하고
-    (예: K-MIMIC의 ``.../VITALDB/398/3986/SICU.../file.vital``에서 ``--subject-from-parent 3``
+    (예: K-MIMIC의 ``.../VITALDB/398/3986/SICU.../file.vital``에서
+    ``--subject-from-parent 3``
     → subject ``VDB_0398``), session_id는 파일 stem에서 파생한다.
     """
     if subject_from_parent > 0:
@@ -611,6 +705,7 @@ def _save_subject_manifest(
     # POSIX fcntl.flock (Linux 서버 환경 가정). Windows에서는 no-op fallback.
     try:
         import fcntl
+
         _has_flock = True
     except ImportError:
         _has_flock = False
@@ -638,7 +733,9 @@ def _save_subject_manifest(
                     existing_session = s
                     break
             if existing_session is not None:
-                existing_files = {r["file"] for r in existing_session["recordings"]}
+                existing_files = {
+                    r["file"] for r in existing_session["recordings"]
+                }
                 for rec in recordings:
                     if rec["file"] not in existing_files:
                         existing_session["recordings"].append(rec)
@@ -650,7 +747,9 @@ def _save_subject_manifest(
             manifest = {
                 "subject_id": subject_id,
                 "source": "vitaldb",
-                "sessions": [{"session_id": session_id, "recordings": recordings}],
+                "sessions": [
+                    {"session_id": session_id, "recordings": recordings}
+                ],
             }
 
         with open(manifest_path, "w", encoding="utf-8") as f:
@@ -714,12 +813,18 @@ def process_vital(
     available_tracks = vf.get_track_names()
 
     recordings: list[dict] = []
-    processed_keys: set[tuple[int, int]] = set()  # (signal_type, spatial_id) 중복 방지
+    processed_keys: set[tuple[int, int]] = (
+        set()
+    )  # (signal_type, spatial_id) 중복 방지
 
-    for track_name in available_tracks:
-        if track_name not in TRACK_MAP:
-            continue
+    # TRACK_MAP 의 선언 순서 = 우선순위. 같은 (signal_type, spatial) 이 여러
+    # 소스로 존재할 때(예: Intellivue/ECG_II 500Hz vs ECG_II_WAV 250Hz,
+    # Intellivue/CO2_WAV vs 마취기 CO2) 표에서 먼저 나오는 트랙이 채택된다.
+    # 파일 내 트랙 순서에 의존하지 않도록 명시적으로 정렬한다 (2026-09-13).
+    available_set = set(available_tracks)
+    ordered_tracks = [t for t in TRACK_MAP if t in available_set]
 
+    for track_name in ordered_tracks:
         stype_key, spatial_id = TRACK_MAP[track_name]
         signal_type = SIGNAL_TYPES[stype_key]
         cfg = SIGNAL_CONFIGS[stype_key]
@@ -749,6 +854,24 @@ def process_vital(
 
         data = data.flatten()
 
+        # ── Step -1: raw-0 sentinel 제거 + 단위 환산 ──
+        # .vital 트랙은 value = raw·gain + offset 으로 저장된다. raw 0 은 장비가
+        # "값 없음"을 뜻하는 sentinel 로 쓰는 경우가 많고, 그 값은 정확히 offset
+        # 이 된다 (GE CO2 −5.83%·AWP −20·Flow −133.3, Intellivue CO2/AWP −10·
+        # FLOW −130, Primus AWP −20·AWF −200). offset 이 음수인 트랙에서 offset 과
+        # 정확히 같은 값은 생리값이 아니므로 NaN 처리한다. offset ≥ 0 (예: Primus
+        # CO2 offset 0 → 0 mmHg 는 정상 흡기값) 은 건드리지 않는다.
+        trk_offset = float(getattr(trk, "offset", 0.0) or 0.0)
+        if trk_offset < 0.0:
+            sentinel = np.isclose(data, trk_offset, rtol=0.0, atol=1e-6)
+            n_sent = int(sentinel.sum())
+            if n_sent > 0:
+                data = data.copy()
+                data[sentinel] = np.nan
+        unit_scale = TRACK_UNIT_SCALE.get(track_name)
+        if unit_scale is not None:
+            data = data * unit_scale
+
         # ── Step 0: vitaldb chunk 경계 micro NaN 보간 ──
         # vitaldb library 가 .vital 파일의 2-3s chunk 경계마다 1-2 sample NaN 을
         # 채우는 artifact. 이를 인접 값으로 forward-fill 보간해서 artificial
@@ -762,7 +885,8 @@ def process_vital(
             if n_bad > 0:
                 pct = n_bad / len(data) * 100
                 print(
-                    f"    [RANGE] {track_name}: {n_bad} samples ({pct:.1f}%) out of range",
+                    f"    [RANGE] {track_name}: {n_bad} samples ({pct:.1f}%) "
+                    f"out of range",
                     file=sys.stderr,
                 )
 
@@ -774,7 +898,8 @@ def process_vital(
             if n_blanked > 0:
                 pct = n_blanked / len(data) * 100
                 print(
-                    f"    [SPIKE] {track_name}: {n_blanked} samples ({pct:.1f}%) blanked",
+                    f"    [SPIKE] {track_name}: {n_blanked} samples "
+                    f"({pct:.1f}%) blanked",
                     file=sys.stderr,
                 )
 
@@ -784,7 +909,8 @@ def process_vital(
             if n_step > 0:
                 pct = n_step / len(data) * 100
                 print(
-                    f"    [STEP] {track_name}: {n_step} samples ({pct:.1f}%) blanked",
+                    f"    [STEP] {track_name}: {n_step} samples ({pct:.1f}%) "
+                    f"blanked",
                     file=sys.stderr,
                 )
 
@@ -794,7 +920,8 @@ def process_vital(
             if n_motion > 0:
                 pct = n_motion / len(data) * 100
                 print(
-                    f"    [MOTION] {track_name}: {n_motion} samples ({pct:.1f}%) blanked",
+                    f"    [MOTION] {track_name}: {n_motion} samples "
+                    f"({pct:.1f}%) blanked",
                     file=sys.stderr,
                 )
 
@@ -820,7 +947,9 @@ def process_vital(
 
             # Median filter → Notch filter → Bandpass/Lowpass 순서
             if cfg.median_kernel > 0:
-                segment = _apply_median_filter(segment, kernel_size=cfg.median_kernel)
+                segment = _apply_median_filter(
+                    segment, kernel_size=cfg.median_kernel
+                )
             if cfg.notch_freq is not None:
                 segment = _apply_notch_filter(
                     segment, freq=cfg.notch_freq, sr=native_sr
@@ -836,7 +965,9 @@ def process_vital(
             # 윈도우 단위 품질 검사 → 연속 통과 윈도우를 그룹으로 수집
             win_samples = int(quality_window_s * TARGET_SR)
             # pass/fail 결과를 윈도우 인덱스와 함께 기록
-            window_results: list[tuple[int, np.ndarray]] = []  # (win_idx, win_data)
+            window_results: list[
+                tuple[int, np.ndarray]
+            ] = []  # (win_idx, win_data)
             n_windows = 0
             n_fail_basic = 0
             n_fail_domain = 0
@@ -891,7 +1022,9 @@ def process_vital(
                     continue
 
                 # Domain-specific 품질 검사
-                domain_result = domain_quality_check(stype_key, win, sr=TARGET_SR)
+                domain_result = domain_quality_check(
+                    stype_key, win, sr=TARGET_SR
+                )
                 if not domain_result["pass"]:
                     n_fail_domain += 1
                     window_results.append((win_idx, None))
@@ -914,7 +1047,9 @@ def process_vital(
                     else:
                         # 새 연속 그룹 시작
                         if current_group:
-                            contiguous_groups.append((current_first_idx, current_group))
+                            contiguous_groups.append(
+                                (current_first_idx, current_group)
+                            )
                         current_group = [win_data]
                         current_first_idx = win_idx
                     prev_idx = win_idx
@@ -927,14 +1062,17 @@ def process_vital(
                 if n_windows > 0:
                     print(
                         f"    [SKIP] {track_name} seg{seg_idx}: "
-                        f"모든 윈도우 불량 ({n_windows}개 중 basic={n_fail_basic}, domain={n_fail_domain})",
+                        f"모든 윈도우 불량 ({n_windows}개 중 basic={n_fail_basic}, "
+                        f"domain={n_fail_domain})",
                         file=sys.stderr,
                     )
                 continue
 
             # 각 연속 그룹을 별도 세그먼트로 저장
             n_good_total = sum(len(g) for _, g in contiguous_groups)
-            for group_idx, (first_win_idx, group) in enumerate(contiguous_groups):
+            for group_idx, (first_win_idx, group) in enumerate(
+                contiguous_groups
+            ):
                 clean_segment = np.concatenate(group)
                 channel_data = clean_segment.reshape(1, -1).astype(np.float32)
 
@@ -945,12 +1083,17 @@ def process_vital(
 
                 # 절대 시작 sample (TARGET_SR 기준)
                 # = segment 시작(원본→TARGET_SR) + 품질 통과 첫 윈도우 offset
-                group_start_sample = seg_start_target + first_win_idx * win_samples
+                group_start_sample = (
+                    seg_start_target + first_win_idx * win_samples
+                )
 
                 pt_name = (
-                    f"{session_id}_{stype_key}_{spatial_id}_seg{seg_idx}_{group_idx}.pt"
+                    f"{session_id}_{stype_key}_{spatial_id}_seg{seg_idx}_"
+                    f"{group_idx}.pt"
                 )
-                save_recording(torch.from_numpy(channel_data), str(subj_out / pt_name))
+                save_recording(
+                    torch.from_numpy(channel_data), str(subj_out / pt_name)
+                )
 
                 rec = {
                     "signal_type": signal_type,
@@ -960,6 +1103,7 @@ def process_vital(
                     "n_timesteps": channel_data.shape[1],
                     "spatial_ids": [spatial_id],
                     "start_sample": group_start_sample,
+                    "track": track_name,  # 출처 트랙 (장비/우선순위 추적용, 2026-09-13)
                 }
                 track_recordings.append(rec)
                 recordings.append(rec)
@@ -972,14 +1116,17 @@ def process_vital(
                 / TARGET_SR
             )
             print(
-                f"    saved {stype_key} seg{seg_idx}: {n_groups} contiguous group(s), "
+                f"    saved {stype_key} seg{seg_idx}: {n_groups} contiguous "
+                f"group(s), "
                 f"{total_dur:.0f}s total"
                 f"  ({n_good_total}/{n_windows} windows, {pct:.0f}% pass)"
             )
 
         if seg_count > 0:
             processed_keys.add(key)
-            _save_subject_manifest(subj_out, subject_id, session_id, track_recordings)
+            _save_subject_manifest(
+                subj_out, subject_id, session_id, track_recordings
+            )
             if seg_count > 1:
                 print(f"    [{track_name}] {seg_count}개 세그먼트 저장")
 
@@ -1069,8 +1216,10 @@ def _write_manifest_full(out_dir: Path) -> None:
 
     full_file = out_dir / "manifest_full.jsonl"
     count = 0
-    with open(index_file, encoding="utf-8") as idx, \
-         open(full_file, "w", encoding="utf-8") as out:
+    with (
+        open(index_file, encoding="utf-8") as idx,
+        open(full_file, "w", encoding="utf-8") as out,
+    ):
         for line in idx:
             line = line.strip()
             if not line:
@@ -1110,14 +1259,16 @@ def main() -> None:
         "--skip-quality-window",
         action="store_true",
         help="윈도우 단위 quality check (basic/domain) 를 건너뜀. ICU 등 noisy 데이터에서 "
-             "60s+ NaN-free segment 만으로 통과시킴 (학습 시 PackedStdScaler + masking 으로 흡수).",
+        "60s+ NaN-free segment 만으로 통과시킴 (학습 시 PackedStdScaler + masking 으로 "
+        "흡수).",
     )
     parser.add_argument(
         "--lenient-quality",
         action="store_true",
-        help="ICU 친화 loose threshold — 명백한 garbage (95%%+ flatline / 50%%+ saturation / "
-             "진폭 ~0) 만 거름. domain check (HR/regularity) 는 부정맥 환자 보호 위해 skip. "
-             "--skip-quality-window 와 함께 쓰면 --skip 이 우선.",
+        help="ICU 친화 loose threshold — 명백한 garbage (95%%+ flatline / 50%%+ "
+        "saturation / "
+        "진폭 ~0) 만 거름. domain check (HR/regularity) 는 부정맥 환자 보호 위해 skip. "
+        "--skip-quality-window 와 함께 쓰면 --skip 이 우선.",
     )
     parser.add_argument(
         "--discover",
@@ -1135,7 +1286,8 @@ def main() -> None:
         type=int,
         nargs="+",
         default=None,
-        help="파싱할 signal type IDs (0=ECG,1=ABP,2=PPG,3=CVP,4=CO2,5=AWP,6=PAP,7=ICP). 미지정 시 전부.",
+        help="파싱할 signal type IDs "
+        "(0=ECG,1=ABP,2=PPG,3=CVP,4=CO2,5=AWP,6=PAP,7=ICP). 미지정 시 전부.",
     )
     parser.add_argument(
         "--workers",
@@ -1154,7 +1306,8 @@ def main() -> None:
         "--test-ratio",
         type=float,
         default=0.0,
-        help="Test split 비율 (0.0~1.0). 0이면 분할 없이 전체 --out으로. 예: 0.2이면 20%% test.",
+        help="Test split 비율 (0.0~1.0). 0이면 분할 없이 전체 --out으로. 예: 0.2이면 20%% "
+        "test.",
     )
     parser.add_argument(
         "--test-out",
@@ -1184,20 +1337,25 @@ def main() -> None:
         help=(
             "manifest_full.jsonl 재생성을 건너뛴다. "
             "분할 실행(subject 디렉토리 루프)에서 매번 재생성되는 O(N²) 비용 회피용. "
-            "최종적으로 'python -m data.parser.vitaldb --rebuild-manifest-full --out ...'으로 한 번만 생성."
+            "최종적으로 'python -m data.parser.vitaldb --rebuild-manifest-full "
+            "--out ...'으로 한 번만 생성."
         ),
     )
     parser.add_argument(
         "--rebuild-manifest-full",
         action="store_true",
-        help="parsing 없이 manifest_full.jsonl만 재생성 (--out 필요). --skip-manifest-full 후 마지막 단계.",
+        help="parsing 없이 manifest_full.jsonl만 재생성 (--out 필요). "
+        "--skip-manifest-full 후 마지막 단계.",
     )
     args = parser.parse_args()
 
     # ── Manifest-full rebuild-only 모드 ──
     if args.rebuild_manifest_full:
         if args.out is None:
-            print("ERROR: --rebuild-manifest-full은 --out이 필요합니다.", file=sys.stderr)
+            print(
+                "ERROR: --rebuild-manifest-full은 --out이 필요합니다.",
+                file=sys.stderr,
+            )
             sys.exit(1)
         out_dir = Path(args.out)
         if not out_dir.exists():
@@ -1212,6 +1370,7 @@ def main() -> None:
     # 대규모 raw_dir에서는 glob 자체가 수십 초~분 단위로 걸리므로 tqdm으로 진행 표시
     try:
         from tqdm import tqdm as _tqdm_scan
+
         _scan_have_tqdm = True
     except ImportError:
         _scan_have_tqdm = False
@@ -1226,21 +1385,31 @@ def main() -> None:
 
         list_path = Path(args.from_list)
         if not list_path.is_file():
-            print(f"ERROR: --from-list 파일이 없습니다: {list_path}", file=sys.stderr)
+            print(
+                f"ERROR: --from-list 파일이 없습니다: {list_path}",
+                file=sys.stderr,
+            )
             sys.exit(1)
         # 깨진 라인(병렬 find race condition으로 두 path가 한 줄에 합쳐진 경우) 까지
         # robust 파싱: 라인 안에서 모든 .vital 종료 path 추출.
         # NOTE: is_file() stat 호출은 NAS에서 path당 5-10ms × N = 매우 느림.
         # find 로 이미 만든 list 라면 모든 path 가 존재 보장 → stat 생략.
         seen: set[str] = set()
+        # 한 줄 = 경로 하나가 정상. 경로에 공백(예: "서울대학교 병원 수술방 데이터")이
+        # 있을 수 있으므로 줄 전체가 .vital 로 끝나면 그대로 채택하고, 여러 경로가
+        # 한 줄에 합쳐진 깨진 라인(병렬 find race)만 정규식으로 분리한다.
+        _multi_re = re.compile(r"(?:[A-Za-z]:[\/]|/)[^\s]*?\.vital(?=\s|$)")
         with open(list_path, encoding="utf-8") as f:
             for line in f:
-                line = line.rstrip("\n")
+                line = line.strip().lstrip("﻿")
                 if not line:
                     continue
-                # 한 라인 안에 / 로 시작하고 .vital 로 끝나는 모든 절대 경로 매칭
-                for m in re.finditer(r"/[^/\s]+(?:/[^/\s]+)*\.vital", line):
-                    p_str = m.group(0)
+                low = line.lower()
+                if low.endswith(".vital") and low.count(".vital") == 1:
+                    cands = [line]
+                else:
+                    cands = [m.group(0) for m in _multi_re.finditer(line)]
+                for p_str in cands:
                     if p_str in seen:
                         continue
                     seen.add(p_str)
@@ -1265,7 +1434,9 @@ def main() -> None:
     vital_files.sort()
 
     if not vital_files:
-        print(f"ERROR: {raw_dir} 하위에 .vital 파일이 없습니다.", file=sys.stderr)
+        print(
+            f"ERROR: {raw_dir} 하위에 .vital 파일이 없습니다.", file=sys.stderr
+        )
         sys.exit(1)
 
     if args.max_files is not None:
@@ -1298,7 +1469,8 @@ def main() -> None:
     if test_ratio > 0:
         if args.test_out is None:
             print(
-                "ERROR: --test-ratio > 0이면 --test-out을 지정하세요.", file=sys.stderr
+                "ERROR: --test-ratio > 0이면 --test-out을 지정하세요.",
+                file=sys.stderr,
             )
             sys.exit(1)
         import random
@@ -1312,7 +1484,8 @@ def main() -> None:
         test_out_dir = Path(args.test_out)
         test_out_dir.mkdir(parents=True, exist_ok=True)
         print(
-            f"Train/Test split: {len(train_indices)} train, {len(test_indices)} test (seed={args.split_seed})\n"
+            f"Train/Test split: {len(train_indices)} train, "
+            f"{len(test_indices)} test (seed={args.split_seed})\n"
         )
     else:
         test_indices = set()
@@ -1349,7 +1522,10 @@ def main() -> None:
             prev = jp.read_text(encoding="utf-8")
         new_line = (
             json.dumps(
-                {"subject_id": subject_id, "manifest": f"{subject_id}/manifest.json"},
+                {
+                    "subject_id": subject_id,
+                    "manifest": f"{subject_id}/manifest.json",
+                },
                 ensure_ascii=False,
             )
             + "\n"
@@ -1376,6 +1552,7 @@ def main() -> None:
 
     try:
         from tqdm import tqdm
+
         _have_tqdm = True
     except ImportError:
         _have_tqdm = False
@@ -1398,15 +1575,20 @@ def main() -> None:
             processes=args.workers,
             initializer=_init_worker,
             initargs=(
-                min_dur, sig_filter, args.subject_from_parent,
-                args.skip_quality_window, args.lenient_quality,
+                min_dur,
+                sig_filter,
+                args.subject_from_parent,
+                args.skip_quality_window,
+                args.lenient_quality,
             ),
         ) as pool:
             iterator = pool.imap(_worker_split, tasks)
             if _have_tqdm:
                 iterator = tqdm(
-                    iterator, total=len(tasks),
-                    desc="Parsing .vital", unit="file",
+                    iterator,
+                    total=len(tasks),
+                    desc="Parsing .vital",
+                    unit="file",
                 )
             for i, result in enumerate(iterator):
                 _handle_result(result, i)
@@ -1419,7 +1601,8 @@ def main() -> None:
         if _have_tqdm:
             single_iter = tqdm(
                 list(enumerate(vital_files)),
-                desc="Parsing .vital", unit="file",
+                desc="Parsing .vital",
+                unit="file",
             )
         for i, vf_path in single_iter:
             target_dir = test_out_dir if i in test_indices else out_dir

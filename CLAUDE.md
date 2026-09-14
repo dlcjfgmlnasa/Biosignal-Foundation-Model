@@ -52,7 +52,7 @@ main.py     # Entry point / training orchestration
 
 **`data/collate.py`**: PackCollate (FFD bin-packing collate). `patch_size`/`stride` 정렬 패딩. `spatial_ids` 전달 (v2: spatial_id 폐지로 값이 signal_type과 동일, 모델 미사용 — plumbing 유지).
 
-**`data/spatial_map.py`**: signal_type 매핑 테이블 (v2: 단일 modality embedding, 9종 — ECG(0)·ABP(1)·PPG(2)·CVP(3)·CO2(4)·AWP(5)·ICP(6)·RESP_Impedance(7)·RESP_Flow(8). RESP를 Impedance(7)/Flow(8)로 분리, ECG lead 통합, PAP 완전 제거(2026-06-23, 구 6번 슬롯 삭제 후 뒤 번호 1칸씩 당김 — ICP 7→6, RESP_Imp 8→7, RESP_Flow 9→8), spatial_id 소분류 폐지). `SIGNAL_TYPE_NAMES`, `CHANNEL_NAME_TO_SIGNAL_TYPE`, `remap_record_v2()` (load-time remap: 디스크 manifest 는 구 disk spec 유지 → PAP drop · RESP 7/8 분기 · spatial 평탄화 · 뒤 번호 당김), `MECHANISM_GROUP`, `CROSS_PRED_ALLOWED_PAIRS` (강결합 γ쌍 (0,1)(0,2)(1,2)(5,8)). `get_global_spatial_id()`/`TOTAL_SPATIAL_IDS`는 하위호환용 유지(반환값 = signal_type).
+**`data/spatial_map.py`**: signal_type 매핑 테이블 (v2: 단일 modality embedding, 10종 — ECG(0)·ABP(1)·PPG(2)·CVP(3)·CO2(4)·AWP(5)·ICP(6)·RESP_Impedance(7)·RESP_Flow(8)·PAP(9). PAP는 2026-09-13 SNUH OR 재학습을 위해 9번 끝 슬롯으로 복원(구 disk 6 → v2 9 remap, 기존 0~8 불변; PAP 학습 시 config `num_signal_types: 10`). RESP를 Impedance(7)/Flow(8)로 분리, ECG lead 통합, PAP 완전 제거(2026-06-23, 구 6번 슬롯 삭제 후 뒤 번호 1칸씩 당김 — ICP 7→6, RESP_Imp 8→7, RESP_Flow 9→8), spatial_id 소분류 폐지). `SIGNAL_TYPE_NAMES`, `CHANNEL_NAME_TO_SIGNAL_TYPE`, `remap_record_v2()` (load-time remap: 디스크 manifest 는 구 disk spec 유지 → PAP 6→9 · RESP 7/8 분기 · spatial 평탄화 · ICP 7→6), `MECHANISM_GROUP`, `CROSS_PRED_ALLOWED_PAIRS` (강결합 γ쌍 (0,1)(0,2)(1,2)(5,8)). `get_global_spatial_id()`/`TOTAL_SPATIAL_IDS`는 하위호환용 유지(반환값 = signal_type).
 
 **`module/patch.py`**: PatchEmbedding (고정/overlapping 패치 토큰화) — Residual MLP projection (TimesFM 스타일). 단일 해상도.
 
@@ -71,6 +71,8 @@ main.py     # Entry point / training orchestration
 **`train/1_channel_independency.py`**: Phase 1 CI 사전학습 스크립트. collate_mode="ci", MPM + Next-Pred, random horizon.
 
 **`train/2_any_variate.py`**: Phase 2 Any-Variate 학습 스크립트. Phase 1 checkpoint 로드, collate_mode="any_variate", cross-modal loss(γ), variate-level 마스킹.
+
+**`data/parser/vitaldb.py`**: .vital 파서 (VitalDB Open·K-MIMIC·SNUH OR 공용). `TRACK_MAP` 선언 순서가 곧 우선순위(같은 signal_type 중복 시 먼저 나온 트랙 채택 — Intellivue ECG_II 500Hz > ECG_II_WAV 250Hz, Intellivue 가스모듈 > 마취기). 2026-09-13: SNUH 마취기 트랙(Primus·MedibusX·Datex-Ohmeda·CS2·CS650) 추가, `TRACK_UNIT_SCALE`로 GE CO2 %→mmHg(×7.13)·Dräger AWP hPa→cmH2O 통일, raw-0 sentinel(offset<0 트랙에서 값==offset) NaN 처리. Dräger Atlan은 스케일 불량으로 제외.
 
 **`data/parser/sleep_edf.py`**: Sleep-EDF raw EDF → processed .pt 변환 스크립트.
 
