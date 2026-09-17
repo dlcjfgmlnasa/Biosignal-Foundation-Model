@@ -607,7 +607,10 @@ def train_one_epoch(
     max_nan_batches = 10
 
     enable_next = config.beta > 0
-    use_amp = scaler is not None
+    # ⚠️ scaler 유무로 판단하지 말 것. create_scaler() 는 bf16 에서 항상 None 을
+    # 반환하므로 `scaler is not None` 으로 두면 autocast 가 영구히 꺼져 학습이
+    # FP32 로 돌게 된다 (validate() 와 동일한 규칙을 써야 함).
+    use_amp = config.use_amp and device.type == "cuda"
     amp_dtype = torch.bfloat16  # fp16 → bf16: overflow 회피 (L40S native 지원, fp32 range)
     use_dist = dist.is_available() and dist.is_initialized()
 
