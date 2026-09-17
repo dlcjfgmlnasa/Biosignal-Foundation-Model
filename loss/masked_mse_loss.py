@@ -419,13 +419,18 @@ def _find_contiguous_runs_grouped(
     """
     if len(indices) == 0:
         return []
+    # ⚠️ 원소마다 .item() 을 부르면 토큰 하나당 device→host 동기화가 일어나
+    # GPU 파이프라인이 매번 멈춘다 (96 rows × 305 patch 기준 step 당 약 3만 회).
+    # 한 번의 전송으로 리스트화한 뒤 순회한다 — 결과는 완전히 동일하다.
+    idx_list: list[int] = indices.tolist()
+    grp_list: list[int] = group_key.tolist()
     runs: list[tuple[int, int]] = []
-    start = indices[0].item()
+    start = idx_list[0]
     prev = start
-    prev_g = group_key[0].item()
-    for i in range(1, len(indices)):
-        cur = indices[i].item()
-        cur_g = group_key[i].item()
+    prev_g = grp_list[0]
+    for i in range(1, len(idx_list)):
+        cur = idx_list[i]
+        cur_g = grp_list[i]
         if cur == prev + 1 and cur_g == prev_g:
             prev = cur
         else:
@@ -443,11 +448,14 @@ def _find_contiguous_runs(
     """정렬된 인덱스에서 연속 구간 (start, length) 리스트를 반환한다."""
     if len(indices) == 0:
         return []
+    # 원소별 .item() 은 토큰마다 device→host 동기화를 유발한다
+    # (_find_contiguous_runs_grouped 주석 참조). 한 번에 리스트로 옮긴다.
+    idx_list: list[int] = indices.tolist()
     runs: list[tuple[int, int]] = []
-    start = indices[0].item()
+    start = idx_list[0]
     prev = start
-    for i in range(1, len(indices)):
-        cur = indices[i].item()
+    for i in range(1, len(idx_list)):
+        cur = idx_list[i]
         if cur == prev + 1:
             prev = cur
         else:
