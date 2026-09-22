@@ -3,7 +3,7 @@
 
 GroupedBatchSampler/collate 와 동일한 (session_id, time_slot) 그룹핑을 manifest
 레벨에서 재현하여, cross-modal pair 가 실제로 얼마나 생기는지 측정한다.
-Phase 2 학습 로그에서 cross/contrastive loss 가 0 으로 자주 찍히는 원인이
+Phase 2 학습 로그에서 cross loss 가 0 으로 자주 찍히는 원인이
 (A) session_id 부재인지 (B) 같은 슬롯 multi-modal 부족인지 숫자로 확정한다.
 
 Usage:
@@ -107,7 +107,7 @@ def main() -> None:
     # ── 판정 ──
     if no_session > total_rec * 0.5:
         print("⚠️ session_id 가 대부분 비어있음 → (session,slot) 그룹화 불가가")
-        print("   cross/contrastive 0 빈발의 근본 원인. sampler 의 시간 키를")
+        print("   cross 0 빈발의 근본 원인. sampler 의 시간 키를")
         print("   session_id 대신 다른 식별자(예: subject+절대시간)로 바꿔야 함.")
     elif n_groups > 0 and multi < n_groups * 0.2:
         print(f"⚠️ multi-modal 그룹 비율 {100*multi/n_groups:.1f}% 로 낮음 →")
