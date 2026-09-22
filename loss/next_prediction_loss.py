@@ -6,15 +6,15 @@ from __future__ import annotations
 Phase 1 (CI): 같은 variate 내 시간 예측 (dynamics).
 Phase 2 (Any-variate): 같은 variate 시간 예측 + cross-modal 예측 (causality).
 """
-import torch
-from torch import nn
+import torch  # noqa: E402
+from torch import nn  # noqa: E402
 
-from data.spatial_map import (
+from data.spatial_map import (  # noqa: E402
     CROSS_COUPLING_WEIGHTS,
     CROSS_PRED_ALLOWED_PAIRS,
     MECHANISM_GROUP,
 )
-from loss.masked_mse_loss import compute_patch_loss
+from loss.masked_mse_loss import compute_patch_loss  # noqa: E402
 
 
 # signal_type → mechanism_group 변환용 lookup tensor (최대 signal_type + 1 크기)
@@ -69,6 +69,10 @@ class NextPredictionLoss(nn.Module):
         lambda_spec: float = 0.0,
         spec_n_ffts: tuple[int, ...] = (16, 32, 64),
         coupling_weights: dict[tuple[int, int], float] | None = None,
+        learnable_coupling: bool = False,
+        coupling_l1: float = 0.0,
+        coupling_init_logit: tuple[float, float] = (2.0, -2.0),
+        dual_coupling: bool = False,
         cross_masked_target_only: bool = True,
         cross_observed_source_only: bool = True,
     ) -> None:
@@ -80,7 +84,7 @@ class NextPredictionLoss(nn.Module):
         self.cross_observed_source_only = cross_observed_source_only
         # Directed cross-modal coupling weights W[source→target] (soft CMPM).
         # None → allowlist 재현 기본값(_DEFAULT_COUPLING_W). dict override 시 그 값으로
-        # (미지정 쌍 = 0 = γ 비활성, δ contrastive 만). buffer 로 등록해 device 이동 대응
+        # (미지정 쌍 = 0 = γ 비활성). buffer 로 등록해 device 이동 대응
         # (config 상수라 state_dict 저장 X → persistent=False).
         if coupling_weights is None:
             _cw = _DEFAULT_COUPLING_W.clone()
@@ -89,6 +93,42 @@ class NextPredictionLoss(nn.Module):
             for (_s, _t), _w in coupling_weights.items():
                 _cw[_s, _t] = float(_w)
         self.register_buffer("_coupling_w", _cw, persistent=False)
+
+        # ── 학습 가능한 결합 그래프 (기본 비활성) ──
+        # 구조 마스크: 계산 대상 쌍. 기본은 "공동측정이 존재하는 modality 쌍"으로
+        # 두되, coupling_weights 로 좁힐 수 있다. 가중치는 학습한다.
+        self.learnable_coupling = bool(learnable_coupling)
+        self.coupling_l1 = float(coupling_l1)
+        self.dual_coupling = bool(dual_coupling)
+        if self.learnable_coupling:
+            hi, lo = coupling_init_logit
+            # 기존 allowlist 는 높은 logit, 나머지 쌍은 낮은 logit 으로 출발.
+            # 자기 자신(i==i)은 cross 가 아니므로 마스크에서 제외한다.
+            _a = torch.full((_MAX_ST, _MAX_ST), float(lo), dtype=torch.float32)
+            _m = torch.ones(_MAX_ST, _MAX_ST, dtype=torch.bool)
+            _m.fill_diagonal_(False)
+            for _i in range(_MAX_ST):
+                for _j in range(_MAX_ST):
+                    if _cw[_i, _j] > 0:
+                        _a[_i, _j] = float(hi)
+            self.coupling_logit = nn.Parameter(_a)
+            self.register_buffer("_coupling_mask", _m, persistent=False)
+            # 예측형(t → t+1) 전용 두 번째 그래프. 동시점 그래프와 같은 초기값에서
+            # 출발시켜, 학습 후 두 행렬의 차이가 곧 "타이밍이 만드는 비대칭"이 된다.
+            if self.dual_coupling:
+                self.coupling_logit_next = nn.Parameter(_a.clone())
+
+    def coupling_matrix(self) -> torch.Tensor:
+        """동시점(t↔t) 결합 가중치 W_now[source, target]."""
+        if not self.learnable_coupling:
+            return self._coupling_w
+        return torch.sigmoid(self.coupling_logit) * self._coupling_mask
+
+    def coupling_matrix_next(self) -> torch.Tensor:
+        """예측형(t→t+1) 결합 가중치 W_next. dual 아니면 W_now 를 공유한다."""
+        if not (self.learnable_coupling and self.dual_coupling):
+            return self.coupling_matrix()
+        return torch.sigmoid(self.coupling_logit_next) * self._coupling_mask
 
     def forward(
         self,
@@ -99,13 +139,18 @@ class NextPredictionLoss(nn.Module):
         patch_mask: torch.Tensor,  # (B, N) bool
         patch_sample_id: torch.Tensor,  # (B, N) long
         patch_variate_id: torch.Tensor,  # (B, N) long
-        time_id: torch.Tensor | None = None,  # (B, N) long — cross-modal 페어링용
+        time_id: torch.Tensor
+        | None = None,  # (B, N) long — cross-modal 페어링용
         patch_signal_types: torch.Tensor
         | None = None,  # (B, N) long — mechanism group 필터용
         pred_mask: torch.Tensor
         | None = None,  # (B, N) bool — 마스킹된 패치. CMPM 타깃/소스 제한에 사용
         compute_next: bool = True,
         compute_cross: bool = True,
+        compute_cross_next: bool = False,
+        # (B, N, T, P) — 예측형 전용 head 출력. None 이면 동시점 head 를 재사용하나
+        # 한 출력이 t·t+1 두 타깃을 동시에 맞춰야 해서 타협값만 학습된다.
+        cross_next_pred_per_type: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Block Next Prediction loss 계산.
 
@@ -159,10 +204,34 @@ class NextPredictionLoss(nn.Module):
         else:
             cross_modal_loss = zero
 
+        # ── Cross-modal 예측형 loss (t → t+1) ──
+        if (
+            compute_cross_next
+            and cross_pred_per_type is not None
+            and time_id is not None
+        ):
+            cross_next_dict = self._cross_modal_loss(
+                cross_next_pred_per_type
+                if cross_next_pred_per_type is not None
+                else cross_pred_per_type,
+                original_patches,
+                patch_mask,
+                patch_sample_id,
+                patch_variate_id,
+                time_id,
+                patch_signal_types,
+                pred_mask,
+                temporal="next",
+            )
+            cross_next_loss = cross_next_dict["total"]
+        else:
+            cross_next_loss = zero
+
         return {
             "next_loss": next_loss,
             "next_spec": next_spec,
             "cross_modal_loss": cross_modal_loss,
+            "cross_next_loss": cross_next_loss,
         }
 
     def _same_variate_loss(
@@ -201,7 +270,10 @@ class NextPredictionLoss(nn.Module):
                 patch_mask[:, : n - step]
                 & patch_mask[:, step:]
                 & (patch_sample_id[:, : n - step] == patch_sample_id[:, step:])
-                & (patch_variate_id[:, : n - step] == patch_variate_id[:, step:])
+                & (
+                    patch_variate_id[:, : n - step]
+                    == patch_variate_id[:, step:]
+                )
             )  # (B, N-step)
 
             if not bool(valid.any()):
@@ -232,7 +304,8 @@ class NextPredictionLoss(nn.Module):
 
     def _cross_modal_loss(
         self,
-        cross_pred_per_type: torch.Tensor,  # (B, N, T, P) — per-target-type prediction
+        # (B, N, T, P) — per-target-type prediction
+        cross_pred_per_type: torch.Tensor,
         original_patches: torch.Tensor,  # (B, N, P)
         patch_mask: torch.Tensor,  # (B, N) bool
         patch_sample_id: torch.Tensor,  # (B, N) long
@@ -240,6 +313,7 @@ class NextPredictionLoss(nn.Module):
         time_id: torch.Tensor,  # (B, N) long
         patch_signal_types: torch.Tensor | None = None,  # (B, N) long
         pred_mask: torch.Tensor | None = None,  # (B, N) bool — 마스킹된 패치
+        temporal: str = "now",  # "now": t↔t / "next": t→t+1
     ) -> dict[str, torch.Tensor]:
         """Cross-modal prediction loss (target-conditioned).
 
@@ -249,25 +323,40 @@ class NextPredictionLoss(nn.Module):
         ``CROSS_COUPLING_WEIGHTS``(data/spatial_map.py, directed)에 W>0 인 방향만
         허용 (v2). 현재 γ 방향: ECG→ABP, ECG→PPG (단방향), ABP↔PPG, AWP↔RESP_Flow
         (양방향). ECG-as-target(ABP/PPG→ECG) 및 약결합 CVP·CO2·ICP·RESP_Imp 관련
-        쌍은 γ 제외 → δ contrastive 전용.
+        쌍은 γ 에서 제외된다.
         """
         # group_key: (batch, sample_id, time_id)가 같은 패치를 그룹핑
         b, n = time_id.shape
         k = time_id.max() + 1  # 0-dim 텐서 (CUDA sync 없음)
         s = patch_sample_id.max() + 1  # 0-dim 텐서 (CUDA sync 없음)
-        batch_idx = torch.arange(b, device=time_id.device).unsqueeze(-1)  # (B, 1)
-        group_key = batch_idx * (s * k) + patch_sample_id * k + time_id  # (B, N)
+        batch_idx = torch.arange(b, device=time_id.device).unsqueeze(
+            -1
+        )  # (B, 1)
+        group_key = (
+            batch_idx * (s * k) + patch_sample_id * k + time_id
+        )  # (B, N)
 
         # (B, N, N) pairwise 비교
         same_group = group_key.unsqueeze(-1) == group_key.unsqueeze(-2)
-        diff_variate = patch_variate_id.unsqueeze(-1) != patch_variate_id.unsqueeze(-2)
+        diff_variate = patch_variate_id.unsqueeze(
+            -1
+        ) != patch_variate_id.unsqueeze(-2)
         both_valid = patch_mask.unsqueeze(-1) & patch_mask.unsqueeze(-2)
         # 패딩 (variate_id == 0) 제외
         non_pad = (patch_variate_id > 0).unsqueeze(-1) & (
             patch_variate_id > 0
         ).unsqueeze(-2)
 
-        cross_mask = same_group & diff_variate & both_valid & non_pad  # (B, N, N)
+        if temporal == "next":
+            # 예측형: source i 가 t, target j 가 t+1. axis -2 = source, -1 = target.
+            # 같은 sample 안에서만 잇는다(group_key 에 +1 하면 sample 경계를 넘는다).
+            same_group = (
+                patch_sample_id.unsqueeze(-1) == patch_sample_id.unsqueeze(-2)
+            ) & ((time_id.unsqueeze(-1) + 1) == time_id.unsqueeze(-2))
+
+        cross_mask = (
+            same_group & diff_variate & both_valid & non_pad
+        )  # (B, N, N)
 
         # ── 마스킹 제약: "관측된 소스 → 마스킹된 타깃" 만 CMPM 대상 ──
         # cross_mask 축 규약: axis -2 = source(i), axis -1 = target(j)
@@ -278,7 +367,8 @@ class NextPredictionLoss(nn.Module):
         if self.cross_masked_target_only or self.cross_observed_source_only:
             if pred_mask is None:
                 raise ValueError(
-                    "cross_masked_target_only / cross_observed_source_only 가 켜져 "
+                    "cross_masked_target_only / cross_observed_source_only 가 "
+                    "켜져 "
                     "있으면 pred_mask 를 반드시 넘겨야 합니다 (None 수신)."
                 )
             if self.cross_masked_target_only:
@@ -291,11 +381,18 @@ class NextPredictionLoss(nn.Module):
         # Directed coupling 필터: W[source→target] > 0 인 쌍만 (양의 가중).
         # st_i = source(예측 근거), st_j = target(복원 대상) — 방향 구분.
         if patch_signal_types is not None:
-            cw = self._coupling_w.to(patch_signal_types.device)
+            cw = (
+                self.coupling_matrix_next()
+                if temporal == "next"
+                else self.coupling_matrix()
+            ).to(patch_signal_types.device)
             st_i = patch_signal_types.unsqueeze(-1)  # (B, N, 1) = source
             st_j = patch_signal_types.unsqueeze(-2)  # (B, 1, N) = target
             w_ij = cw[st_i, st_j]  # (B, N, N) directed weight
-            cross_mask = cross_mask & (w_ij > 0)
+            # 학습 모드에서는 sigmoid 가 정확히 0 이 되지 않으므로 임계를 둔다.
+            # (구조 마스크로 이미 자기 자신·비공존 쌍은 걸러진다)
+            _thr = 0.02 if self.learnable_coupling else 0.0
+            cross_mask = cross_mask & (w_ij > _thr)
 
         b_idx, i_idx, j_idx = torch.where(cross_mask)
 
@@ -321,10 +418,15 @@ class NextPredictionLoss(nn.Module):
 
         # directed coupling 가중평균: 각 (source→target) pair 를 W[source, target] 로
         # 가중. 가중치가 전부 1 이면 = 기존 균등 pair-balanced 평균과 동일.
-        cw = self._coupling_w.to(pred_p.device)
+        cw = (
+            self.coupling_matrix_next()
+            if temporal == "next"
+            else self.coupling_matrix()
+        ).to(pred_p.device)
         for pk in unique_pairs:
             mask = pair_key == pk
-            # pk = source_st * _MAX_ST + target_st → 방향별 W 조회 (CUDA sync 없이 텐서 인덱싱)
+            # pk = source_st * _MAX_ST + target_st → 방향별 W 조회 (CUDA sync 없이 텐서
+            # 인덱싱)
             w = cw[pk // _MAX_ST, pk % _MAX_ST]  # 0-dim tensor
             pair_loss = compute_patch_loss(
                 pred_p[mask],

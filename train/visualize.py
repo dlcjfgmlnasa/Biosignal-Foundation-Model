@@ -72,7 +72,9 @@ def _build_signal_map(
     b: int,
 ) -> dict[tuple[int, int, int], int]:
     """(row, sample_id, variate_id) → signal_type 매핑을 반환한다."""
-    has_signal_types = hasattr(batch, "signal_types") and batch.signal_types is not None
+    has_signal_types = (
+        hasattr(batch, "signal_types") and batch.signal_types is not None
+    )
     mapping: dict[tuple[int, int, int], int] = {}
     if not has_signal_types:
         return mapping
@@ -214,7 +216,9 @@ def _plot_figure_grid(
 
                 # Context + ground-truth(예측 구간) 전체를 steelblue로, 예측 구간은
                 # 점선으로 덧씌워 GT임을 강조.
-                ax.plot(t, orig_view, color="steelblue", linewidth=0.9, alpha=0.8)
+                ax.plot(
+                    t, orig_view, color="steelblue", linewidth=0.9, alpha=0.8
+                )
 
                 # Predicted block: K patches를 빨간색 실선으로
                 ctx_len_patches = block_start - ctx_start
@@ -256,7 +260,9 @@ def _plot_figure_grid(
                 pred_wave = pred_patches_cropped.reshape(-1)
                 t = np.arange(len(orig_wave)) / sampling_rate
 
-                ax.plot(t, orig_wave, color="steelblue", linewidth=0.8, alpha=0.9)
+                ax.plot(
+                    t, orig_wave, color="steelblue", linewidth=0.8, alpha=0.9
+                )
 
                 n_pred = 0
                 for patch_idx in range(n_show):
@@ -271,7 +277,10 @@ def _plot_figure_grid(
                             color=highlight_color,
                         )
                         ax.plot(
-                            t[start:end], patch_pred, color=pred_color, linewidth=1.2
+                            t[start:end],
+                            patch_pred,
+                            color=pred_color,
+                            linewidth=1.2,
                         )
                         n_pred += 1
                 duration_shown = n_show * p / sampling_rate
@@ -291,19 +300,36 @@ def _plot_figure_grid(
     if mode == "next_pred":
         legend_elements = [
             Line2D(
-                [0], [0], color="steelblue", linewidth=1, label="Context / Ground truth"
+                [0],
+                [0],
+                color="steelblue",
+                linewidth=1,
+                label="Context / Ground truth",
             ),
-            Line2D([0], [0], color=pred_color, linewidth=1.4, label=pred_label),
             Line2D(
-                [0], [0], color="gray", linewidth=1.0, linestyle=":", label="GT overlay"
+                [0], [0], color=pred_color, linewidth=1.4, label=pred_label
             ),
-            Patch(facecolor=highlight_color, alpha=0.12, label=highlight_label),
+            Line2D(
+                [0],
+                [0],
+                color="gray",
+                linewidth=1.0,
+                linestyle=":",
+                label="GT overlay",
+            ),
+            Patch(
+                facecolor=highlight_color, alpha=0.12, label=highlight_label
+            ),
         ]
     else:
         legend_elements = [
             Line2D([0], [0], color="steelblue", linewidth=1, label="Original"),
-            Line2D([0], [0], color=pred_color, linewidth=1.2, label=pred_label),
-            Patch(facecolor=highlight_color, alpha=0.12, label=highlight_label),
+            Line2D(
+                [0], [0], color=pred_color, linewidth=1.2, label=pred_label
+            ),
+            Patch(
+                facecolor=highlight_color, alpha=0.12, label=highlight_label
+            ),
         ]
     axes[0, 0].legend(handles=legend_elements, loc="upper right", fontsize=7)
 
@@ -344,8 +370,8 @@ def _extract_patches_and_scales(
     p = model.patch_size
     loc = out["loc"]  # (B, L, 1)
     scale = out["scale"]  # (B, L, 1)
-    b, l = batch.values.shape[0], batch.values.shape[1]
-    n = l // p
+    b, seq_len = batch.values.shape[0], batch.values.shape[1]
+    n = seq_len // p
     original_patches = batch.values[:, : n * p].reshape(b, n, p)
 
     stride = model.patch_embed.stride
@@ -364,7 +390,8 @@ def _extract_candidates(
     patch_loc: torch.Tensor,  # (B, N)
     patch_scale: torch.Tensor,  # (B, N)
     pred_tensor: torch.Tensor,  # (B, N, P) — reconstructed or next_pred
-    build_pred_fn,  # (seg_orig, seg_pred_denorm, seg_indices, ...) -> pred array
+    # (seg_orig, seg_pred_denorm, seg_indices, ...) -> pred array
+    build_pred_fn,
     patch_size: int,
 ) -> list[RowCandidate]:
     """(sample_id, variate_id) 단위로 RowCandidate를 추출한다."""
@@ -397,7 +424,9 @@ def _extract_candidates(
             seg_pred_norm = pred_tensor[bi, seg_indices]
             seg_loc = patch_loc[bi, seg_indices].unsqueeze(-1)
             seg_scale = patch_scale[bi, seg_indices].unsqueeze(-1)
-            seg_pred_denorm = (seg_pred_norm * seg_scale + seg_loc).cpu().numpy()
+            seg_pred_denorm = (
+                (seg_pred_norm * seg_scale + seg_loc).cpu().numpy()
+            )
 
             pred = build_pred_fn(seg_orig, seg_pred_denorm, seg_indices, n_seg)
             if pred is None:
@@ -455,7 +484,8 @@ def _process_recon_batch(
     pred_mask = out["pred_mask"]
 
     def build_pred(seg_orig, seg_pred_denorm, seg_indices, n_seg):
-        seg_masked = pred_mask[0][seg_indices].cpu().numpy()  # noqa — closure captures b
+        # note: closure captures b
+        seg_masked = pred_mask[0][seg_indices].cpu().numpy()
         pred = np.full_like(seg_orig, np.nan)
         pred[seg_masked] = seg_pred_denorm[seg_masked]
         return pred
@@ -569,7 +599,9 @@ def _process_next_pred_batch(
             if n_seg <= k:
                 continue
 
-            seg_orig = original_patches[bi, seg_indices].cpu().numpy()  # (n_seg, P)
+            seg_orig = (
+                original_patches[bi, seg_indices].cpu().numpy()
+            )  # (n_seg, P)
 
             # context 끝 패치 = n_seg - K - 1 (그 다음 K개 자리에 GT가 존재)
             ctx_end_local = n_seg - k - 1
@@ -582,7 +614,9 @@ def _process_next_pred_batch(
             block_norm = next_pred[bi, ctx_end_global]  # (K, P)
             ctx_loc = seg_loc[ctx_end_local]  # scalar
             ctx_scale = seg_scale[ctx_end_local]  # scalar
-            block_denorm = (block_norm * ctx_scale + ctx_loc).cpu().numpy()  # (K, P)
+            block_denorm = (
+                (block_norm * ctx_scale + ctx_loc).cpu().numpy()
+            )  # (K, P)
 
             pred = np.full((n_seg, p), np.nan)
             # 예측 블록: ctx_end_local + 1 .. ctx_end_local + K
@@ -656,7 +690,9 @@ def save_reconstruction_figure(
             )
         )
 
-    grid = _select_diverse_grid(all_candidates, samples_per_type=samples_per_type)
+    grid = _select_diverse_grid(
+        all_candidates, samples_per_type=samples_per_type
+    )
 
     if not grid:
         model.train()
@@ -707,7 +743,9 @@ def save_next_pred_figure(
     for b in batches:
         all_candidates.extend(_process_next_pred_batch(model, b, device))
 
-    grid = _select_diverse_grid(all_candidates, samples_per_type=samples_per_type)
+    grid = _select_diverse_grid(
+        all_candidates, samples_per_type=samples_per_type
+    )
 
     if not grid:
         model.train()

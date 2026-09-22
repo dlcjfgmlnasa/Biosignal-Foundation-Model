@@ -7,26 +7,28 @@ Phase 1 checkpoint를 로드하여, 다변량 세션에서 cross-modal 학습을
 DDP 지원, Block Masking, Horizon Curriculum 포함.
 
 Usage (single GPU):
-    python -m train.2_any_variate --resume outputs/phase1/base/checkpoints/best.pt
+    python -m train.2_any_variate --resume \
+        outputs/phase1/base/checkpoints/best.pt
 
 Usage (multi GPU -- DDP):
-    torchrun --nproc_per_node=2 launch_phase2.py --resume outputs/phase1/base/checkpoints/best.pt
+    torchrun --nproc_per_node=2 launch_phase2.py --resume \
+        outputs/phase1/base/checkpoints/best.pt
 """
-import argparse
-import gc
-import os
-import time
-from pathlib import Path
+import argparse  # noqa: E402
+import gc  # noqa: E402
+import os  # noqa: E402
+import time  # noqa: E402
+from pathlib import Path  # noqa: E402
 
-import torch
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
+import torch  # noqa: E402
+import torch.distributed as dist  # noqa: E402
+from torch.nn.parallel import DistributedDataParallel as DDP  # noqa: E402
 
-from data import BiosignalDataset, create_dataloader
-from loss.criterion import CombinedLoss
-from model import BiosignalFoundationModel, ModelConfig
-from model.checkpoint import load_checkpoint
-from .train_utils import (
+from data import BiosignalDataset, create_dataloader  # noqa: E402
+from loss.criterion import CombinedLoss  # noqa: E402
+from model import BiosignalFoundationModel, ModelConfig  # noqa: E402
+from model.checkpoint import load_checkpoint  # noqa: E402
+from .train_utils import (  # noqa: E402
     CSVLogger,
     EarlyStopping,
     TrainConfig,
@@ -46,11 +48,16 @@ from .train_utils import (
     train_one_epoch,
     validate,
 )
-from .visualize import save_reconstruction_figure, save_next_pred_figure
-from .visualize_phase2 import save_cross_modal_figure
+from .visualize import (  # noqa: E402
+    save_reconstruction_figure,
+    save_next_pred_figure,
+)
+from .visualize_phase2 import save_cross_modal_figure  # noqa: E402
 
 
-def find_phase1_checkpoint(search_dirs: list[str] | None = None) -> Path | None:
+def find_phase1_checkpoint(
+    search_dirs: list[str] | None = None,
+) -> Path | None:
     """Phase 1 best/final checkpoint를 자동 탐색한다."""
     if search_dirs is None:
         search_dirs = [
@@ -62,7 +69,11 @@ def find_phase1_checkpoint(search_dirs: list[str] | None = None) -> Path | None:
     for base_str in search_dirs:
         base = Path(base_str)
         # base 하위의 모든 서브디렉토리도 탐색
-        for d in [base] + sorted(base.glob("*/checkpoints")) + sorted(base.glob("*")):
+        for d in (
+            [base]
+            + sorted(base.glob("*/checkpoints"))
+            + sorted(base.glob("*"))
+        ):
             if not d.exists() or not d.is_dir():
                 continue
             best = sorted(d.glob("*_best.pt"))
@@ -87,7 +98,9 @@ def parse_args() -> argparse.Namespace:
         help="YAML config file path. CLI args override YAML values.",
     )
     p.add_argument(
-        "--dry-run", action="store_true", help="1 batch만 실행 후 종료 (OOM/NaN 검증용)"
+        "--dry-run",
+        action="store_true",
+        help="1 batch만 실행 후 종료 (OOM/NaN 검증용)",
     )
 
     # Resume
@@ -105,11 +118,19 @@ def parse_args() -> argparse.Namespace:
     g.add_argument("--patch_size", type=int, default=100)
     g.add_argument("--num_heads", type=int, default=None)
     g.add_argument("--num_groups", type=int, default=None)
-    g.add_argument("--use_glu", action=argparse.BooleanOptionalAction, default=True)
-    g.add_argument("--use_moe", action=argparse.BooleanOptionalAction, default=False)
-    g.add_argument("--use_rope", action=argparse.BooleanOptionalAction, default=True)
     g.add_argument(
-        "--use_var_attn_bias", action=argparse.BooleanOptionalAction, default=True
+        "--use_glu", action=argparse.BooleanOptionalAction, default=True
+    )
+    g.add_argument(
+        "--use_moe", action=argparse.BooleanOptionalAction, default=False
+    )
+    g.add_argument(
+        "--use_rope", action=argparse.BooleanOptionalAction, default=True
+    )
+    g.add_argument(
+        "--use_var_attn_bias",
+        action=argparse.BooleanOptionalAction,
+        default=True,
     )
     g.add_argument("--dropout_p", type=float, default=0.0)
     g.add_argument("--next_block_size", type=int, default=4)
@@ -117,9 +138,13 @@ def parse_args() -> argparse.Namespace:
     # Data
     g = p.add_argument_group("Data")
     g.add_argument("--data_dir", type=str, default="datasets/processed")
-    # v2 연속 9종 (2026-06-23 PAP 제거): 0 ECG~5 AWP, 6 ICP, 7 RESP_Imp, 8 RESP_Flow.
+    # v2 연속 9종 (2026-06-23 PAP 제거): 0 ECG~5 AWP, 6 ICP, 7 RESP_Imp, 8
+    # RESP_Flow.
     g.add_argument(
-        "--signal_types", type=int, nargs="+", default=[0, 1, 2, 3, 4, 5, 6, 7, 8]
+        "--signal_types",
+        type=int,
+        nargs="+",
+        default=[0, 1, 2, 3, 4, 5, 6, 7, 8],
     )
     g.add_argument("--max_subjects", type=int, default=None)
     g.add_argument("--window_seconds", type=float, default=30.0)
@@ -146,10 +171,9 @@ def parse_args() -> argparse.Namespace:
     g.add_argument(
         "--beta", type=float, default=0.3, help="Next-patch prediction weight"
     )
-    g.add_argument("--gamma", type=float, default=1.0, help="Cross-modal loss weight")
-    g.add_argument("--delta", type=float, default=0.1, help="Contrastive loss weight")
-    g.add_argument("--contrastive_proj_dim", type=int, default=128)
-    g.add_argument("--contrastive_temperature", type=float, default=0.07)
+    g.add_argument(
+        "--gamma", type=float, default=1.0, help="Cross-modal loss weight"
+    )
 
     # Masking
     g.add_argument(
@@ -162,7 +186,8 @@ def parse_args() -> argparse.Namespace:
         "--variate_drop_prob",
         type=float,
         default=0.1,
-        help="Complete variate dropout probability (zero-shot cross-modal generation용)",
+        help="Complete variate dropout probability (zero-shot cross-modal "
+        "generation용)",
     )
     g.add_argument(
         "--block_mask",
@@ -182,7 +207,9 @@ def parse_args() -> argparse.Namespace:
     g.add_argument("--use_amp", action="store_true")
     g.add_argument("--device", type=str, default="auto")
     g.add_argument("--num_workers", type=int, default=4)
-    g.add_argument("--output_dir", type=str, default="outputs/phase2_any_variate")
+    g.add_argument(
+        "--output_dir", type=str, default="outputs/phase2_any_variate"
+    )
     g.add_argument("--checkpoint_every", type=int, default=5)
     g.add_argument("--viz_every", type=int, default=5)
     g.add_argument("--exp_name", type=str, default="")
@@ -228,7 +255,6 @@ def main():
             use_var_attn_bias=args.use_var_attn_bias,
             dropout_p=args.dropout_p,
             next_block_size=args.next_block_size,
-            contrastive_proj_dim=args.contrastive_proj_dim,
         )
 
         config = TrainConfig(
@@ -253,8 +279,6 @@ def main():
             alpha=args.alpha,
             beta=args.beta,
             gamma=args.gamma,
-            delta=args.delta,
-            contrastive_temperature=args.contrastive_temperature,
             variate_mask_prob=args.variate_mask_prob,
             variate_drop_prob=args.variate_drop_prob,
             block_mask=args.block_mask,
@@ -280,7 +304,10 @@ def main():
         print("Phase 2: Any-Variate Training (Cross-Modal)")
         if config.exp_name:
             print(f"Experiment: {config.exp_name}")
-        print(f"Device: {device}" + (f" (DDP: {world_size} GPUs)" if use_ddp else ""))
+        print(
+            f"Device: {device}"
+            + (f" (DDP: {world_size} GPUs)" if use_ddp else "")
+        )
         print(f"{'=' * 60}")
 
     # ── Checkpoint (Phase 1 transition or Phase 2 resume) ──
@@ -306,7 +333,9 @@ def main():
     #  - 그 외(phase1_ci, 누락) : Phase 1 → 2 transition → weight만, optimizer fresh
     ckpt_phase = str(ckpt_state.get("phase", ""))
     is_resume_phase2 = ckpt_phase.startswith("phase2_av")
-    mode_label = "Resume Phase 2" if is_resume_phase2 else "Transition from Phase 1"
+    mode_label = (
+        "Resume Phase 2" if is_resume_phase2 else "Transition from Phase 1"
+    )
     if rank0:
         print(f"Loading checkpoint ({mode_label}): {ckpt_path}")
     if "config" in ckpt_state:
@@ -320,24 +349,40 @@ def main():
         # 채워지므로(예: 신규 추가된 next_head_d_inner=None), yaml에 명시된
         # 값과 다르면 yaml 값이 무시된다는 경고가 표시됨 — 의도된 동작.
         # NOTE: num_spatial_ids는 v2에서 폐지됨 (model/_config.py 참고) — 제외.
-        # use_lscnorm/d_cond는 cond_proj·modulation weight shape에 영향 → shape-lock.
+        # use_lscnorm/d_cond는 cond_proj·modulation weight shape에 영향 →
+        # shape-lock.
         SHAPE_LOCKED_FIELDS = {
-            "d_model", "num_layers", "patch_size", "stride",
-            "num_heads", "num_groups",
-            "use_glu", "use_moe", "num_experts",
-            "use_rope", "use_var_attn_bias", "use_spatial_embed",
-            "num_signal_types", "next_head_d_inner",
-            "use_lscnorm", "d_cond",
+            "d_model",
+            "num_layers",
+            "patch_size",
+            "stride",
+            "num_heads",
+            "num_groups",
+            "use_glu",
+            "use_moe",
+            "num_experts",
+            "use_rope",
+            "use_var_attn_bias",
+            "use_spatial_embed",
+            "num_signal_types",
+            "next_head_d_inner",
+            "use_lscnorm",
+            "d_cond",
         }
         # 런타임 또는 안전한 재초기화 가능 필드 — yaml 값이 우선.
-        # (next_block_size, contrastive_proj_dim은 head shape에 영향 있지만
-        #  새 head를 random init으로 만들 수 있어 user override 허용.)
+        # (next_block_size 는 head shape에 영향 있지만 새 head를 random init
+        #  으로 만들 수 있어 user override 허용.)
+        # dual_cross_head 는 신규 head(cross_next_heads)를 random init 으로 붙인다.
+        # 미분류로 두면 Phase 1 ckpt 의 False 가 덮어써 head 가 안 생긴다(09-22 g_dual).
         USER_OVERRIDABLE_FIELDS = {
-            "dropout_p", "num_experts_per_token",
-            "next_block_size", "contrastive_proj_dim",
+            "dropout_p",
+            "num_experts_per_token",
+            "next_block_size",
+            "dual_cross_head",
         }
 
         from dataclasses import fields as dc_fields
+
         all_field_names = {f.name for f in dc_fields(ModelConfig)}
         # 카테고리 누락 검출 — ModelConfig 확장 시 분류 강제
         unclassified = (
@@ -369,8 +414,8 @@ def main():
             user_val = getattr(user_model_config, fname)
             ckpt_val = getattr(ckpt_model_config, fname)
             if user_val != ckpt_val and rank0:
-                # next_block_size / contrastive_proj_dim은 새 head 재초기화 안내
-                if fname in ("next_block_size", "contrastive_proj_dim"):
+                # next_block_size 는 새 head 재초기화 안내
+                if fname == "next_block_size":
                     print(
                         f"  ⚠️  {fname} override: ckpt={ckpt_val} → "
                         f"yaml={user_val} (해당 head 일부가 random 재초기화됩니다)"
@@ -387,8 +432,7 @@ def main():
                 f"  Model config: patch_size={ckpt_model_config.patch_size}, "
                 f"d_model={ckpt_model_config.d_model}, "
                 f"num_layers={ckpt_model_config.num_layers}, "
-                f"next_block_size K={ckpt_model_config.next_block_size}, "
-                f"contrastive_proj_dim={ckpt_model_config.contrastive_proj_dim}"
+                f"next_block_size K={ckpt_model_config.next_block_size}"
             )
 
     model = BiosignalFoundationModel.from_config(config.model_config)
@@ -442,7 +486,8 @@ def main():
         )
         if rank0:
             print(
-                f"Train/Val split: {len(train_manifest)} train, {len(val_manifest)} val"
+                f"Train/Val split: {len(train_manifest)} train, "
+                f"{len(val_manifest)} val"
             )
     else:
         train_manifest = manifest
@@ -463,12 +508,16 @@ def main():
         shard_index_path=config.shard_index_path,
         shard_cache_size=config.shard_cache_size,
         # 멀티소스: data_dir(list) 을 소스별 authoritative manifest resolve 에 사용.
-        source_dirs=config.data_dir if isinstance(config.data_dir, list) else None,
+        source_dirs=config.data_dir
+        if isinstance(config.data_dir, list)
+        else None,
     )
     if rank0:
         if config.shard_index_path:
-            print(f"  Shard backend ON: {config.shard_index_path} "
-                  f"(shard_cache_size={config.shard_cache_size})")
+            print(
+                f"  Shard backend ON: {config.shard_index_path} "
+                f"(shard_cache_size={config.shard_cache_size})"
+            )
         print(f"Train dataset: {len(dataset)} windows")
 
     dataloader = create_dataloader(
@@ -477,8 +526,11 @@ def main():
         batch_size=config.batch_size,
         shuffle=True,
         num_workers=config.num_workers,
-        pin_memory=False,         # pinned RAM 누적 방지 (NCCL stuck 시 leak 회피)
-        persistent_workers=True,  # epoch 경계 worker re-fork 회피 → shard cache 보존, dataloader cold-start stall 제거 (NCCL ALLREDUCE timeout 재발 방지). worker leak 처방 c8e7325/cd53873 적용 후 안전.
+        pin_memory=False,  # pinned RAM 누적 방지 (NCCL stuck 시 leak 회피)
+        # epoch 경계 worker re-fork 회피 → shard cache 보존, dataloader cold-start
+        # stall 제거 (NCCL ALLREDUCE timeout 재발 방지). worker leak 처방
+        # c8e7325/cd53873 적용 후 안전.
+        persistent_workers=True,
         collate_mode=config.collate_mode,
         patch_size=config.model_config.patch_size,
         min_patches=config.min_patches,
@@ -496,7 +548,9 @@ def main():
             min_patches=config.min_patches,
             shard_index_path=config.shard_index_path,
             shard_cache_size=config.shard_cache_size,
-            source_dirs=config.data_dir if isinstance(config.data_dir, list) else None,
+            source_dirs=config.data_dir
+            if isinstance(config.data_dir, list)
+            else None,
         )
         val_dataloader = create_dataloader(
             val_dataset,
@@ -504,19 +558,27 @@ def main():
             batch_size=config.batch_size,
             shuffle=False,
             num_workers=config.num_workers,
-            persistent_workers=True,  # val 경계도 worker 보존 (train↔val 전환에서 stall 회피)
+            # val 경계도 worker 보존 (train↔val 전환에서 stall 회피)
+            persistent_workers=True,
             collate_mode=config.collate_mode,
             patch_size=config.model_config.patch_size,
             min_patches=config.min_patches,
         )
         if rank0:
             print(
-                f"Val dataset: {len(val_dataset)} windows, {len(val_dataloader)} batches"
+                f"Val dataset: {len(val_dataset)} windows, "
+                f"{len(val_dataloader)} batches"
             )
 
     # ── DDP wrap ──
     if use_ddp:
-        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+        model = DDP(
+            model, device_ids=[local_rank], find_unused_parameters=True,
+            # broadcast_buffers=False (2026-09-12): RoPE cos/sin cache 는 seq_len 에 따라 lazily 확장되는
+            # non-persistent buffer 라 rank 마다 크기가 달라질 수 있고(patch 50: 행 640 tok > 캐시 512),
+            # DDP 의 매 step buffer broadcast 가 크기 불일치로 hang 했다. 학습 통계 buffer 는 없으므로 동기화 불필요.
+            broadcast_buffers=False
+        )
 
     raw_model = model.module if use_ddp else model
 
@@ -525,13 +587,16 @@ def main():
         alpha=config.alpha,
         beta=config.beta,
         gamma=config.gamma,
-        delta=config.delta,
         peak_alpha=config.peak_alpha,
         lambda_spec=config.lambda_spec,
         spec_n_ffts=config.spec_n_ffts,
-        contrastive_temperature=config.contrastive_temperature,
-        learnable_temperature=config.learnable_temperature,
-        coupling_weights=None,  # CMPM γ = directed allowlist 균일 1.0 (경험적 가중 폐기)
+        # CMPM γ = directed allowlist 균일 1.0 (경험적 가중 폐기)
+        coupling_weights=None,
+        # 학습 가능한 결합 그래프 (config 로 제어)
+        learnable_coupling=getattr(config, "learnable_coupling", False),
+        coupling_l1=getattr(config, "coupling_l1", 0.0),
+        dual_coupling=getattr(config, "dual_coupling", False),
+        gamma_next=getattr(config, "gamma_next", 0.0),
     ).to(device)
     optimizer = create_optimizer(
         list(model.parameters()) + list(criterion.parameters()),
@@ -553,18 +618,48 @@ def main():
         )
         start_epoch = int(resume_state.get("epoch", 0)) + 1
         loss_val = resume_state.get("loss", float("inf"))
+
+        # criterion state(학습형 coupling·temperature) 복원.
+        # save_training_checkpoint 가 criterion 을 별도 파일로 떨구므로 같은
+        # epoch 의 criterion_*.pt 를 찾아 싣는다. 이게 없으면 학습된 coupling
+        # 행렬이 초기 logit 으로 리셋되어 resume 이 무의미해진다.
+        _ck_dir = Path(ckpt_path).parent
+        _ep = int(resume_state.get("epoch", 0))
+        _cands = sorted(_ck_dir.glob(f"criterion_epoch{_ep:03d}*.pt"))
+        if _cands:
+            _cs = torch.load(_cands[0], map_location=device, weights_only=False)
+            if isinstance(_cs, dict) and "state_dict" in _cs:
+                _cs = _cs["state_dict"]
+            criterion.load_state_dict(_cs, strict=False)
+            if rank0:
+                print(f"  criterion restored: {_cands[0].name}")
+                _npl = getattr(criterion, "next_loss_fn", None)
+                if getattr(_npl, "learnable_coupling", False):
+                    _w = _npl.coupling_matrix()
+                    print(
+                        f"  coupling mean={_w.mean():.4f} "
+                        f"ECG->ABP={_w[0, 1]:.3f} ABP->ECG={_w[1, 0]:.3f}"
+                    )
+        elif rank0:
+            print(
+                f"  !! criterion_epoch{_ep:03d}*.pt 없음 "
+                f"— coupling 이 초기값으로 리셋된다"
+            )
         try:
             resumed_best_loss = float(loss_val)
         except (TypeError, ValueError):
             resumed_best_loss = None
         import warnings
+
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             for _ in range(start_epoch):
                 scheduler.step()
         if rank0:
             best_str = (
-                f"{resumed_best_loss:.6f}" if resumed_best_loss is not None else "?"
+                f"{resumed_best_loss:.6f}"
+                if resumed_best_loss is not None
+                else "?"
             )
             print(
                 f"Resumed: continuing from epoch {start_epoch}, "
@@ -589,11 +684,14 @@ def main():
         viz_batches = []
         seen_types: set[int] = set()
         all_types = (
-            set(config.signal_types) if hasattr(config, "signal_types") else set()
+            set(config.signal_types)
+            if hasattr(config, "signal_types")
+            else set()
         )
         max_viz_batches = min(100, len(val_dataloader))
         try:
             from tqdm import tqdm
+
             pbar = tqdm(
                 total=max_viz_batches,
                 desc="viz_batches prep (cold val shard load)",
@@ -610,7 +708,8 @@ def main():
                 if pbar is not None:
                     pbar.update(1)
                     pbar.set_postfix(
-                        types_seen=f"{len(seen_types)}/{len(all_types) if all_types else '?'}",
+                        types_seen=f"{len(seen_types)}/"
+                        f"{len(all_types) if all_types else '?'}",
                     )
                 if all_types and seen_types >= all_types:
                     break
@@ -647,39 +746,49 @@ def main():
         resumed_best_loss if resumed_best_loss is not None else float("inf")
     )
     early_stopper = (
-        EarlyStopping(patience=config.patience) if config.patience > 0 else None
+        EarlyStopping(patience=config.patience)
+        if config.patience > 0
+        else None
     )
     csv_logger = CSVLogger(output_dir / "training_log.csv") if rank0 else None
 
     if rank0:
         if start_epoch > 0:
             print(
-                f"\nStarting training: epoch {start_epoch} → {config.n_epochs - 1} "
+                f"\nStarting training: epoch {start_epoch} → "
+                f"{config.n_epochs - 1} "
                 f"({config.n_epochs - start_epoch} epochs to go)"
             )
         else:
             print(f"\nStarting training: {config.n_epochs} epochs")
         print(
-            f"  alpha={config.alpha}, beta={config.beta}, gamma={config.gamma}, delta={config.delta}"
+            f"  alpha={config.alpha}, beta={config.beta}, "
+            f"gamma={config.gamma}"
         )
         print(
-            f"  next_block_size={config.model_config.next_block_size}, mask_ratio={config.mask_ratio}"
+            f"  next_block_size={config.model_config.next_block_size}, "
+            f"mask_ratio={config.mask_ratio}"
         )
         print(f"  variate_mask_prob={config.variate_mask_prob}")
         print(
-            f"  block_mask={config.block_mask}, block_size=[{config.block_size_min}, {config.block_size_max}]"
+            f"  block_mask={config.block_mask}, "
+            f"block_size=[{config.block_size_min}, {config.block_size_max}]"
         )
         print(f"  warmup_epochs={config.warmup_epochs}")
         print(f"  collate_mode={config.collate_mode}")
         if val_dataloader is not None:
-            print(f"  val_ratio={config.val_ratio}, patience={config.patience}")
+            print(
+                f"  val_ratio={config.val_ratio}, patience={config.patience}"
+            )
         print(f"{'=' * 60}")
 
     for epoch in range(start_epoch, config.n_epochs):
         # DDP: sampler epoch sync
         if sampler is not None:
             sampler.set_epoch(epoch)
-        if hasattr(dataloader, "batch_sampler") and hasattr(dataloader.batch_sampler, "set_epoch"):
+        if hasattr(dataloader, "batch_sampler") and hasattr(
+            dataloader.batch_sampler, "set_epoch"
+        ):
             dataloader.batch_sampler.set_epoch(epoch)
 
         # 에폭 경계 메모리 정리: val/viz 잔여 + fragmentation 해소
@@ -723,8 +832,7 @@ def main():
                 f"train: {losses['total']:.6f} | "
                 f"masked: {losses['masked_loss']:.6f} | "
                 f"next: {losses['next_loss']:.6f} | "
-                f"cross: {losses['cross_modal_loss']:.6f} | "
-                f"contrastive: {losses['contrastive_loss']:.6f}"
+                f"cross: {losses['cross_modal_loss']:.6f}"
             )
             if val_losses is not None:
                 line += f" | val: {val_losses['total']:.6f}"
@@ -780,13 +888,16 @@ def main():
                 print(f"  -> Cross-modal figure: {cross_path}")
             else:
                 print(
-                    f"  -> Cross-modal figure: SKIP (no multi-variate pairs found in viz batch)"
+                    f"  -> Cross-modal figure: SKIP (no multi-variate pairs "
+                    f"found in viz batch)"
                 )
 
         # Best model
         if rank0:
             track_loss = (
-                val_losses["total"] if val_losses is not None else losses["total"]
+                val_losses["total"]
+                if val_losses is not None
+                else losses["total"]
             )
             if track_loss < best_loss:
                 best_loss = track_loss
@@ -800,6 +911,7 @@ def main():
                     loss=best_loss,
                     output_dir=output_dir,
                     tag="best",
+                    criterion=criterion,
                 )
                 print(f"  -> Best model: {path}")
 
@@ -827,7 +939,8 @@ def main():
                 if rank0:
                     print(
                         f"\n  Early stopping at epoch {epoch} "
-                        f"(patience={config.patience}, best_val={early_stopper.best_loss:.6f})"
+                        f"(patience={config.patience}, "
+                        f"best_val={early_stopper.best_loss:.6f})"
                     )
                 break
 
@@ -848,7 +961,10 @@ def main():
         print(f"Phase 2 complete. Final train loss: {losses['total']:.6f}")
         if val_losses is not None:
             print(f"Final val loss: {val_losses['total']:.6f}")
-        print(f"Best {'val' if val_dataloader else 'train'} loss: {best_loss:.6f}")
+        print(
+            f"Best {'val' if val_dataloader else 'train'} loss: "
+            f"{best_loss:.6f}"
+        )
         print(f"Final checkpoint: {final_path}")
         print(f"{'=' * 60}")
 

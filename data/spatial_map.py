@@ -135,7 +135,6 @@ def get_global_spatial_id(signal_type: int, local_id: int) -> int:
 
 # ── Mechanism Group ────────────────────────────────────────────
 # Cross-Modal MSE reconstruction은 같은 mechanism group 내에서만 허용.
-# Contrastive (InfoNCE)는 전체 허용 (그룹 무관).
 #
 # Cardiovascular (0): ECG, ABP, PPG, CVP, ICP — 심혈관계, 심박 주기 동기화
 # Respiratory (1): CO2, AWP, RESP_Impedance, RESP_Flow — 호흡계, 환기 동기화
@@ -162,7 +161,7 @@ MECHANISM_GROUP_NAMES: dict[int, str] = {
 # ── Cross-Pred Allowed Pairs ──────────────────────────────────
 # Cross-Modal MSE reconstruction에서 허용되는 signal type 쌍.
 # 생리학적으로 waveform 복원이 가능한(인과 관계가 있는) 쌍만 포함.
-# Contrastive (InfoNCE)에는 적용되지 않음 (전체 쌍 허용).
+# learnable_coupling 을 쓰면 이 목록은 제약이 아니라 학습 그래프의 초기값이다.
 #
 # 선별 원칙:
 #   1. 같은 물리 도메인 (amplitude 예측 가능)
@@ -181,7 +180,7 @@ MECHANISM_GROUP_NAMES: dict[int, str] = {
 #
 # 제외 후보 (v2 에서 미포함):
 #   (7,8) RESP_Impedance↔RESP_Flow: 같은 호흡 주기지만 물리량(임피던스 vs 유량)·
-#     위상 차이가 커 waveform 복원 인과 약함. Contrastive 에서만 다뤄짐.
+#     위상 차이가 커 waveform 복원 인과 약함.
 #   (5,7) AWP↔RESP_Impedance: 약한 상관은 있으나 직접 인과 아님.
 #
 # 기존(구 spec) 기각 후보 (유지):
@@ -191,12 +190,12 @@ MECHANISM_GROUP_NAMES: dict[int, str] = {
 
 # ── γ (CMPM, directed cross-modal MSE 복원) 대상 쌍 — 강결합만 ──
 # 손실 배정 (팀 4 생리학 교차검증 + 문헌, 2026-06-03 확정):
-#   "파형이 실제로 전달되는 강결합"만 γ(directed MSE)에 사용한다. 절대압·용적·
-#   compliance 가 끼어 형태가 전기신호에 안 실리는 약결합은 δ(contrastive)로만
-#   정렬한다(δ 는 ungated 전체 쌍이라 약결합은 자동으로 CMCL 만 받음).
-#   약결합에 복원을 걸면 "리듬만 베끼는" shortcut 으로 loss 를 낮추므로 contrastive 가 안전.
+#   "파형이 실제로 전달되는 강결합"만 γ(directed MSE)의 초기 높은 가중치로 둔다.
+#   절대압·용적·compliance 가 끼어 형태가 전기신호에 안 실리는 약결합은 낮은
+#   초기값에서 출발시킨다. 약결합에 강한 복원을 걸면 "리듬만 베끼는" shortcut 으로
+#   loss 를 낮춘다.
 #   문헌: cross-modal waveform 변환은 PPG↔ECG(CardioGAN 등)에 집중, ECG↔CVP 등은
-#   공백 → 약결합은 합성(CMPM)이 아니라 정렬(CMCL)로 다루는 것이 근거와 일치.
+#   공백 → 강결합만 고가중으로 출발시키는 편이 근거와 일치.
 # NOTE: 2026-06-23 PAP 제거로 signal_type 번호 재배치(ICP=6, RESP_Imp=7, RESP_Flow=8).
 #   쌍은 의미로 정의되며 새 번호로 갱신했다.
 CROSS_PRED_ALLOWED_PAIRS: set[tuple[int, int]] = {
@@ -210,7 +209,7 @@ CROSS_PRED_ALLOWED_PAIRS: set[tuple[int, int]] = {
         8,
     ),  # AWP ↔ RESP_Flow — airway pressure ↔ flow, P–Q 운동방정식 직접 인과
 }
-# ── γ 에서 제외된 쌍 (δ contrastive 로만 cross-modal 정렬) — 약결합 ──
+# ── γ 초기값이 낮은 쌍 — 약결합 ──
 #   (0,3) ECG↔CVP      : a/c/v파가 P/QRS/T에 타이밍 lock 되나, 절대압·진폭은
 #       용적상태·우심기능·삼첨판·흉강내압이 결정 → ECG 에 없음 (타이밍 강·형태 약).
 #   (1,6) ABP↔ICP      : P1(박동)만 ABP 인과. P2(compliance)·B-wave·plateau 불가.
@@ -224,7 +223,7 @@ CROSS_PRED_ALLOWED_PAIRS: set[tuple[int, int]] = {
 # ── γ (CMPM) cross-modal 예측 방향 (directed) + 가중 ─────────────────────────
 # W[(source, target)] = source 로 target 을 생성 예측할 때의 CMPM loss 가중치.
 # patch(2s) 안에서 보이는 빠른·같은대역·shape 결합만 CMPM 재구성 대상이며, 방향은
-# 생리적 복원가능성으로 확정한다 (범위·변조·희소 쌍은 δ contrastive 로만 정렬):
+# 생리적 복원가능성으로 확정한다 (범위·변조·희소 쌍은 낮은 초기값):
 #   ECG → ABP/PPG   : 전기→기계 트리거 (역방향 QRS 복원불가 → 단방향)
 #   ABP ↔ PPG       : 같은 동맥맥파 (양방향; ppg→abp = cuffless BP)
 #   AWP ↔ RESP_Flow : P–V̇ 운동방정식 (양방향)

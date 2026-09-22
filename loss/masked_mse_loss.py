@@ -6,8 +6,8 @@ from __future__ import annotations
 Phase 1 (CI): 랜덤 패치 마스킹 → 같은 variate 내 형태학 복원.
 Phase 2 (Any-variate): variate-level 마스킹 → 다른 모달리티로부터 복원 (Virtual Sensing).
 """
-import torch
-from torch import nn
+import torch  # noqa: E402
+from torch import nn  # noqa: E402
 
 # ``reflection_pad1d``의 backward CUDA 커널은 배치 차원을 ``gridDim.z``에 싣는데
 # 그 상한이 65535다. ``torch.stft``는 ``center=True``일 때 내부적으로 reflect pad를
@@ -62,9 +62,10 @@ def _stft_terms_chunked(
 
         diff_sq = diff_sq + (target_mag - pred_mag).pow(2).sum()
         target_sq = target_sq + target_mag.pow(2).sum()
-        log_abs_sum = log_abs_sum + (
-            torch.log1p(pred_mag) - torch.log1p(target_mag)
-        ).abs().sum()
+        log_abs_sum = (
+            log_abs_sum
+            + (torch.log1p(pred_mag) - torch.log1p(target_mag)).abs().sum()
+        )
         n_elem += target_mag.numel()
 
     sc = diff_sq.sqrt() / (target_sq.sqrt() + 1e-8)
@@ -109,10 +110,14 @@ def _multi_resolution_stft_loss(
             # 청크 경로. 아래 단일-샷 경로와 수식이 동일하지만 reduction 순서가
             # 달라 마지막 비트가 어긋날 수 있어, 상한 아래에서는 기존 경로를
             # 그대로 둔다 (기존 체크포인트와의 비트 재현성 보존).
-            sc, log_mag = _stft_terms_chunked(pred_f, target_f, n_fft, hop, window)
+            sc, log_mag = _stft_terms_chunked(
+                pred_f, target_f, n_fft, hop, window
+            )
         else:
             pred_mag = _stft_magnitude(pred_f, n_fft, hop, window)  # (M, F, T)
-            target_mag = _stft_magnitude(target_f, n_fft, hop, window)  # (M, F, T)
+            target_mag = _stft_magnitude(
+                target_f, n_fft, hop, window
+            )  # (M, F, T)
 
             # Spectral Convergence: Frobenius norm ratio
             sc = torch.norm(target_mag - pred_mag, p="fro") / (
@@ -120,7 +125,9 @@ def _multi_resolution_stft_loss(
             )
 
             # Log-magnitude L1
-            log_mag = (torch.log1p(pred_mag) - torch.log1p(target_mag)).abs().mean()
+            log_mag = (
+                (torch.log1p(pred_mag) - torch.log1p(target_mag)).abs().mean()
+            )
 
         loss = loss + sc + log_mag
 
@@ -149,7 +156,9 @@ def compute_peak_weighted_mse(
     """
     if peak_alpha > 0:
         abs_target = target.abs()  # (M, P)
-        max_abs = abs_target.amax(dim=-1, keepdim=True).clamp(min=1e-8)  # (M, 1)
+        max_abs = abs_target.amax(dim=-1, keepdim=True).clamp(
+            min=1e-8
+        )  # (M, 1)
         weight = 1.0 + peak_alpha * (abs_target / max_abs)  # (M, P)
         return (weight * (pred - target) ** 2).mean()
     return ((pred - target) ** 2).mean()
@@ -251,7 +260,8 @@ def create_patch_mask(
     block_mask: bool = False,  # True면 연속 블록 마스킹
     block_size_min: int = 3,  # 블록 최소 크기 (패치 수)
     block_size_max: int = 8,  # 블록 최대 크기 (패치 수)
-    patch_sample_id: torch.Tensor | None = None,  # (B, N) — packing unit 식별자
+    patch_sample_id: torch.Tensor
+    | None = None,  # (B, N) — packing unit 식별자
 ) -> torch.Tensor:  # (B, N) bool — 마스킹 대상 (True=마스킹)
     """패치 마스킹 생성.
 
@@ -292,7 +302,9 @@ def create_patch_mask(
     pred_mask = torch.zeros(b, n, dtype=torch.bool, device=device)
 
     for bi in range(b):
-        row_valid_idx = patch_mask[bi].nonzero(as_tuple=True)[0]  # 유효 패치 인덱스
+        row_valid_idx = patch_mask[bi].nonzero(as_tuple=True)[
+            0
+        ]  # 유효 패치 인덱스
         if len(row_valid_idx) == 0:
             continue
 
@@ -301,7 +313,9 @@ def create_patch_mask(
             unit_groups = [row_valid_idx]
         else:
             row_sids = patch_sample_id[bi, row_valid_idx]
-            unit_groups = [row_valid_idx[row_sids == uid] for uid in row_sids.unique()]
+            unit_groups = [
+                row_valid_idx[row_sids == uid] for uid in row_sids.unique()
+            ]
 
         for valid_idx in unit_groups:
             if len(valid_idx) == 0:
@@ -325,7 +339,9 @@ def create_patch_mask(
                             patch_variate_id[bi] == chosen_var
                         ) & patch_mask[bi]
                     else:
-                        pred_mask[bi, valid_idx[valid_var_ids == chosen_var]] = True
+                        pred_mask[
+                            bi, valid_idx[valid_var_ids == chosen_var]
+                        ] = True
                     continue
                 # 단일 variate unit → 아래 block/random 마스킹으로 폴백
                 # (구 동작은 여기서 행 전체가 block 마스킹으로 넘어갔다)
@@ -341,7 +357,10 @@ def create_patch_mask(
                 # valid_idx는 정렬되어 있으므로 연속 구간(run) 추출.
                 # unit 스코핑 시에는 variate 경계도 끊어, 하나의 블록이 서로 다른
                 # 신호에 걸치지 않도록 한다.
-                if patch_sample_id is not None and patch_variate_id is not None:
+                if (
+                    patch_sample_id is not None
+                    and patch_variate_id is not None
+                ):
                     runs = _find_contiguous_runs_grouped(
                         valid_idx, patch_variate_id[bi, valid_idx]
                     )
@@ -351,9 +370,9 @@ def create_patch_mask(
                 while masked_count < n_mask and runs:
                     # 배치 가능한 run만 필터링
                     eligible = [
-                        (i, s, l)
-                        for i, (s, l) in enumerate(runs)
-                        if l >= block_size_min
+                        (i, s, seq_len)
+                        for i, (s, seq_len) in enumerate(runs)
+                        if seq_len >= block_size_min
                     ]
                     if not eligible:
                         break
@@ -397,7 +416,9 @@ def create_patch_mask(
                     remaining = valid_idx[~pred_mask[bi, valid_idx]]
                     if len(remaining) > 0:
                         extra = min(n_mask - masked_count, len(remaining))
-                        perm = torch.randperm(len(remaining), device=device)[:extra]
+                        perm = torch.randperm(len(remaining), device=device)[
+                            :extra
+                        ]
                         pred_mask[bi, remaining[perm]] = True
             else:
                 # ── Random Masking (기본) ──
