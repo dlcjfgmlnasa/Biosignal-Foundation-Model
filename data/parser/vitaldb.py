@@ -345,6 +345,9 @@ TRACK_MAP: dict[str, tuple[str, int]] = {
 # 트랙별 단위 환산 계수 (로드 직후 곱함). 목표 단위: CO2 mmHg · AWP cmH2O · Flow L/min.
 #   GE CO2 %(vol) → mmHg: ×(P_amb − P_H2O)/100 ≈ (760 − 47)/100 = 7.13
 #   Dräger AWP hPa → cmH2O: ×1.01972
+# raw 0(= offset)이 sentinel 이 아니라 측정 범위 바닥(클리핑)인 트랙 — process_vital Step -1 참고.
+RAW0_NOT_SENTINEL: set[str] = {"Intellivue/RESP"}
+
 TRACK_UNIT_SCALE: dict[str, float] = {
     "Datex-Ohmeda/CO2": 7.13,
     "CS2/CO2": 7.13,
@@ -861,8 +864,13 @@ def process_vital(
         # FLOW −130, Primus AWP −20·AWF −200). offset 이 음수인 트랙에서 offset 과
         # 정확히 같은 값은 생리값이 아니므로 NaN 처리한다. offset ≥ 0 (예: Primus
         # CO2 offset 0 → 0 mmHg 는 정상 흡기값) 은 건드리지 않는다.
+        # 예외: Intellivue/RESP(임피던스, offset −0.6·범위 −0.6~1.9)는 raw 0 이
+        # sentinel 이 아니라 ADC 바닥 = 호흡 골의 클리핑이다. NaN 으로 바꾸면 골마다
+        # 구멍이 나 60s 연속 구간이 끊기고 RESP_Imp 시간의 58%가 사라진다
+        # (2026-09-28 202501 ICU 40파일 A/B: 3.9h → 9.4h). 전극 없는 −0.6 평탄선은
+        # 품질 검사의 flatline 게이트가 거른다.
         trk_offset = float(getattr(trk, "offset", 0.0) or 0.0)
-        if trk_offset < 0.0:
+        if trk_offset < 0.0 and track_name not in RAW0_NOT_SENTINEL:
             sentinel = np.isclose(data, trk_offset, rtol=0.0, atol=1e-6)
             n_sent = int(sentinel.sum())
             if n_sent > 0:
