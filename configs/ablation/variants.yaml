@@ -1,154 +1,131 @@
-# Ablation variants — 6 ablation × 14 variant (baseline 포함).
+# CARMEN ablation variants (2026-09-30 확정) — 6 ablation, 기준 포함 9 variant.
 # ────────────────────────────────────────────────────────────────
-# 각 variant 는 base yaml(_phase1_base.yaml, _phase2_base.yaml) 위에
-# selective override 만 가한다. scripts/run_ablation.py 가 base + overrides
-# 를 merge 하여 임시 config 를 만들고 train 스크립트를 invoke 한다.
+# 각 variant 는 base yaml(_phase1_base.yaml, _phase2_base.yaml) 위에 overrides 만 얹는다.
+# scripts/run_ablation.py 가 merge → 임시 config → torchrun. ckpt 는 마지막 epoch 을 쓴다
+# (고정 예산 비교 — val loss 로 고르지 않는다).
 #
-# run_phase2: false 면 Phase 2 skip (예: ablation #4 Phase 1 only).
-# phase1.reuse: <variant_name> 이면 해당 variant 의 Phase 1 ckpt 를 그대로
-# 사용 (예: ablation #3/#4 — Phase 1 baseline 공유).
+# run_phase2: false 면 Phase 2 skip. phase1.reuse: <variant> 면 그 variant 의 Phase 1 ckpt 로
+# Phase 2 를 시작한다(Phase 1 이 기준과 같은 variant 는 학습을 공유).
+# 논문 순서: 1 LSCNorm → 2 조건 해상도 → 3 Phase 2 → 4 목적함수 → 5 patch → 6 규모.
+#
+# ⚠ 모델 규모(06b) 는 CARMEN_GRAD_CKPT=1 필수. batch 는 bstest(bs96/192) 결과로 확정할 것.
 
 variants:
-  # ── #0 Baseline (CARMEN full) ────────────────────────────────
-  # exp_name 은 _phase1_base.yaml / _phase2_base.yaml 의 기본값과 동일하게
-  # 유지 (ablation_phase1_base / ablation_phase2_base) — 이미 진행 중인
-  # base 학습 ckpt 를 옵션 C reuse chain 에서 그대로 활용하기 위함.
+  # ── #0 기준 (CARMEN full) ────────────────────────────────────
   - name: "00_full"
-    description: "CARMEN full (α=0.5 sampler, all losses on, LSCNorm on, Phase 1+2, var_attn_bias on)"
+    description: "CARMEN 기준 — LSCNorm(patchls, PPG 게이팅) · Phase 1+2 · MPM+Next+Cross · patch 0.25 s · 174M"
     ablation_group: "baseline"
     phase1:
       overrides:
-        exp_name: ablation_phase1_base
+        exp_name: ablation_00_full_p1
     phase2:
       overrides:
-        exp_name: ablation_phase2_base
+        exp_name: ablation_00_full_p2
 
-  # ── #1 Loss component ────────────────────────────────────────
-  - name: "01a_no_mpm"
-    description: "−MPM (alpha=0): masked reconstruction off"
-    ablation_group: "loss_component"
-    phase1:
-      overrides:
-        alpha: 0.0
-        exp_name: ablation_01a_no_mpm_p1
-    phase2:
-      overrides:
-        alpha: 0.0
-        exp_name: ablation_01a_no_mpm_p2
-
-  - name: "01b_no_next"
-    description: "−Next (beta=0): next-pred off"
-    ablation_group: "loss_component"
-    phase1:
-      overrides:
-        beta: 0.0
-        exp_name: ablation_01b_no_next_p1
-    phase2:
-      overrides:
-        beta: 0.0
-        exp_name: ablation_01b_no_next_p2
-
-  - name: "01c_no_crossnext"
-    description: "−CrossNext (gamma=0): cross-modal prediction off (Phase 2 only)"
-    ablation_group: "loss_component"
-    phase1:
-      reuse: "00_full"               # Phase 1 baseline 재사용
-    phase2:
-      overrides:
-        gamma: 0.0
-        exp_name: ablation_01c_no_crossnext_p2
-
-  - name: "01d_no_contrastive"
-    description: "−Contrastive (delta=0): contrastive off (Phase 2 only)"
-    ablation_group: "loss_component"
-    phase1:
-      reuse: "00_full"
-    phase2:
-      overrides:
-        delta: 0.0
-        exp_name: ablation_01d_no_contrastive_p2
-
-  # ── #2 LSCNorm conditioning ──────────────────────────────────
-  - name: "02_no_lscnorm"
-    description: "LSCNorm off (plain RMSNorm — cond_proj/modulation zero-freeze)"
+  # ── #1 LSCNorm ───────────────────────────────────────────────
+  # use_lscnorm=false: cond_proj·modulation zero-freeze → 조건 없는 RMSNorm(학습 affine 도 없음).
+  - name: "01_no_lscnorm"
+    description: "LSCNorm → 일반 RMSNorm (조건화 없음)"
     ablation_group: "lscnorm"
     phase1:
       overrides:
-        model_config:
-          use_lscnorm: false
-        exp_name: ablation_02_no_lscnorm_p1
+        model_config: {use_lscnorm: false}
+        exp_name: ablation_01_no_lscnorm_p1
     phase2:
       overrides:
-        model_config:
-          use_lscnorm: false
-        exp_name: ablation_02_no_lscnorm_p2
+        model_config: {use_lscnorm: false}
+        exp_name: ablation_01_no_lscnorm_p2
 
-  # ── #3 Cross-modal objective ─────────────────────────────────
-  - name: "03a_samevar_only"
-    description: "Same-variate next only (gamma=0, delta=0)"
-    ablation_group: "cross_modal"
+  # ── #2 조건 벡터 시간 해상도 ─────────────────────────────────
+  - name: "02_cond_window_only"
+    description: "조건 벡터 = 창 통계(loc·scale)만 — patch 상대 통계 제거 (cond_trend_mode none)"
+    ablation_group: "cond_resolution"
+    phase1:
+      overrides:
+        model_config: {cond_trend_mode: none}
+        exp_name: ablation_02_cond_window_only_p1
+    phase2:
+      overrides:
+        model_config: {cond_trend_mode: none}
+        exp_name: ablation_02_cond_window_only_p2
+
+  # ── #3 Any-Variate 사전학습 (Phase 2) ─────────────────────────
+  - name: "03_phase1_only"
+    description: "Phase 1(Channel-Independent) 만 — Phase 2 생략, 기준 Phase 1 ckpt 공유"
+    ablation_group: "phase2"
+    run_phase2: false
+    phase1:
+      reuse: "00_full"
+
+  # ── #4 사전학습 목적함수 ─────────────────────────────────────
+  - name: "04a_no_next"
+    description: "−Next (beta=0): Block Next Prediction 제거 (Phase 1·2)"
+    ablation_group: "objective"
+    phase1:
+      overrides:
+        beta: 0.0
+        exp_name: ablation_04a_no_next_p1
+    phase2:
+      overrides:
+        beta: 0.0
+        exp_name: ablation_04a_no_next_p2
+
+  - name: "04b_no_cross"
+    description: "−Cross (gamma=0): cross-modal 예측 제거 (Phase 2 만 해당, Phase 1 은 기준 공유)"
+    ablation_group: "objective"
     phase1:
       reuse: "00_full"
     phase2:
       overrides:
         gamma: 0.0
-        delta: 0.0
-        exp_name: ablation_03a_samevar_p2
+        learnable_coupling: false   # cross 가 없으면 결합 그래프도 학습할 대상이 없다
+        exp_name: ablation_04b_no_cross_p2
 
-  - name: "03b_cross_only"
-    description: "+cross next only (gamma=0.15, delta=0): contrastive off"
-    ablation_group: "cross_modal"
+  # ── #5 Patch 크기 ────────────────────────────────────────────
+  # patch 0.5 s 에 딸린 항목은 시간 단위를 유지하도록 전부 절반 토큰으로(full_174m·g_graph 규칙).
+  # max_length 는 그대로 → 행당 토큰은 절반, 행당 신호 시간은 같다.
+  - name: "05_patch050"
+    description: "patch 0.5 s (50 샘플)"
+    ablation_group: "patch_size"
     phase1:
-      reuse: "00_full"
+      overrides:
+        model_config: {patch_size: 50, next_block_size: 12}
+        min_patches: 20
+        spec_n_ffts: [16, 32]
+        block_size_min: 12
+        block_size_max: 32
+        exp_name: ablation_05_patch050_p1
     phase2:
       overrides:
-        gamma: 0.15
-        delta: 0.0
-        exp_name: ablation_03b_cross_p2
+        model_config: {patch_size: 50, next_block_size: 12}
+        min_patches: 20
+        spec_n_ffts: [16, 32]
+        block_size_min: 12
+        block_size_max: 32
+        exp_name: ablation_05_patch050_p2
 
-  # ── #4 Pretraining stage ─────────────────────────────────────
-  - name: "04_phase1_only"
-    description: "Phase 1 only (no Any-Variate phase)"
-    ablation_group: "phase_stage"
-    phase1:
-      reuse: "00_full"
-    run_phase2: false                # Phase 2 skip
-
-  # ── #5 Modality-balanced sampling ── DROPPED (run/aggregate에서 제외) ──
-  # sampling ablation(05a/05b)은 제외하기로 결정. 되살리려면 주석 해제.
-  # - name: "05a_samp_a0"
-  #   description: "Modality-balanced sampling α=0 (uniform)"
-  #   ablation_group: "sampling"
-  #   phase1:
-  #     overrides:
-  #       modality_balanced_alpha: 0.0
-  #       exp_name: ablation_05a_samp_a0_p1
-  #   phase2:
-  #     overrides:
-  #       exp_name: ablation_05a_samp_a0_p2
-  #
-  # - name: "05b_samp_a1"
-  #   description: "Modality-balanced sampling α=1.0 (full inverse)"
-  #   ablation_group: "sampling"
-  #   phase1:
-  #     overrides:
-  #       modality_balanced_alpha: 1.0
-  #       exp_name: ablation_05b_samp_a1_p1
-  #   phase2:
-  #     overrides:
-  #       exp_name: ablation_05b_samp_a1_p2
-
-  # ── #6 Variate attention bias ────────────────────────────────
-  - name: "06_no_attnbias"
-    description: "Variate attention bias off (use_var_attn_bias=false)"
-    ablation_group: "attn_bias"
+  # ── #6 모델 규모 ─────────────────────────────────────────────
+  # 기준 174M(d768 x 24 x 12h). 데이터·스케줄·batch 는 기준과 동일(같은 토큰 수).
+  - name: "06a_small"
+    description: "소형 — d512 x 16층 x 8heads"
+    ablation_group: "model_scale"
     phase1:
       overrides:
-        model_config:
-          use_var_attn_bias: false
-        exp_name: ablation_06_no_attnbias_p1
+        model_config: {d_model: 512, num_layers: 16, num_heads: 8}
+        exp_name: ablation_06a_small_p1
     phase2:
       overrides:
-        model_config:
-          use_var_attn_bias: false
-        exp_name: ablation_06_no_attnbias_p2
+        model_config: {d_model: 512, num_layers: 16, num_heads: 8}
+        exp_name: ablation_06a_small_p2
+
+  - name: "06b_large"
+    description: "대형 — d1024 x 32층 x 16heads (CARMEN_GRAD_CKPT=1)"
+    ablation_group: "model_scale"
+    phase1:
+      overrides:
+        model_config: {d_model: 1024, num_layers: 32, num_heads: 16}
+        exp_name: ablation_06b_large_p1
+    phase2:
+      overrides:
+        model_config: {d_model: 1024, num_layers: 32, num_heads: 16}
+        exp_name: ablation_06b_large_p2
