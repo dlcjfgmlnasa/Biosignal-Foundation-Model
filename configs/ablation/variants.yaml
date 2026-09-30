@@ -1,4 +1,4 @@
-# CARMEN ablation variants (2026-09-30 확정) — 6 ablation, 기준 포함 9 variant.
+# CARMEN ablation variants (2026-09-30 확정) — 6 ablation, 기준 포함 10 variant.
 # ────────────────────────────────────────────────────────────────
 # 각 variant 는 base yaml(_phase1_base.yaml, _phase2_base.yaml) 위에 overrides 만 얹는다.
 # scripts/run_ablation.py 가 merge → 임시 config → torchrun. ckpt 는 마지막 epoch 을 쓴다
@@ -82,9 +82,9 @@ variants:
         exp_name: ablation_04b_no_cross_p2
 
   # ── #5 Patch 크기 ────────────────────────────────────────────
-  # patch 0.5 s 에 딸린 항목은 시간 단위를 유지하도록 전부 절반 토큰으로(full_174m·g_graph 규칙).
+  # patch 0.5·1.0 s 에 딸린 항목은 시간 단위를 유지하도록 전부 절반 토큰으로(full_174m·g_graph 규칙).
   # max_length 는 그대로 → 행당 토큰은 절반, 행당 신호 시간은 같다.
-  - name: "05_patch050"
+  - name: "05a_patch050"
     description: "patch 0.5 s (50 샘플)"
     ablation_group: "patch_size"
     phase1:
@@ -94,7 +94,7 @@ variants:
         spec_n_ffts: [16, 32]
         block_size_min: 12
         block_size_max: 32
-        exp_name: ablation_05_patch050_p1
+        exp_name: ablation_05a_patch050_p1
     phase2:
       overrides:
         model_config: {patch_size: 50, next_block_size: 12}
@@ -102,7 +102,27 @@ variants:
         spec_n_ffts: [16, 32]
         block_size_min: 12
         block_size_max: 32
-        exp_name: ablation_05_patch050_p2
+        exp_name: ablation_05a_patch050_p2
+
+  - name: "05b_patch100"
+    description: "patch 1.0 s (100 샘플)"
+    ablation_group: "patch_size"
+    phase1:
+      overrides:
+        model_config: {patch_size: 100, next_block_size: 6}
+        min_patches: 10
+        spec_n_ffts: [32, 64]
+        block_size_min: 6
+        block_size_max: 16
+        exp_name: ablation_05b_patch100_p1
+    phase2:
+      overrides:
+        model_config: {patch_size: 100, next_block_size: 6}
+        min_patches: 10
+        spec_n_ffts: [32, 64]
+        block_size_min: 6
+        block_size_max: 16
+        exp_name: ablation_05b_patch100_p2
 
   # ── #6 모델 규모 ─────────────────────────────────────────────
   # 기준 174M(d768 x 24 x 12h). 데이터·스케줄·batch 는 기준과 동일(같은 토큰 수).
