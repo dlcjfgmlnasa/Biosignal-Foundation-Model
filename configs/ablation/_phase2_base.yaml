@@ -1,105 +1,122 @@
-# Ablation Phase 2 base — K-MIMIC 25% subset, CARMEN full settings.
-# ──────────────────────────────────────────────────────────────
-# Phase 1 ablation checkpoint 에서 resume. variant 별 resume 경로 override 필수.
-#
-# Usage (2-GPU DDP):
-#   torchrun --nproc_per_node=2 -m train.2_any_variate \
-#       --config configs/ablation/<variant>_phase2.yaml
-
-# ── Resume (variant 별 override) ──
-resume: /home/coder/workspace/k-mimic-/bio_fm/outputs/ablation/ablation_phase1_base/checkpoints/best.pt
-
-# ── 모델 (Phase 1 과 동일: d=384, L=16, ~30M) ──
+# ============================================================
+# [09-30] CARMEN ablation Phase 2 base — 재학습 레시피. variants.yaml 의 overrides 만 얹는다.
+#   출처: configs/g_graph_p25.yaml (09-24/25 확정 레시피) 에서 아래만 바꿈
+#   - 코퍼스: SNUH OR/ICU 2025 1~12월(로컬 6 + R2 6) + 2026 1~9월 = 21개월
+#     TODO: K-MIMIC-MORTAL 노드 이관 후 data_dir/shard_index_path 에 추가
+#   - PAP 켬: num_signal_types 10 · signal_types 에 9 추가 (from-scratch 필수)
+#   - modality_balanced_w_max_ratio 5 -> 10 (09-28 사용자 승인, 전체 코퍼스 기준 재계산 후 확정)
+#   - output_dir outputs/ablation (exp_name 은 variant 별; run_ablation.py 의 OUTPUT_ROOT 와 일치)
+# ============================================================
 model_config:
-  d_model: 384
-  num_layers: 16
-  patch_size: 200
+  d_model: 768
+  num_layers: 24
+  patch_size: 25
   stride: null
-  num_heads: 6
+  num_heads: 12
   num_groups: null
-  num_signal_types: 9        # v2 단일 modality 9종 (ECG0~RESP_Flow8, 2026-06-23 PAP 제거)
+  num_signal_types: 10
   use_glu: true
   use_moe: false
   use_rope: true
-  use_var_attn_bias: true          # ablation #6 에서 false override
+  use_var_attn_bias: true
   use_spatial_embed: true
-  use_lscnorm: true                # ablation #2 에서 false override
-  d_cond: 16
   dropout_p: 0.1
-  next_block_size: 3          # Block Next Prediction K=3 — 미래 6s (3 patch × 2s), 호흡 1주기 보장 / MPM block_size_min 과 정합
-  contrastive_proj_dim: 128        # Phase 2 contrastive head 활성
-
-# ── 데이터 ──
-data_dir:
-  - /home/coder/workspace/k-mimic-/bio_fm/data/train/k_mimic/
-signal_types: [0, 1, 2, 3, 4, 5, 6, 7, 8]
+  use_lscnorm: true
+  d_cond: 32
+  gate_unitless_cond: true
+  enrich_cond_peak: false
+  gated_cond_signal_types: [2]
+  next_block_size: 24
+  contrastive_proj_dim: 0
+  cond_trend_mode: patchls
+  mask_cond_trend: true
+data_dir: [/NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/processed/202501/,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/processed/202502/,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/processed_r2/202503/,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/processed/202504/,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/processed_r2/202505/,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/processed_r2/202506/,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/processed/202507/,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/processed_r2/202508/,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/processed_r2/202509/,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/processed_r2/202510/,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/processed/202511/,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/processed/202512/,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/processed/202601/,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/processed/202602/,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/processed/202603/,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/processed/202604/,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/processed/202605/,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/processed/202606/,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/processed/202607/,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/processed/202608/,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/processed/202609/]
+shard_index_path: [/NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/sharded/202501/shard_index.json,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/sharded/202502/shard_index.json,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/sharded_r2/202503/shard_index.json,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/sharded/202504/shard_index.json,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/sharded_r2/202505/shard_index.json,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/sharded_r2/202506/shard_index.json,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/sharded/202507/shard_index.json,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/sharded_r2/202508/shard_index.json,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/sharded_r2/202509/shard_index.json,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/sharded_r2/202510/shard_index.json,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/sharded/202511/shard_index.json,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/sharded/202512/shard_index.json,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/sharded/202601/shard_index.json,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/sharded/202602/shard_index.json,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/sharded/202603/shard_index.json,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/sharded/202604/shard_index.json,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/sharded/202605/shard_index.json,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/sharded/202606/shard_index.json,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/sharded/202607/shard_index.json,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/sharded/202608/shard_index.json,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/sharded/202609/shard_index.json]
+shard_cache_size: 4
+signal_types: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
 max_subjects: null
-subject_ids_file: configs/ablation/subset_25pct_subjects.txt  # 본 학습 (25% subset)
-window_seconds: 600.0
-max_length: 128000   # Phase 1 OOM 처방 일치 — per-row memory ½
-cache_size: 16
+window_seconds: 300.0
+max_length: 48000
+cache_size: 64
 crop_ratio_min: 0.01
 crop_ratio_max: 1.0
-min_patches: 5
-
-# ── Shard backend ──
-shard_index_path: /home/coder/workspace/k-mimic-/bio_fm/data/train/k_mimic_shard_500mb/shard_index.json   # fp16 + 500MB shard
-shard_cache_size: 2     # 1→2: leak 해결됐으니 cache hit ratio ↑ (IO 병목 ↓)
-
-# ── 학습 ──
-batch_size: 64       # 옵션 B: batch 2× ↑ (Phase 1 동일 비율)
-lr: 4.0e-4           # 옵션 B: linear scaling (batch 2× → LR 2×)
-n_epochs: 25          # 본 학습 (Phase 1 동일)
-warmup_epochs: 3
+min_patches: 40
+modality_balanced_alpha: 0.5
+modality_balanced_w_max_ratio: 10.0
+batch_size: 110
+lr: 0.00035
+weight_decay: 0.1
+n_epochs: 8
+warmup_epochs: 1
 min_lr_ratio: 0.1
 mask_ratio: 0.4
 gradient_clip: 1.0
 seed: 42
 collate_mode: any_variate
-max_batches: 4000
-
-# ── Loss 가중치 (Phase 2: MPM + Next + Cross + Contrastive) ──
-# variant 별 override (#1 Loss, #3 Cross-modal):
-#   -MPM:        alpha=0
-#   -Next:       beta=0
-#   -CrossNext:  gamma=0
-#   -Contrastive: delta=0
-#   #3 same-var only: gamma=0, delta=0
-#   #3 +cross only:   gamma=0.15, delta=0
-alpha: 0.7
-beta: 0.3
-gamma: 0.15
-delta: 0.5
-peak_alpha: 1.0
+max_batches: 500
+alpha: 1.0
+beta: 0.8
+gamma: 0.3
+delta: 0.0
 lambda_spec: 0.2
-spec_n_ffts: [16, 32, 64]      # Phase 1과 통일 (phase별 window set 차이 제거)
+spec_n_ffts: [8, 16]
+peak_alpha: 1.0
 aux_loss_weight: 0.01
 contrastive_temperature: 0.07
 learnable_temperature: true
-
-# ── Masking ──
 variate_mask_prob: 0.3
-variate_drop_prob: 0.1
 block_mask: true
-block_size_min: 2
-block_size_max: 3
-
-# ── Modality-balanced sampling (Phase 2 는 any_variate 이므로 일반적으로 미적용) ──
-modality_balanced_alpha: 0.0
-modality_balanced_w_max_ratio: 5.0
-
-# ── Mixed Precision ──
+block_size_min: 24
+block_size_max: 64
 use_amp: true
-
-# ── Validation & Early Stopping ──
-val_ratio: 0.05
-val_max_batches: 500
-patience: 6           # 본 학습
-
-# ── 시스템 ──
+val_ratio: 0.02
+val_max_batches: 200
+patience: 0
 device: auto
-num_workers: 2     # 4→2: DataLoader subprocess RAM 누적 줄여 Pod OOM/다운 방지 (학습 결과 무관)
-output_dir: /home/coder/workspace/k-mimic-/bio_fm/outputs/ablation
-checkpoint_every: 5
+num_workers: 6
+output_dir: outputs/ablation
+checkpoint_every: 1
 viz_every: 0
-exp_name: ablation_phase2_base
+exp_name: ablation_00_full_p2
+learnable_coupling: true
+coupling_l1: 0.005

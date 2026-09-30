@@ -90,22 +90,23 @@ class RecordingLocalitySampler(Sampler[int]):
         g = torch.Generator()
         g.manual_seed(self.seed + self.epoch)
 
-        rec_to_shard = getattr(self.dataset, "_rec_to_shard", None)
+        # 단일·멀티소스 통일 게이팅 (멀티소스는 _rec_to_shard=None 이라 has_shard_backend 사용)
+        use_shard = getattr(self.dataset, "has_shard_backend", False)
 
         if self.shuffle:
             # Shard-aware shuffling: dataset이 shard backend를 쓰면 같은 shard
             # recordings를 묶어서 셔플 → shard LRU cache hit율 ~100% 보장.
             # 미사용 시 (file backend) 기존 random 셔플로 fallback.
-            if rec_to_shard is not None:
-                rec_order = self._shard_aware_shuffle(rec_to_shard, g)
+            if use_shard:
+                rec_order = self._shard_aware_shuffle(g)
             else:
                 rec_order = torch.randperm(self._n_recs, generator=g).tolist()
         else:
             # shuffle=False (val) — shard backend라면 deterministic shard 순서로
             # recording 그루핑하여 cache hit 보장. 매 epoch 동일 순서 유지하면서
             # locality도 챙김. file backend면 단순 sequential.
-            if rec_to_shard is not None:
-                rec_order = self._shard_grouped_order(rec_to_shard)
+            if use_shard:
+                rec_order = self._shard_grouped_order()
             else:
                 rec_order = list(range(self._n_recs))
 
@@ -135,23 +136,20 @@ class RecordingLocalitySampler(Sampler[int]):
 
         return iter(indices)
 
-    def _shard_grouped_order(self, rec_to_shard: dict[str, int]) -> list[int]:
+    def _shard_grouped_order(self) -> list[int]:
         """Deterministic shard-grouped 순서 (shuffle 없이).
 
-        shard_id 오름차순으로 그루핑하여 같은 shard recordings가 연속 yield.
+        shard group key 오름차순으로 그루핑하여 같은 shard recordings가 연속 yield.
         매 epoch 동일 순서 → val에서 EarlyStopping 통계 안정.
+
+        그룹 키는 ``dataset.shard_group_of(rec_i)`` — 단일소스 int / 멀티소스
+        ``(src, shard_id)`` 튜플 (동종이라 ``sorted()`` 타입 안전).
         """
         from collections import defaultdict
 
-        path_map = getattr(self.dataset, "_path_to_shard_key", None)
-        shard_to_recs: dict[int, list[int]] = defaultdict(list)
+        shard_to_recs: dict = defaultdict(list)
         for rec_i in range(self._n_recs):
-            if path_map is not None:
-                entry_path = self.dataset._manifest[rec_i].path
-                shard_key = path_map.get(entry_path, str(rec_i))
-            else:
-                shard_key = str(rec_i)
-            sid = rec_to_shard.get(shard_key, 0)
+            sid = self.dataset.shard_group_of(rec_i)
             shard_to_recs[sid].append(rec_i)
 
         rec_order: list[int] = []
@@ -161,37 +159,25 @@ class RecordingLocalitySampler(Sampler[int]):
 
     def _shard_aware_shuffle(
         self,
-        rec_to_shard: dict[str, int],
         generator: torch.Generator,
     ) -> list[int]:
         """Shard 단위로 묶어서 셔플 — shard cache hit율 ~100% 보장.
 
-        1. (rec_idx → shard_id) 매핑으로 recording을 shard별로 그루핑
+        1. ``dataset.shard_group_of(rec_i)`` 로 recording을 shard group별로 그루핑
         2. shard 순서 셔플 (외부)
         3. 각 shard 내 recording 순서 셔플 (내부)
 
         결과: 같은 shard recording들이 연속으로 yield → 한 번 로드한 shard에서
         모든 recording 처리 후 다음 shard로 → cache eviction storm 방지.
 
-        train/val split 등으로 dataset이 manifest의 부분집합인 경우, 로컬 rec_i
-        는 원본 rec_global_idx와 다르므로 path → 원본 rec_idx 매핑(dataset의
-        _path_to_shard_key)을 우회해서 정확한 shard 분류를 한다.
+        train/val split 등으로 dataset이 manifest의 부분집합이거나 멀티소스여도
+        ``shard_group_of`` 가 path → (src,) shard 매핑을 중앙집중 처리한다.
         """
         from collections import defaultdict
 
-        # 부분집합 manifest 대응 — dataset의 path map 사용
-        path_map = getattr(self.dataset, "_path_to_shard_key", None)
-
-        shard_to_recs: dict[int, list[int]] = defaultdict(list)
+        shard_to_recs: dict = defaultdict(list)
         for rec_i in range(self._n_recs):
-            shard_key: str
-            if path_map is not None:
-                # path → 원본 rec_global_idx (= shard 내 key)
-                entry_path = self.dataset._manifest[rec_i].path
-                shard_key = path_map.get(entry_path, str(rec_i))
-            else:
-                shard_key = str(rec_i)
-            sid = rec_to_shard.get(shard_key, 0)
+            sid = self.dataset.shard_group_of(rec_i)
             shard_to_recs[sid].append(rec_i)
 
         shard_ids = list(shard_to_recs.keys())
@@ -291,22 +277,15 @@ class GroupedBatchSampler(Sampler[list[int]]):
         self._groups: list[list[int]] = list(groups.values())
         keys = list(groups.keys())
         self._group_rec_ids: list[int] = [group_to_rec[k] for k in keys]
-        # Shard backend 지원 — recording → shard 매핑 보존 (있을 때만).
-        # 부분집합 manifest(train/val split 등)에서는 로컬 r_id ≠ 원본 rec_global_idx
-        # 이므로 path map 통해 정확한 shard로 매핑.
-        rec_to_shard = getattr(dataset, "_rec_to_shard", None)
-        if rec_to_shard is not None:
-            path_map = getattr(dataset, "_path_to_shard_key", None)
-            self._rec_to_shard: dict[int, int] | None = {}
+        # Shard backend 지원 — recording → shard group 매핑 보존 (있을 때만).
+        # 부분집합 manifest(train/val split 등)·멀티소스는 dataset.shard_group_of 가
+        # path → (src,) shard 매핑을 중앙집중 처리 (로컬 r_id 는 _manifest 인덱스).
+        if getattr(dataset, "has_shard_backend", False):
+            # 값: 단일소스 int shard_id / 멀티소스 (src, shard_id) 튜플
+            self._rec_to_shard: dict | None = {}
             unique_local_recs = set(self._group_rec_ids)
             for r_id in unique_local_recs:
-                if path_map is not None:
-                    entry_path = dataset._manifest[r_id].path
-                    shard_key = path_map.get(entry_path, str(r_id))
-                else:
-                    shard_key = str(r_id)
-                sid = rec_to_shard.get(shard_key, 0)
-                self._rec_to_shard[r_id] = sid
+                self._rec_to_shard[r_id] = dataset.shard_group_of(r_id)
         else:
             self._rec_to_shard = None
 
@@ -628,11 +607,11 @@ class ModalityBalancedRecordingSampler(Sampler[int]):
         g = torch.Generator()
         g.manual_seed(self.seed + self.epoch)
 
-        rec_to_shard = getattr(self.dataset, "_rec_to_shard", None)
-        path_map = getattr(self.dataset, "_path_to_shard_key", None)
+        # 단일·멀티소스 통일 게이팅
+        use_shard = getattr(self.dataset, "has_shard_backend", False)
 
         # virtual entry 의 셔플 순서 결정 (shard-aware)
-        order = self._make_virtual_order(rec_to_shard, path_map, g)
+        order = self._make_virtual_order(use_shard, g)
 
         # 패딩 (DDP rank 균등 분배)
         if self._n_virtual_padded > self._n_virtual:
@@ -660,43 +639,30 @@ class ModalityBalancedRecordingSampler(Sampler[int]):
 
     def _make_virtual_order(
         self,
-        rec_to_shard: dict[str, int] | None,
-        path_map: dict[str, str] | None,
+        use_shard: bool,
         generator: torch.Generator,
     ) -> list[int]:
         """virtual entry 순서 결정. shard-aware shuffle 우선."""
         if not self.shuffle:
-            if rec_to_shard is not None:
-                return self._shard_grouped_virtual_order(rec_to_shard, path_map)
+            if use_shard:
+                return self._shard_grouped_virtual_order()
             return list(range(self._n_virtual))
 
-        if rec_to_shard is not None:
-            return self._shard_aware_virtual_shuffle(rec_to_shard, path_map, generator)
+        if use_shard:
+            return self._shard_aware_virtual_shuffle(generator)
 
         # file backend — 순수 permutation
         return torch.randperm(self._n_virtual, generator=generator).tolist()
 
-    def _virtual_to_shard(
-        self,
-        v_idx: int,
-        rec_to_shard: dict[str, int],
-        path_map: dict[str, str] | None,
-    ) -> int:
+    def _virtual_to_shard(self, v_idx: int):
+        """virtual entry → shard group key (단일 int / 멀티 (src, shard) 튜플)."""
         real_idx = self._virtual_entries[v_idx][0]
-        if path_map is not None:
-            shard_key = path_map.get(self.dataset._manifest[real_idx].path, str(real_idx))
-        else:
-            shard_key = str(real_idx)
-        return rec_to_shard.get(shard_key, 0)
+        return self.dataset.shard_group_of(real_idx)
 
-    def _shard_grouped_virtual_order(
-        self,
-        rec_to_shard: dict[str, int],
-        path_map: dict[str, str] | None,
-    ) -> list[int]:
-        shard_to_vs: dict[int, list[int]] = defaultdict(list)
+    def _shard_grouped_virtual_order(self) -> list[int]:
+        shard_to_vs: dict = defaultdict(list)
         for v_idx in range(self._n_virtual):
-            sid = self._virtual_to_shard(v_idx, rec_to_shard, path_map)
+            sid = self._virtual_to_shard(v_idx)
             shard_to_vs[sid].append(v_idx)
         order: list[int] = []
         for sid in sorted(shard_to_vs.keys()):
@@ -705,13 +671,11 @@ class ModalityBalancedRecordingSampler(Sampler[int]):
 
     def _shard_aware_virtual_shuffle(
         self,
-        rec_to_shard: dict[str, int],
-        path_map: dict[str, str] | None,
         generator: torch.Generator,
     ) -> list[int]:
-        shard_to_vs: dict[int, list[int]] = defaultdict(list)
+        shard_to_vs: dict = defaultdict(list)
         for v_idx in range(self._n_virtual):
-            sid = self._virtual_to_shard(v_idx, rec_to_shard, path_map)
+            sid = self._virtual_to_shard(v_idx)
             shard_to_vs[sid].append(v_idx)
 
         shard_ids = list(shard_to_vs.keys())

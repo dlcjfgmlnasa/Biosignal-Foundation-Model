@@ -3,6 +3,12 @@
 
 Salesforce uni2ts (Apache 2.0)에서 포팅.
 scatter_add 기반 O(L) 구현 (기존 O(L^2) pairwise mask 대체).
+
+conditioning enrichment (2026-07-15): loc/scale 외에 그룹별 winsorized max/min 도
+반환한다 (4-tuple). max/min 은 정규화에는 쓰이지 않고 AdaLN conditioning 입력으로만
+사용된다 (calibrated 신호의 SBP/DBP·ETCO2·PIP/PEEP 같은 절대 peak 정보). unitless
+신호(PPG·RESP_Imp)는 model 단 게이팅으로 conditioning 에서 제외되므로 여기서는 신호
+종류 구분 없이 전 그룹에 대해 균일 계산한다.
 """
 
 from __future__ import annotations
@@ -14,7 +20,11 @@ from ._util import safe_div
 
 
 class PackedScaler(nn.Module):
-    """Packed batch 정규화 스케일러 기본 클래스."""
+    """Packed batch 정규화 스케일러 기본 클래스.
+
+    forward 는 ``(loc, scale, max, min)`` 4-tuple 을 반환한다. loc/scale 은 정규화용,
+    max/min 은 conditioning enrichment 용(winsorized 그룹 극값).
+    """
 
     def forward(
         self,
@@ -25,6 +35,8 @@ class PackedScaler(nn.Module):
     ) -> tuple[
         torch.Tensor,  # (*batch, seq_len, #dim) — loc
         torch.Tensor,  # (*batch, seq_len, #dim) — scale
+        torch.Tensor,  # (*batch, seq_len, #dim) — winsorized max
+        torch.Tensor,  # (*batch, seq_len, #dim) — winsorized min
     ]:
         if observed_mask is None:
             observed_mask = torch.ones_like(target, dtype=torch.bool)
@@ -37,8 +49,7 @@ class PackedScaler(nn.Module):
                 target.shape[:-1], dtype=torch.long, device=target.device
             )
 
-        loc, scale = self._get_loc_scale(target, observed_mask, sample_id, variate_id)
-        return loc, scale
+        return self._get_loc_scale(target, observed_mask, sample_id, variate_id)
 
     def _get_loc_scale(
         self,
@@ -46,10 +57,7 @@ class PackedScaler(nn.Module):
         observed_mask: torch.Tensor,  # (*batch, seq_len, #dim) bool
         sample_id: torch.Tensor,  # (*batch, seq_len) long
         variate_id: torch.Tensor,  # (*batch, seq_len) long
-    ) -> tuple[
-        torch.Tensor,  # (*batch, seq_len, #dim) — loc
-        torch.Tensor,  # (*batch, seq_len, #dim) — scale
-    ]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         raise NotImplementedError
 
 
@@ -73,8 +81,45 @@ def _make_group_key(
     return group_key, n_groups
 
 
+def _grouped_winsor_minmax(
+    target: torch.Tensor,  # (B, L, D)
+    gk: torch.Tensor,  # (B, L, D) group key (expanded)
+    n_groups: int,
+    loc: torch.Tensor,  # (B, L, D) per-timestep group mean
+    scale: torch.Tensor,  # (B, L, D) per-timestep group std
+    observed_mask: torch.Tensor,  # (B, L, D) bool
+    k: float = 5.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """그룹별 winsorized max/min — loc±k·scale 로 clamp 후 scatter_reduce amax/amin.
+
+    극값 outlier(스파이크)가 max/min 을 지배하지 않게 하면서 정렬 없이 O(L) 로 robust
+    peak 를 얻는다 (분위수 대비 ~130× 저렴). include_self=False + ±inf 초기화로 빈 그룹은
+    gather 되지 않는다. 미관측(observed_mask=False) 위치는 ±inf 로 채워 극값 산정에서 제외.
+    """
+    B, L, D = target.shape
+    lo = loc - k * scale
+    hi = loc + k * scale
+    capped = torch.minimum(torch.maximum(target, lo), hi)  # (B, L, D)
+    not_obs = ~observed_mask
+    src_max = capped.masked_fill(not_obs, float("-inf"))
+    src_min = capped.masked_fill(not_obs, float("inf"))
+
+    group_max = torch.full(
+        (B, n_groups, D), float("-inf"), dtype=target.dtype, device=target.device
+    )
+    group_max.scatter_reduce_(1, gk, src_max, reduce="amax", include_self=False)
+    group_min = torch.full(
+        (B, n_groups, D), float("inf"), dtype=target.dtype, device=target.device
+    )
+    group_min.scatter_reduce_(1, gk, src_min, reduce="amin", include_self=False)
+
+    max_ = group_max.gather(1, gk)  # (B, L, D)
+    min_ = group_min.gather(1, gk)  # (B, L, D)
+    return max_, min_
+
+
 class PackedNOPScaler(PackedScaler):
-    """No-op 스케일러: loc=0, scale=1."""
+    """No-op 스케일러: loc=0, scale=1. max/min 도 0 (conditioning 정보 없음)."""
 
     def _get_loc_scale(
         self,
@@ -82,13 +127,12 @@ class PackedNOPScaler(PackedScaler):
         observed_mask: torch.Tensor,  # (*batch, seq_len, #dim) bool
         sample_id: torch.Tensor,  # (*batch, seq_len) long
         variate_id: torch.Tensor,  # (*batch, seq_len) long
-    ) -> tuple[
-        torch.Tensor,  # (*batch, seq_len, #dim) — loc
-        torch.Tensor,  # (*batch, seq_len, #dim) — scale
-    ]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         loc = torch.zeros_like(target, dtype=target.dtype)
         scale = torch.ones_like(target, dtype=target.dtype)
-        return loc, scale
+        max_ = torch.zeros_like(target, dtype=target.dtype)
+        min_ = torch.zeros_like(target, dtype=target.dtype)
+        return loc, scale, max_, min_
 
 
 class PackedStdScaler(PackedScaler):
@@ -102,12 +146,17 @@ class PackedStdScaler(PackedScaler):
         분산 계산 시 Bessel 보정값.
     minimum_scale:
         최소 스케일 (수치 안정성).
+    winsor_k:
+        max/min conditioning 계산 시 loc±k·scale clamp 배수 (outlier 억제).
     """
 
-    def __init__(self, correction: int = 1, minimum_scale: float = 1e-5):
+    def __init__(
+        self, correction: int = 1, minimum_scale: float = 1e-5, winsor_k: float = 5.0
+    ):
         super().__init__()
         self.correction = correction
         self.minimum_scale = minimum_scale
+        self.winsor_k = winsor_k
 
     def _get_loc_scale(
         self,
@@ -115,10 +164,7 @@ class PackedStdScaler(PackedScaler):
         observed_mask: torch.Tensor,  # (B, L, D) bool
         sample_id: torch.Tensor,  # (B, L) long
         variate_id: torch.Tensor,  # (B, L) long
-    ) -> tuple[
-        torch.Tensor,  # (B, L, D) — loc
-        torch.Tensor,  # (B, L, D) — scale
-    ]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         B, L, D = target.shape
         group_key, n_groups = _make_group_key(sample_id, variate_id)  # (B, L), int
 
@@ -155,12 +201,19 @@ class PackedStdScaler(PackedScaler):
         group_scale = torch.sqrt(group_var + self.minimum_scale)  # (B, n_groups, D)
         scale = group_scale.gather(1, gk)  # (B, L, D)
 
+        # 그룹별 winsorized max/min (conditioning enrichment 전용; 정규화엔 미사용)
+        max_, min_ = _grouped_winsor_minmax(
+            target, gk, n_groups, loc, scale, observed_mask, k=self.winsor_k
+        )
+
         # 패딩 위치(sample_id==0) 초기화
         padding = (sample_id == 0).unsqueeze(-1)  # (B, L, 1)
         loc = loc.masked_fill(padding, 0.0)
         scale = scale.masked_fill(padding, 1.0)
+        max_ = max_.masked_fill(padding, 0.0)
+        min_ = min_.masked_fill(padding, 0.0)
 
-        return loc, scale
+        return loc, scale, max_, min_
 
 
 class PackedAbsMeanScaler(PackedScaler):
@@ -172,11 +225,14 @@ class PackedAbsMeanScaler(PackedScaler):
     ----------
     minimum_scale:
         최소 스케일 (수치 안정성).
+    winsor_k:
+        max/min conditioning 계산 시 loc±k·scale clamp 배수.
     """
 
-    def __init__(self, minimum_scale: float = 1e-5):
+    def __init__(self, minimum_scale: float = 1e-5, winsor_k: float = 5.0):
         super().__init__()
         self.minimum_scale = minimum_scale
+        self.winsor_k = winsor_k
 
     def _get_loc_scale(
         self,
@@ -184,10 +240,7 @@ class PackedAbsMeanScaler(PackedScaler):
         observed_mask: torch.Tensor,  # (B, L, D) bool
         sample_id: torch.Tensor,  # (B, L) long
         variate_id: torch.Tensor,  # (B, L) long
-    ) -> tuple[
-        torch.Tensor,  # (B, L, D) — loc
-        torch.Tensor,  # (B, L, D) — scale
-    ]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         B, L, D = target.shape
         group_key, n_groups = _make_group_key(sample_id, variate_id)  # (B, L), int
 
@@ -213,9 +266,16 @@ class PackedAbsMeanScaler(PackedScaler):
 
         loc = torch.zeros_like(scale)
 
+        # 그룹별 winsorized max/min (loc=0 기준 ±k·scale clamp)
+        max_, min_ = _grouped_winsor_minmax(
+            target, gk, n_groups, loc, scale, observed_mask, k=self.winsor_k
+        )
+
         # 패딩 위치 초기화
         padding = (sample_id == 0).unsqueeze(-1)
         loc = loc.masked_fill(padding, 0.0)
         scale = scale.masked_fill(padding, 1.0)
+        max_ = max_.masked_fill(padding, 0.0)
+        min_ = min_.masked_fill(padding, 0.0)
 
-        return loc, scale
+        return loc, scale, max_, min_

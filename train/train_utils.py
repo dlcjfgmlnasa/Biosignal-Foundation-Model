@@ -6,37 +6,39 @@ from __future__ import annotations
 ``train/1_channel_independency.py``와 ``train/2_any_variate.py``에서 공통으로 사용하는
 데이터 로딩, 학습 루프, 체크포인트 함수를 정의한다.
 """
-import csv
-import hashlib
-import json
-import math
-import os
-import pickle
-import random
-from dataclasses import asdict, dataclass, field, fields
-from pathlib import Path
-from typing import Any
+import csv  # noqa: E402
+import hashlib  # noqa: E402
+import json  # noqa: E402
+import math  # noqa: E402
+import os  # noqa: E402
+import pickle  # noqa: E402
+import random  # noqa: E402
+from dataclasses import asdict, dataclass, field, fields  # noqa: E402
+from pathlib import Path  # noqa: E402
+from typing import Any  # noqa: E402
 
-import gc
-from datetime import timedelta
+import gc  # noqa: E402
+from datetime import timedelta  # noqa: E402
+
 try:
     import psutil
+
     _HAVE_PSUTIL = True
 except ImportError:
     _HAVE_PSUTIL = False
-import torch
-import torch.distributed as dist
-import yaml
-from torch import nn
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.optim.lr_scheduler import LambdaLR
+import torch  # noqa: E402
+import torch.distributed as dist  # noqa: E402
+import yaml  # noqa: E402
+from torch import nn  # noqa: E402
+from torch.nn.parallel import DistributedDataParallel as DDP  # noqa: E402
+from torch.optim.lr_scheduler import LambdaLR  # noqa: E402
 
-from data import RecordingManifest
-from data.spatial_map import remap_record_v2
-from loss.criterion import CombinedLoss
-from loss.masked_mse_loss import create_patch_mask  # noqa: F401 — downstream에서 re-import 가능
-from model.checkpoint import save_checkpoint
-from model import ModelConfig
+from data import RecordingManifest  # noqa: E402
+from data.spatial_map import remap_record_v2  # noqa: E402
+from loss.criterion import CombinedLoss  # noqa: E402
+from loss.masked_mse_loss import create_patch_mask  # noqa: E402, F401
+from model.checkpoint import save_checkpoint  # noqa: E402
+from model import ModelConfig  # noqa: E402
 
 
 # ── 설정 ────────────────────────────────────────────────────────
@@ -68,16 +70,25 @@ class TrainConfig:
     cache_size: int = 16
     crop_ratio_min: float = 0.0  # >0이면 random crop 활성 (min ratio)
     crop_ratio_max: float = 0.0  # >0이면 random crop 활성 (max ratio)
-    min_patches: int = 5  # random crop 최소 patch 수 (임상 10s floor @ patch_size=200, 100Hz)
+    min_patches: int = (
+        5  # random crop 최소 patch 수 (임상 10s floor @ patch_size=200, 100Hz)
+    )
 
-    # Shard backend (file open() 폭증 방지) — None이면 file backend
-    shard_index_path: str | None = None  # build_shards.py가 만든 shard_index.json 경로
+    # Shard backend (file open() 폭증 방지) — None이면 file backend.
+    # str: 단일소스 shard_index.json 경로.
+    # list[str]: 멀티소스(Option A) — data_dir(list) 와 병렬·길이/순서 일치.
+    #   각 shard set 을 물리 병합 없이 하나의 코퍼스로 라우팅한다.
+    shard_index_path: str | list[str] | None = (
+        None  # build_shards.py가 만든 shard_index.json 경로
+    )
     shard_cache_size: int = 4  # shard LRU 크기 (한 shard ~수백 MB)
 
     # 학습
     batch_size: int = 16
     lr: float = 1e-3
-    weight_decay: float = 0.1        # AdamW decoupled weight decay (2D+ 텐서에만 적용)
+    weight_decay: float = (
+        0.1  # AdamW decoupled weight decay (2D+ 텐서에만 적용)
+    )
     n_epochs: int = 70
     warmup_epochs: int = 5
     min_lr_ratio: float = 0.1
@@ -90,20 +101,36 @@ class TrainConfig:
     alpha: float = 1.0  # masked reconstruction
     beta: float = 0.0  # next-patch prediction (β=0이면 next-pred만 비활성)
     gamma: float = 0.0  # cross-modal prediction (γ=0이면 cross-modal만 비활성)
-    delta: float = 0.0  # cross-modal contrastive
+    # [deprecated] 경험적 가중(EMPIRICAL_COUPLING_WEIGHTS) 폐기로 무효화됨 — CMPM(γ)는
+    # 항상 directed allowlist 균일 1.0(CROSS_COUPLING_WEIGHTS)을 사용한다. 하위호환 유지.
+    use_soft_coupling: bool = False
+    # 학습 가능한 cross-modal 결합 그래프. False 면 기존 고정 allowlist.
+    learnable_coupling: bool = False
+    coupling_l1: float = 0.0
+    # 예측형(t→t+1) cross-modal 전용 두 번째 결합 그래프
+    dual_coupling: bool = False
+    gamma_next: float = 0.0
     peak_alpha: float = 0.0  # Peak-Weighted MSE 강도 (0=일반 MSE)
     lambda_spec: float = 0.0  # Spectral Loss 가중치 (하위 호환)
     spec_n_ffts: tuple[int, ...] = (16, 32, 64)  # 하위 호환
     aux_loss_weight: float = 0.01  # MoE load balancing auxiliary loss
-    contrastive_temperature: float = 0.07
-    learnable_temperature: bool = True
 
     # Masking 전략
     variate_mask_prob: float = 0.0  # Phase 2: variate-level 마스킹 확률
-    variate_drop_prob: float = 0.0  # Phase 2: variate를 attention에서 완전 제거 (zero-shot용)
+    variate_drop_prob: float = (
+        0.0  # Phase 2: variate를 attention에서 완전 제거 (zero-shot용)
+    )
     block_mask: bool = False  # True면 연속 블록 단위 마스킹
     block_size_min: int = 3  # 블록 최소 크기 (패치 수, 즉 초)
     block_size_max: int = 8  # 블록 최대 크기 (패치 수, 즉 초)
+
+    # Augmentation (2026-09-11): 진폭 jitter — 학습 중 variate 별 std 에 비례한 가우시안 노이즈
+    # x + jitter_std·std_v·ε 를 유효 토큰에만 더한다 (0=비활성, 검증/추론 무영향).
+    # 근거: 장비 지문·미세 형태 의존을 줄이는 표준 augmentation. cond(loc/scale)는 노이즈 포함
+    # 값으로 계산되나 scale 팽창은 sqrt(1+σ²) (σ=0.05 → +0.1%) 로 무시 가능.
+    # float 이면 전 modality 동일 σ. dict {signal_type: σ} 이면 modality 별 σ (없는 type 은 0).
+    # 근거(2026-09-12): σ0.05 일괄 적용 시 압력 계열(IOH·BP)↑ / ECG 형태 과제(pECG·부정맥)↓.
+    jitter_std: float | dict = 0.0
 
     # 시스템
     device: str = "auto"  # "auto", "cuda", "cpu"
@@ -154,7 +181,11 @@ class TrainConfig:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             yaml.dump(
-                d, f, default_flow_style=False, allow_unicode=True, sort_keys=False
+                d,
+                f,
+                default_flow_style=False,
+                allow_unicode=True,
+                sort_keys=False,
             )
 
     @classmethod
@@ -224,7 +255,11 @@ def _parse_manifest_files(
     total = len(manifest_files)
     for idx, mf in enumerate(manifest_files):
         if total > 100 and (idx + 1) % 500 == 0:
-            print(f"  Parsing manifests: {idx + 1}/{total} ({100*(idx+1)//total}%)", flush=True)
+            print(
+                f"  Parsing manifests: {idx + 1}/{total} "
+                f"({100 * (idx + 1) // total}%)",
+                flush=True,
+            )
         subject_dir = mf.parent
         with open(mf, encoding="utf-8") as f:
             meta = json.load(f)
@@ -241,7 +276,10 @@ def _parse_manifest_files(
                 if remapped is None:
                     continue  # PAP drop
                 new_signal_type, new_spatial_ids = remapped
-                if signal_types is not None and new_signal_type not in signal_types:
+                if (
+                    signal_types is not None
+                    and new_signal_type not in signal_types
+                ):
                     continue
                 file_ref = rec["file"]
                 if "#" in file_ref:
@@ -328,7 +366,10 @@ def _parse_manifest_full_jsonl(
                     if remapped is None:
                         continue  # PAP drop
                     new_signal_type, new_spatial_ids = remapped
-                    if signal_types is not None and new_signal_type not in signal_types:
+                    if (
+                        signal_types is not None
+                        and new_signal_type not in signal_types
+                    ):
                         continue
                     file_ref = rec["file"]
                     if "#" in file_ref:
@@ -430,7 +471,10 @@ def load_manifest_from_processed(
             try:
                 with open(cache_path, "rb") as cf:
                     entries = pickle.load(cf)
-                print(f"  Manifest cache hit: {cache_path.name} ({len(entries)} recordings)")
+                print(
+                    f"  Manifest cache hit: {cache_path.name} ({len(entries)} "
+                    f"recordings)"
+                )
                 return entries
             except Exception:
                 pass
@@ -442,17 +486,25 @@ def load_manifest_from_processed(
                 full_jsonl = d / "manifest_full.jsonl"
                 if full_jsonl.exists():
                     parsed = _parse_manifest_full_jsonl(
-                        full_jsonl, signal_types, max_subjects,
+                        full_jsonl,
+                        signal_types,
+                        max_subjects,
                         subject_filter=subject_filter,
                     )
                     entries.extend(parsed)
-                    print(f"  Using manifest_full.jsonl: {full_jsonl} ({len(parsed)} recordings)")
+                    print(
+                        f"  Using manifest_full.jsonl: {full_jsonl} "
+                        f"({len(parsed)} recordings)"
+                    )
             # 캐시 저장
             try:
                 cache_dir.mkdir(parents=True, exist_ok=True)
                 with open(cache_path, "wb") as cf:
                     pickle.dump(entries, cf, protocol=pickle.HIGHEST_PROTOCOL)
-                print(f"  Manifest cache saved: {cache_path.name} ({len(entries)} recordings)")
+                print(
+                    f"  Manifest cache saved: {cache_path.name} "
+                    f"({len(entries)} recordings)"
+                )
             except OSError:
                 pass
             return entries
@@ -465,13 +517,18 @@ def load_manifest_from_processed(
         if jsonl_file.exists():
             paths = _load_manifest_paths_from_jsonl(jsonl_file, max_subjects)
             manifest_files.extend(paths)
-            print(f"  Using manifest.jsonl: {jsonl_file} ({len(paths)} subjects)")
+            print(
+                f"  Using manifest.jsonl: {jsonl_file} ({len(paths)} subjects)"
+            )
         elif index_file.exists():
             with open(index_file) as f:
                 manifest_files.extend(
                     Path(line.strip()) for line in f if line.strip()
                 )
-            print(f"  Using manifest index: {index_file} ({len(manifest_files)} files)")
+            print(
+                f"  Using manifest index: {index_file} ({len(manifest_files)} "
+                f"files)"
+            )
         else:
             manifest_files.extend(sorted(d.glob("*/manifest.json")))
     if max_subjects is not None:
@@ -489,7 +546,10 @@ def load_manifest_from_processed(
         try:
             with open(cache_path, "rb") as cf:
                 entries = pickle.load(cf)
-            print(f"  Manifest cache hit: {cache_path.name} ({len(entries)} recordings)")
+            print(
+                f"  Manifest cache hit: {cache_path.name} ({len(entries)} "
+                f"recordings)"
+            )
             return entries
         except Exception:
             pass
@@ -500,16 +560,22 @@ def load_manifest_from_processed(
     if subject_filter is not None:
         before = len(entries)
         entries = [
-            e for e in entries
+            e
+            for e in entries
             if Path(str(e.path).split("#", 1)[0]).parent.name in subject_filter
         ]
-        print(f"  subject_filter applied: {before} → {len(entries)} recordings")
+        print(
+            f"  subject_filter applied: {before} → {len(entries)} recordings"
+        )
 
     try:
         cache_dir.mkdir(parents=True, exist_ok=True)
         with open(cache_path, "wb") as cf:
             pickle.dump(entries, cf, protocol=pickle.HIGHEST_PROTOCOL)
-        print(f"  Manifest cache saved: {cache_path.name} ({len(entries)} recordings)")
+        print(
+            f"  Manifest cache saved: {cache_path.name} ({len(entries)} "
+            f"recordings)"
+        )
     except OSError:
         pass
 
@@ -556,6 +622,53 @@ def split_manifest_by_subject(
 # ── 학습 루프 ───────────────────────────────────────────────────
 
 
+def apply_amplitude_jitter(
+    values: torch.Tensor,  # (B, L)
+    variate_id: torch.Tensor,  # (B, L), 0 = padding
+    std_ratio: float | dict,
+    signal_types: torch.Tensor | None = None,  # (total_variates,) row-major, dict σ 에 필요
+) -> torch.Tensor:  # (B, L)
+    """variate 별 표준편차에 비례한 가우시안 노이즈를 유효 토큰에 더한다 (학습 전용).
+
+    loc/scale 을 모델 내부 scaler 가 다시 계산하므로 여기서는 원 단위 값에 직접 더한다.
+    variate 마다 진폭 단위가 다르므로 (mmHg·mV·unitless) 절대 σ 가 아니라 std 비례 σ 를 쓴다.
+    """
+    if not isinstance(std_ratio, dict) and std_ratio <= 0.0:
+        return values
+    valid = variate_id > 0
+    B, _ = values.shape
+    n_var = int(variate_id.max().item()) + 1
+    idx = variate_id.clamp(min=0)
+    vf = values.float() * valid
+    cnt = torch.zeros(B, n_var, device=values.device).scatter_add_(
+        1, idx, valid.float()
+    )
+    s1 = torch.zeros(B, n_var, device=values.device).scatter_add_(1, idx, vf)
+    s2 = torch.zeros(B, n_var, device=values.device).scatter_add_(
+        1, idx, vf * vf
+    )
+    cnt = cnt.clamp(min=1.0)
+    mean = s1 / cnt
+    std = (s2 / cnt - mean * mean).clamp(min=0.0).sqrt()  # (B, V)
+    std_tok = std.gather(1, idx)  # (B, L)
+    if isinstance(std_ratio, dict):
+        assert signal_types is not None, "dict jitter_std 는 batch.signal_types 필요"
+        # 토큰 → 전역 variate 인덱스: 행별 variate 수(=max id) 누적 오프셋 + (vid-1)
+        n_per_row = variate_id.max(dim=1).values  # (B,)
+        offset = torch.cumsum(n_per_row, 0) - n_per_row  # (B,)
+        gidx = (offset.unsqueeze(1) + idx - 1).clamp(min=0)  # (B, L)
+        st_tok = signal_types.to(values.device)[gidx]  # (B, L)
+        table = torch.zeros(int(signal_types.max().item()) + 1, device=values.device)
+        for k, v in std_ratio.items():
+            if int(k) < table.numel():
+                table[int(k)] = float(v)
+        sigma_tok = table[st_tok]  # (B, L)
+    else:
+        sigma_tok = torch.full_like(std_tok, float(std_ratio))
+    noise = torch.randn_like(vf) * std_tok * sigma_tok * valid
+    return (values.float() + noise).to(values.dtype)
+
+
 def train_one_epoch(
     model: nn.Module,
     dataloader,
@@ -574,7 +687,8 @@ def train_one_epoch(
         raise ValueError(
             "config.gamma > 0 requires collate_mode='any_variate' "
             "(CI 모드는 row당 1 variate라 cross-modal pair 없음 → loss=0). "
-            f"received: gamma={config.gamma}, collate_mode={config.collate_mode}"
+            f"received: gamma={config.gamma}, "
+            f"collate_mode={config.collate_mode}"
         )
 
     # 데이터셋에 epoch 전파 — 같은 (rec, win) 샘플도 epoch마다 다른 random crop을 받음.
@@ -588,12 +702,6 @@ def train_one_epoch(
     epoch_masked = torch.zeros(1, device=device)
     epoch_next = torch.zeros(1, device=device)
     epoch_cross = torch.zeros(1, device=device)
-    # Contrastive: weighted-mean aggregation
-    # (per-batch loss was already per-anchor-mean; we multiply by anchor count
-    # to get batch-sum, then divide by total anchors across epoch to get
-    # global per-anchor mean. Zero-anchor batches contribute 0/0, ignored.)
-    epoch_contrastive_weighted = torch.zeros(1, device=device)
-    epoch_contrastive_anchors = torch.zeros(1, device=device)
     epoch_spec = torch.zeros(1, device=device)
     epoch_aux = torch.zeros(1, device=device)
     n_batches = 0
@@ -601,8 +709,13 @@ def train_one_epoch(
     max_nan_batches = 10
 
     enable_next = config.beta > 0
-    use_amp = scaler is not None
-    amp_dtype = torch.bfloat16  # fp16 → bf16: overflow 회피 (L40S native 지원, fp32 range)
+    # ⚠️ scaler 유무로 판단하지 말 것. create_scaler() 는 bf16 에서 항상 None 을
+    # 반환하므로 `scaler is not None` 으로 두면 autocast 가 영구히 꺼져 학습이
+    # FP32 로 돌게 된다 (validate() 와 동일한 규칙을 써야 함).
+    use_amp = config.use_amp and device.type == "cuda"
+    amp_dtype = (
+        torch.bfloat16
+    )  # fp16 → bf16: overflow 회피 (L40S native 지원, fp32 range)
     use_dist = dist.is_available() and dist.is_initialized()
 
     def _sync_criterion_grads() -> None:
@@ -634,7 +747,9 @@ def train_one_epoch(
 
         if use_dist:
             flag = torch.tensor(
-                [1 if batch is not None else 0], device=device, dtype=torch.long
+                [1 if batch is not None else 0],
+                device=device,
+                dtype=torch.long,
             )
             dist.all_reduce(flag, op=dist.ReduceOp.MIN)
             if flag.item() == 0:
@@ -647,6 +762,16 @@ def train_one_epoch(
         batch.values = batch.values.to(device)
         batch.sample_id = batch.sample_id.to(device)
         batch.variate_id = batch.variate_id.to(device)
+        # jitter 는 입력(과 scaler 가 계산하는 loc/scale cond)에만 더하고, 복원 목표는
+        # jitter 전 clean 값으로 만든다(denoising). cond 는 추론 때도 입력 자체에서 계산되므로
+        # noisy 로 두는 것이 일관되고, 교란 크기도 σ/√N 수준이라 무시할 수 있다.
+        # 반면 target 이 noisy 이면 STFT 크기 손실이 노이즈 바닥까지 따라가는 편향이 생긴다.
+        clean_values = batch.values
+        if isinstance(config.jitter_std, dict) or config.jitter_std > 0.0:
+            batch.values = apply_amplitude_jitter(
+                batch.values, batch.variate_id, config.jitter_std,
+                signal_types=batch.signal_types,
+            )
 
         # ── Forward (single call: task="both" for DDP compatibility) ──
         with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
@@ -665,7 +790,10 @@ def train_one_epoch(
             )
 
             reconstructed = out["reconstructed"]  # (B, N, patch_size)
-            cross_pred_per_type = out.get("cross_pred_per_type")  # (B, N, T, P)
+            cross_next_pred_per_type = out.get("cross_next_pred_per_type")
+            cross_pred_per_type = out.get(
+                "cross_pred_per_type"
+            )  # (B, N, T, P)
             patch_mask = out["patch_mask"]  # (B, N) bool
             time_id = out["time_id"]  # (B, N)
             next_pred = out.get("next_pred")  # (B, N, patch_size) or None
@@ -674,23 +802,23 @@ def train_one_epoch(
             # MoE aux_loss 수집
             aux_loss = torch.zeros(1, device=device)
             for layer in raw_model.encoder.layers:
-                if hasattr(layer.ffn, "aux_loss") and layer.ffn.aux_loss is not None:
+                if (
+                    hasattr(layer.ffn, "aux_loss")
+                    and layer.ffn.aux_loss is not None
+                ):
                     aux_loss = aux_loss + layer.ffn.aux_loss
 
-            # 원본 패치 추출 (정규화된 값)
+            # 원본 패치 추출 (정규화된 값) — jitter 전 clean 값을 목표로 쓴다
             p = raw_model.patch_size
             normalized = (
-                (batch.values.unsqueeze(-1) - out["loc"]) / out["scale"]
+                (clean_values.unsqueeze(-1) - out["loc"]) / out["scale"]
             ).squeeze(-1)
-            b, l = normalized.shape
-            n = l // p
+            b, seq_len = normalized.shape
+            n = seq_len // p
             original_patches = normalized.reshape(b, n, p)  # (B, N, P)
 
-            # ── Contrastive embeddings ──
-            contrastive_z = out.get("contrastive_z")  # (B, N, proj_dim) or None
-
             # ── CombinedLoss ──
-            needs_time_id = config.gamma > 0 or config.delta > 0
+            needs_time_id = config.gamma > 0
             losses = criterion(
                 reconstructed=reconstructed,
                 next_pred=next_pred,
@@ -699,9 +827,11 @@ def train_one_epoch(
                 patch_mask=patch_mask,
                 patch_sample_id=out["patch_sample_id"],
                 patch_variate_id=out["patch_variate_id"],
-                cross_pred_per_type=cross_pred_per_type if config.gamma > 0 else None,
+                cross_next_pred_per_type=cross_next_pred_per_type,
+                cross_pred_per_type=cross_pred_per_type
+                if config.gamma > 0
+                else None,
                 time_id=time_id if needs_time_id else None,
-                contrastive_z=contrastive_z if config.delta > 0 else None,
                 patch_signal_types=out.get("patch_signal_types"),
             )
 
@@ -715,15 +845,16 @@ def train_one_epoch(
         if not torch.isfinite(loss):
             # rank-local 경고. is_main_process() 게이트하면 silent rank divergence
             # 디버깅 불가 — 모든 rank에서 출력.
-            rank_str = f"rank{dist.get_rank()}" if (
-                dist.is_available() and dist.is_initialized()
-            ) else "rank?"
+            rank_str = (
+                f"rank{dist.get_rank()}"
+                if (dist.is_available() and dist.is_initialized())
+                else "rank?"
+            )
             print(
                 f"  [{phase_name}][{rank_str}] WARNING: NaN/Inf loss at batch "
                 f"{n_batches + 1} (masked={losses['masked_loss'].item():.4f}, "
                 f"next={losses['next_loss'].item():.4f}, "
-                f"cross={losses['cross_modal_loss'].item():.4f}, "
-                f"contrastive={losses['contrastive_loss'].item():.4f})"
+                f"cross={losses['cross_modal_loss'].item():.4f})"
             )
 
         optimizer.zero_grad(set_to_none=True)
@@ -747,7 +878,8 @@ def train_one_epoch(
         if not torch.isfinite(grad_norm):
             if is_main_process():
                 print(
-                    f"  [{phase_name}] WARNING: NaN/Inf gradient at batch {n_batches + 1}, "
+                    f"  [{phase_name}] WARNING: NaN/Inf gradient at batch "
+                    f"{n_batches + 1}, "
                     f"skipping update."
                 )
             nan_count += 1
@@ -756,7 +888,8 @@ def train_one_epoch(
             if nan_count >= max_nan_batches:
                 if is_main_process():
                     print(
-                        f"  [{phase_name}] ERROR: {nan_count} consecutive NaN/Inf batches. "
+                        f"  [{phase_name}] ERROR: {nan_count} consecutive "
+                        f"NaN/Inf batches. "
                         f"Stopping epoch early."
                     )
                 break
@@ -783,16 +916,6 @@ def train_one_epoch(
         epoch_masked += losses["masked_loss"].detach()
         epoch_next += losses["next_loss"].detach()
         epoch_cross += losses["cross_modal_loss"].detach()
-        # Contrastive: loss * n_anchors 누적 + anchor count 누적
-        # (zero-anchor 배치는 loss=0 & count=0으로 자동 제외됨)
-        _contrastive_anchors = losses.get(
-            "contrastive_n_anchors",
-            losses["contrastive_loss"].new_zeros((), dtype=torch.long),
-        ).detach().to(epoch_contrastive_anchors.dtype)
-        epoch_contrastive_weighted += (
-            losses["contrastive_loss"].detach() * _contrastive_anchors
-        )
-        epoch_contrastive_anchors += _contrastive_anchors
         epoch_spec += losses["masked_spec"].detach()
         epoch_aux += aux_loss.detach()
         n_batches += 1
@@ -812,8 +935,6 @@ def train_one_epoch(
             is_av = config.collate_mode == "any_variate"
             if is_av or losses["cross_modal_loss"].item() > 0:
                 parts.append(f"cross: {losses['cross_modal_loss'].item():.6f}")
-            if is_av or losses["contrastive_loss"].item() > 0:
-                parts.append(f"contrastive: {losses['contrastive_loss'].item():.6f}")
             if aux_loss.item() > 0:
                 parts.append(f"aux: {aux_loss.item():.6f}")
             parts.append(f"grad_norm: {grad_norm:.4f}")
@@ -836,7 +957,8 @@ def train_one_epoch(
             rss_gb = psutil.Process().memory_info().rss / 1024**3
             gpu_gb = (
                 torch.cuda.memory_allocated() / 1024**3
-                if torch.cuda.is_available() else 0.0
+                if torch.cuda.is_available()
+                else 0.0
             )
             print(
                 f"  [mem] batch {n_batches}: "
@@ -847,26 +969,22 @@ def train_one_epoch(
         if config.max_batches > 0 and n_batches >= config.max_batches:
             if is_main_process():
                 print(
-                    f"  [{phase_name}] max_batches={config.max_batches} 도달, 에폭 종료."
+                    f"  [{phase_name}] max_batches={config.max_batches} 도달, "
+                    f"에폭 종료."
                 )
             break
 
     denom = max(n_batches, 1)
-    contrastive_denom = epoch_contrastive_anchors.clamp(min=1.0)
     agg_masked = (epoch_masked / denom).item()
     agg_next = (epoch_next / denom).item()
     agg_cross = (epoch_cross / denom).item()
-    agg_contrastive = (epoch_contrastive_weighted / contrastive_denom).item()
     agg_spec = (epoch_spec / denom).item()
     agg_aux = (epoch_aux / denom).item()
-    # total을 aggregated 컴포넌트로부터 재계산 — per-batch total은 contrastive를
-    # batch-local mean으로 합산하지만 epoch contrastive는 anchor-weighted mean
-    # 이라 두 값이 일치 안 함. 컴포넌트 합으로 재계산하여 보고 일관성 확보.
+    # total 은 aggregated 컴포넌트로부터 재계산하여 보고 일관성을 확보한다.
     agg_total = (
         config.alpha * agg_masked
         + config.beta * agg_next
         + config.gamma * agg_cross
-        + config.delta * agg_contrastive
         + config.aux_loss_weight * agg_aux
     )
     return {
@@ -875,14 +993,13 @@ def train_one_epoch(
         "masked_spec": agg_spec,
         "next_loss": agg_next,
         "cross_modal_loss": agg_cross,
-        # Weighted per-anchor mean (zero-anchor batches excluded)
-        "contrastive_loss": agg_contrastive,
-        "contrastive_n_anchors": epoch_contrastive_anchors.item(),
         "aux_loss": agg_aux,
     }
 
 
-_VAL_DETERMINISTIC_SEED = 0xCAFEBABE  # validation에서 mask/dropout 결정성 확보용
+_VAL_DETERMINISTIC_SEED = (
+    0xCAFEBABE  # validation에서 mask/dropout 결정성 확보용
+)
 
 
 @torch.no_grad()
@@ -932,27 +1049,31 @@ def validate(
     epoch_masked = 0.0
     epoch_next = 0.0
     epoch_cross = 0.0
-    # Contrastive: weighted-mean aggregation (동일 설계, train_one_epoch 참조)
-    epoch_contrastive_weighted = 0.0
-    epoch_contrastive_anchors = 0.0
     epoch_spec = 0.0
     epoch_aux = 0.0
     n_batches = 0
 
     enable_next = config.beta > 0
     use_amp = config.use_amp and device.type == "cuda"
-    amp_dtype = torch.bfloat16  # fp16 → bf16: overflow 회피 (L40S native 지원, fp32 range)
+    amp_dtype = (
+        torch.bfloat16
+    )  # fp16 → bf16: overflow 회피 (L40S native 지원, fp32 range)
 
     # validation 진행률 표시 (rank 0만, cold val shard 로드라 분 단위 걸림)
     val_limit = (
-        config.val_max_batches if config.val_max_batches > 0 else config.max_batches
+        config.val_max_batches
+        if config.val_max_batches > 0
+        else config.max_batches
     )
     pbar = None
     if is_main_process():
         try:
             from tqdm import tqdm
+
             total_batches = (
-                min(val_limit, len(dataloader)) if val_limit > 0 else len(dataloader)
+                min(val_limit, len(dataloader))
+                if val_limit > 0
+                else len(dataloader)
             )
             pbar = tqdm(
                 total=total_batches,
@@ -983,6 +1104,7 @@ def validate(
 
             reconstructed = out["reconstructed"]
             cross_pred_per_type = out.get("cross_pred_per_type")
+            cross_next_pred_per_type = out.get("cross_next_pred_per_type")
             patch_mask = out["patch_mask"]
             time_id = out["time_id"]
             next_pred = out.get("next_pred")
@@ -991,20 +1113,21 @@ def validate(
             # MoE aux_loss 수집
             aux_loss = 0.0
             for layer in raw_model.encoder.layers:
-                if hasattr(layer.ffn, "aux_loss") and layer.ffn.aux_loss is not None:
+                if (
+                    hasattr(layer.ffn, "aux_loss")
+                    and layer.ffn.aux_loss is not None
+                ):
                     aux_loss += layer.ffn.aux_loss.item()
 
             p = raw_model.patch_size
             normalized = (
                 (batch.values.unsqueeze(-1) - out["loc"]) / out["scale"]
             ).squeeze(-1)
-            b, l = normalized.shape
-            n = l // p
+            b, seq_len = normalized.shape
+            n = seq_len // p
             original_patches = normalized.reshape(b, n, p)
 
-            contrastive_z = out.get("contrastive_z")
-
-            needs_time_id = config.gamma > 0 or config.delta > 0
+            needs_time_id = config.gamma > 0
             losses = criterion(
                 reconstructed=reconstructed,
                 next_pred=next_pred,
@@ -1013,9 +1136,11 @@ def validate(
                 patch_mask=patch_mask,
                 patch_sample_id=out["patch_sample_id"],
                 patch_variate_id=out["patch_variate_id"],
-                cross_pred_per_type=cross_pred_per_type if config.gamma > 0 else None,
+                cross_next_pred_per_type=cross_next_pred_per_type,
+                cross_pred_per_type=cross_pred_per_type
+                if config.gamma > 0
+                else None,
                 time_id=time_id if needs_time_id else None,
-                contrastive_z=contrastive_z if config.delta > 0 else None,
                 patch_signal_types=out.get("patch_signal_types"),
             )
 
@@ -1028,17 +1153,6 @@ def validate(
         epoch_masked += losses["masked_loss"].item()
         epoch_next += losses["next_loss"].item()
         epoch_cross += losses["cross_modal_loss"].item()
-        # Contrastive: loss * n_anchors 누적
-        _val_contrastive_anchors = float(
-            losses.get(
-                "contrastive_n_anchors",
-                torch.zeros((), dtype=torch.long),
-            ).item()
-        )
-        epoch_contrastive_weighted += (
-            losses["contrastive_loss"].item() * _val_contrastive_anchors
-        )
-        epoch_contrastive_anchors += _val_contrastive_anchors
         epoch_spec += losses["masked_spec"].item()
         epoch_aux += aux_loss
         n_batches += 1
@@ -1062,21 +1176,16 @@ def validate(
 
     model.train()
     denom = max(n_batches, 1)
-    contrastive_denom = max(epoch_contrastive_anchors, 1.0)
     agg_masked = epoch_masked / denom
     agg_next = epoch_next / denom
     agg_cross = epoch_cross / denom
-    agg_contrastive = epoch_contrastive_weighted / contrastive_denom
     agg_spec = epoch_spec / denom
     agg_aux = epoch_aux / denom
-    # total을 aggregated 컴포넌트로부터 재계산 — per-batch total은 contrastive를
-    # batch-local mean으로 합산하지만 epoch contrastive는 anchor-weighted mean이라
-    # 두 값이 일치 안 함. 컴포넌트 합으로 재계산하여 보고 일관성 확보.
+    # total 은 aggregated 컴포넌트로부터 재계산하여 보고 일관성을 확보한다.
     agg_total = (
         config.alpha * agg_masked
         + config.beta * agg_next
         + config.gamma * agg_cross
-        + config.delta * agg_contrastive
         + config.aux_loss_weight * agg_aux
     )
     return {
@@ -1085,8 +1194,6 @@ def validate(
         "masked_spec": agg_spec,
         "next_loss": agg_next,
         "cross_modal_loss": agg_cross,
-        "contrastive_loss": agg_contrastive,
-        "contrastive_n_anchors": epoch_contrastive_anchors,
         "aux_loss": agg_aux,
     }
 
@@ -1140,13 +1247,11 @@ class CSVLogger:
         "train_masked",
         "train_next",
         "train_cross",
-        "train_contrastive",
         "train_aux",
         "val_total",
         "val_masked",
         "val_next",
         "val_cross",
-        "val_contrastive",
         "val_aux",
         "lr",
         "epoch_sec",
@@ -1179,13 +1284,11 @@ class CSVLogger:
             train_losses["masked_loss"],
             train_losses["next_loss"],
             train_losses["cross_modal_loss"],
-            train_losses["contrastive_loss"],
             train_losses["aux_loss"],
             val_losses["total"] if val_losses else "",
             val_losses["masked_loss"] if val_losses else "",
             val_losses["next_loss"] if val_losses else "",
             val_losses["cross_modal_loss"] if val_losses else "",
-            val_losses["contrastive_loss"] if val_losses else "",
             val_losses["aux_loss"] if val_losses else "",
             lr,
             f"{epoch_sec:.1f}",
@@ -1196,7 +1299,9 @@ class CSVLogger:
         except OSError:
             # 네트워크 파일시스템에서 append 미지원 시 read+write 우회
             existing = (
-                self.path.read_text(encoding="utf-8") if self.path.exists() else ""
+                self.path.read_text(encoding="utf-8")
+                if self.path.exists()
+                else ""
             )
             import io
 
@@ -1251,7 +1356,9 @@ def setup_ddp(rank: int, world_size: int) -> None:
         "nccl",
         rank=rank,
         world_size=world_size,
-        timeout=timedelta(minutes=30),   # default 10분 → 30분 (rank straggler 견딤)
+        timeout=timedelta(
+            minutes=30
+        ),  # default 10분 → 30분 (rank straggler 견딤)
     )
     torch.cuda.set_device(rank)
 
@@ -1304,7 +1411,8 @@ def create_scheduler(
     """Linear warmup + Cosine decay 스케줄러를 생성한다.
 
     - ``[0, warmup_epochs)``: lr을 0에서 ``config.lr``까지 선형 증가.
-    - ``[warmup_epochs, n_epochs)``: ``config.lr``에서 ``config.lr * min_lr_ratio``까지 cosine 감쇠.
+    - ``[warmup_epochs, n_epochs)``: ``config.lr``에서 ``config.lr *
+    min_lr_ratio``까지 cosine 감쇠.
     """
     warmup = config.warmup_epochs
     total = config.n_epochs
@@ -1376,7 +1484,6 @@ def save_experiment_info(
         f"alpha (masked)      = {config.alpha}",
         f"beta  (next-pred)   = {config.beta}",
         f"gamma (cross-modal) = {config.gamma}",
-        f"delta (contrastive) = {config.delta}",
         f"variate_mask_prob   = {config.variate_mask_prob}",
         "",
         "[Data]",
@@ -1405,6 +1512,7 @@ def save_training_checkpoint(
     loss: float,
     output_dir: Path,
     tag: str = "",
+    criterion: nn.Module | None = None,
 ) -> Path:
     """학습 checkpoint를 저장하고 경로를 반환한다."""
     ckpt_dir = output_dir / "checkpoints"
@@ -1421,4 +1529,11 @@ def save_training_checkpoint(
         phase=phase_name,
         loss=loss,
     )
+    # 학습 가능한 결합 그래프는 model 이 아니라 criterion 에 있으므로 따로 남긴다.
+    # 이것이 없으면 학습 후 "모델이 어떤 쌍을 골랐는가" 를 볼 수 없다.
+    if criterion is not None:
+        cp = {k: v.detach().cpu() for k, v in criterion.state_dict().items()}
+        cp = {k: v for k, v in cp.items() if "coupling" in k or "temperature" in k}
+        if cp:
+            torch.save(cp, ckpt_dir / f"criterion_epoch{epoch:03d}{suffix}.pt")
     return path

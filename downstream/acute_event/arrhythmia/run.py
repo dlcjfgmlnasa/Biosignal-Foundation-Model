@@ -383,8 +383,13 @@ def train_lora(
     patience: int = 0,
     use_ddp: bool = False,
     use_val: bool = False,
+    train_all: bool = False,
 ) -> list[float]:
     """LoRA fine-tune (multi-class, CrossEntropy).
+
+    ``train_all=True`` 이면 LoRA adapter 대신 encoder 전체를 학습한다
+    (CARMEN-scratch 대조군). 나머지 경로(batch 빌드·DDP wrap·best-val 복원)는
+    LoRA 와 완전히 동일하다.
 
     ``ddp_module`` 가 주어지면(torchrun) encode→pool→probe 를 DDP 래퍼 forward 로
     호출해 grad all-reduce 가 등록되게 한다. wrap_lora_ddp 는 logits 만 반환하므로
@@ -404,7 +409,12 @@ def train_lora(
     probe = probe.to(device)
     probe.train()
 
-    lora_params = model.lora_parameters()
+    # 학습 대상 encoder 파라미터: lora=adapter 만, scratch=encoder 전체.
+    lora_params = (
+        [p for p in model.model.parameters() if p.requires_grad]
+        if train_all
+        else model.lora_parameters()
+    )
     optimizer = torch.optim.AdamW([
         {"params": lora_params, "lr": lr},
         {"params": probe.parameters(), "lr": lr},
@@ -718,7 +728,11 @@ def main() -> None:
         "--mode",
         type=str,
         default="linear_probe",
-        choices=["linear_probe", "lora"],
+        choices=["linear_probe", "lora", "scratch"],
+        help="linear_probe: frozen encoder, lora: LoRA adapters, "
+             "scratch: 동일 구조 random init + 전체 파라미터 학습 "
+             "(사전학습 대조군). scratch 도 --checkpoint 이 필요하나 "
+             "ModelConfig 만 읽고 가중치는 버린다.",
     )
     parser.add_argument("--lora-rank", type=int, default=8)
     parser.add_argument("--lora-alpha", type=float, default=16.0)
@@ -767,8 +781,18 @@ def main() -> None:
     elif args.checkpoint:
         from downstream.model_wrapper import DownstreamModelWrapper
 
-        print(f"Loading checkpoint: {args.checkpoint}")
-        model = DownstreamModelWrapper(args.checkpoint, args.model_version, args.device)
+        # scratch: 가중치는 버리고 ModelConfig 만 재사용 → 사전학습 모델과 아키텍처
+        # 동일한 random-init 대조군 (파라미터 수가 자동으로 일치).
+        if args.mode == "scratch":
+            print(f"Reading ModelConfig only (weights discarded): {args.checkpoint}")
+        else:
+            print(f"Loading checkpoint: {args.checkpoint}")
+        model = DownstreamModelWrapper(
+            args.checkpoint,
+            args.model_version,
+            args.device,
+            init_random=(args.mode == "scratch"),
+        )
         d_model = model.d_model
 
         if args.mode == "lora":
@@ -833,8 +857,10 @@ def main() -> None:
         print("\nEvaluating on test set with best-val probe...")
         metrics = _eval_probe_cached(probe, test_features, test_labels, device)
 
-    elif args.mode == "lora":
-        # lora: encoder fine-tune → feature 캐싱 불가, pre-built batches 필요.
+    elif args.mode in ("lora", "scratch"):
+        # lora/scratch: encoder 를 함께 학습 → feature 캐싱 불가, pre-built batches 필요.
+        # 두 모드는 학습 대상 파라미터만 다르고(adapter vs encoder 전체) 나머지
+        # 경로(batch 빌드·DDP wrap·best-val 복원)는 공유한다. — MT/IOH 러너와 동일 패턴.
         # 주의: 큰 윈도우면 RAM 위험 — ablation 은 linear_probe 만 사용.
         # ── DDP(B안): train window 를 rank 별로 분할 후 전 rank 최소 길이로 정렬
         #   (step 동기화). test 는 분할하지 않는다(평가는 rank0 이 full set 으로 수행).
@@ -864,10 +890,22 @@ def main() -> None:
         train_batches = _make_batches(
             train_windows, args.batch_size, args.patch_size, max_length
         )
-        n_lora = sum(p.numel() for p in model.lora_parameters())
+        is_scratch = args.mode == "scratch"
+        n_enc = sum(
+            p.numel()
+            for p in (
+                [q for q in model.model.parameters() if q.requires_grad]
+                if is_scratch
+                else model.lora_parameters()
+            )
+        )
         n_probe = sum(p.numel() for p in probe.parameters())
-        print(f"\nTraining LoRA + Probe (rank={args.lora_rank}, "
-              f"LoRA={n_lora:,} + Probe={n_probe:,} params)...")
+        if is_scratch:
+            print(f"\nTraining from scratch (random init, full encoder={n_enc:,} "
+                  f"+ Probe={n_probe:,} params)...")
+        else:
+            print(f"\nTraining LoRA + Probe (rank={args.lora_rank}, "
+                  f"LoRA={n_enc:,} + Probe={n_probe:,} params)...")
         # DDP: encode→pool→probe 를 한 forward 로 묶어 grad all-reduce 등록. 단일 GPU
         # 면 use_ddp=False → ddp_module=None → 기존 forward 경로 그대로(불변).
         ddp_module = wrap_lora_ddp(model.model, probe) if use_ddp else None
@@ -881,7 +919,7 @@ def main() -> None:
             model, probe, train_batches, args.epochs, args.lr, device,
             ddp_module=ddp_module,
             val_batches=val_batches, patience=args.patience, use_ddp=use_ddp,
-            use_val=True,
+            use_val=True, train_all=is_scratch,
         )
         # DDP: 학습 종료 동기화 후 test/저장은 rank0 전담 → non-rank0 는 정리·종료.
         if use_ddp:

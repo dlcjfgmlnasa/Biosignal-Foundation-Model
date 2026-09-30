@@ -36,6 +36,16 @@ def _load_one_tensor(path: str) -> torch.Tensor:
     return t
 
 
+def _init_worker_single_thread() -> None:
+    """Worker initializer: torch intra-op 스레드를 1개로 제한.
+
+    워커마다 torch 기본값(코어 수)만큼 스레드를 띄우면 workers × cores 개가 경쟁한다.
+    실측(2026-09-14, 72코어·64워커): load avg 2,170, 47s/shard → 1스레드 제한 시
+    0.9s/shard (~45배). 작업이 파일 단위라 병렬성은 워커 수로 충분하다.
+    """
+    torch.set_num_threads(1)
+
+
 def _load_manifest_paths_from_jsonl(jsonl_path: Path) -> list[dict]:
     """manifest_full.jsonl에서 모든 (subject_dir, recording_dict)를 평탄화하여 반환."""
     entries: list[dict] = []
@@ -260,9 +270,14 @@ def main() -> None:
     pool: ProcessPoolExecutor | ThreadPoolExecutor | None = None
     if use_parallel:
         if args.io_backend == "thread":
+            # 스레드 워커는 프로세스의 intra-op 풀을 공유하므로 여기서 한 번 제한
+            torch.set_num_threads(1)
             pool = ThreadPoolExecutor(max_workers=args.workers)
         else:
-            pool = ProcessPoolExecutor(max_workers=args.workers)
+            pool = ProcessPoolExecutor(
+                max_workers=args.workers,
+                initializer=_init_worker_single_thread,
+            )
         print(
             f"  Using {args.workers} parallel {args.io_backend} workers "
             f"for torch.load (single pool)"

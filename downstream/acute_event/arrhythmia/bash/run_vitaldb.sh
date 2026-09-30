@@ -1,10 +1,11 @@
 #!/bin/bash
-# Arrhythmia (VitalDB) — 5-fold 실험 실행 (linear_probe + lora)
+# Arrhythmia (VitalDB) — 5-fold 실험 실행 (linear_probe + lora + scratch)
 # 사전조건: prepare_vitaldb.sh 로 arrhythmia_ecg_ppg_fold{0..N-1}.pt 생성
 #
 # 사용법 (서버):
 #   bash downstream/acute_event/arrhythmia/bash/run_vitaldb.sh
-#   NPROC=4 bash .../run_vitaldb.sh        # lora 를 torchrun DDP 데이터 병렬
+#   NPROC=4 bash .../run_vitaldb.sh        # lora/scratch 를 torchrun DDP 데이터 병렬
+#   MODES_OVERRIDE=scratch NPROC=4 bash .../run_vitaldb.sh   # 사전학습 대조군만
 set -e
 
 # ── 경로 (memory project_kmimic_bio_fm_paths — updown 기본은 stale, override 필수) ──
@@ -24,6 +25,20 @@ LORA_PATIENCE="${LORA_PATIENCE:-10}"  # LoRA: val macro-AUROC 무개선 10 epoch
 LORA_RANK="${LORA_RANK:-8}"
 LORA_ALPHA="${LORA_ALPHA:-16}"
 LORA_BATCH="${LORA_BATCH:-128}"   # ⚠ batch≠32 면 LR 재튜닝 필요 (memory lora_acceleration)
+
+# ── CARMEN-scratch (random init + 전체 파라미터 end-to-end 학습) ──
+# 사전학습 대조군(Table 3). CNN baseline 과 달리 **CARMEN 과 동일 아키텍처**다.
+# ⚠ batch 는 LoRA 보다 작아야 한다. LoRA 는 base weight 가 frozen 이라 autograd 가
+#   그 Linear 들의 입력 activation 을 저장하지 않지만(weight grad 불필요), scratch 는
+#   q/k/v/out/fc1/fc2/gate 전부가 학습 대상이라 입력을 backward 까지 보유한다.
+#   Arrhythmia 는 window 가 30s 로 IOH(300s) 의 1/10 이라 32 는 여유가 있다.
+#   OOM 시 PYTORCH_ALLOC_CONF=expandable_segments:True 를 함께 준다.
+# ⚠ NPROC>1 이면 effective batch = SCRATCH_BATCH × NPROC.
+# ⚠ 한 task 의 전 fold 는 같은 batch/LR/epoch 으로 돌아야 표 비교가 성립한다.
+SCRATCH_EPOCHS="${SCRATCH_EPOCHS:-30}"   # ceiling. patience early-stop 이 수렴 시 자동 중단
+SCRATCH_LR="${SCRATCH_LR:-3e-4}"
+SCRATCH_PATIENCE="${SCRATCH_PATIENCE:-5}"
+SCRATCH_BATCH="${SCRATCH_BATCH:-32}"
 
 # NPROC>1 → lora 는 torchrun DDP. linear_probe 는 frozen feature 캐싱이라 항상 python -m.
 NPROC=${NPROC:-1}
@@ -53,6 +68,12 @@ for SIGNALS in "${SIGNAL_COMBOS[@]}"; do
         mkdir -p "$EXP_DIR"
         if [ "$MODE" = "linear_probe" ]; then
             EPOCHS=$LP_EPOCHS; LR=$LP_LR; PAT=$LP_PATIENCE; EXTRA_ARGS=""; LAUNCH="python -m"
+        elif [ "$MODE" = "scratch" ]; then
+            # scratch: LoRA 와 같은 end-to-end 경로(=DDP 런처 공유), 학습 대상만 encoder 전체.
+            # --lora-rank/alpha 는 전달하지 않는다(inject_lora 를 타지 않음).
+            EPOCHS=$SCRATCH_EPOCHS; LR=$SCRATCH_LR; PAT=$SCRATCH_PATIENCE
+            EXTRA_ARGS="--batch-size $SCRATCH_BATCH"
+            LAUNCH="$LORA_LAUNCH"
         else
             EPOCHS=$LORA_EPOCHS; LR=$LORA_LR; PAT=$LORA_PATIENCE
             EXTRA_ARGS="--lora-rank $LORA_RANK --lora-alpha $LORA_ALPHA --batch-size $LORA_BATCH"

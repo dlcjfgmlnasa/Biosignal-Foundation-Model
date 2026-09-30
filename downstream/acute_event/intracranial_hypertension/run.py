@@ -905,7 +905,11 @@ def main() -> None:
     parser.add_argument("--model-version", type=str, default="v1", choices=["v1", "v2"])
     parser.add_argument("--data-path", type=str, required=True)
     parser.add_argument("--mode", type=str, default="linear_probe",
-                        choices=["linear_probe", "lora"])
+                        choices=["linear_probe", "lora", "scratch"],
+                        help="linear_probe: frozen encoder, lora: LoRA adapters, "
+                             "scratch: 동일 구조 random init + 전체 파라미터 학습 "
+                             "(사전학습 대조군). scratch 도 --checkpoint 이 필요하나 "
+                             "ModelConfig 만 읽고 가중치는 버린다.")
     parser.add_argument("--lora-rank", type=int, default=8)
     parser.add_argument("--lora-alpha", type=float, default=16.0)
     parser.add_argument(
@@ -982,8 +986,27 @@ def main() -> None:
 
     from downstream.model_wrapper import DownstreamModelWrapper
 
-    print(f"Loading checkpoint: {args.checkpoint}")
-    model = DownstreamModelWrapper(args.checkpoint, args.model_version, args.device)
+    # scratch: 가중치는 버리고 ModelConfig 만 재사용 → 사전학습 모델과 아키텍처
+    # 동일한 random-init 대조군 (파라미터 수가 자동으로 일치).
+    is_scratch = args.mode == "scratch"
+    # ⚠ LOSO 경로(run_loso)는 encoder embedding 을 한 번 캐싱해 per-patient probe 만
+    #   학습한다 — encoder 를 절대 갱신하지 않는다. scratch 와 조합하면 "random encoder
+    #   의 고정 feature + probe" 가 되어 조용히 대조군이 아닌 것이 나온다. 차단한다.
+    if is_scratch and args.eval_mode == "loso":
+        print(
+            "ERROR: --mode scratch 는 --eval-mode loso 와 함께 쓸 수 없습니다 "
+            "(LOSO 는 frozen embedding 캐시 기반이라 encoder 를 학습하지 않음).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if is_scratch:
+        print(f"Reading ModelConfig only (weights discarded): {args.checkpoint}")
+    else:
+        print(f"Loading checkpoint: {args.checkpoint}")
+    model = DownstreamModelWrapper(
+        args.checkpoint, args.model_version, args.device,
+        init_random=is_scratch,
+    )
     d_model = model.d_model
 
     if args.mode == "lora":
@@ -994,7 +1017,9 @@ def main() -> None:
     # OOM(SIGKILL). linear_probe(DDP)=각 rank stride 로드→추출→gather 로 rank0 복원,
     # lora(DDP)=train 만 stride(학습 병렬)·val/test 는 rank0 full, 단일 GPU/LOSO=full.
     load_fold = int(args.fold) if int(args.n_folds) > 1 else None
-    is_lora = args.mode == "lora"
+    # is_lora = "encoder 를 함께 학습하는 end-to-end 경로" 플래그 (데이터 shard·batch
+    # 빌드·DDP wrap·best_model_state 저장 공유). scratch 는 학습 대상 파라미터만 다르다.
+    is_lora = args.mode in ("lora", "scratch")
     is_loso = args.eval_mode == "loso"
     tr_gidx = va_gidx = te_gidx = None
     print(f"\nLoading data: {args.data_path} (fold={load_fold})"
@@ -1095,7 +1120,7 @@ def main() -> None:
         return
 
     probe = LinearProbe(d_model, n_classes=1)
-    is_lora = args.mode == "lora"
+    is_lora = args.mode in ("lora", "scratch")
     grad_accum = max(1, int(args.grad_accum))  # lora 전용 (1=기존 동작)
 
     # ── 준비: linear_probe=frozen feature 캐싱 / lora=batch 빌드 + DDP shard ──
@@ -1176,7 +1201,12 @@ def main() -> None:
         # val/test 는 rank0 만 평가에 쓰며(분할 X — full set), batch 리스트를 미리
         # 빌드하지 않고 매번 _iter_lora_batches 로 스트리밍한다(host-RAM OOM 회피).
         probe = probe.to(device)
-        lora_params = model.lora_parameters()
+        # 학습 대상 encoder 파라미터: lora=adapter 만, scratch=encoder 전체.
+        lora_params = (
+            [p for p in model.model.parameters() if p.requires_grad]
+            if is_scratch
+            else model.lora_parameters()
+        )
         # probe 는 랜덤 초기화라 encoder adapter 와 학습 시간 척도가 다르다. LoRA 는
         # best epoch(~11) 까지 probe 가 2.4k step × 1e-4 밖에 못 밟는 반면, frozen
         # linear_probe 의 probe 는 881k step × 1e-3 을 밟는다(LR×step 3,600배). 게다가
@@ -1199,7 +1229,11 @@ def main() -> None:
         #   rank0 만 full feature 로 head 를 fit → 직후 wrap_lora_ddp(DDP construction)가
         #   rank0 head 를 전 rank 로 broadcast(파라미터 동기). head_warmup_epochs=0 이면
         #   이 블록 전체가 no-op(기존 동작 불변).
-        if args.head_warmup_epochs > 0:
+        # scratch 는 warm-start 를 건너뛴다. 이 블록의 전제("LoRA B=0 → inject 직후
+        # encoder 출력 = frozen 사전학습 feature")가 random-init 에서는 성립하지 않는다.
+        # 랜덤 encoder feature 로 head 를 먼저 수렴시키면 이득이 없고, 대조군에
+        # 사전학습 경로에만 있는 추가 절차가 끼어 비교가 불공정해진다.
+        if args.head_warmup_epochs > 0 and not is_scratch:
             ws_lr = args.probe_lr if args.probe_lr is not None else 1e-3
             ws_feats, ws_labels = _extract_features_presharded(
                 model, train_windows, tr_gidx,
@@ -1222,14 +1256,18 @@ def main() -> None:
         # DDP: encode→pool→probe 를 한 forward 로 묶어 grad all-reduce 등록. 단일 GPU
         # 면 use_ddp=False → ddp_module=None → 기존 _make/forward 경로 그대로(불변).
         ddp_module = wrap_lora_ddp(model.model, probe) if use_ddp else None
-        n_lora = sum(p.numel() for p in model.lora_parameters())
+        n_enc = sum(p.numel() for p in lora_params)
         eff_batch = args.batch_size * (ddp_world_size() if use_ddp else 1) * grad_accum
-        print(f"\nTraining LoRA + Probe (rank={args.lora_rank}, LoRA={n_lora:,}) "
-              f"with val best-ckpt...")
+        if is_scratch:
+            print(f"\nTraining from scratch (random init, full encoder={n_enc:,}) "
+                  f"with val best-ckpt...")
+        else:
+            print(f"\nTraining LoRA + Probe (rank={args.lora_rank}, LoRA={n_enc:,}) "
+                  f"with val best-ckpt...")
         print(f"  batch: micro={args.batch_size} × nproc="
               f"{ddp_world_size() if use_ddp else 1} × accum={grad_accum} "
               f"→ effective {eff_batch}")
-        print(f"  lr: lora={args.lr:g} (wd 0.01) | "
+        print(f"  lr: {'encoder' if is_scratch else 'lora'}={args.lr:g} (wd 0.01) | "
               f"probe={probe_lr:g} (wd {args.probe_wd:g})")
 
     criterion = nn.BCEWithLogitsLoss()

@@ -14,20 +14,23 @@ Usage (멀티 GPU -- DDP)
 -----
     torchrun --nproc_per_node=2 -m train.1_channel_independency
 """
-import argparse
-import gc
-import os
-import time
+import argparse  # noqa: E402
+import gc  # noqa: E402
+import os  # noqa: E402
+import time  # noqa: E402
 
-import torch
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
+import torch  # noqa: E402
+import torch.distributed as dist  # noqa: E402
+from torch.nn.parallel import DistributedDataParallel as DDP  # noqa: E402
 
-from data import BiosignalDataset, create_dataloader
-from data.sampler import ModalityBalancedRecordingSampler, RecordingLocalitySampler
-from loss.criterion import CombinedLoss
-from model import BiosignalFoundationModel, ModelConfig
-from .train_utils import (
+from data import BiosignalDataset, create_dataloader  # noqa: E402
+from data.sampler import (  # noqa: E402
+    ModalityBalancedRecordingSampler,
+    RecordingLocalitySampler,
+)
+from loss.criterion import CombinedLoss  # noqa: E402
+from model import BiosignalFoundationModel, ModelConfig  # noqa: E402
+from .train_utils import (  # noqa: E402
     CSVLogger,
     EarlyStopping,
     TrainConfig,
@@ -47,12 +50,17 @@ from .train_utils import (
     train_one_epoch,
     validate,
 )
-from model.checkpoint import load_checkpoint
-from .visualize import save_reconstruction_figure, save_next_pred_figure
+from model.checkpoint import load_checkpoint  # noqa: E402
+from .visualize import (  # noqa: E402
+    save_reconstruction_figure,
+    save_next_pred_figure,
+)
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Phase 1: Channel-Independent Pre-training")
+    p = argparse.ArgumentParser(
+        description="Phase 1: Channel-Independent Pre-training"
+    )
 
     # Config file + dry-run
     p.add_argument(
@@ -62,10 +70,15 @@ def parse_args() -> argparse.Namespace:
         help="YAML config file path. CLI args override YAML values.",
     )
     p.add_argument(
-        "--dry-run", action="store_true", help="1 batch만 실행 후 종료 (OOM/NaN 검증용)"
+        "--dry-run",
+        action="store_true",
+        help="1 batch만 실행 후 종료 (OOM/NaN 검증용)",
     )
     p.add_argument(
-        "--resume", type=str, default=None, help="학습 재개할 checkpoint 경로 (.pt)"
+        "--resume",
+        type=str,
+        default=None,
+        help="학습 재개할 checkpoint 경로 (.pt)",
     )
 
     # Model
@@ -75,11 +88,19 @@ def parse_args() -> argparse.Namespace:
     g.add_argument("--patch_size", type=int, default=100)
     g.add_argument("--num_heads", type=int, default=None)
     g.add_argument("--num_groups", type=int, default=None)
-    g.add_argument("--use_glu", action=argparse.BooleanOptionalAction, default=True)
-    g.add_argument("--use_moe", action=argparse.BooleanOptionalAction, default=False)
-    g.add_argument("--use_rope", action=argparse.BooleanOptionalAction, default=True)
     g.add_argument(
-        "--use_var_attn_bias", action=argparse.BooleanOptionalAction, default=True
+        "--use_glu", action=argparse.BooleanOptionalAction, default=True
+    )
+    g.add_argument(
+        "--use_moe", action=argparse.BooleanOptionalAction, default=False
+    )
+    g.add_argument(
+        "--use_rope", action=argparse.BooleanOptionalAction, default=True
+    )
+    g.add_argument(
+        "--use_var_attn_bias",
+        action=argparse.BooleanOptionalAction,
+        default=True,
     )
     g.add_argument("--dropout_p", type=float, default=0.0)
     g.add_argument("--next_block_size", type=int, default=5)
@@ -129,29 +150,34 @@ def parse_args() -> argparse.Namespace:
         "--beta", type=float, default=1.0, help="Next-patch prediction weight"
     )
     g.add_argument(
-        "--delta", type=float, default=0.0, help="Contrastive loss weight (0=disabled)"
-    )
-    g.add_argument(
         "--val_ratio",
         type=float,
         default=0.2,
         help="Validation 비율 (subject 단위, 0=비활성)",
     )
     g.add_argument(
-        "--patience", type=int, default=10, help="Early stopping patience (0=비활성)"
+        "--patience",
+        type=int,
+        default=10,
+        help="Early stopping patience (0=비활성)",
     )
 
     # System
     g = p.add_argument_group("System")
     g.add_argument(
-        "--use_amp", action="store_true", help="AMP (Automatic Mixed Precision) 활성"
+        "--use_amp",
+        action="store_true",
+        help="AMP (Automatic Mixed Precision) 활성",
     )
     g.add_argument("--device", type=str, default="auto")
     g.add_argument("--num_workers", type=int, default=4)
     g.add_argument("--output_dir", type=str, default="outputs/phase1_ci")
     g.add_argument("--checkpoint_every", type=int, default=10)
     g.add_argument(
-        "--max_batches", type=int, default=0, help="에폭당 최대 배치 수 (0=무제한)"
+        "--max_batches",
+        type=int,
+        default=0,
+        help="에폭당 최대 배치 수 (0=무제한)",
     )
     g.add_argument(
         "--viz_every",
@@ -208,7 +234,6 @@ def main():
             use_var_attn_bias=args.use_var_attn_bias,
             dropout_p=args.dropout_p,
             next_block_size=args.next_block_size,
-            contrastive_proj_dim=0,
         )
 
         config = TrainConfig(
@@ -236,7 +261,6 @@ def main():
             alpha=args.alpha,
             beta=args.beta,
             gamma=0.0,
-            delta=args.delta,
             # Phase 1
             variate_mask_prob=0.0,
             # Validation & Early Stopping
@@ -273,7 +297,10 @@ def main():
         print("Phase 1: Channel-Independent Pre-training")
         if config.exp_name:
             print(f"Experiment: {config.exp_name}")
-        print(f"Device: {device}" + (f" (DDP: {world_size} GPUs)" if use_ddp else ""))
+        print(
+            f"Device: {device}"
+            + (f" (DDP: {world_size} GPUs)" if use_ddp else "")
+        )
         print(f"{'=' * 60}")
 
     # ── 데이터 로딩 ──
@@ -296,7 +323,8 @@ def main():
         )
         if rank0:
             print(
-                f"Train/Val split: {len(train_manifest)} train, {len(val_manifest)} val recordings"
+                f"Train/Val split: {len(train_manifest)} train, "
+                f"{len(val_manifest)} val recordings"
             )
     else:
         train_manifest = manifest
@@ -316,10 +344,16 @@ def main():
         min_patches=config.min_patches,
         shard_index_path=config.shard_index_path,
         shard_cache_size=config.shard_cache_size,
+        # 멀티소스: data_dir(list) 을 소스별 authoritative manifest resolve 에 사용.
+        source_dirs=config.data_dir
+        if isinstance(config.data_dir, list)
+        else None,
     )
     if rank0 and config.shard_index_path:
-        print(f"  Shard backend ON: {config.shard_index_path} "
-              f"(shard_cache_size={config.shard_cache_size})")
+        print(
+            f"  Shard backend ON: {config.shard_index_path} "
+            f"(shard_cache_size={config.shard_cache_size})"
+        )
     if rank0:
         print(f"Train dataset: {len(dataset)} windows")
 
@@ -357,9 +391,9 @@ def main():
         num_workers=config.num_workers,
         collate_mode=config.collate_mode,
         patch_size=config.model_config.patch_size,
-        pin_memory=False,         # pinned RAM 누적 방지 (NCCL stuck 시 leak 회피)
-        prefetch_factor=4,        # 2→4: leak 해결됐으니 queue ↑ (GPU starvation ↓)
-        persistent_workers=False, # epoch마다 worker 재생성 → leak 누적 reset
+        pin_memory=False,  # pinned RAM 누적 방지 (NCCL stuck 시 leak 회피)
+        prefetch_factor=4,  # 2→4: leak 해결됐으니 queue ↑ (GPU starvation ↓)
+        persistent_workers=False,  # epoch마다 worker 재생성 → leak 누적 reset
         sampler=sampler,
         use_length_aware_batching=config.use_length_aware_batching,
         length_overpack=config.length_overpack,
@@ -377,6 +411,9 @@ def main():
             min_patches=config.min_patches,
             shard_index_path=config.shard_index_path,
             shard_cache_size=config.shard_cache_size,
+            source_dirs=config.data_dir
+            if isinstance(config.data_dir, list)
+            else None,
         )
         val_sampler = RecordingLocalitySampler(
             val_dataset,
@@ -393,16 +430,17 @@ def main():
             num_workers=config.num_workers,
             collate_mode=config.collate_mode,
             patch_size=config.model_config.patch_size,
-            pin_memory=False,         # pinned RAM 누적 방지
-            prefetch_factor=4,        # 2→4: queue ↑ (leak 해결 후 throughput 회복)
-            persistent_workers=False, # epoch 사이 leak reset
+            pin_memory=False,  # pinned RAM 누적 방지
+            prefetch_factor=4,  # 2→4: queue ↑ (leak 해결 후 throughput 회복)
+            persistent_workers=False,  # epoch 사이 leak reset
             sampler=val_sampler,
             use_length_aware_batching=config.use_length_aware_batching,
             length_overpack=config.length_overpack,
         )
         if rank0:
             print(
-                f"Val dataset: {len(val_dataset)} windows, {len(val_dataloader)} batches"
+                f"Val dataset: {len(val_dataset)} windows, "
+                f"{len(val_dataloader)} batches"
             )
 
     # ── 모델 (V2) ──
@@ -410,7 +448,13 @@ def main():
     model.to(device)
 
     if use_ddp:
-        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+        model = DDP(
+            model, device_ids=[local_rank], find_unused_parameters=True,
+            # broadcast_buffers=False (2026-09-12): RoPE cos/sin cache 는 seq_len 에 따라 lazily 확장되는
+            # non-persistent buffer 라 rank 마다 크기가 달라질 수 있고(patch 50: 행 640 tok > 캐시 512),
+            # DDP 의 매 step buffer broadcast 가 크기 불일치로 hang 했다. 학습 통계 buffer 는 없으므로 동기화 불필요.
+            broadcast_buffers=False
+        )
 
     if rank0:
         raw_model = model.module if use_ddp else model
@@ -422,12 +466,11 @@ def main():
         alpha=config.alpha,
         beta=config.beta,
         gamma=config.gamma,
-        delta=config.delta,
         peak_alpha=config.peak_alpha,
         lambda_spec=config.lambda_spec,
         spec_n_ffts=config.spec_n_ffts,
-        contrastive_temperature=config.contrastive_temperature,
-        learnable_temperature=config.learnable_temperature,
+        # CMPM γ = directed allowlist 균일 1.0 (경험적 가중 폐기)
+        coupling_weights=None,
     ).to(device)
     optimizer = create_optimizer(
         list(model.parameters()) + list(criterion.parameters()),
@@ -457,10 +500,12 @@ def main():
                 scheduler.step()
         if rank0:
             print(
-                f"Resumed from {args.resume} (epoch {state.get('epoch', '?')}, loss {best_loss:.6f})"
+                f"Resumed from {args.resume} (epoch "
+                f"{state.get('epoch', '?')}, loss {best_loss:.6f})"
             )
             print(
-                f"  Continuing from epoch {start_epoch}, LR={optimizer.param_groups[0]['lr']:.6e}"
+                f"  Continuing from epoch {start_epoch}, "
+                f"LR={optimizer.param_groups[0]['lr']:.6e}"
             )
 
     # ── 시각화용 배치 캐시 (rank 0만) ──
@@ -477,11 +522,14 @@ def main():
         viz_batches = []
         seen_types: set[int] = set()
         all_types = (
-            set(config.signal_types) if hasattr(config, "signal_types") else set()
+            set(config.signal_types)
+            if hasattr(config, "signal_types")
+            else set()
         )
         max_viz_batches = min(100, len(val_dataloader))
         try:
             from tqdm import tqdm
+
             pbar = tqdm(
                 total=max_viz_batches,
                 desc="viz_batches prep (cold val shard load)",
@@ -498,7 +546,8 @@ def main():
                 if pbar is not None:
                     pbar.update(1)
                     pbar.set_postfix(
-                        types_seen=f"{len(seen_types)}/{len(all_types) if all_types else '?'}",
+                        types_seen=f"{len(seen_types)}/"
+                        f"{len(all_types) if all_types else '?'}",
                     )
                 if all_types and seen_types >= all_types:
                     break
@@ -534,18 +583,25 @@ def main():
     if not args.resume:
         best_loss = float("inf")
     early_stopper = (
-        EarlyStopping(patience=config.patience) if config.patience > 0 else None
+        EarlyStopping(patience=config.patience)
+        if config.patience > 0
+        else None
     )
     csv_logger = CSVLogger(output_dir / "training_log.csv") if rank0 else None
     if rank0:
         print(f"\nStarting training: {config.n_epochs} epochs")
-        print(f"  alpha={config.alpha}, beta={config.beta}, gamma={config.gamma}")
         print(
-            f"  next_block_size={config.model_config.next_block_size}, mask_ratio={config.mask_ratio}"
+            f"  alpha={config.alpha}, beta={config.beta}, gamma={config.gamma}"
+        )
+        print(
+            f"  next_block_size={config.model_config.next_block_size}, "
+            f"mask_ratio={config.mask_ratio}"
         )
         print(f"  warmup_epochs={config.warmup_epochs}")
         if val_dataloader is not None:
-            print(f"  val_ratio={config.val_ratio}, patience={config.patience}")
+            print(
+                f"  val_ratio={config.val_ratio}, patience={config.patience}"
+            )
         print(f"{'=' * 60}")
 
     for epoch in range(start_epoch, config.n_epochs):
@@ -603,7 +659,12 @@ def main():
             # CSV 로깅
             if csv_logger is not None:
                 csv_logger.log(
-                    epoch, "Phase1_CI", losses, val_losses, current_lr, epoch_sec
+                    epoch,
+                    "Phase1_CI",
+                    losses,
+                    val_losses,
+                    current_lr,
+                    epoch_sec,
                 )
 
             # Reconstruction & Next-Pred 시각화
@@ -634,7 +695,9 @@ def main():
 
             # Best model 저장 (val_loss 기준, 없으면 train_loss)
             track_loss = (
-                val_losses["total"] if val_losses is not None else losses["total"]
+                val_losses["total"]
+                if val_losses is not None
+                else losses["total"]
             )
             if track_loss < best_loss:
                 best_loss = track_loss
@@ -675,7 +738,8 @@ def main():
                 if rank0:
                     print(
                         f"\n  Early stopping at epoch {epoch} "
-                        f"(patience={config.patience}, best_val={early_stopper.best_loss:.6f})"
+                        f"(patience={config.patience}, "
+                        f"best_val={early_stopper.best_loss:.6f})"
                     )
                 break
 
@@ -696,7 +760,10 @@ def main():
         print(f"Phase 1 complete. Final train loss: {losses['total']:.6f}")
         if val_losses is not None:
             print(f"Final val loss: {val_losses['total']:.6f}")
-        print(f"Best {'val' if val_dataloader else 'train'} loss: {best_loss:.6f}")
+        print(
+            f"Best {'val' if val_dataloader else 'train'} loss: "
+            f"{best_loss:.6f}"
+        )
         print(f"Final checkpoint: {final_path}")
         print(f"{'=' * 60}")
 

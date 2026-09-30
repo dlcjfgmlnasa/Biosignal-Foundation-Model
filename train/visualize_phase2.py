@@ -1,5 +1,5 @@
 # -*- coding:utf-8 -*-
-"""Phase 2 전용 시각화 — Cross-Modal Prediction & Contrastive Embedding.
+"""Phase 2 전용 시각화 — Cross-Modal Prediction.
 
 Phase 2 (Any-Variate) 학습에서 cross-modal 관계 학습 정도를 모니터링하는
 시각화 함수들을 제공한다.
@@ -84,7 +84,9 @@ def _build_signal_map(
     b: int,
 ) -> dict[tuple[int, int, int], int]:
     """(row, sample_id, variate_id) → signal_type 매핑."""
-    has_signal_types = hasattr(batch, "signal_types") and batch.signal_types is not None
+    has_signal_types = (
+        hasattr(batch, "signal_types") and batch.signal_types is not None
+    )
     mapping: dict[tuple[int, int, int], int] = {}
     if not has_signal_types:
         return mapping
@@ -180,7 +182,10 @@ def save_cross_modal_figure(
     allowed = {(min(a, b), max(a, b)) for a, b in CROSS_PRED_ALLOWED_PAIRS}
     cardio_pairs = []
     for p in all_pairs:
-        tp = (min(p["sig_type_a"], p["sig_type_b"]), max(p["sig_type_a"], p["sig_type_b"]))
+        tp = (
+            min(p["sig_type_a"], p["sig_type_b"]),
+            max(p["sig_type_a"], p["sig_type_b"]),
+        )
         if tp not in allowed:
             continue
         if len(cardio_pairs) < max_pairs:
@@ -235,8 +240,8 @@ def _extract_cross_modal_pairs(
     p = model.patch_size
     loc = out["loc"]
     scale = out["scale"]
-    b_size, l = batch.values.shape[0], batch.values.shape[1]
-    n = l // p
+    b_size, seq_len = batch.values.shape[0], batch.values.shape[1]
+    n = seq_len // p
 
     patch_mask = out["patch_mask"]
     p_sid = out["patch_sample_id"]
@@ -308,24 +313,53 @@ def _extract_cross_modal_pairs(
                     sig_type_a = sig_map.get((bi, sid, vid_a), -1)
                     sig_type_b = sig_map.get((bi, sid, vid_b), -1)
 
-                    # target-conditioned cross_pred 선택 + target의 loc/scale로 denorm
+                    # target-conditioned cross_pred 선택 + target의 loc/scale로
+                    # denorm
                     # cp_a: A 위치에서 B(target)를 예측 → B의 loc/scale로 denorm
-                    cp_a = cross_pred_per_type[bi, idx_a, sig_type_b] if sig_type_b >= 0 else cross_pred_per_type[bi, idx_a, 0]
+                    cp_a = (
+                        cross_pred_per_type[bi, idx_a, sig_type_b]
+                        if sig_type_b >= 0
+                        else cross_pred_per_type[bi, idx_a, 0]
+                    )
                     loc_b_denorm = patch_loc[bi, idx_b].unsqueeze(-1)
                     scl_b_denorm = patch_scale[bi, idx_b].unsqueeze(-1)
                     # idx_a와 idx_b 길이가 다를 수 있으므로, 짧은 쪽에 맞춤
                     n_common = min(len(idx_a), len(idx_b))
-                    cpred_a = (cp_a[:n_common] * scl_b_denorm[:n_common] + loc_b_denorm[:n_common]).detach().cpu().numpy()
+                    cpred_a = (
+                        (
+                            cp_a[:n_common] * scl_b_denorm[:n_common]
+                            + loc_b_denorm[:n_common]
+                        )
+                        .detach()
+                        .cpu()
+                        .numpy()
+                    )
 
                     # cp_b: B 위치에서 A(target)를 예측 → A의 loc/scale로 denorm
-                    cp_b = cross_pred_per_type[bi, idx_b, sig_type_a] if sig_type_a >= 0 else cross_pred_per_type[bi, idx_b, 0]
+                    cp_b = (
+                        cross_pred_per_type[bi, idx_b, sig_type_a]
+                        if sig_type_a >= 0
+                        else cross_pred_per_type[bi, idx_b, 0]
+                    )
                     loc_a_denorm = patch_loc[bi, idx_a].unsqueeze(-1)
                     scl_a_denorm = patch_scale[bi, idx_a].unsqueeze(-1)
-                    cpred_b = (cp_b[:n_common] * scl_a_denorm[:n_common] + loc_a_denorm[:n_common]).detach().cpu().numpy()
+                    cpred_b = (
+                        (
+                            cp_b[:n_common] * scl_a_denorm[:n_common]
+                            + loc_a_denorm[:n_common]
+                        )
+                        .detach()
+                        .cpu()
+                        .numpy()
+                    )
 
                     # 원본도 n_common에 맞춤
-                    orig_a = original_patches[bi, idx_a[:n_common]].cpu().numpy()
-                    orig_b = original_patches[bi, idx_b[:n_common]].cpu().numpy()
+                    orig_a = (
+                        original_patches[bi, idx_a[:n_common]].cpu().numpy()
+                    )
+                    orig_b = (
+                        original_patches[bi, idx_b[:n_common]].cpu().numpy()
+                    )
 
                     pairs.append(
                         {
@@ -335,8 +369,12 @@ def _extract_cross_modal_pairs(
                             "cross_pred_b": cpred_b,
                             "sig_type_a": sig_type_a,
                             "sig_type_b": sig_type_b,
-                            "sig_name_a": SIGNAL_TYPE_NAMES.get(sig_type_a, "?"),
-                            "sig_name_b": SIGNAL_TYPE_NAMES.get(sig_type_b, "?"),
+                            "sig_name_a": SIGNAL_TYPE_NAMES.get(
+                                sig_type_a, "?"
+                            ),
+                            "sig_name_b": SIGNAL_TYPE_NAMES.get(
+                                sig_type_b, "?"
+                            ),
                             "n_patches_a": n_common,
                             "n_patches_b": n_common,
                             "time_ids_a": tid_a.cpu().numpy(),
@@ -371,16 +409,16 @@ def _plot_pair_rows(
         ) in enumerate(
             [
                 (
-                    "orig_b",         # target 원본: B
-                    "cross_pred_a",   # A→B 예측
+                    "orig_b",  # target 원본: B
+                    "cross_pred_a",  # A→B 예측
                     pair["sig_name_b"],
                     pair["sig_type_b"],
                     pair["sig_name_a"],
                     pair["n_patches_a"],
                 ),
                 (
-                    "orig_a",         # target 원본: A
-                    "cross_pred_b",   # B→A 예측
+                    "orig_a",  # target 원본: A
+                    "cross_pred_b",  # B→A 예측
                     pair["sig_name_a"],
                     pair["sig_type_a"],
                     pair["sig_name_b"],
@@ -422,25 +460,31 @@ def _plot_pair_rows(
 
             mse = np.mean((orig_wave - cross_wave) ** 2)
             corr = (
-                np.corrcoef(orig_wave, cross_wave)[0, 1] if min_len > 1 else 0.0
+                np.corrcoef(orig_wave, cross_wave)[0, 1]
+                if min_len > 1
+                else 0.0
             )
 
             duration = n_show * p / sampling_rate
-            ax.set_ylabel(target_name, fontsize=10, color=orig_color, fontweight="bold")
+            ax.set_ylabel(
+                target_name, fontsize=10, color=orig_color, fontweight="bold"
+            )
             ax.tick_params(labelsize=7)
             ax.legend(loc="upper right", fontsize=7)
 
             if sub_row == 0:
                 ax.set_title(
                     f"{pair['sig_name_a']} \u2194 {pair['sig_name_b']}  |  "
-                    f"{source_name}\u2192{target_name}  MSE={mse:.4f}  r={corr:.3f}  |  {duration:.0f}s",
+                    f"{source_name}\u2192{target_name}  MSE={mse:.4f}  "
+                    f"r={corr:.3f}  |  {duration:.0f}s",
                     fontsize=10,
                     loc="left",
                     fontweight="bold",
                 )
             else:
                 ax.set_title(
-                    f"{source_name}\u2192{target_name}  MSE={mse:.4f}  r={corr:.3f}  |  {duration:.0f}s",
+                    f"{source_name}\u2192{target_name}  MSE={mse:.4f}  "
+                    f"r={corr:.3f}  |  {duration:.0f}s",
                     fontsize=9,
                     loc="left",
                 )
@@ -477,7 +521,8 @@ def _plot_cross_modal_figure(
 
     fig.suptitle(
         f"Cross-Modal Prediction — Epoch {epoch}  [{len(pairs)} pairs]",
-        fontsize=13, y=1.01,
+        fontsize=13,
+        y=1.01,
     )
     fig.tight_layout()
 

@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections import namedtuple
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -50,6 +51,7 @@ from data.collate import PackCollate, PackedBatch
 from data.dataset import BiosignalSample
 from data.spatial_map import SIGNAL_KEY_TO_TYPE
 from downstream._save_utils import load_prepared_chunked
+from downstream.generation.cross_modal import _bp_metrics
 from loss.masked_mse_loss import compute_patch_loss
 
 # signal_type_key -> signal_type_id : data.spatial_map 의 SSOT(v2) 사용.
@@ -498,6 +500,43 @@ def build_waveform_decoder(
     raise ValueError(
         f"Unknown decoder_type: {decoder_type!r} (choices: conv, upsample)"
     )
+
+
+# ── Calibration conditioning (PATCH B) ──────────────────────
+
+
+class CalibConditioner(nn.Module):
+    """Anchor calibration stats -> FiLM(gamma, beta) on pooled encoder features.
+
+    pretrain 의 ``cond_proj``/LSCNorm 을 **건드리지 않는** downstream 전용 modulation.
+    각 환자의 anchor window(첫 gated-valid window) ABP 통계를 전역-affine 단위로 넣어,
+    그 환자의 non-anchor window 예측을 patient-specific 절대 레벨로 anchoring 한다.
+
+    stats = ``[anchor_loc, anchor_scale, anchor_sbp, anchor_dbp]`` (전역-affine 단위,
+    즉 ``(mmHg - abp_mu_train)/abp_sd_train``). 마지막 Linear zero-init →
+    초기 ``(gamma=0, beta=0)`` = identity → 'blind'(calib 우회)와 'calibrated'가
+    init 시 동일 → 깨끗한 on/off ablation.
+
+    입출력: ``feats (B, N, d_model)`` + ``stats (B, n_stats)`` → ``(B, N, d_model)``.
+    """
+
+    def __init__(self, d_model: int, n_stats: int = 4) -> None:
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(n_stats, d_model),
+            nn.SiLU(),
+            nn.Linear(d_model, 2 * d_model),
+        )
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+    def forward(
+        self,
+        feats: torch.Tensor,   # (B, N, d_model)
+        stats: torch.Tensor,   # (B, n_stats)
+    ) -> torch.Tensor:         # (B, N, d_model)
+        gamma, beta = self.mlp(stats).chunk(2, dim=-1)  # each (B, d_model)
+        return feats * (1.0 + gamma).unsqueeze(1) + beta.unsqueeze(1)
 
 
 # ── LoRA data utilities ─────────────────────────────────────
@@ -1263,11 +1302,17 @@ def _cross_pred_window(
     n_common = min(len(idx_a), len(idx_b))
     ia, ib = idx_a[:n_common], idx_b[:n_common]
 
-    # source 위치에서 target 예측 → target 의 loc/scale 로 denorm (시각화 동일).
-    cp = cpp[0, ia, target_type]  # (n_common, P) normalized
-    cpred = cp * patch_scale[ib].unsqueeze(-1) + patch_loc[ib].unsqueeze(-1)
-    gt = original[ib]  # (n_common, P) raw target
-    return cpred.reshape(-1).cpu().numpy(), gt.reshape(-1).cpu().numpy()
+    # PATCH B: oracle denorm 제거. 예전에는 cp 를 **target(ABP) 자신의 GT loc/scale**
+    # (patch_scale[ib]/patch_loc[ib]) 로 denorm 했는데, 이는 정답(MAP+맥압)을 주입하는
+    # 누수였다. 절대 mmHg 는 calibrated trained-decoder 경로(run_calibrated_absolute)
+    # 에서만 산출한다. 이 함수는 **model-normalized 공간의 shape 진단(blind)** 전용으로
+    # 강등 — normalized 그대로 반환하고 절대 지표에 쓰지 않는다.
+    cp = cpp[0, ia, target_type]  # (n_common, P) model-normalized shape
+    # GT 도 동일 normalized 공간으로 맞춰 shape r 을 공정 비교 (raw 대신 z).
+    gt_norm = (original[ib] - patch_loc[ib].unsqueeze(-1)) / patch_scale[ib].clamp(
+        min=1e-8
+    ).unsqueeze(-1)
+    return cp.reshape(-1).cpu().numpy(), gt_norm.reshape(-1).cpu().numpy()
 
 
 @torch.no_grad()
@@ -1356,9 +1401,10 @@ def run_cross_modal_generate_eval(
 
     print(f"\n{'=' * 50}")
     print(f"  Scenario:      {scenario.name}")
-    print(f"  MSE:           {metrics['mse']:.6f}  (denormalized)")
+    print("  [PATCH B] shape-only diagnostic (model-normalized, NOT absolute mmHg).")
+    print(f"  MSE:           {metrics['mse']:.6f}  (model-normalized)")
     print(f"  MAE:           {metrics['mae']:.6f}")
-    print(f"  Pearson r_win: {metrics['pearson_r_win']:.4f}  (per-window)")
+    print(f"  Pearson r_win: {metrics['pearson_r_win']:.4f}  (per-window shape)")
     print(f"  N windows:     {metrics['n_windows']}")
     print(f"{'=' * 50}")
 
@@ -2178,6 +2224,589 @@ def run_linear_probe_regression(
     return results
 
 
+# ── Calibrated absolute-mmHg PPG->ABP (PATCH B) ─────────────
+#
+# 결정(coordinator lock): absolute=trained-decoder 전용 · zero-shot cross_pred 는
+# shape 진단으로 강등 · downstream FiLM(CalibConditioner) 채택(native cond_proj 재사용
+# 아님) · anchor=환자별 첫 gated-valid window 1개 · abp_mu/sd_train=fold-train 전용.
+# 공유 계약 키(patch A 제공, 소비만): patient_ids · win_starts · is_anchor ·
+# meta abp_mu_train/abp_sd_train.
+#
+# TODO(fairness): basic TCN baseline 은 동일 calib_stats 를 input concat 으로 받아야
+# 정보 대등. TCN 은 이 파일(FM 경로) 밖에 있으므로 여기서는 계약(4-stat affine)만
+# 확정하고, TCN 쪽 구현은 별도(패치 C/baseline runner)에서 동일 stat 을 소비한다.
+
+CalibBatch = namedtuple(
+    "CalibBatch",
+    ["batch", "target_patches", "calib_stats", "is_anchor", "patient_id"],
+)
+
+
+def _to_np(x) -> np.ndarray:
+    """torch.Tensor(fp16 포함) 또는 array-like → 1D float64 numpy."""
+    if isinstance(x, torch.Tensor):
+        return x.float().cpu().numpy().astype(np.float64).ravel()
+    return np.asarray(x, dtype=np.float64).ravel()
+
+
+def _compute_anchor_map(
+    split_data: dict,
+    scenario: Scenario,
+    abp_mu: float,
+    abp_sd: float,
+    sr: float = 100.0,
+) -> tuple[dict[str, np.ndarray], np.ndarray, np.ndarray]:
+    """환자별 anchor window ABP 통계를 **전역-affine 단위**로 매핑.
+
+    stats vector = ``[loc_affine, scale_affine, sbp_affine, dbp_affine]`` where
+    ``*_affine = (mmHg - abp_mu)/abp_sd``. 첫 anchor(=첫 gated-valid window,
+    patch A 가 is_anchor 로 표시)만 사용.
+
+    Returns (anchor_map{pid->stats(4,)}, is_anchor(N,), patient_ids(N,) str).
+    """
+    signals = split_data["signals"]
+    is_anchor = split_data.get("is_anchor")
+    patient_ids = split_data.get("patient_ids")
+    if is_anchor is None or patient_ids is None:
+        raise ValueError(
+            "calibrated_absolute 는 prepared data 에 'is_anchor'·'patient_ids' "
+            "(patch A 제공)가 필요합니다. 누락되었습니다."
+        )
+    is_anchor = np.asarray(_to_np_bool(is_anchor)).astype(bool)
+    patient_ids = np.array([str(p) for p in _as_list(patient_ids)], dtype=str)
+
+    target_key = scenario.target
+    n = _first_dim(signals[scenario.inputs[0]])
+    amap: dict[str, np.ndarray] = {}
+    for i in range(n):
+        if not is_anchor[i]:
+            continue
+        pid = patient_ids[i]
+        if pid in amap:
+            continue  # first anchor wins
+        raw = _to_np(signals[target_key][i])
+        loc = float(raw.mean())
+        scale = float(raw.std()) or 1.0
+        bp = _bp_metrics.waveform_to_bp(raw, sr=sr)
+        sbp = bp["sbp"] if bp else float(np.percentile(raw, 95))
+        dbp = bp["dbp"] if bp else float(np.percentile(raw, 5))
+        amap[pid] = np.array([
+            (loc - abp_mu) / abp_sd,
+            scale / abp_sd,
+            (sbp - abp_mu) / abp_sd,
+            (dbp - abp_mu) / abp_sd,
+        ], dtype=np.float32)
+    return amap, is_anchor, patient_ids
+
+
+def _to_np_bool(x) -> np.ndarray:
+    if isinstance(x, torch.Tensor):
+        return x.cpu().numpy().astype(bool)
+    return np.asarray(x).astype(bool)
+
+
+def _as_list(x) -> list:
+    if isinstance(x, torch.Tensor):
+        return x.cpu().tolist()
+    return list(x)
+
+
+def _first_dim(x) -> int:
+    if isinstance(x, torch.Tensor):
+        return int(x.shape[0])
+    return int(np.asarray(x).shape[0]) if hasattr(x, "__len__") else len(x)
+
+
+def _build_calib_batches(
+    split_data: dict,
+    scenario: Scenario,
+    patch_size: int,
+    batch_size: int,
+    abp_mu: float,
+    abp_sd: float,
+    sr: float = 100.0,
+) -> tuple[list[CalibBatch], dict[str, np.ndarray]]:
+    """calibrated-absolute batch 빌더.
+
+    - target = **train-only 전역 고정 affine** ``(abp_mmHg - abp_mu)/abp_sd`` (가역).
+    - 각 window 에 그 환자 anchor 의 4-stat calib 를 attach (FiLM·persistence 공용).
+    - anchor 없는 환자의 window 는 skip(칼리브 불가).
+    - anchor window 자체는 학습엔 포함되나 eval scoring 에서 제외(is_anchor 플래그로).
+    """
+    from collections import defaultdict
+
+    signals = split_data["signals"]
+    amap, is_anchor, patient_ids = _compute_anchor_map(
+        split_data, scenario, abp_mu, abp_sd, sr=sr
+    )
+    n = _first_dim(signals[scenario.inputs[0]])
+
+    batches: list[CalibBatch] = []
+    for start in range(0, n, batch_size):
+        end = min(start + batch_size, n)
+        all_samples: list[BiosignalSample] = []
+        row_targets: list[torch.Tensor] = []
+        row_stats: list[np.ndarray] = []
+        row_anchor: list[bool] = []
+        row_pid: list[str] = []
+        rec = 0
+        for gi in range(start, end):
+            pid = patient_ids[gi]
+            if pid not in amap:
+                continue  # 칼리브 불가 → skip
+            added = False
+            for ch_idx, stype_key in enumerate(scenario.inputs):
+                sig = _to_np(signals[stype_key][gi])
+                n_usable = (len(sig) // patch_size) * patch_size
+                if n_usable == 0:
+                    continue
+                all_samples.append(BiosignalSample(
+                    values=torch.tensor(sig[:n_usable], dtype=torch.float32),
+                    length=n_usable,
+                    channel_idx=ch_idx,
+                    recording_idx=rec,
+                    sampling_rate=sr,
+                    n_channels=len(scenario.inputs),
+                    win_start=0,
+                    signal_type=SIGNAL_TYPE_IDS[stype_key],
+                    session_id=f"calib_{gi}",
+                    spatial_id=0,
+                ))
+                added = True
+            if not added:
+                continue
+            raw_t = _to_np(signals[scenario.target][gi])
+            tz = (raw_t - abp_mu) / abp_sd  # 전역 affine (가역 → mmHg)
+            row_targets.append(_patchify(torch.tensor(tz, dtype=torch.float32), patch_size))
+            row_stats.append(amap[pid])
+            row_anchor.append(bool(is_anchor[gi]))
+            row_pid.append(pid)
+            rec += 1
+
+        if not all_samples:
+            continue
+
+        row_lengths: dict[int, int] = defaultdict(int)
+        for s in all_samples:
+            row_lengths[s.recording_idx] += s.length
+        max_length = max(row_lengths.values())
+        collate_mode = "any_variate" if len(scenario.inputs) > 1 else "ci"
+        collate = PackCollate(
+            max_length=max_length, collate_mode=collate_mode, patch_size=patch_size,
+        )
+        batch = collate(all_samples)
+
+        min_np = min(t.shape[0] for t in row_targets)
+        target_patches = torch.stack([t[:min_np] for t in row_targets], dim=0)
+        calib_stats = torch.tensor(np.stack(row_stats), dtype=torch.float32)
+        is_anchor_row = torch.tensor(row_anchor, dtype=torch.bool)
+        pid_row = np.array(row_pid, dtype=str)
+        batches.append(CalibBatch(batch, target_patches, calib_stats, is_anchor_row, pid_row))
+
+    return batches, amap
+
+
+def train_calib_regression(
+    wrapper,
+    head: nn.Module,
+    calib: CalibConditioner,
+    train_batches: list[CalibBatch],
+    epochs: int,
+    lr: float,
+    device: torch.device,
+    use_calib: bool,
+    use_lora: bool,
+    gradient_clip: float = 1.0,
+    peak_alpha: float = 0.0,
+    lambda_spec: float = 0.0,
+) -> list[float]:
+    """Frozen encoder(+optional LoRA) 위 head + CalibConditioner 학습.
+
+    ``use_lora=False`` 이면 encoder 동결 → pooled feature 를 1-pass 캐싱해 가속.
+    ``use_calib=False`` 이면 blind(calib 미적용) 학습.
+    """
+    fm = wrapper.model
+    head = head.to(device)
+    calib = calib.to(device)
+    params = list(head.parameters()) + list(calib.parameters())
+    if use_lora:
+        params = params + list(wrapper.lora_parameters())
+        fm.train()
+    else:
+        fm.eval()
+        for p in fm.parameters():
+            p.requires_grad_(False)
+    optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=0.01)
+
+    cache: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] | None = None
+    if not use_lora:
+        cache = []
+        with torch.no_grad():
+            for cb in train_batches:
+                b = wrapper.batch_to_device(cb.batch)
+                out = fm(b, task="masked", mask_ratio=0.0)
+                pooled = _pool_by_time(out["encoded"], out["time_id"], out["patch_mask"])
+                n_out = min(pooled.shape[1], cb.target_patches.shape[1])
+                cache.append((
+                    pooled[:, :n_out].detach().cpu(),
+                    cb.target_patches[:, :n_out].float(),
+                    cb.calib_stats,
+                ))
+
+    losses: list[float] = []
+    for epoch in range(epochs):
+        epoch_loss, n_b = 0.0, 0
+        iterable = cache if cache is not None else train_batches
+        for item in iterable:
+            if cache is not None:
+                pooled_c, target_c, stats_c = item
+                pooled = pooled_c.to(device)
+                target = target_c.to(device)
+                stats = stats_c.to(device)
+            else:
+                cb = item
+                b = wrapper.batch_to_device(cb.batch)
+                out = fm(b, task="masked", mask_ratio=0.0)
+                pooled = _pool_by_time(out["encoded"], out["time_id"], out["patch_mask"])
+                ntmp = min(pooled.shape[1], cb.target_patches.shape[1])
+                pooled = pooled[:, :ntmp]
+                target = cb.target_patches[:, :ntmp].float().to(device)
+                stats = cb.calib_stats.to(device)
+
+            feats = calib(pooled, stats) if use_calib else pooled
+            n_out = min(feats.shape[1], target.shape[1])
+            pred = head(feats[:, :n_out])
+            loss = _waveform_loss(pred, target[:, :n_out], peak_alpha, lambda_spec)
+
+            optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(params, gradient_clip)
+            optimizer.step()
+            epoch_loss += loss.item()
+            n_b += 1
+
+        avg = epoch_loss / max(n_b, 1)
+        losses.append(avg)
+        if (epoch + 1) % 5 == 0 or epoch == 0:
+            print(f"  Epoch {epoch + 1}/{epochs}  loss={avg:.6f}")
+    return losses
+
+
+@torch.no_grad()
+def evaluate_calib_regression(
+    wrapper,
+    head: nn.Module,
+    calib: CalibConditioner,
+    test_batches: list[CalibBatch],
+    device: torch.device,
+    abp_mu: float,
+    abp_sd: float,
+    sr: float = 100.0,
+    collect_raw: bool = True,
+) -> dict:
+    """calibrated vs blind 절대 mmHg 평가 (anchor window scoring 제외).
+
+    각 non-anchor window: pred(affine)→mmHg 역변환→waveform_to_bp 로 SBP/DBP/MAP.
+    absolute_bp_metrics + trending_metrics 를 calibrated·blind 두 arm 으로 산출.
+    """
+    fm = wrapper.model
+    fm.eval()
+    head.to(device).eval()
+    calib.to(device).eval()
+
+    comps = ("sbp", "dbp", "map")
+    acc = {"calibrated": {c: [] for c in comps}, "blind": {c: [] for c in comps}}
+    true_acc = {c: [] for c in comps}
+    pid_acc: list[str] = []
+    raw_true: list[np.ndarray] = []
+    raw_cal: list[np.ndarray] = []
+    raw_blind: list[np.ndarray] = []
+
+    for cb in test_batches:
+        b = wrapper.batch_to_device(cb.batch)
+        out = fm(b, task="masked", mask_ratio=0.0)
+        pooled = _pool_by_time(out["encoded"], out["time_id"], out["patch_mask"])
+        n_out = min(pooled.shape[1], cb.target_patches.shape[1])
+        pooled = pooled[:, :n_out]
+        stats = cb.calib_stats.to(device)
+
+        pred_cal = head(calib(pooled, stats))[:, :n_out].cpu()   # affine
+        pred_blind = head(pooled)[:, :n_out].cpu()
+        target = cb.target_patches[:, :n_out].float().cpu()
+
+        for i in range(pred_cal.shape[0]):
+            if bool(cb.is_anchor[i]):
+                continue  # scoring 제외
+            true_w = target[i].reshape(-1).numpy() * abp_sd + abp_mu
+            cal_w = pred_cal[i].reshape(-1).numpy() * abp_sd + abp_mu
+            bl_w = pred_blind[i].reshape(-1).numpy() * abp_sd + abp_mu
+            bt = _bp_metrics.waveform_to_bp(true_w, sr)
+            bc = _bp_metrics.waveform_to_bp(cal_w, sr)
+            bb = _bp_metrics.waveform_to_bp(bl_w, sr)
+            if bt is None or bc is None or bb is None:
+                continue
+            for c in comps:
+                acc["calibrated"][c].append(bc[c])
+                acc["blind"][c].append(bb[c])
+                true_acc[c].append(bt[c])
+            pid_acc.append(str(cb.patient_id[i]))
+            if collect_raw:
+                raw_true.append(true_w.astype(np.float32))
+                raw_cal.append(cal_w.astype(np.float32))
+                raw_blind.append(bl_w.astype(np.float32))
+
+    pid_arr = np.array(pid_acc, dtype=str)
+    true_bp = {c: np.array(true_acc[c]) for c in comps}
+    results: dict = {"n_windows": len(pid_acc)}
+    for arm in ("calibrated", "blind"):
+        pred_bp = {c: np.array(acc[arm][c]) for c in comps}
+        results[arm] = {
+            "absolute": _bp_metrics.absolute_bp_metrics(pred_bp, true_bp, pid_arr),
+            "trending": _bp_metrics.trending_metrics(pred_bp, true_bp, pid_arr),
+        }
+    if collect_raw and raw_true:
+        min_l = min(len(a) for a in raw_true)
+        results["raw"] = {
+            "y_true_mmHg": np.stack([a[:min_l] for a in raw_true]),
+            "y_pred_cal_mmHg": np.stack([a[:min_l] for a in raw_cal]),
+            "y_pred_blind_mmHg": np.stack([a[:min_l] for a in raw_blind]),
+            "patient_id": pid_arr,
+            "is_anchor": np.zeros(len(pid_arr), dtype=bool),  # scoring 대상은 전부 non-anchor
+        }
+    return results
+
+
+@torch.no_grad()
+def evaluate_null_baselines(
+    test_batches: list[CalibBatch],
+    abp_mu: float,
+    abp_sd: float,
+    sr: float = 100.0,
+) -> dict:
+    """Null floor: persistence(anchor carry-forward) · patient-shuffle · covariate(TODO).
+
+    CARMEN 이 유의하게 이겨야 하는 하한. persistence 는 anchor BP 를 그대로 예측값으로
+    쓴다("calibration 만으로 얻는 바닥"). patient-shuffle 은 persistence 예측을 window
+    간 셔플(잘못된 환자 calibration)한 chance floor. covariate-only 는 demographics/HR
+    소스가 공유 계약에 없어 TODO.
+    """
+    comps = ("sbp", "dbp", "map")
+    persist = {c: [] for c in comps}
+    true_acc = {c: [] for c in comps}
+    pid_acc: list[str] = []
+
+    for cb in test_batches:
+        for i in range(cb.target_patches.shape[0]):
+            if bool(cb.is_anchor[i]):
+                continue
+            st = cb.calib_stats[i].numpy()
+            a_sbp = float(st[2] * abp_sd + abp_mu)
+            a_dbp = float(st[3] * abp_sd + abp_mu)
+            a_map = a_dbp + (a_sbp - a_dbp) / 3.0
+            true_w = cb.target_patches[i].reshape(-1).numpy() * abp_sd + abp_mu
+            bt = _bp_metrics.waveform_to_bp(true_w, sr)
+            if bt is None:
+                continue
+            persist["sbp"].append(a_sbp)
+            persist["dbp"].append(a_dbp)
+            persist["map"].append(a_map)
+            for c in comps:
+                true_acc[c].append(bt[c])
+            pid_acc.append(str(cb.patient_id[i]))
+
+    pid_arr = np.array(pid_acc, dtype=str)
+    true_bp = {c: np.array(true_acc[c]) for c in comps}
+    pp = {c: np.array(persist[c]) for c in comps}
+
+    rng = np.random.default_rng(0)
+    perm = rng.permutation(len(pid_arr)) if len(pid_arr) else np.array([], dtype=int)
+    sh = {c: (pp[c][perm] if len(pp[c]) else pp[c]) for c in comps}
+
+    return {
+        "n_windows": len(pid_acc),
+        "persistence": {
+            "absolute": _bp_metrics.absolute_bp_metrics(pp, true_bp, pid_arr),
+            "trending": _bp_metrics.trending_metrics(pp, true_bp, pid_arr),
+        },
+        "patient_shuffle": {
+            "absolute": _bp_metrics.absolute_bp_metrics(sh, true_bp, pid_arr),
+            "trending": _bp_metrics.trending_metrics(sh, true_bp, pid_arr),
+        },
+        "covariate_only": None,  # TODO: demographics/HR 소스가 공유 계약에 없음
+    }
+
+
+def _print_calib_summary(scenario: Scenario, eval_res: dict, null_res: dict) -> None:
+    """calibrated/blind/null 절대압 지표 요약 출력."""
+    print(f"\n{'=' * 64}")
+    print(f"  Calibrated absolute PPG->ABP: {scenario.name}")
+    print(f"  N scoring windows: {eval_res.get('n_windows', 0)}")
+    print(f"{'-' * 64}")
+    hdr = f"  {'arm':<16}{'MAE(SBP/DBP/MAP)':<26}{'β(SBP)':<9}{'AAMI(SBP)':<10}"
+    print(hdr)
+    for arm in ("calibrated", "blind"):
+        ab = eval_res.get(arm, {}).get("absolute", {})
+        s = ab.get("sbp", {})
+        d = ab.get("dbp", {})
+        m = ab.get("map", {})
+
+        def _mae(x):
+            return f"{x.get('mae', float('nan')):.1f}" if x else "  -"
+
+        maes = f"{_mae(s)}/{_mae(d)}/{_mae(m)}"
+        beta = f"{s.get('slope_beta', float('nan')):.2f}" if s else "  -"
+        aami = ("PASS" if s.get("aami_pass") else "fail") if s else "-"
+        print(f"  {arm:<16}{maes:<26}{beta:<9}{aami:<10}")
+    for name in ("persistence", "patient_shuffle"):
+        ab = (null_res.get(name) or {}).get("absolute", {})
+        s = ab.get("sbp", {})
+        if s:
+            print(f"  [null] {name:<10} MAE(SBP)={s.get('mae', float('nan')):.1f}  "
+                  f"β={s.get('slope_beta', float('nan')):.2f}")
+    print(f"{'=' * 64}")
+
+
+def run_calibrated_absolute(
+    checkpoint_path: str,
+    data_path: str,
+    scenario: Scenario,
+    model_version: str = "v1",
+    epochs: int = 30,
+    lr: float = 1e-3,
+    batch_size: int = 16,
+    device_str: str = "cpu",
+    out_dir: str = ".",
+    fold: int | None = None,
+    n_folds: int = 1,
+    dump_preds: bool = True,
+    peak_alpha: float = 1.0,
+    lambda_spec: float = 0.2,
+    decoder_type: str = "conv",
+    use_lora: bool = False,
+    lora_rank: int = 8,
+    lora_alpha: float = 16.0,
+) -> dict:
+    """Calibrated absolute-mmHg PPG->ABP 학습/평가 (PATCH B 메인 엔트리).
+
+    frozen FM(기본) 위 WaveformConvDecoder + CalibConditioner(FiLM) 를 학습해
+    전역-affine ABP 를 예측, mmHg 역변환 후 SBP/DBP/MAP·Bland-Altman·β·AAMI/BHS·
+    trending 을 calibrated·blind·null 로 산출한다. anchor window 는 scoring 제외.
+    """
+    from downstream.model_wrapper import DownstreamModelWrapper
+
+    inputs_str = " + ".join(s.upper() for s in scenario.inputs)
+    print("=" * 70)
+    print("Task: Calibrated Absolute-mmHg PPG->ABP (PATCH B)")
+    print(f"  Scenario:   {inputs_str} -> {scenario.target.upper()}")
+    print(f"  Checkpoint: {checkpoint_path}")
+    print(f"  Encoder:    {'LoRA' if use_lora else 'frozen'}, decoder={decoder_type}")
+    print("=" * 70)
+
+    device = torch.device(device_str)
+    wrapper = DownstreamModelWrapper(checkpoint_path, model_version, device)
+    if use_lora:
+        wrapper.inject_lora(rank=lora_rank, alpha=lora_alpha)
+    patch_size = wrapper.patch_size
+
+    data = _load_prepared_data(data_path, fold=fold)
+    meta = data.get("metadata", {})
+    abp_mu = meta.get("abp_mu_train")
+    abp_sd = meta.get("abp_sd_train")
+    if abp_mu is None or abp_sd is None:
+        print("ERROR: metadata 에 abp_mu_train/abp_sd_train 이 없습니다 "
+              "(patch A 제공 필수, fold-train 전용).", file=sys.stderr)
+        sys.exit(1)
+    abp_mu = float(abp_mu)
+    abp_sd = float(abp_sd) if float(abp_sd) != 0 else 1.0
+
+    print("\nBuilding calib batches...")
+    train_batches, _ = _build_calib_batches(
+        data["train"], scenario, patch_size, batch_size, abp_mu, abp_sd,
+    )
+    test_batches, _ = _build_calib_batches(
+        data["test"], scenario, patch_size, batch_size, abp_mu, abp_sd,
+    )
+    print(f"  Train: {len(train_batches)} batches, Test: {len(test_batches)} batches")
+    if not train_batches or not test_batches:
+        print("ERROR: empty batches (anchor/patient_ids 확인).", file=sys.stderr)
+        sys.exit(1)
+
+    head = build_waveform_decoder(decoder_type, wrapper.d_model, patch_size)
+    calib = CalibConditioner(wrapper.d_model, n_stats=4)
+    n_head = sum(p.numel() for p in head.parameters())
+    n_calib = sum(p.numel() for p in calib.parameters())
+    print(f"  Trainable: head={n_head:,} + calib={n_calib:,}"
+          + (f" + LoRA={sum(p.numel() for p in wrapper.lora_parameters()):,}"
+             if use_lora else " (encoder frozen)"))
+
+    print("\nTraining (head + CalibConditioner)...")
+    train_losses = train_calib_regression(
+        wrapper, head, calib, train_batches, epochs, lr, device,
+        use_calib=True, use_lora=use_lora,
+        peak_alpha=peak_alpha, lambda_spec=lambda_spec,
+    )
+
+    print("\nEvaluating (calibrated vs blind)...")
+    eval_res = evaluate_calib_regression(
+        wrapper, head, calib, test_batches, device, abp_mu, abp_sd,
+        sr=100.0, collect_raw=dump_preds,
+    )
+    print("Evaluating null baselines...")
+    null_res = evaluate_null_baselines(test_batches, abp_mu, abp_sd, sr=100.0)
+
+    _print_calib_summary(scenario, eval_res, null_res)
+
+    raw = eval_res.pop("raw", None)
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+    scenario_slug = scenario.name.replace("->", "_to_").replace("+", "_")
+    results = {
+        "scenario": scenario.name,
+        "inputs": scenario.inputs,
+        "target": scenario.target,
+        "metrics": eval_res,
+        "null_baselines": null_res,
+        "train_losses": train_losses,
+        "config": {
+            "mode": "calibrated_absolute",
+            "encoder": "lora" if use_lora else "frozen",
+            "decoder": decoder_type,
+            "epochs": epochs,
+            "lr": lr,
+            "batch_size": batch_size,
+            "abp_mu_train": abp_mu,
+            "abp_sd_train": abp_sd,
+            "data_path": data_path,
+            "fold": fold,
+            "n_folds": n_folds,
+        },
+    }
+    results_file = out_path / f"task_calib_abs_{scenario_slug}.json"
+    with open(results_file, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"\nResults saved: {results_file}")
+
+    if dump_preds and raw is not None:
+        preds_path = out_path / f"preds_fold{int(fold) if fold is not None else 0}.npz"
+        np.savez_compressed(
+            preds_path,
+            y_true=raw["y_true_mmHg"].astype(np.float32),        # mmHg (N_win, L)
+            y_score=raw["y_pred_cal_mmHg"].astype(np.float32),   # calibrated
+            y_score_blind=raw["y_pred_blind_mmHg"].astype(np.float32),
+            patient_id=raw["patient_id"],
+            is_anchor=raw["is_anchor"],
+            abp_mu_train=np.float32(abp_mu),
+            abp_sd_train=np.float32(abp_sd),
+            fold_idx=np.int64(int(fold) if fold is not None else 0),
+            n_folds=np.int64(int(n_folds)),
+            task=f"calib_abs_{scenario_slug}",
+            classes=np.array([], dtype=str),
+        )
+        print(f"Predictions saved: {preds_path} (y_true={raw['y_true_mmHg'].shape})")
+
+    return results
+
+
 # ── Output ───────────────────────────────────────────────────
 
 
@@ -2246,12 +2875,16 @@ def main() -> None:
         "--mode",
         type=str,
         default="zero_shot",
-        choices=["zero_shot", "generate", "generate_lora", "linear_probe", "lora"],
+        choices=["zero_shot", "generate", "generate_lora", "linear_probe", "lora",
+                 "calibrated_absolute"],
         help="zero_shot: pretrained cross_pred head (fixed-scenario recon), "
              "generate: 진짜 PPG->ABP (generate_cross_modal, target 부재, 학습X), "
              "generate_lora: generate + LoRA fine-tune of cross_pred (companion), "
              "linear_probe: frozen encoder + regression head, "
-             "lora: LoRA + regression head",
+             "lora: LoRA + regression head, "
+             "calibrated_absolute: PATCH B — anchor-calibrated 절대 mmHg PPG->ABP "
+             "(frozen FM + WaveformConvDecoder + CalibConditioner FiLM, "
+             "SBP/DBP/MAP·Bland-Altman·β·AAMI/BHS·trending, blind/null 병기).",
     )
     parser.add_argument(
         "--data-path",
@@ -2318,9 +2951,13 @@ def main() -> None:
     )
     parser.add_argument(
         "--decoder", type=str, default="conv", choices=["conv", "upsample"],
-        help="파형 decoder head 종류 (lora/linear_probe 모드). "
+        help="파형 decoder head 종류 (lora/linear_probe/calibrated_absolute 모드). "
              "conv=WaveformConvDecoder(기존 default), "
              "upsample=WaveformUpsampleDecoder(dilated-TCN + ConvTranspose 합성).",
+    )
+    parser.add_argument(
+        "--use-lora", action="store_true",
+        help="calibrated_absolute 모드에서 frozen encoder 대신 LoRA 어댑터 학습.",
     )
     args = parser.parse_args()
 
@@ -2474,6 +3111,37 @@ def main() -> None:
             peak_alpha=args.peak_alpha,
             lambda_spec=args.lambda_spec,
             decoder_type=args.decoder,
+        )
+
+    elif args.mode == "calibrated_absolute":
+        if not args.data_path:
+            print("Error: --data-path required for calibrated_absolute mode",
+                  file=sys.stderr)
+            sys.exit(1)
+        if not args.scenario:
+            print("Error: --scenario required for calibrated_absolute mode "
+                  "(e.g. 'PPG->ABP')", file=sys.stderr)
+            sys.exit(1)
+        scenario = parse_scenario(args.scenario)
+        run_calibrated_absolute(
+            checkpoint_path=args.checkpoint,
+            data_path=args.data_path,
+            scenario=scenario,
+            model_version=args.model_version,
+            epochs=args.epochs,
+            lr=args.lr,
+            batch_size=args.batch_size,
+            device_str=args.device,
+            out_dir=args.out_dir,
+            fold=load_fold,
+            n_folds=args.n_folds,
+            dump_preds=not args.no_dump_preds,
+            peak_alpha=args.peak_alpha,
+            lambda_spec=args.lambda_spec,
+            decoder_type=args.decoder,
+            use_lora=args.use_lora,
+            lora_rank=args.lora_rank,
+            lora_alpha=args.lora_alpha,
         )
 
 

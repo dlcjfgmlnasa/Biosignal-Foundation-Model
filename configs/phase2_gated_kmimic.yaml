@@ -1,0 +1,121 @@
+# Phase 2: Any-Variate Cross-Modal Training — K-MIMIC only (K=2)
+# ──────────────────────────────────────────────────────────────
+# Server: 2×L40S 48GB, KHDP 분석환경
+# Dataset: K-MIMIC ICU ~3,500 subjects, ~1.94M recordings
+# Phase 1 K-MIMIC checkpoint 에서 resume → cross-modal 학습
+#
+# 핵심 차이 (vs phase2_kmimic.yaml): conditioning redesign A+B 활성 + gated Phase 1 ckpt.
+#   코퍼스·레시피는 phase2_kmimic.yaml 과 1:1 (K-MIMIC 단독, SNUH 결합 아님).
+#
+#   A (gate_unitless_cond: true) — ECG(0)·PPG(2)·RESP_Imp(7) 의 AdaLN conditioning 차단
+#      (게이팅 대상 (2,7)→(0,2,7), ECG 추가). B (enrich_cond_peak: true) — cond 입력
+#      [loc,scale]→[loc,scale,max,min], d_cond 16→32. 상세 근거는 phase1_gated_kmimic.yaml.
+#
+# ⚠️⚠️ resume 은 반드시 **gated lineage 의 Phase 1 ckpt** 여야 합니다. 구 lineage
+#   (kmimic_d384_L16_10min_p200_k2) ckpt 는 cond_proj 입력이 2 라 구조 비호환입니다.
+#   아래 경로는 Phase 1 gated 완료 후 실제 파일명으로 교체할 것.
+#
+# Usage (2-GPU DDP):
+#   torchrun --nproc_per_node=2 -m train.2_any_variate \
+#       --config configs/phase2_gated_kmimic.yaml
+#
+# Smoke test:
+#   python -m train.2_any_variate --config configs/phase2_gated_kmimic.yaml --dry-run
+
+# ── Phase 1 gated checkpoint (d384/L16) ──
+# ⚠️ 실제 파일명은 phase1_gated_kmimic 완료 후 확정 (best 또는 최종 epoch).
+resume: /home/coder/workspace/k-mimic-/bio_fm/outputs/main/phase1_gated/kmimic_gated_d384_L16_10min_p200_k2/checkpoints/checkpoint_phase1_ci_best.pt
+
+# ── 모델 (Phase 1 과 동일 — checkpoint 에서 로드: d=384, L=16, ~30M) ──
+model_config:
+  d_model: 384
+  num_layers: 16
+  patch_size: 200              # 100Hz × 2초 = 200 samples/patch
+  stride: null                 # non-overlapping (= patch_size)
+  num_heads: 6                 # head_dim = 384/6 = 64
+  num_groups: null             # MHA (= num_heads)
+  num_signal_types: 9        # v2 단일 modality 9종 (ECG0~RESP_Flow8, 2026-06-23 PAP 제거)
+  use_glu: true
+  use_moe: false
+  use_rope: true
+  use_var_attn_bias: true
+  use_spatial_embed: true
+  dropout_p: 0.1
+
+  # ── Conditioning redesign (gated lineage — Phase 1 과 반드시 동일해야 ckpt 로드됨) ──
+  use_lscnorm: true            # LSCNorm(RMSNorm + AdaLN modulation) 활성
+  d_cond: 32                   # 4-tuple cond 입력에 맞춰 16→32
+  gate_unitless_cond: true     # A: ECG(0)·PPG(2)·RESP_Imp(7) conditioning 차단
+  enrich_cond_peak: true       # B: cond 입력 [loc,scale]→[loc,scale,max,min]
+
+  # ── Task heads ──
+  next_block_size: 3           # Block Next Prediction K=3 — 6s 미래 예측 (Phase 1 과 동일, 호흡 1주기)
+  contrastive_proj_dim: 128    # Contrastive projection head (Phase 2 활성)
+
+# ── 데이터 (K-MIMIC ICU 전용) ──
+data_dir:
+  - /home/coder/workspace/k-mimic-/bio_fm/data/train/k_mimic/
+signal_types: [0, 1, 2, 3, 4, 5, 6, 7, 8]  # ECG ABP PPG CVP CO2 AWP ICP RESP_Imp RESP_Flow (v2 9종 연속, 2026-06-23 PAP 제거)
+max_subjects: null
+window_seconds: 600.0          # 10분 윈도우 — 다변량 세션
+max_length: 180000             # row 당 다수 unit packing 지원 (cross-session neg 풍부)
+cache_size: 16
+crop_ratio_min: 0.01           # Long recording(≥600s) 만 crop
+crop_ratio_max: 1.0
+min_patches: 5                 # 10s floor (cross-modal multi-tier truncate 기준)
+
+# ── Modality-balanced sampling (Phase 1과 통일, √-inverse) ──
+modality_balanced_alpha: 0.5         # p_m ∝ n_m^(1-α); 0.5 = 제곱근 tempering
+modality_balanced_w_max_ratio: 5.0   # recording 가중치 상한 = 5 × mean(w)
+
+# ── Shard backend ──
+shard_index_path: /home/coder/workspace/k-mimic-/bio_fm/data/train/k_mimic_shard_500mb/shard_index.json
+shard_cache_size: 1            # OOM 회피
+
+# ── 학습 ──
+batch_size: 64                 # any_variate multi-channel packing
+lr: 2.0e-4                     # Phase 1(8e-4) 대비 낮은 LR (fine-tuning)
+weight_decay: 0.1              # AdamW decoupled WD (Phase 1과 통일)
+n_epochs: 50
+warmup_epochs: 3
+min_lr_ratio: 0.1              # 최종 LR = 2e-5
+mask_ratio: 0.4
+gradient_clip: 1.0
+seed: 42
+collate_mode: any_variate      # Phase 2 핵심: 다변량 collate
+max_batches: 2000              # 4-GPU(global 256) 기준: 2-GPU 설계 토큰예산 복원. 2-GPU로 돌릴 땐 4000
+
+# ── Loss 가중치 (Phase 2: MPM + Next-Pred + Cross-Modal + Contrastive) ──
+alpha: 0.7                     # masked reconstruction
+beta: 0.3                      # next-patch prediction
+gamma: 0.15                    # cross-modal
+delta: 0.5                     # cross-modal contrastive (InfoNCE)
+peak_alpha: 1.0                # Peak-Weighted MSE
+lambda_spec: 0.2               # Multi-Resolution STFT Loss
+spec_n_ffts: [16, 32, 64]      # Phase 1과 통일 (phase별 window set 차이 제거)
+aux_loss_weight: 0.01
+contrastive_temperature: 0.07
+learnable_temperature: true
+
+# ── Masking (Block MPM) ──
+variate_mask_prob: 0.3         # 30% 확률로 전체 variate 마스킹 (virtual sensing)
+variate_drop_prob: 0.1         # 10% 확률로 variate 를 attention 에서 완전 제거 (zero-shot용)
+block_mask: true
+block_size_min: 3              # Phase 1과 통일 — 최소 3패치(6초)로 호흡 1 cycle(~5초) 보장
+block_size_max: 8              # Phase 1과 통일 — 최대 8패치(16초)
+
+# ── Mixed Precision ──
+use_amp: true
+
+# ── Validation & Early Stopping ──
+val_ratio: 0.05
+val_max_batches: 500
+patience: 15
+
+# ── 시스템 ──
+device: auto
+num_workers: 4                 # 보수적
+output_dir: /home/coder/workspace/k-mimic-/bio_fm/outputs/main/phase2_gated
+checkpoint_every: 5
+viz_every: 1
+exp_name: kmimic_gated_phase2_k2

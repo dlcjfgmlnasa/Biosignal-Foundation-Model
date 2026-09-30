@@ -79,6 +79,12 @@ class DownstreamModelWrapper(nn.Module):
         ``"v1"`` 또는 ``"v2"``.
     device:
         모델 로드 디바이스.
+    init_random:
+        ``True`` 면 checkpoint 에서 **ModelConfig 만** 읽고 가중치는 로드하지 않는다
+        (random init). from-scratch baseline("CARMEN-scratch") 전용: 사전학습 모델과
+        아키텍처·파라미터 수가 비트 단위로 동일한 대조군을 만들기 위해 config 를
+        checkpoint 에서 그대로 가져온다. encoder 는 freeze 하지 않고 train() 모드로
+        둔다(호출측이 전체 파라미터를 학습).
     """
 
     def __init__(
@@ -86,6 +92,9 @@ class DownstreamModelWrapper(nn.Module):
         checkpoint_path: str | Path,
         model_version: str = "v1",
         device: str | torch.device = "cuda",
+        patch_stride: int | None = None,
+        rope_pi: bool = True,
+        init_random: bool = False,
     ) -> None:
         super().__init__()
         self.device = torch.device(device)
@@ -100,23 +109,43 @@ class DownstreamModelWrapper(nn.Module):
         else:
             raise ValueError("Checkpoint에 'config' 키가 없습니다.")
 
+        # overlapping-stride 추론 override (granularity 프로브 전용).
+        # stride는 학습 파라미터가 아니라 PatchEmbedding 생성 인자 → 같은 checkpoint를
+        # 다른 stride로 재구성 가능(projection 가중치 shape 불변, byte-identical 로드).
+        # patch_size % stride == 0 필수(PatchEmbedding에서 assert).
+        if patch_stride is not None:
+            config.stride = patch_stride
+
         model_cls = BiosignalFoundationModel
         self.model: BiosignalFoundationModel = model_cls.from_config(config)
+        # RoPE PI 토글: overlapping일 때만 유효. naive-overlap ablation은 rope_pi=False.
+        self.model.rope_pi = rope_pi
         self.model.to(self.device)
 
-        # 2. State dict 로드
-        missing, unexpected = self.model.load_state_dict(
-            state["model_state_dict"],
-            strict=False,
-        )
-        if missing:
-            print(f"  [model_wrapper] Missing keys: {missing}")
-        if unexpected:
-            print(f"  [model_wrapper] Unexpected keys: {unexpected}")
+        # 2. State dict 로드 (init_random 이면 건너뜀 — config 만 재사용)
+        if init_random:
+            n_param = sum(p.numel() for p in self.model.parameters())
+            print(
+                f"  [model_wrapper] init_random=True: 사전학습 가중치 미로드 "
+                f"(from-scratch, {n_param:,} params)"
+            )
+        else:
+            missing, unexpected = self.model.load_state_dict(
+                state["model_state_dict"],
+                strict=False,
+            )
+            if missing:
+                print(f"  [model_wrapper] Missing keys: {missing}")
+            if unexpected:
+                print(f"  [model_wrapper] Unexpected keys: {unexpected}")
 
-        # 3. Encoder freeze + eval 모드
-        self.freeze_encoder()
-        self.model.eval()
+        # 3. Encoder freeze + eval 모드 (from-scratch 는 전체 학습 → unfreeze + train)
+        if init_random:
+            self.unfreeze_encoder()
+            self.model.train()
+        else:
+            self.freeze_encoder()
+            self.model.eval()
 
         # 4. 편의 속성
         self.d_model: int = config.d_model

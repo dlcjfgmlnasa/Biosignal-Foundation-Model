@@ -668,6 +668,14 @@ def main() -> None:
     parser.add_argument("--window-sec", type=float, default=600.0)
     parser.add_argument("--stride-sec", type=float, default=60.0)
     parser.add_argument("--patch-size", type=int, default=DEFAULT_PATCH_SIZE)
+    parser.add_argument(
+        "--patch-stride", type=int, default=None,
+        help="overlapping-stride 추론용 patch stride (None=비중첩=patch_size). "
+             "granularity 프로브: patch_size의 약수(예: 200→100/50). RoPE PI 자동 적용. "
+             "collate는 --patch-size로 정렬되므로 patch_size 배수 max_length면 그대로 호환.")
+    parser.add_argument(
+        "--no-rope-pi", action="store_true",
+        help="overlapping 시 RoPE position interpolation 끔(naive-overlap ablation용).")
     parser.add_argument("--train-ratio", type=float, default=0.7)
     parser.add_argument("--out-dir", type=str, default=".")
     parser.add_argument("--fold", type=int, default=0,
@@ -726,7 +734,15 @@ def main() -> None:
         from downstream.model_wrapper import DownstreamModelWrapper
 
         print(f"Loading checkpoint: {args.checkpoint}")
-        model = DownstreamModelWrapper(args.checkpoint, args.model_version, args.device)
+        if args.patch_stride is not None:
+            print(
+                f"  [granularity probe] overlapping stride={args.patch_stride} "
+                f"(patch_size={args.patch_size}), RoPE PI={'off' if args.no_rope_pi else 'on'}"
+            )
+        model = DownstreamModelWrapper(
+            args.checkpoint, args.model_version, args.device,
+            patch_stride=args.patch_stride, rope_pi=not args.no_rope_pi,
+        )
         d_model = model.d_model
 
         if args.mode == "lora":

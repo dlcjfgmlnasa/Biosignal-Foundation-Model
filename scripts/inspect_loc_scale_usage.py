@@ -212,7 +212,6 @@ def compute_loss(
         patch_variate_id=out["patch_variate_id"],
         cross_pred_per_type=out.get("cross_pred_per_type") if config.gamma > 0 else None,
         time_id=out["time_id"] if needs_time_id else None,
-        contrastive_z=out.get("contrastive_z") if config.delta > 0 else None,
         patch_signal_types=out.get("patch_signal_types"),
     )
     # tensor → float
@@ -367,7 +366,6 @@ def main() -> None:
         peak_alpha=getattr(config, "peak_alpha", 0.0),
         lambda_spec=getattr(config, "lambda_spec", 0.0),
         spec_n_ffts=getattr(config, "spec_n_ffts", (16, 32, 64)),
-        contrastive_temperature=getattr(config, "contrastive_temperature", 0.07),
         learnable_temperature=getattr(config, "learnable_temperature", True),
     ).to(device)
 

@@ -1,0 +1,126 @@
+# Phase 1: Channel-Independent Pre-training — K-MIMIC only with shard backend
+# ──────────────────────────────────────────────────────────────
+# Server: 4×L40S 44GB (canonical run = 4-GPU DDP)
+# Dataset: K-MIMIC ICU 725 patients, 1.203B tokens (patch=200 @100Hz)
+#          → ~1,793 shards (500MB each, shard backend 필수)
+# Window: 10분 (600초, 300 patches @patch_size=200)
+#
+# 핵심 차이 (vs phase1_kmimic.yaml): conditioning redesign A+B 활성. 그 외 전부 동일.
+#   코퍼스·레시피·하이퍼파라미터를 phase1_kmimic.yaml 과 1:1 로 맞춰 A/B 효과만 격리한다.
+#   (SNUH 결합 코퍼스 아님 — 재학습은 K-MIMIC 단독.)
+#
+#   A (gate_unitless_cond: true) — loc/scale 이 물리적 영점에 추적되지 않는 modality
+#      ECG(0)·PPG(2)·RESP_Imp(7) 의 AdaLN conditioning 차단. 게이팅 대상이 기존 (2,7)
+#      에서 (0,2,7) 로 확장됨 (ECG 추가): ECG 는 명목상 mV 이나 highpass 로 patch mean
+#      이 항등적 0 이라 loc 정보량이 없고, 진폭은 환자별 상수에 가까워(within/between
+#      rCV 비 0.065) 생리가 아닌 지문으로 작동. 근거 = SNUH OR raw probe 2026-08-03.
+#      비게이팅 6종 = ABP·CVP·ICP·CO2·AWP·RespFlow (모두 물리적 영점 기준 절대값).
+#   B (enrich_cond_peak: true) — cond 입력 [loc,scale] → [loc,scale,max,min] (4-tuple).
+#      수축기/이완기압처럼 극값 자체가 진단 기준인 신호 반영. d_cond 16→32 동반.
+#
+# ⚠️⚠️ from-scratch 필수: B 가 cond_proj 입력 차원을 2→4 로 바꾸므로 구 checkpoint 와
+#   구조 비호환입니다. --resume 에 구 lineage ckpt(kmimic_d384_L16_10min_p200_k2 등) 를
+#   절대 넣지 말 것. 같은 lineage 의 중단 지점 재개만 허용.
+#
+# Usage (4-GPU DDP):
+#   export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+#   torchrun --nproc_per_node=4 -m train.1_channel_independency \
+#       --config configs/phase1_gated_kmimic.yaml
+#   resume: 위 명령에 --resume <checkpoints/..._best.pt> 추가 (같은 lineage 만)
+#
+# Smoke test:
+#   python -m train.1_channel_independency --config configs/phase1_gated_kmimic.yaml --dry-run
+
+# ── 모델 (Main: d=384, L=16, ~30M params / 30.21M) ──
+model_config:
+  d_model: 384
+  num_layers: 16
+  patch_size: 200            # 100Hz × 2초 = 200 samples/patch (300 patches/10min)
+  stride: null               # non-overlapping (= patch_size)
+  num_heads: 6               # head_dim = 384/6 = 64
+  num_groups: null           # MHA (= num_heads)
+  num_signal_types: 9        # v2 단일 modality 9종 (ECG0~RESP_Flow8, 2026-06-23 PAP 제거)
+  use_glu: true
+  use_moe: false             # Phase 1 CI에서는 off
+  use_rope: true
+  use_var_attn_bias: true
+  use_spatial_embed: true
+  dropout_p: 0.1
+
+  # ── Conditioning redesign (gated lineage) ──
+  use_lscnorm: true          # LSCNorm(RMSNorm + AdaLN modulation) 활성
+  d_cond: 32                 # 4-tuple cond 입력에 맞춰 16→32
+  gate_unitless_cond: true   # A: ECG(0)·PPG(2)·RESP_Imp(7) conditioning 차단
+  enrich_cond_peak: true     # B: cond 입력 [loc,scale]→[loc,scale,max,min] (구 ckpt 비호환)
+
+  # ── Task heads ──
+  next_block_size: 3         # Block Next Prediction K=3 — 미래 6s (3 patch × 2s), 호흡 1주기 보장 / MPM block_size_min 과 정합
+  contrastive_proj_dim: 0    # Contrastive (Phase 2에서 활성)
+
+# ── 데이터 (K-MIMIC ICU 전용) ──
+data_dir:
+  - /home/coder/workspace/k-mimic-/bio_fm/data/train/k_mimic/
+signal_types: [0, 1, 2, 3, 4, 5, 6, 7, 8]  # ECG ABP PPG CVP CO2 AWP ICP RESP_Imp RESP_Flow (v2 9종 연속, 2026-06-23 PAP 제거)
+max_subjects: null             # 전체 ~3,500 subjects
+window_seconds: 600.0          # 10분 윈도우
+max_length: 64000              # CI: 10분 윈도우(60000) + patch 정렬 여유
+cache_size: 16                 # shard backend면 recording-level cache 작아도 됨
+crop_ratio_min: 0.01           # 이론상 6s (실효는 min_patches floor에 의해 10s)
+crop_ratio_max: 1.0
+min_patches: 5                 # 임상 최소 입력 — 10s floor (patch_size=200 × 5 / 100Hz)
+
+# ── Modality-balanced sampling (√-inverse, sparse modality 보정) ──
+modality_balanced_alpha: 0.5         # p_m ∝ n_m^(1-α); 0.5 = 제곱근 tempering
+modality_balanced_w_max_ratio: 5.0   # recording 가중치 상한 = 5 × mean(w)
+
+# ── Shard backend (shard backend 필수, file backend 비현실적) ──
+# ⚠️ shard_cache_size 는 PER WORKER. 총 RAM ≈ workers × cache × shard_size_GB × num_ranks
+#   예: 4 workers × 1 cache × 0.5GB × 2 ranks = 4GB (shard 500MB)
+shard_index_path: /home/coder/workspace/k-mimic-/bio_fm/data/train/k_mimic_shard_500mb/shard_index.json
+shard_cache_size: 1            # OOM 회피 (locality sampler 가 sequential read 보장)
+
+# ── 학습 ──
+batch_size: 96                 # L40S 44GB. 128→96 하향 (epoch 2 criterion STFT loss OOM 회피, 2026-06-23). expandable_segments 켠 상태에서도 worst-case packed batch가 터져 하향
+lr: 8.0e-4
+weight_decay: 0.1              # AdamW decoupled WD (norm/bias/temperature 제외, 2D+ 텐서만)
+n_epochs: 40                   # over-training 회피 (estimator: 80ep≈토큰 25× 재방문). 부족 시 --resume 연장
+warmup_epochs: 4               # 10% 비율 유지 (40ep 기준)
+min_lr_ratio: 0.1              # 최종 LR = 8e-5
+mask_ratio: 0.4                # 40% 패치 마스킹
+gradient_clip: 1.0
+seed: 42
+collate_mode: ci
+max_batches: 4000              # 4-GPU(global 384, batch96) 기준: batch 128→96 하향으로 줄어든 토큰예산 복원 (384×4000 = 512×3000, ~15× 재방문). 2-GPU로 돌릴 땐 8000
+
+# ── Loss 가중치 (Phase 1: MPM + Next-Pred) ──
+alpha: 1.0                     # masked reconstruction
+beta: 0.8                      # next-pred
+gamma: 0.0                     # cross-modal (Phase 2에서 활성)
+delta: 0.0                     # contrastive (Phase 2에서 활성)
+lambda_spec: 0.2               # Multi-Resolution STFT Loss
+peak_alpha: 1.0                # Peak-Weighted MSE — R-peak 강화
+aux_loss_weight: 0.01
+contrastive_temperature: 0.07
+learnable_temperature: true
+
+# ── Masking (Block MPM) ──
+variate_mask_prob: 0.0         # Phase 1은 비활성
+block_mask: true               # 연속 블록 단위 마스킹
+block_size_min: 3              # 최소 3패치(6초) — 호흡계 1 cycle 보장
+block_size_max: 8              # 최대 8패치(16초)
+
+# ── Mixed Precision ──
+use_amp: true                  # L40S BF16/FP16 tensor cores
+
+# ── Validation & Early Stopping ──
+val_ratio: 0.05                # subject 단위 5% validation
+val_max_batches: 500
+patience: 10
+
+# ── 시스템 ──
+device: auto
+num_workers: 4                 # 보수적 (안정 후 8 가능)
+output_dir: /home/coder/workspace/k-mimic-/bio_fm/outputs/main/phase1_gated
+checkpoint_every: 5
+viz_every: 1
+exp_name: kmimic_gated_d384_L16_10min_p200_k2

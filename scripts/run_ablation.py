@@ -50,7 +50,7 @@ VARIANTS_FILE = ABL_DIR / "variants.yaml"
 OUTPUT_ROOT = Path(
     os.environ.get(
         "ABLATION_OUTPUT_ROOT",
-        "/home/coder/workspace/k-mimic-/bio_fm/outputs/ablation",
+        str(REPO_ROOT / "outputs" / "ablation"),  # _phase*_base.yaml 의 output_dir
     )
 )
 
@@ -99,18 +99,19 @@ def resolve_variants(
 
 
 def ckpt_path_for_exp(exp_name: str) -> Path:
-    """exp_name 으로부터 가장 최신 *_best.pt 경로 반환.
+    """exp_name 으로부터 **마지막 epoch** 모델 ckpt 경로 반환.
 
-    train_utils.save_training_checkpoint 은
-        checkpoint_{phase_name}_epoch{NNN}_best.pt
-    형식으로 저장하므로 단일 best.pt 가 아닌 glob 매칭이 필요.
+    train_utils.save_training_checkpoint 은 checkpoint_{phase}_epoch{NNN}[_tag].pt 를,
+    결합 그래프는 criterion_epoch{NNN}[_tag].pt 를 따로 남긴다. ``*_best.pt`` 로 찾으면
+    criterion 파일이 걸리므로 checkpoint_* 만 본다. ablation 은 고정 예산 비교라
+    val loss 로 고르지 않고 마지막 epoch 을 쓴다.
 
     파일이 아직 없으면 (dry-run / 학습 미완료) placeholder 경로 반환 —
     caller (run_variant) 가 reuse 시점에 .exists() 로 검증한다.
     """
     ckpt_dir = OUTPUT_ROOT / exp_name / "checkpoints"
     if ckpt_dir.is_dir():
-        candidates = sorted(ckpt_dir.glob("*_best.pt"))
+        candidates = sorted(ckpt_dir.glob("checkpoint_*_epoch*.pt"))
         if candidates:
             return candidates[-1]
     # 아직 없음 — caller 에서 .exists() False 로 처리됨
@@ -286,8 +287,8 @@ def main() -> None:
                     help="실행할 variant name (반복 가능). 미지정 시 전체")
     ap.add_argument("--group", action="append", default=[],
                     help="실행할 ablation_group (반복 가능)")
-    ap.add_argument("--nproc", type=int, default=2,
-                    help="torchrun --nproc_per_node (default 2)")
+    ap.add_argument("--nproc", type=int, default=7,
+                    help="torchrun --nproc_per_node (default 7 — B200 노드는 GPU 7 사용 금지)")
     ap.add_argument("--dry-run", action="store_true",
                     help="merge 된 config 출력만, train 실행 안 함")
     ap.add_argument("--skip-existing", action="store_true",
