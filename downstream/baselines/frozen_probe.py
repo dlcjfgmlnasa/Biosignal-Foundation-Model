@@ -161,6 +161,6 @@ if __name__ == "__main__":
     ap.add_argument("--feat", nargs="+", help="probe: tag=feat.npz")
     ap.add_argument("--sets", nargs="+", help="probe: name=k1,k2 채널 조합")
     ap.add_argument("--pairs", nargs="*", help="probe: b-a (b − a) paired Δ")
-    ap.add_argument("--boot", type=int, default=1000)
+    ap.add_argument("--boot", type=int, default=2000)
     a = ap.parse_args()
     feat(a) if a.cmd == "feat" else probe(a)
