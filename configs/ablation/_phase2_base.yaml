@@ -82,7 +82,7 @@ crop_ratio_min: 0.01
 crop_ratio_max: 1.0
 min_patches: 40
 modality_balanced_alpha: 0.5
-modality_balanced_w_max_ratio: 10.0
+modality_balanced_w_max_ratio: 5.0
 batch_size: 110
 lr: 0.00035
 weight_decay: 0.1
