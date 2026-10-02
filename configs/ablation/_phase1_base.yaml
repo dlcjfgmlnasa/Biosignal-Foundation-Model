@@ -4,7 +4,7 @@
 #   - 코퍼스: SNUH OR/ICU 2025 1~12월(로컬 6 + R2 6) + 2026 1~9월 = 21개월
 #     TODO: K-MIMIC-MORTAL 노드 이관 후 data_dir/shard_index_path 에 추가
 #   - PAP 켬: num_signal_types 10 · signal_types 에 9 추가 (from-scratch 필수)
-#   - modality_balanced_w_max_ratio 5 -> 10 (09-28 사용자 승인, 전체 코퍼스 기준 재계산 후 확정)
+#   - modality_balanced_w_max_ratio 5 유지 (09-28 에 10 으로 승인했으나 10-02 사용자 지시로 현 모델·Table S-hp 와 같은 5 로 되돌림)
 #   - output_dir outputs/ablation (exp_name 은 variant 별; run_ablation.py 의 OUTPUT_ROOT 와 일치)
 # ============================================================
 model_config:
