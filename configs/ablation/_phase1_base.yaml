@@ -2,7 +2,7 @@
 # [09-30] CARMEN ablation Phase 1 base — 재학습 레시피. variants.yaml 의 overrides 만 얹는다.
 #   출처: configs/full_174m_p25.yaml (09-24/25 확정 레시피) 에서 아래만 바꿈
 #   - 코퍼스: SNUH OR/ICU 2025 1~12월(로컬 6 + R2 6) + 2026 1~9월 = 21개월
-#     TODO: K-MIMIC-MORTAL 노드 이관 후 data_dir/shard_index_path 에 추가
+#     + K-MIMIC-MORTAL 725명(snuh_or/{processed,sharded}/kmimic_p0..7, 10-05 노드 반영) — PAP 4,485 rec 포함
 #   - PAP 켬: num_signal_types 10 · signal_types 에 9 추가 (from-scratch 필수)
 #   - modality_balanced_w_max_ratio 5 유지 (09-28 에 10 으로 승인했으나 10-02 사용자 지시로 현 모델·Table S-hp 와 같은 5 로 되돌림)
 #   - output_dir outputs/ablation (exp_name 은 variant 별; run_ablation.py 의 OUTPUT_ROOT 와 일치)
@@ -50,7 +50,15 @@ data_dir: [/NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/pro
   /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/processed/202606/,
   /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/processed/202607/,
   /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/processed/202608/,
-  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/processed/202609/]
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/processed/202609/,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/processed/kmimic_p0/,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/processed/kmimic_p1/,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/processed/kmimic_p2/,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/processed/kmimic_p3/,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/processed/kmimic_p4/,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/processed/kmimic_p5/,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/processed/kmimic_p6/,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/processed/kmimic_p7/]
 shard_index_path: [/NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/sharded/202501/shard_index.json,
   /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/sharded/202502/shard_index.json,
   /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/sharded_r2/202503/shard_index.json,
@@ -71,7 +79,15 @@ shard_index_path: [/NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snu
   /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/sharded/202606/shard_index.json,
   /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/sharded/202607/shard_index.json,
   /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/sharded/202608/shard_index.json,
-  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/sharded/202609/shard_index.json]
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/sharded/202609/shard_index.json,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/sharded/kmimic_p0/shard_index.json,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/sharded/kmimic_p1/shard_index.json,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/sharded/kmimic_p2/shard_index.json,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/sharded/kmimic_p3/shard_index.json,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/sharded/kmimic_p4/shard_index.json,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/sharded/kmimic_p5/shard_index.json,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/sharded/kmimic_p6/shard_index.json,
+  /NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd/snuh_or/sharded/kmimic_p7/shard_index.json]
 shard_cache_size: 4
 signal_types: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
 max_subjects: null
