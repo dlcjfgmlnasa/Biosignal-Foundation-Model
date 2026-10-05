@@ -195,7 +195,7 @@ class GroupedQueryAttention(nn.Module):
             )
 
         attn_bias = 0
-        if self.var_attn_bias is not None:
+        if self.var_attn_bias is not None and query_var_id is not None:
             attn_bias = attn_bias + self.var_attn_bias(
                 query,
                 key,
@@ -299,6 +299,9 @@ class GroupedQueryAttention(nn.Module):
             value.shape[-1],
         )  # (*batch, group, hpg, kv_len, dim)
 
+        # var_id 미지정 = 모든 토큰이 같은 variate → var bias 는 행마다 상수라
+        # softmax 불변(no-op). 계산을 건너뛰어야 SDPA 가 fused 커널을 탄다(1.5배).
+        skip_var_bias = query_var_id is None and kv_var_id is None
         query_var_id, kv_var_id = self._get_var_id(query, key, query_var_id, kv_var_id)
         query_time_id, kv_time_id = self._get_time_id(
             query,
@@ -311,7 +314,7 @@ class GroupedQueryAttention(nn.Module):
             attn_mask,
             query,
             key,
-            query_var_id=query_var_id,
+            query_var_id=None if skip_var_bias else query_var_id,
             kv_var_id=kv_var_id,
             query_time_id=query_time_id,
             kv_time_id=kv_time_id,

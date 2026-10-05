@@ -915,8 +915,11 @@ class BiosignalFoundationModel(nn.Module):
             )
         else:
             rope_time_id = time_id
+        # sample 당 variate 1개(CI)면 var_id=None — attention 이 같은-sample 로만
+        # 열려 있어 var bias 가 상수(no-op)이므로 attention 쪽에서 계산을 건너뛴다.
+        single_variate = not bool((p_vid > 1).any())
         encoder_kwargs = dict(
-            var_id=p_vid,
+            var_id=None if single_variate else p_vid,
             time_id=rope_time_id,
             token_mask=token_valid,
             cond=ada_cond,

@@ -218,6 +218,8 @@ def main():
         # Phase 1 CI 고정값
         config.collate_mode = "ci"
         config.variate_mask_prob = 0.0
+        # Phase 2 와 동일하게 YAML resume 을 fallback 으로 허용 (run_ablation 재개용)
+        args.resume = args.resume or config.resume
         if rank0:
             print(f"Config loaded from: {args.config}")
     else:
