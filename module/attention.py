@@ -8,6 +8,7 @@ RMSNorm을 기본 norm_layer로 사용하도록 수정.
 from __future__ import annotations
 
 import math
+import os as _os
 from collections.abc import Callable
 from functools import partial
 
@@ -15,6 +16,11 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
 from torch import nn
+
+# CARMEN_SDPA_RANK4=1 이면 SDPA 에 5D 대신 4D 텐서를 넘긴다. 5D 를 넘기면
+# PyTorch 가 fused 커널(flash / mem-efficient / cuDNN)을 전부 거부하고 math 로
+# 떨어진다. (group, hpg) 를 합쳐 4D 로 주면 fused 커널이 선택된다.
+_SDPA_RANK4 = _os.environ.get("CARMEN_SDPA_RANK4", "0") == "1"
 
 from .norm import RMSNorm
 from .position import AttentionBias, QueryKeyProjection
@@ -99,10 +105,16 @@ class GroupedQueryAttention(nn.Module):
         self.num_groups = num_groups
         self.head_dim = dim // num_heads
         self.heads_per_group = num_heads // num_groups
-        self.var_attn_bias = var_attn_bias() if var_attn_bias is not None else None
-        self.time_attn_bias = time_attn_bias() if time_attn_bias is not None else None
+        self.var_attn_bias = (
+            var_attn_bias() if var_attn_bias is not None else None
+        )
+        self.time_attn_bias = (
+            time_attn_bias() if time_attn_bias is not None else None
+        )
         self.var_qk_proj = var_qk_proj() if var_qk_proj is not None else None
-        self.time_qk_proj = time_qk_proj() if time_qk_proj is not None else None
+        self.time_qk_proj = (
+            time_qk_proj() if time_qk_proj is not None else None
+        )
 
         self.softmax_scale = softmax_scale or 1 / math.sqrt(self.head_dim)
 
@@ -110,10 +122,14 @@ class GroupedQueryAttention(nn.Module):
         self.k_proj = nn.Linear(dim, self.head_dim * num_groups, bias=bias)
         self.v_proj = nn.Linear(dim, self.head_dim * num_groups, bias=bias)
         self.q_norm = (
-            norm_layer(self.head_dim) if norm_layer is not None else nn.Identity()
+            norm_layer(self.head_dim)
+            if norm_layer is not None
+            else nn.Identity()
         )
         self.k_norm = (
-            norm_layer(self.head_dim) if norm_layer is not None else nn.Identity()
+            norm_layer(self.head_dim)
+            if norm_layer is not None
+            else nn.Identity()
         )
         self.attn_dropout_p = attn_dropout_p
         self.out_proj = nn.Linear(dim, dim, bias=bias)
@@ -132,18 +148,24 @@ class GroupedQueryAttention(nn.Module):
             if query_var_id is None:
                 query_var_id = repeat(
                     torch.zeros((), device=query.device, dtype=torch.long),
-                    f" -> {' '.join(map(str, query.shape[:-4]))} 1 1 {query.shape[-2]}",
+                    f" -> {' '.join(map(str, query.shape[:-4]))} 1 1 "
+                    f"{query.shape[-2]}",
                 )
             else:
-                query_var_id = rearrange(query_var_id, "... q_len -> ... 1 1 q_len")
+                query_var_id = rearrange(
+                    query_var_id, "... q_len -> ... 1 1 q_len"
+                )
 
             if kv_var_id is None:
                 kv_var_id = repeat(
                     torch.zeros((), device=key.device, dtype=torch.long),
-                    f" -> {' '.join(map(str, key.shape[:-4]))} 1 1 {key.shape[-2]}",
+                    f" -> {' '.join(map(str, key.shape[:-4]))} 1 1 "
+                    f"{key.shape[-2]}",
                 )
             else:
-                kv_var_id = rearrange(kv_var_id, "... kv_len -> ... 1 1 kv_len")
+                kv_var_id = rearrange(
+                    kv_var_id, "... kv_len -> ... 1 1 kv_len"
+                )
 
         return query_var_id, kv_var_id
 
@@ -163,18 +185,26 @@ class GroupedQueryAttention(nn.Module):
                     torch.arange(
                         query.shape[-2], device=query.device, dtype=torch.long
                     ),
-                    f"q_len -> {' '.join(map(str, query.shape[:-4]))} 1 1 q_len",
+                    f"q_len -> {' '.join(map(str, query.shape[:-4]))} 1 1 "
+                    f"q_len",
                 )
             else:
-                query_time_id = rearrange(query_time_id, "... q_len -> ... 1 1 q_len")
+                query_time_id = rearrange(
+                    query_time_id, "... q_len -> ... 1 1 q_len"
+                )
 
             if kv_time_id is None:
                 kv_time_id = repeat(
-                    torch.arange(key.shape[-2], device=key.device, dtype=torch.long),
-                    f"kv_len -> {' '.join(map(str, key.shape[:-4]))} 1 1 kv_len",
+                    torch.arange(
+                        key.shape[-2], device=key.device, dtype=torch.long
+                    ),
+                    f"kv_len -> {' '.join(map(str, key.shape[:-4]))} 1 1 "
+                    f"kv_len",
                 )
             else:
-                kv_time_id = rearrange(kv_time_id, "... kv_len-> ... 1 1 kv_len")
+                kv_time_id = rearrange(
+                    kv_time_id, "... kv_len-> ... 1 1 kv_len"
+                )
 
         return query_time_id, kv_time_id
 
@@ -185,9 +215,12 @@ class GroupedQueryAttention(nn.Module):
         key: torch.Tensor,  # (*batch, group, hpg, kv_len, dim)
         query_var_id: torch.Tensor | None = None,  # (*batch, 1, 1, q_len) long
         kv_var_id: torch.Tensor | None = None,  # (*batch, 1, 1, kv_len) long
-        query_time_id: torch.Tensor | None = None,  # (*batch, 1, 1, q_len) long
+        query_time_id: torch.Tensor
+        | None = None,  # (*batch, 1, 1, q_len) long
         kv_time_id: torch.Tensor | None = None,  # (*batch, 1, 1, kv_len) long
-    ) -> torch.Tensor | None:  # (*batch, #group, #hpg, q_len, kv_len) bool|float
+    ) -> (
+        torch.Tensor | None
+    ):  # (*batch, #group, #hpg, q_len, kv_len) bool|float
         if attn_mask is not None:
             attn_mask = rearrange(
                 attn_mask,
@@ -217,7 +250,9 @@ class GroupedQueryAttention(nn.Module):
             else (
                 attn_bias
                 if attn_mask is None
-                else attn_bias.masked_fill(attn_mask.logical_not(), float("-inf"))
+                else attn_bias.masked_fill(
+                    attn_mask.logical_not(), float("-inf")
+                )
             )
         )
         return attn_mask
@@ -226,9 +261,11 @@ class GroupedQueryAttention(nn.Module):
         self,
         query: torch.Tensor,  # (*batch, group, hpg, q_len, dim)
         key: torch.Tensor,  # (*batch, group, hpg, kv_len, dim)
-        query_var_id: torch.Tensor | None,  # (*batch, #group, #hpg, q_len) long
+        query_var_id: torch.Tensor
+        | None,  # (*batch, #group, #hpg, q_len) long
         kv_var_id: torch.Tensor | None,  # (*batch, #group, #hpg, kv_len) long
-        query_time_id: torch.Tensor | None,  # (*batch, #group, #hpg, q_len) long
+        query_time_id: torch.Tensor
+        | None,  # (*batch, #group, #hpg, q_len) long
         kv_time_id: torch.Tensor | None,  # (*batch, #group, #hpg, kv_len) long
     ) -> tuple[
         torch.Tensor,  # (*batch, group, hpg, q_len, dim)
@@ -302,7 +339,9 @@ class GroupedQueryAttention(nn.Module):
         # var_id 미지정 = 모든 토큰이 같은 variate → var bias 는 행마다 상수라
         # softmax 불변(no-op). 계산을 건너뛰어야 SDPA 가 fused 커널을 탄다(1.5배).
         skip_var_bias = query_var_id is None and kv_var_id is None
-        query_var_id, kv_var_id = self._get_var_id(query, key, query_var_id, kv_var_id)
+        query_var_id, kv_var_id = self._get_var_id(
+            query, key, query_var_id, kv_var_id
+        )
         query_time_id, kv_time_id = self._get_time_id(
             query,
             key,
@@ -329,15 +368,36 @@ class GroupedQueryAttention(nn.Module):
             kv_time_id=kv_time_id,
         )
 
-        out = F.scaled_dot_product_attention(
-            query,
-            key,
-            value,
-            attn_mask=attn_mask,
-            dropout_p=self.attn_dropout_p if self.training else 0.0,
-            scale=self.softmax_scale,
-        )
-        out = rearrange(out, "... group hpg q_len dim -> ... q_len (group hpg dim)")
+        if _SDPA_RANK4:
+            # heads_per_group == 1 (MHA) 이면 flatten 이 단순 view 라 복사가 없다.
+            q4 = query.flatten(-4, -3)
+            k4 = key.flatten(-4, -3)
+            v4 = value.flatten(-4, -3)
+            if attn_mask is not None and attn_mask.dim() == query.dim():
+                m4 = attn_mask.flatten(-4, -3)
+            else:
+                m4 = attn_mask
+            out = F.scaled_dot_product_attention(
+                q4,
+                k4,
+                v4,
+                attn_mask=m4,
+                dropout_p=self.attn_dropout_p if self.training else 0.0,
+                scale=self.softmax_scale,
+            )
+            out = rearrange(out, "... h q_len dim -> ... q_len (h dim)")
+        else:
+            out = F.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=attn_mask,
+                dropout_p=self.attn_dropout_p if self.training else 0.0,
+                scale=self.softmax_scale,
+            )
+            out = rearrange(
+                out, "... group hpg q_len dim -> ... q_len (group hpg dim)"
+            )
         return self.out_proj(out)
 
 
